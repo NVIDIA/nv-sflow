@@ -10,15 +10,15 @@ Define _what to run_ in a `sflow.yaml` — tasks, dependencies, how to launch ea
 
 ## Documentation
 
-Full user documentation is available at: **https://nvidia.github.io/nv-sflow/**
+Full user documentation is available at: <a href="https://nvidia.github.io/nv-sflow/" target="_blank"><b>https://nvidia.github.io/nv-sflow/</b></a>
 
 Start here:
 
-- [Introduction](https://nvidia.github.io/nv-sflow/docs/user/intro)
-- [Quickstart](https://nvidia.github.io/nv-sflow/docs/user/quickstart)
-- [Configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration)
-- [CLI Reference](https://nvidia.github.io/nv-sflow/docs/user/cli)
-- [Sample Workflows](https://nvidia.github.io/nv-sflow/docs/user/samples)
+- <a href="https://nvidia.github.io/nv-sflow/docs/user/intro" target="_blank">Introduction</a>
+- <a href="https://nvidia.github.io/nv-sflow/docs/user/quickstart" target="_blank">Quickstart</a>
+- <a href="https://nvidia.github.io/nv-sflow/docs/user/configuration" target="_blank">Configuration</a>
+- <a href="https://nvidia.github.io/nv-sflow/docs/user/cli" target="_blank">CLI Reference</a>
+- <a href="https://nvidia.github.io/nv-sflow/docs/user/samples" target="_blank">Sample Workflows</a>
 ## Quickstart
 
 If you just want to validate the workflow engine locally (no Slurm required):
@@ -76,7 +76,7 @@ This guide will help you set up the development environment for contributing to 
   pip install uv
   ```
 
-### Getting Started
+### Cloning the Repository and Installing in Development Mode
 
 1. **Clone the repository**
 
