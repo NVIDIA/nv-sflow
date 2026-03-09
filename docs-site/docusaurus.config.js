@@ -16,8 +16,8 @@ function readReleasedDocVersions() {
 const config = {
   title: "sflow",
   tagline: "Workflow Orchestrator with Pluggable Backends",
-  url: "https://nvidia.github.io",
-  baseUrl: "/nv-sflow/",
+  url: "https://urban-carnival-zg812kp.pages.github.io",
+  baseUrl: "/",
   trailingSlash: false,
   favicon: "img/sflow-logo.ico",
   onBrokenLinks: "throw",
