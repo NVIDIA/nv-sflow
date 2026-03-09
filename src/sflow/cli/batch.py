@@ -267,8 +267,6 @@ def batch(
     if output_dir:
         sflow_cmd_parts.extend(["--output-dir", shlex.quote(str(output_dir))])
 
-    sflow_cmd = " ".join(sflow_cmd_parts)
-
     # Build sbatch directives
     sbatch_directives = [
         f"#SBATCH --job-name={job_name}",
@@ -362,12 +360,14 @@ def batch(
 
     script_lines.extend(
         [
-            f"cd {workspace_dir}",
+            f"cd {shlex.quote(str(workspace_dir))}",
             # "# Run sflow workflow dry-run to validate configuration and fail early if configuration error is detected",
             # f"{sflow_cmd} --dry-run | grep -q 'Configuration error' && (echo 'Detected Configuration error in dry run, aborting.'; exit 1;) || echo 'Configuration validated successfully, continuing.'",
             "",
             "# Run sflow workflow",
-            shlex.quote(str(Path(activate_script).resolve().parent)) + "/" + sflow_cmd,
+            shlex.quote(str(activate_script.resolve().parent / "sflow"))
+            + " "
+            + " ".join(sflow_cmd_parts[1:]),
             "",
         ]
     )
