@@ -9,7 +9,7 @@
             "args": [
                 "run",
                 "-f",
-                "${workspaceFolder}/examples/dynamo_trtllm_qwen3_32b.yaml",
+                "${workspaceFolder}/examples/local_hello_world.yaml",
                 "--tui"
             ],
             "console": "integratedTerminal"

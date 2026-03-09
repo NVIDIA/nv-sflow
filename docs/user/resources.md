@@ -7,7 +7,7 @@ sidebar_position: 7
 
 ## GPUs: `CUDA_VISIBLE_DEVICES` slicing (Slurm)
 
-This is based on `tests/integration/guide/sflow_slurm_gpu_cuda_visible.yaml`.
+GPU resource example:
 
 Key idea:
 
@@ -20,7 +20,7 @@ Minimal example:
 version: "0.1"
 
 variables:
-  SLURM_ACCOUNT: { value: edmundw }
+  SLURM_ACCOUNT: { value: your_slurm_account }
   SLURM_PARTITION: { value: your_slurm_partition }
   SLURM_TIME: { value: "00:05:00" }
   SLURM_NODES: { value: 1 }
@@ -54,7 +54,7 @@ workflow:
 
 This is useful for “server + client” style workflows where `127.0.0.1` must work.
 
-Example pattern (based on `tests/integration/guide/sflow_http_echo_slurm_container.yaml`):
+Example pattern:
 
 ```yaml
 workflow:

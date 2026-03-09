@@ -12,7 +12,7 @@ If a task does not set `operator: ...`, `sflow` chooses a backend-specific defau
 
 ## Define an operator and reference it from tasks
 
-This is based on `tests/integration/guide/sflow_http_echo_slurm_container.yaml`:
+Example with a containerized srun operator:
 
 ```yaml
 version: "0.1"

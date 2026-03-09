@@ -8,7 +8,7 @@ SFLOW CLI - Command Line Interface for the sflow workflow orchestrator
 import typer
 
 # Documentation link shown in all --help messages
-DOCS_URL = "https://github.com/NVIDIA/nv-sflow.git"
+DOCS_URL = "https://nvidia.github.io/nv-sflow/"
 
 # Create the main CLI app
 app = typer.Typer(

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --account=edmundw
+#SBATCH --account=your_slurm_account
 #SBATCH --partition=your_slurm_partition
 #SBATCH --job-name=sflow-test
 #SBATCH --nodes=2
@@ -18,4 +18,4 @@ cd ${SLURM_SUBMIT_DIR}
 
 # Run sflow - it will detect the existing Slurm allocation
 source .venv/bin/activate
-python -m sflow run --file tests/integration/guide/sflow_slurm_backend.yaml
+python -m sflow run --file sflow.yaml

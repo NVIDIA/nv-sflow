@@ -23,7 +23,7 @@ def sample(
     name: Annotated[
         Optional[str],
         typer.Argument(
-            help="Name of the sample to copy (e.g., 'hello_local' or 'hello_local.yaml'). "
+            help="Name of the sample to copy (e.g., 'local_hello_world' or 'local_hello_world.yaml'). "
             "Omit to list all available samples.",
         ),
     ] = None,
@@ -64,13 +64,13 @@ def sample(
         sflow sample
 
         # Copy a sample to current directory
-        sflow sample hello_local
+        sflow sample local_hello_world
 
         # Copy with custom output path
-        sflow sample hello_local --output my_workflow.yaml
+        sflow sample local_hello_world --output my_workflow.yaml
 
         # Overwrite existing file
-        sflow sample hello_local --force
+        sflow sample local_hello_world --force
     """
     # If no name provided or --list flag, show available samples
     if name is None or list_all:

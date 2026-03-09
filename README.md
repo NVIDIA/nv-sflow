@@ -1,5 +1,9 @@
 # sflow
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml/badge.svg)](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml)
+
 A Python CLI workflow orchestrator with **pluggable backends** (e.g. local, Slurm) for running declarative YAML DAGs, collecting logs, and organizing outputs consistently.
 
 Define _what to run_ in a `sflow.yaml` — tasks, dependencies, how to launch each task, and required resources. `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure. Example of a dynamo PD disaggregation LLM inference service workflow:
@@ -28,10 +32,10 @@ uv venv
 source .venv/bin/activate
 uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
 
-sflow run --file examples/hello_local.yaml --tui
+sflow run --file examples/local_hello_world.yaml --tui
 ```
 
-The `hello_local.yaml` file looks like this:
+The `local_hello_world.yaml` file looks like this:
 
 ```yaml
 version: "0.1"
@@ -45,7 +49,6 @@ workflow:
   name: hello_local
   tasks:
     - name: hello
-      operator: local_bash
       script:
         - echo "Hello ${WHO}"
 ```
@@ -118,3 +121,7 @@ This guide will help you set up the development environment for contributing to 
 ## Contributing
 
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to contribute to this project.
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).

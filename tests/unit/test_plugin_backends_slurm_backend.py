@@ -75,13 +75,13 @@ def test_allocate_success_single_node(monkeypatch, slurm_test_logger):
                 0,
                 [
                     "salloc: Granted job allocation 1111111",
-                    "salloc: Nodes eos1111 are ready for job",
+                    "salloc: Nodes node001 are ready for job",
                 ],
             ),
             (
                 0,
                 [
-                    "eos1111: 10.0.0.1:123",
+                    "node001: 10.0.0.1:123",
                 ],
             ),
         ]
@@ -91,7 +91,7 @@ def test_allocate_success_single_node(monkeypatch, slurm_test_logger):
     allocation = asyncio.run(backend.allocate())
 
     assert allocation.allocation_id == "1111111"
-    assert [n.name for n in allocation.nodes] == ["eos1111"]
+    assert [n.name for n in allocation.nodes] == ["node001"]
     assert [n.ip_address for n in allocation.nodes] == ["10.0.0.1"]
     assert [n.index for n in allocation.nodes] == [0]
     assert [n.num_gpus for n in allocation.nodes] == [8]
@@ -113,7 +113,7 @@ def test_allocate_success_single_node(monkeypatch, slurm_test_logger):
         "--no-shell",
         "--exclusive",
     ]
-    assert fake_launcher.calls[1]["command"] == ["scontrol", "getaddrs", "eos1111"]
+    assert fake_launcher.calls[1]["command"] == ["scontrol", "getaddrs", "node001"]
 
 
 def test_allocate_success_multiple_nodes(monkeypatch, slurm_test_logger):
@@ -142,14 +142,14 @@ def test_allocate_success_multiple_nodes(monkeypatch, slurm_test_logger):
                 0,
                 [
                     "salloc: Granted job allocation 2222222",
-                    "salloc: Nodes eos1111,eos1112 are ready for job",
+                    "salloc: Nodes node001,node002 are ready for job",
                 ],
             ),
             (
                 0,
                 [
-                    "eos1111: 10.0.0.1:123",
-                    "eos1112: 10.0.0.2:123",
+                    "node001: 10.0.0.1:123",
+                    "node002: 10.0.0.2:123",
                 ],
             ),
         ]
@@ -160,13 +160,13 @@ def test_allocate_success_multiple_nodes(monkeypatch, slurm_test_logger):
 
     assert allocation.allocation_id == "2222222"
     assert [(n.name, n.ip_address, n.index) for n in allocation.nodes] == [
-        ("eos1111", "10.0.0.1", 0),
-        ("eos1112", "10.0.0.2", 1),
+        ("node001", "10.0.0.1", 0),
+        ("node002", "10.0.0.2", 1),
     ]
     assert fake_launcher.calls[1]["command"] == [
         "scontrol",
         "getaddrs",
-        "eos1111,eos1112",
+        "node001,node002",
     ]
 
 
@@ -234,15 +234,15 @@ def test_allocate_reuses_env_allocation_and_skips_salloc(
     )
 
     monkeypatch.setenv("SLURM_JOB_ID", "9999999")
-    monkeypatch.setenv("SLURM_JOB_NODELIST", "eos1111,eos1112")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "node001,node002")
 
     fake_launcher = _FakeSubprocessLauncher(
         script=[
             (
                 0,
                 [
-                    "eos1111: 10.0.0.1:123",
-                    "eos1112: 10.0.0.2:123",
+                    "node001: 10.0.0.1:123",
+                    "node002: 10.0.0.2:123",
                 ],
             )
         ]
@@ -253,14 +253,14 @@ def test_allocate_reuses_env_allocation_and_skips_salloc(
 
     assert allocation.allocation_id == "9999999"
     assert [(n.name, n.ip_address, n.index, n.num_gpus) for n in allocation.nodes] == [
-        ("eos1111", "10.0.0.1", 0, 8),
-        ("eos1112", "10.0.0.2", 1, 8),
+        ("node001", "10.0.0.1", 0, 8),
+        ("node002", "10.0.0.2", 1, 8),
     ]
     assert len(fake_launcher.calls) == 1
     assert fake_launcher.calls[0]["command"] == [
         "scontrol",
         "getaddrs",
-        "eos1111,eos1112",
+        "node001,node002",
     ]
 
 
@@ -291,7 +291,7 @@ def test_allocate_fallback_to_srun_when_scontrol_fails(monkeypatch, slurm_test_l
                 0,
                 [
                     "salloc: Granted job allocation 3333333",
-                    "salloc: Nodes eos1111,eos1112 are ready for job",
+                    "salloc: Nodes node001,node002 are ready for job",
                 ],
             ),
             # scontrol getaddrs fails (e.g., not available on this cluster)
@@ -300,8 +300,8 @@ def test_allocate_fallback_to_srun_when_scontrol_fails(monkeypatch, slurm_test_l
             (
                 0,
                 [
-                    "eos1111:10.0.0.1",
-                    "eos1112:10.0.0.2",
+                    "node001:10.0.0.1",
+                    "node002:10.0.0.2",
                 ],
             ),
         ]
@@ -312,8 +312,8 @@ def test_allocate_fallback_to_srun_when_scontrol_fails(monkeypatch, slurm_test_l
 
     assert allocation.allocation_id == "3333333"
     assert [(n.name, n.ip_address, n.index) for n in allocation.nodes] == [
-        ("eos1111", "10.0.0.1", 0),
-        ("eos1112", "10.0.0.2", 1),
+        ("node001", "10.0.0.1", 0),
+        ("node002", "10.0.0.2", 1),
     ]
     assert len(fake_launcher.calls) == 3
     # First call: salloc (Command object)
@@ -323,13 +323,13 @@ def test_allocate_fallback_to_srun_when_scontrol_fails(monkeypatch, slurm_test_l
     assert fake_launcher.calls[1]["command"] == [
         "scontrol",
         "getaddrs",
-        "eos1111,eos1112",
+        "node001,node002",
     ]
     # Third call: srun fallback
     srun_cmd = fake_launcher.calls[2]["command"]
     assert srun_cmd[0] == "srun"
     assert "--nodelist" in srun_cmd
-    assert "eos1111,eos1112" in srun_cmd
+    assert "node001,node002" in srun_cmd
 
 
 def test_allocate_fallback_to_srun_when_scontrol_output_unparseable(

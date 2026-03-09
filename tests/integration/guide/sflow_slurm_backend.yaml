@@ -6,7 +6,7 @@ backends:
     default: true
     # Required for slurm backends (used by sflow for GPU packing/validation).
     gpus_per_node: 1
-    account: "edmundw"
+    account: "your_slurm_account"
     partition: "your_slurm_partition"
     time: "00:10:00"
     nodes: 1

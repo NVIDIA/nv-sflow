@@ -226,7 +226,7 @@ workflow:
 
 ## Minimal example
 
-This is based on `tests/integration/guide/sflow_multi_task_dependencies.yaml`:
+Minimal example:
 
 ```yaml
 version: "0.1"
@@ -313,7 +313,7 @@ When a list is provided:
 
 ## Replicas + variables (a slightly deeper step)
 
-This is based on `tests/integration/guide/sflow_with_variables_and_replicas.yaml`:
+Example with replicas and variables:
 
 ```yaml
 version: "0.1"

@@ -16,7 +16,7 @@ def test_command_requires_exec():
 def test_as_list_includes_exec_opts_and_args_in_order():
     cmd = Command(exec="srun", args=["echo", "hello"])
     cmd.add_opt("--account", "test_account")
-    cmd.add_opt("--nodelist", "eos0001")
+    cmd.add_opt("--nodelist", "node001")
     cmd.add_opt("--jobid", "1111111")
 
     assert cmd.as_list() == [
@@ -24,7 +24,7 @@ def test_as_list_includes_exec_opts_and_args_in_order():
         "--account",
         "test_account",
         "--nodelist",
-        "eos0001",
+        "node001",
         "--jobid",
         "1111111",
         "echo",
@@ -72,10 +72,10 @@ def test_str_dunder_matches_as_str():
 def test_format_command_for_command_str_and_list():
     cmd = Command(exec="srun", args=["echo", "hello, world"])
     cmd.add_opt("--account", "test_account")
-    cmd.add_opt("--nodelist", "eos0001")
+    cmd.add_opt("--nodelist", "node001")
     cmd.add_opt("--jobid", "1111111")
 
-    expected = "srun --account test_account --nodelist eos0001 --jobid 1111111 echo 'hello, world'"
+    expected = "srun --account test_account --nodelist node001 --jobid 1111111 echo 'hello, world'"
     assert format_command(cmd) == expected
     assert format_command(cmd.as_str()) == cmd.as_str()
     assert format_command(cmd.as_list()) == expected

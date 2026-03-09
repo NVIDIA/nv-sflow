@@ -95,24 +95,24 @@ sflow sample --list
 sflow sample
 
 # Copy a sample to current directory
-sflow sample hello_local
+sflow sample local_hello_world
 
 # Copy with custom output path
-sflow sample hello_local --output my_workflow.yaml
+sflow sample local_hello_world --output my_workflow.yaml
 
 # Overwrite existing file
-sflow sample hello_local --force
+sflow sample local_hello_world --force
 ```
 
 Available sample categories:
 
-- **Local**: `hello_local` – minimal local workflow
+- **Local**: `local_hello_world` – minimal local workflow
 - **Slurm**: `slurm_sglang_server_client` – Slurm-based inference workflow
 - **Dynamo**: `dynamo_sglang_qwen3_32b`, `dynamo_vllm_qwen3_32b`, `dynamo_trtllm_qwen3_32b`, etc. – disaggregated inference workflows
 
 Common options:
 
-- `<name>`: sample name (e.g., `hello_local` or `hello_local.yaml`)
+- `<name>`: sample name (e.g., `local_hello_world` or `local_hello_world.yaml`)
 - `--output, -o <path>`: output path for the sample file (default: `./<sample_name>`)
 - `--force, -f`: overwrite existing file if it exists
 - `--list, -l`: list all available samples

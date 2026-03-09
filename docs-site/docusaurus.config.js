@@ -121,7 +121,7 @@ const config = {
             ],
           },
         ],
-        copyright: `Copyright © ${new Date().getFullYear()} sflow`,
+        copyright: `Copyright © ${new Date().getFullYear()} NVIDIA Corporation. Licensed under Apache 2.0.`,
       },
     }),
 };

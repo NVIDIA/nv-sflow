@@ -3,7 +3,7 @@ version: "0.1"
 variables:
   # Override these via `--set` as needed for your cluster.
   SLURM_ACCOUNT:
-    value: edmundw
+    value: your_slurm_account
   SLURM_PARTITION:
     value: your_slurm_partition
   SLURM_TIME:

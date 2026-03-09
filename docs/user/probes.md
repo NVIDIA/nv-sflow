@@ -15,7 +15,7 @@ You can use probes under:
 
 ## Readiness: TCP port probe
 
-This is based on `tests/integration/guide/sflow_http_echo.yaml`:
+Example:
 
 ```yaml
 version: "0.1"
@@ -46,7 +46,7 @@ flowchart TD
 
 ## Readiness: log watch probe (+ retries)
 
-This is based on `tests/integration/guide/sflow_dynamo.yaml`.
+Example:
 
 `log_watch` looks for a pattern in a task log file:
 

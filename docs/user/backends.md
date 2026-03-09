@@ -12,11 +12,11 @@ If you omit `backends:` entirely, `sflow` creates a default local backend:
 - backend: `local` (synthetic allocation: `localhost`, `localhost-1`, ...)
 - default operator: `bash`
 
-This is why `tests/integration/guide/sflow_minimal.yaml` works without any backend/operator config.
+This is why a minimal workflow with just `workflow:` and `tasks:` works without any backend/operator config.
 
 ## Explicit local backend
 
-This is based on `tests/integration/guide/sflow_explicit_local_backend.yaml`:
+Explicit local backend example:
 
 ```yaml
 version: "0.1"
@@ -42,7 +42,7 @@ flowchart TD
 
 ## Slurm backend
 
-This is based on `tests/integration/guide/sflow_slurm_backend.yaml`:
+Slurm backend example:
 
 ```yaml
 version: "0.1"
@@ -51,7 +51,7 @@ backends:
   - name: slurm_cluster
     type: slurm
     default: true
-    account: "edmundw"
+    account: "your_slurm_account"
     partition: "your_slurm_partition"
     time: "00:10:00"
     nodes: 1
@@ -85,7 +85,7 @@ Notes:
 Example:
 
 ```bash
-sbatch --job-name=sflow --output=sflow-%j.out --wrap "cd $SLURM_SUBMIT_DIR && sflow run --file tests/integration/guide/sflow_slurm_backend.yaml"
+sbatch --job-name=sflow --output=sflow-%j.out --wrap "cd $SLURM_SUBMIT_DIR && sflow run --file sflow.yaml"
 ```
 
 ### Cluster-specific flags (`extra_args`)
