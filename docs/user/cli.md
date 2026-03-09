@@ -108,7 +108,7 @@ Available sample categories:
 
 - **Local**: `local_hello_world` – minimal local workflow
 - **Slurm**: `slurm_sglang_server_client` – Slurm-based inference workflow
-- **Dynamo**: `dynamo_sglang_qwen3_32b`, `dynamo_vllm_qwen3_32b`, `dynamo_trtllm_qwen3_32b`, etc. – disaggregated inference workflows
+- **Dynamo**: `slurm_dynamo_sglang_agg`, `slurm_dynamo_vllm_agg`, `slurm_dynamo_trtllm_agg`, etc. – disaggregated inference workflows
 
 Common options:
 

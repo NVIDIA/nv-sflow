@@ -39,7 +39,7 @@ variables:
     value: Nvidia
 
 workflow:
-  name: hello_local
+  name: local_hello_world
   tasks:
     - name: hello
       script:
