@@ -2,6 +2,52 @@
 
 A Python CLI workflow orchestrator with **pluggable backends** (e.g. local, Slurm) for running declarative YAML DAGs, collecting logs, and organizing outputs consistently.
 
+Define _what to run_ in a `sflow.yaml` — tasks, dependencies, how to launch each task, and required resources. `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure. Example of a dynamo PD disaggregation LLM inference service workflow:
+
+```mermaid
+graph TD
+  start((start))
+  stop(((stop)))
+
+  subgraph "prefill_server"
+    prefill_server_0
+    prefill_server_1
+  end
+  subgraph "decode_server"
+    decode_server_0
+    decode_server_1
+  end
+  subgraph "benchmark"
+    benchmark_0
+    benchmark_1
+    benchmark_0 -- Completed --> benchmark_1
+  end
+
+  gpu_monitor["gpu_monitor"]
+  nats_server["nats_server"]
+  etcd_server["etcd_server"]
+  frontend_server["frontend_server"]
+
+  start --> gpu_monitor
+  start --> nats_server
+  start --> etcd_server
+
+  nats_server -- Ready --> frontend_server
+  etcd_server -- Ready --> frontend_server
+  frontend_server -- Ready --> prefill_server_0
+  frontend_server -- Ready --> prefill_server_1
+  frontend_server -- Ready --> decode_server_0
+  frontend_server -- Ready --> decode_server_1
+  frontend_server -- Ready --> benchmark_0
+  prefill_server_0 -- Ready --> benchmark_0
+  prefill_server_1 -- Ready --> benchmark_0
+  decode_server_0 -- Ready --> benchmark_0
+  decode_server_1 -- Ready --> benchmark_0
+
+  gpu_monitor -- Completed --> stop
+  benchmark_1 -- Completed --> stop
+```
+
 ## Documentation
 
 Full user documentation is available at: **https://nvidia.github.io/nv-sflow/**
