@@ -2,11 +2,17 @@
 
 A Python CLI workflow orchestrator with **pluggable backends** (e.g. local, Slurm) for running declarative YAML DAGs, collecting logs, and organizing outputs consistently.
 
-## Introduction
+## Documentation
+
+Full user documentation is available at: **https://nvidia.github.io/nv-sflow/**
 
 Start here:
 
-- **User docs**: `docs/user/intro.md`
+- [Introduction](https://nvidia.github.io/nv-sflow/docs/user/intro)
+- [Quickstart](https://nvidia.github.io/nv-sflow/docs/user/quickstart)
+- [Configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration)
+- [CLI Reference](https://nvidia.github.io/nv-sflow/docs/user/cli)
+- [Sample Workflows](https://nvidia.github.io/nv-sflow/docs/user/samples)
 ## Quickstart
 
 If you just want to validate the workflow engine locally (no Slurm required):
@@ -14,7 +20,7 @@ If you just want to validate the workflow engine locally (no Slurm required):
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
 
 sflow run --file examples/hello_local.yaml --tui
 ```
@@ -69,8 +75,8 @@ This guide will help you set up the development environment for contributing to 
 1. **Clone the repository**
 
    ```bash
-   git clone <repository-url>
-   cd sflow
+   git clone https://github.com/NVIDIA/nv-sflow.git
+   cd nv-sflow
    ```
 
 2. **Create a virtual environment**

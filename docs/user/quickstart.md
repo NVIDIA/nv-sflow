@@ -44,7 +44,7 @@ Create a venv for sflow and install python wheels.
 uv venv --python python3
 source .venv/bin/activate
 # Install the latest sflow version
-uv pip install sflow==0.1.0
+uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
 sflow --help
 ```
 

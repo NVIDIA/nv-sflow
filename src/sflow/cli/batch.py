@@ -167,7 +167,7 @@ def batch(
         Optional[str],
         typer.Option(
             "--sflow-version",
-            help="Version of sflow to install in the generated sflow_compute_node_venv (e.g., '0.1.0', '0.1.0.dev134'). If not specified, reuse the installed version in the existing venv, or create a new venv and install the latest version",
+            help="Git ref (branch or tag) to install from the GitHub repo (e.g., 'main', 'v0.1.0'). If not specified, reuse the installed version in the existing venv, or create a new venv and install the latest main version.",
         ),
     ] = None,
     # output options
@@ -326,7 +326,7 @@ def batch(
         ])
         if sflow_version:
             script_lines.extend([
-                f"uv pip install sflow=={sflow_version} --prerelease=allow",
+                f"uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version}' --prerelease=allow",
             ])
     else:
         script_lines.extend([
@@ -349,7 +349,7 @@ def batch(
             "# uv venv .sflow_venv --python python3",
             "# source .sflow_venv/bin/activate",
             "",
-            f"uv pip install sflow{'=='+sflow_version if sflow_version else ' -U'} --prerelease=allow",
+            f"uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version if sflow_version else 'main'}' --prerelease=allow",
             "sflow --help",
             "",
         ])
