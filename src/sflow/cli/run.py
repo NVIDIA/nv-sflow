@@ -209,13 +209,17 @@ def run(
         _logger.error(f"Configuration error: {e}")
         typer.echo(f"✗ Configuration error: {e}", err=True)
         if _sflow_app.last_workflow_output_dir:
-            typer.echo(f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True)
+            typer.echo(
+                f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True
+            )
         raise typer.Exit(code=1)
     except FileNotFoundError as e:
         _logger.error(f"File not found: {e}")
         typer.echo(f"✗ File not found: {e}", err=True)
         if _sflow_app.last_workflow_output_dir:
-            typer.echo(f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True)
+            typer.echo(
+                f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True
+            )
         raise typer.Exit(code=1)
     except KeyboardInterrupt:
         _logger.info("Workflow cancelled by user")
@@ -227,5 +231,7 @@ def run(
         _logger.exception(f"Workflow execution failed: {e}")
         typer.echo(f"✗ Workflow failed: {e}", err=True)
         if _sflow_app.last_workflow_output_dir:
-            typer.echo(f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True)
+            typer.echo(
+                f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True
+            )
         raise typer.Exit(code=1)

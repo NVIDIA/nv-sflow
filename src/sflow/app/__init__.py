@@ -4,4 +4,3 @@
 """
 Manager modules for sflow.
 """
-

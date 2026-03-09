@@ -56,7 +56,9 @@ class SlurmBackend(Backend):
             ) from e
         self._subprocess_launcher = SubprocessLauncher()
 
-    async def _resolve_nodes_via_scontrol(self, *, nodelist: str) -> list[ComputeNode] | None:
+    async def _resolve_nodes_via_scontrol(
+        self, *, nodelist: str
+    ) -> list[ComputeNode] | None:
         """
         Try to resolve hostnames + IPs using `scontrol getaddrs`.
         Returns None if scontrol getaddrs is not available or fails.
@@ -204,9 +206,7 @@ class SlurmBackend(Backend):
             return nodes
 
         # Fallback to srun method
-        _logger.info(
-            "Falling back to srun method for resolving node addresses"
-        )
+        _logger.info("Falling back to srun method for resolving node addresses")
         return await self._resolve_nodes_via_srun(nodelist=nodelist, job_id=job_id)
 
     async def allocate(self) -> Allocation:
@@ -223,7 +223,9 @@ class SlurmBackend(Backend):
                 f"(SLURM_JOB_ID={job_id!r}, SLURM_JOB_NODELIST={nodelist!r})"
             )
 
-            nodes = await self._resolve_nodes_from_nodelist(nodelist=nodelist, job_id=job_id)
+            nodes = await self._resolve_nodes_from_nodelist(
+                nodelist=nodelist, job_id=job_id
+            )
             if self._nodes and len(nodes) != self._nodes:
                 _logger.warning(
                     "Slurm allocation node count differs from backend config (continuing): "
@@ -259,8 +261,9 @@ class SlurmBackend(Backend):
                 output_lines.append(record.getMessage())
 
         capture_handler = OutputCaptureHandler()
-        with temporary_handler(_logger, parser), temporary_handler(
-            _logger, capture_handler
+        with (
+            temporary_handler(_logger, parser),
+            temporary_handler(_logger, capture_handler),
         ):
             exit_code = await self._subprocess_launcher.run_async(
                 command, output_logger=_logger

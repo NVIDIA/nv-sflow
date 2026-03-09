@@ -318,51 +318,59 @@ def batch(
         activate_script = Path.cwd() / ".sflow_venv" / "bin" / "activate"
 
     if activate_script.exists():
-        script_lines.extend([
-            "# Activate existing Python virtual environment for sflow, please make sure this venv is compatible with your compute node arch of x86 / arm64",
-            "# Sometimes especially in GB200 clusters, login node is x86 and compute node is arm64, so you need to create a venv for arm64",
-            f"source {shlex.quote(str(activate_script))}",
-            "",
-        ])
+        script_lines.extend(
+            [
+                "# Activate existing Python virtual environment for sflow, please make sure this venv is compatible with your compute node arch of x86 / arm64",
+                "# Sometimes especially in GB200 clusters, login node is x86 and compute node is arm64, so you need to create a venv for arm64",
+                f"source {shlex.quote(str(activate_script))}",
+                "",
+            ]
+        )
         if sflow_version:
-            script_lines.extend([
-                f"uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version}' --prerelease=allow",
-            ])
+            script_lines.extend(
+                [
+                    f"uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version}' --prerelease=allow",
+                ]
+            )
     else:
-        script_lines.extend([
-            "# Python virtual environment activation script not found; creating from scratch and installing sflow",
-            f"mkdir -p {shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))}",
-            f"cd {shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))}",
-            "",
-            "# # By default we use compute node's python to create venv and install uv",
-            "# # This is because sometimes especially in GB200 / GB300 clusters, login node is x86 and compute node is arm64, so you need to create a venv for arm64",
-            "/usr/bin/python3 -m venv .sflow_venv",
-            "source .sflow_venv/bin/activate",
-            "pip install uv",
-            "uv --version",
-            "which uv",
-            "",
-            "# # You can uncomment below to fall back to sh way if your meet issues with pip install uv in your cluster",
-            "# curl -LsSf https://astral.sh/uv/install.sh | sh",
-            "# uv --version",
-            "# which uv",
-            "# uv venv .sflow_venv --python python3",
-            "# source .sflow_venv/bin/activate",
-            "",
-            f"uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version if sflow_version else 'main'}' --prerelease=allow",
-            "sflow --help",
-            "",
-        ])
+        script_lines.extend(
+            [
+                "# Python virtual environment activation script not found; creating from scratch and installing sflow",
+                f"mkdir -p {shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))}",
+                f"cd {shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))}",
+                "",
+                "# # By default we use compute node's python to create venv and install uv",
+                "# # This is because sometimes especially in GB200 / GB300 clusters, login node is x86 and compute node is arm64, so you need to create a venv for arm64",
+                "/usr/bin/python3 -m venv .sflow_venv",
+                "source .sflow_venv/bin/activate",
+                "pip install uv",
+                "uv --version",
+                "which uv",
+                "",
+                "# # You can uncomment below to fall back to sh way if your meet issues with pip install uv in your cluster",
+                "# curl -LsSf https://astral.sh/uv/install.sh | sh",
+                "# uv --version",
+                "# which uv",
+                "# uv venv .sflow_venv --python python3",
+                "# source .sflow_venv/bin/activate",
+                "",
+                f"uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version if sflow_version else 'main'}' --prerelease=allow",
+                "sflow --help",
+                "",
+            ]
+        )
 
-    script_lines.extend([
-        f"cd {workspace_dir}",
-        # "# Run sflow workflow dry-run to validate configuration and fail early if configuration error is detected",
-        # f"{sflow_cmd} --dry-run | grep -q 'Configuration error' && (echo 'Detected Configuration error in dry run, aborting.'; exit 1;) || echo 'Configuration validated successfully, continuing.'",
-        "",
-        "# Run sflow workflow",
-        shlex.quote(str(Path(activate_script).resolve().parent)) + "/" + sflow_cmd,
-        "",
-    ])
+    script_lines.extend(
+        [
+            f"cd {workspace_dir}",
+            # "# Run sflow workflow dry-run to validate configuration and fail early if configuration error is detected",
+            # f"{sflow_cmd} --dry-run | grep -q 'Configuration error' && (echo 'Detected Configuration error in dry run, aborting.'; exit 1;) || echo 'Configuration validated successfully, continuing.'",
+            "",
+            "# Run sflow workflow",
+            shlex.quote(str(Path(activate_script).resolve().parent)) + "/" + sflow_cmd,
+            "",
+        ]
+    )
 
     script_content = "\n".join(script_lines)
 

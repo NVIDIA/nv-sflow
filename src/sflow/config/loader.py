@@ -201,11 +201,11 @@ class ConfigLoader:
     def _infer_type(self, value: str) -> Any:
         """
         Infers the type of the value string (int, float, bool, list, or str).
-        
+
         Supports JSON-like list syntax: [1, 2, 3] or ["a", "b", "c"]
         """
         import json
-        
+
         # Try JSON parsing first (handles lists, nested structures)
         # This catches: [1,2,3], ["a","b"], {"key": "value"}, etc.
         value_stripped = value.strip()
@@ -214,7 +214,7 @@ class ConfigLoader:
                 return json.loads(value_stripped)
             except json.JSONDecodeError:
                 pass  # Fall through to other type inference
-        
+
         # Try int
         try:
             return int(value)

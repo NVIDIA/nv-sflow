@@ -106,11 +106,17 @@ def sample(
         typer.echo("\nYou can use it with below options:")
         if "slurm" in output.name.lower():
             typer.echo("\nValidate the workflow with:")
-            typer.echo(f"  sflow run --file {output.name} --set SLURM_ACCOUNT=YOUR_SLURM_ACCOUNT --set SLURM_PARTITION=YOUR_SLURM_PARTITION --set SLURM_NODES=NUMBER_OF_NODES --dry-run")
+            typer.echo(
+                f"  sflow run --file {output.name} --set SLURM_ACCOUNT=YOUR_SLURM_ACCOUNT --set SLURM_PARTITION=YOUR_SLURM_PARTITION --set SLURM_NODES=NUMBER_OF_NODES --dry-run"
+            )
             typer.echo("\nRun it interactively with:")
-            typer.echo(f"  sflow run --file {output.name} --set SLURM_ACCOUNT=YOUR_SLURM_ACCOUNT --set SLURM_PARTITION=YOUR_SLURM_PARTITION --set SLURM_NODES=NUMBER_OF_NODES --tui")
+            typer.echo(
+                f"  sflow run --file {output.name} --set SLURM_ACCOUNT=YOUR_SLURM_ACCOUNT --set SLURM_PARTITION=YOUR_SLURM_PARTITION --set SLURM_NODES=NUMBER_OF_NODES --tui"
+            )
             typer.echo("\nSubmit it to Slurm cluster with:")
-            typer.echo(f"  sflow batch --file {output.name} -J sflow-job-{output.name.replace('.yaml', '')} -A YOUR_SLURM_ACCOUNT -p YOUR_SLURM_PARTITION -N NUMBER_OF_NODES -o sflow-sbatch-{output.name.replace('.yaml', '')}.sh --submit")
+            typer.echo(
+                f"  sflow batch --file {output.name} -J sflow-job-{output.name.replace('.yaml', '')} -A YOUR_SLURM_ACCOUNT -p YOUR_SLURM_PARTITION -N NUMBER_OF_NODES -o sflow-sbatch-{output.name.replace('.yaml', '')}.sh --submit"
+            )
         else:
             typer.echo("\nValidate the workflow with:")
             typer.echo(f"  sflow run --file {output.name} --dry-run")
@@ -171,7 +177,7 @@ def _get_sample_node_info(sample_path: Path) -> str | None:
         content = sample_path.read_text()
         nodes = None
         gpus_per_node = None
-        
+
         for line in content.split("\n"):
             line_stripped = line.strip()
             # Look for SLURM_NODES variable
@@ -200,33 +206,39 @@ def _get_sample_node_info(sample_path: Path) -> str | None:
                         # It's a variable reference, need to find the variable value
                         pass
             # Look for gpus_per_node
-            if line_stripped.startswith("gpus_per_node:") or "GPUS_PER_NODE:" in line_stripped:
+            if (
+                line_stripped.startswith("gpus_per_node:")
+                or "GPUS_PER_NODE:" in line_stripped
+            ):
                 parts = line_stripped.split(":", 1)
                 if len(parts) == 2:
                     val = parts[1].strip()
                     if val.isdigit():
                         gpus_per_node = int(val)
-        
+
         # Parse YAML properly for accurate extraction
         import re
+
         # Find SLURM_NODES value
-        nodes_match = re.search(r'SLURM_NODES:[\s\S]*?value:\s*(\d+)', content)
+        nodes_match = re.search(r"SLURM_NODES:[\s\S]*?value:\s*(\d+)", content)
         if nodes_match:
             nodes = int(nodes_match.group(1))
-        
+
         # Find GPUS_PER_NODE value
-        gpus_match = re.search(r'GPUS_PER_NODE:[\s\S]*?value:\s*(\d+)', content)
+        gpus_match = re.search(r"GPUS_PER_NODE:[\s\S]*?value:\s*(\d+)", content)
         if gpus_match:
             gpus_per_node = int(gpus_match.group(1))
-        
+
         # Build info string
         if nodes is not None and gpus_per_node is not None:
-            return f"{nodes} node{'s, ' if nodes > 1 else ',  '}{gpus_per_node} GPUs/node"
+            return (
+                f"{nodes} node{'s, ' if nodes > 1 else ',  '}{gpus_per_node} GPUs/node"
+            )
         elif nodes is not None:
             return f"{nodes} node{'s' if nodes > 1 else ''}"
         elif gpus_per_node is not None:
             return f"{gpus_per_node} GPUs/node"
-        
+
         return None
     except Exception:
         return None

@@ -19,8 +19,9 @@ _logger = get_logger(__name__)
 def _strip_ansi(text: str) -> str:
     """Strip ANSI escape sequences from text."""
     import re
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    return ansi_escape.sub('', text)
+
+    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    return ansi_escape.sub("", text)
 
 
 class SubprocessLauncher:
@@ -123,6 +124,7 @@ class SubprocessLauncher:
 
         # Set master to non-blocking for async reading
         import fcntl
+
         flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
@@ -165,7 +167,9 @@ class SubprocessLauncher:
                 if ret is not None and not chunk:
                     # Process exited and no more data
                     if buffer:
-                        line_str = _strip_ansi(buffer.decode("utf-8", errors="replace")).rstrip()
+                        line_str = _strip_ansi(
+                            buffer.decode("utf-8", errors="replace")
+                        ).rstrip()
                         if line_str:
                             _logger.info(f"{pfx}{line_str}")
                             if output_logger:

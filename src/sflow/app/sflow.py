@@ -17,11 +17,11 @@ _logger = get_logger(__name__)
 def extract_container_mounts_from_extra_args(extra_args: list[str]) -> list[str]:
     """
     Extract --container-mounts values from extra_args.
-    
+
     Handles both formats:
     - --container-mounts /path1:/path2
     - --container-mounts=/path1:/path2
-    
+
     Multiple comma-separated mounts are split into individual entries.
     """
     mounts: list[str] = []
@@ -64,7 +64,7 @@ class SflowApp:
     ) -> Path | None:
         """
         Run the workflow and return the workflow output directory path.
-        
+
         Returns:
             Path to the workflow output directory (e.g., sflow_output/<workflow-name>-<timestamp>-<id>),
             or None for dry-run mode.
@@ -107,7 +107,11 @@ class SflowApp:
                 refresh_hz = 10
                 if ui is not None:
                     try:
-                        refresh_hz = int(getattr(getattr(ui, "_config", None), "refresh_per_second", 10))
+                        refresh_hz = int(
+                            getattr(
+                                getattr(ui, "_config", None), "refresh_per_second", 10
+                            )
+                        )
                     except Exception:
                         refresh_hz = 10
                 sleep_s = 0.1 if refresh_hz <= 0 else max(0.01, 1.0 / float(refresh_hz))
@@ -153,7 +157,9 @@ class SflowApp:
                     workflow_out_dir = out_dir / "_dry_run" / config.workflow.name
                 else:
                     run_id = f"{config.workflow.name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
-                    slurm_job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID")
+                    slurm_job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get(
+                        "SLURM_JOBID"
+                    )
                     if slurm_job_id:
                         run_id = f"{slurm_job_id}-{run_id}"
                     workflow_out_dir = out_dir / run_id
@@ -252,6 +258,7 @@ class SflowApp:
                 # Output directory structure + built-in envs (SRD REQ-1.4 / REQ-4.4)
                 # -----------------------------------------------------------------
                 tg = state.workflow.task_graph
+
                 # -----------------------------------------------------------------
                 # Container mount hygiene for Slurm/Pyxis runs
                 # -----------------------------------------------------------------
@@ -309,7 +316,11 @@ class SflowApp:
                             existing_keys.add(key)
 
                         if auto_mounts:
-                            setattr(op_conf, "container_mounts", existing_mounts + auto_mounts)
+                            setattr(
+                                op_conf,
+                                "container_mounts",
+                                existing_mounts + auto_mounts,
+                            )
                     except Exception:
                         # Best-effort only; do not break planning/execution due to mount inference.
                         return
@@ -399,7 +410,7 @@ class SflowApp:
                         _logger.warning("Artifact path validation warnings:")
                         for w in artifact_warnings:
                             _logger.warning(f"  ⚠ {w}")
-                    
+
                     # Validate container mount paths (REQ: warn users about invalid mounts)
                     def _validate_container_mounts(
                         tasks: list, *, sflow_output_dir: Path
@@ -467,7 +478,9 @@ class SflowApp:
                             if "=" in var_override:
                                 key, value = var_override.split("=", 1)
                                 value_stripped = value.strip()
-                                if value_stripped.startswith("[") and value_stripped.endswith("]"):
+                                if value_stripped.startswith(
+                                    "["
+                                ) and value_stripped.endswith("]"):
                                     # Domain override (list)
                                     _logger.info(f"    {key} = {value}  (domain sweep)")
                                 else:
@@ -509,7 +522,9 @@ class SflowApp:
                     all_mounts: set[str] = set()
                     for task_name in order:
                         task = tg.get_task(task_name)
-                        task_op_conf = getattr(getattr(task, "operator", None), "config", None)
+                        task_op_conf = getattr(
+                            getattr(task, "operator", None), "config", None
+                        )
                         if task_op_conf is not None:
                             # Get mounts from container_mounts field
                             mounts = getattr(task_op_conf, "container_mounts", None)
@@ -522,7 +537,9 @@ class SflowApp:
                             # Also get mounts from extra_args
                             extra_args = getattr(task_op_conf, "extra_args", None)
                             if extra_args:
-                                for mount in extract_container_mounts_from_extra_args(list(extra_args)):
+                                for mount in extract_container_mounts_from_extra_args(
+                                    list(extra_args)
+                                ):
                                     if "sflow_output" in mount.lower():
                                         continue
                                     all_mounts.add(mount)
@@ -557,19 +574,27 @@ class SflowApp:
                         # Task header
                         _logger.info("")
                         _logger.info(f"  [{idx}] {t.name}")
-                        _logger.info(f"      ├─ backend: {getattr(t, 'backend_name', None)}")
+                        _logger.info(
+                            f"      ├─ backend: {getattr(t, 'backend_name', None)}"
+                        )
                         _logger.info(f"      ├─ operator: {op_type_str}")
                         _logger.info(f"      ├─ deps: {list(deps) if deps else '[]'}")
                         _logger.info(f"      ├─ nodelist: {nodelist}")
                         if cuda_visible:
-                            _logger.info(f"      ├─ CUDA_VISIBLE_DEVICES: {cuda_visible}")
+                            _logger.info(
+                                f"      ├─ CUDA_VISIBLE_DEVICES: {cuda_visible}"
+                            )
                         _logger.info(f"      ├─ task_output_dir: {task_out_dir}")
                         _logger.info(f"      ├─ retries: {retry_str}")
 
                         # Sweep variables
                         if t.sweep_variables:
-                            sweep_vals = {k: t.envs.get(k, "") for k in t.sweep_variables}
-                            sweep_items = ", ".join(f"{k}={v}" for k, v in sweep_vals.items())
+                            sweep_vals = {
+                                k: t.envs.get(k, "") for k in t.sweep_variables
+                            }
+                            sweep_items = ", ".join(
+                                f"{k}={v}" for k, v in sweep_vals.items()
+                            )
                             _logger.info(f"      ├─ sweep_vars: {{{sweep_items}}}")
 
                         # Operator config details
@@ -581,33 +606,52 @@ class SflowApp:
                             if getattr(op_conf, "ntasks", None) is not None:
                                 op_details.append(("ntasks", str(op_conf.ntasks)))
                             if getattr(op_conf, "ntasks_per_node", None) is not None:
-                                op_details.append(("ntasks_per_node", str(op_conf.ntasks_per_node)))
+                                op_details.append(
+                                    ("ntasks_per_node", str(op_conf.ntasks_per_node))
+                                )
                             if getattr(op_conf, "cpus_per_task", None) is not None:
-                                op_details.append(("cpus_per_task", str(op_conf.cpus_per_task)))
+                                op_details.append(
+                                    ("cpus_per_task", str(op_conf.cpus_per_task))
+                                )
                             if getattr(op_conf, "gpus", None) is not None:
                                 op_details.append(("gpus", str(op_conf.gpus)))
                             if getattr(op_conf, "gpus_per_task", None) is not None:
-                                op_details.append(("gpus_per_task", str(op_conf.gpus_per_task)))
+                                op_details.append(
+                                    ("gpus_per_task", str(op_conf.gpus_per_task))
+                                )
                             if getattr(op_conf, "container_image", None) is not None:
-                                op_details.append(("container_image", op_conf.container_image))
+                                op_details.append(
+                                    ("container_image", op_conf.container_image)
+                                )
                             if getattr(op_conf, "container_name", None) is not None:
-                                op_details.append(("container_name", op_conf.container_name))
+                                op_details.append(
+                                    ("container_name", op_conf.container_name)
+                                )
                             if getattr(op_conf, "container_mounts", None):
                                 mounts = op_conf.container_mounts
                                 if len(mounts) <= 3:
                                     op_details.append(("container_mounts", str(mounts)))
                                 else:
-                                    op_details.append(("container_mounts", f"[{len(mounts)} mounts]"))
+                                    op_details.append(
+                                        ("container_mounts", f"[{len(mounts)} mounts]")
+                                    )
                             if getattr(op_conf, "mpi", None) is not None:
                                 op_details.append(("mpi", op_conf.mpi))
-                            if getattr(op_conf, "job_id", None) is not None and getattr(op_conf, "job_id", None) != "0":
+                            if (
+                                getattr(op_conf, "job_id", None) is not None
+                                and getattr(op_conf, "job_id", None) != "0"
+                            ):
                                 op_details.append(("job_id", str(op_conf.job_id)))
                             if getattr(op_conf, "extra_args", None):
                                 extra_args_list = list(op_conf.extra_args)
                                 if len(extra_args_list) <= 5:
-                                    op_details.append(("extra_args", str(extra_args_list)))
+                                    op_details.append(
+                                        ("extra_args", str(extra_args_list))
+                                    )
                                 else:
-                                    op_details.append(("extra_args", f"[{len(extra_args_list)} args]"))
+                                    op_details.append(
+                                        ("extra_args", f"[{len(extra_args_list)} args]")
+                                    )
 
                             if op_details:
                                 _logger.info("      └─ operator config:")

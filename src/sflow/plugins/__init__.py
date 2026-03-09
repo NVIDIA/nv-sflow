@@ -4,4 +4,3 @@
 """
 Plugin implementations for sflow.
 """
-

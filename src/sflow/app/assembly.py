@@ -52,20 +52,24 @@ def _build_task_info(
     for i, node_name_assigned in enumerate(task.assigned_nodes):
         node = alloc_nodes_by_name.get(node_name_assigned)
         if node:
-            task_nodes.append({
-                "name": node.name,
-                "ip_address": node.ip_address,
-                "index": i,  # Use index within task's assigned nodes
-                "num_gpus": node.num_gpus,
-            })
+            task_nodes.append(
+                {
+                    "name": node.name,
+                    "ip_address": node.ip_address,
+                    "index": i,  # Use index within task's assigned nodes
+                    "num_gpus": node.num_gpus,
+                }
+            )
         else:
             # Fallback if node not found in allocation
-            task_nodes.append({
-                "name": node_name_assigned,
-                "ip_address": "",
-                "index": i,
-                "num_gpus": None,
-            })
+            task_nodes.append(
+                {
+                    "name": node_name_assigned,
+                    "ip_address": "",
+                    "index": i,
+                    "num_gpus": None,
+                }
+            )
 
     # Parse GPU indices from CUDA_VISIBLE_DEVICES env var
     gpus: list[int] = []
@@ -113,7 +117,9 @@ def _build_tasks_ctx(
     # If we have replica mapping, also build indexed access by base task name
     if replica_names_by_base:
         for base_name, replica_names in replica_names_by_base.items():
-            if len(replica_names) > 1 or (len(replica_names) == 1 and replica_names[0] != base_name):
+            if len(replica_names) > 1 or (
+                len(replica_names) == 1 and replica_names[0] != base_name
+            ):
                 # This is a replicated task - build a list for indexed access
                 replica_list: list[dict[str, Any]] = []
                 for replica_name in replica_names:
@@ -121,12 +127,14 @@ def _build_tasks_ctx(
                         replica_list.append(tasks_ctx[replica_name])
                     else:
                         # Fallback: empty info
-                        replica_list.append({
-                            "nodes": [],
-                            "gpus": [],
-                            "backend": None,
-                            "operator": None,
-                        })
+                        replica_list.append(
+                            {
+                                "nodes": [],
+                                "gpus": [],
+                                "backend": None,
+                                "operator": None,
+                            }
+                        )
                 # Add the base name as a list for indexed access
                 tasks_ctx[base_name] = replica_list
 
@@ -1210,7 +1218,9 @@ def build_task_graph(
                 # Reserve per-node GPU slices in the global planning cursor so later tasks
                 # don't accidentally "pack" onto nodes that are already fully consumed by
                 # this multi-node request.
-                cursor_keys = [(runtime_backend.name, n_name) for n_name in assigned_nodes]
+                cursor_keys = [
+                    (runtime_backend.name, n_name) for n_name in assigned_nodes
+                ]
                 starts = [gpu_next.get(k, 0) for k in cursor_keys]
                 if len(set(starts)) != 1:
                     raise ValueError(
@@ -1218,7 +1228,7 @@ def build_task_graph(
                         f"already-allocated GPU cursors {starts}. Pin nodes explicitly to avoid ambiguity."
                     )
                 start0 = starts[0]
-                for (n_name, cap) in zip(assigned_nodes, caps, strict=True):
+                for n_name, cap in zip(assigned_nodes, caps, strict=True):
                     if start0 + per_node > cap:
                         raise ValueError(
                             f"Task '{task_name}' requests {per_node} GPUs per node starting at {start0} on node "
@@ -1300,7 +1310,9 @@ def build_task_graph(
                 instances = [{}]
 
         # Generate replica names based on sweep variable values or numeric index
-        def _make_replica_name(base_name: str, idx: int, instance: dict[str, Any], sweep_vars: list[str]) -> str:
+        def _make_replica_name(
+            base_name: str, idx: int, instance: dict[str, Any], sweep_vars: list[str]
+        ) -> str:
             """Generate replica name from variable values (if sweep) or numeric index."""
             if sweep_vars and instance:
                 # Use variable values in the order they appear in sweep_vars
@@ -1309,7 +1321,12 @@ def build_task_graph(
                     if var_name in instance:
                         val = instance[var_name]
                         # Sanitize value for use in task name (replace problematic chars)
-                        val_str = str(val).replace(".", "_").replace("-", "_").replace(" ", "_")
+                        val_str = (
+                            str(val)
+                            .replace(".", "_")
+                            .replace("-", "_")
+                            .replace(" ", "_")
+                        )
                         value_parts.append(val_str)
                 if value_parts:
                     return f"{base_name}_{'_'.join(value_parts)}"
@@ -1451,7 +1468,9 @@ def build_task_graph(
                             return None
                         return (parts[0], parts[1])
 
-                    existing_mounts = list(getattr(op_conf, "container_mounts", None) or [])
+                    existing_mounts = list(
+                        getattr(op_conf, "container_mounts", None) or []
+                    )
                     existing_keys: set[tuple[str, str]] = set()
                     for m in existing_mounts:
                         k = _mount_key(m)
@@ -1461,7 +1480,9 @@ def build_task_graph(
                     auto_mounts: list[str] = []
                     for art in (state.artifacts or {}).values():
                         try:
-                            scheme = (urlparse(str(getattr(art, "uri", ""))).scheme or "").lower()
+                            scheme = (
+                                urlparse(str(getattr(art, "uri", ""))).scheme or ""
+                            ).lower()
                         except Exception:
                             scheme = ""
                         if scheme not in {"fs", "file"}:
@@ -1497,7 +1518,9 @@ def build_task_graph(
                         existing_keys.add(key)
 
                     if auto_mounts:
-                        setattr(op_conf, "container_mounts", existing_mounts + auto_mounts)
+                        setattr(
+                            op_conf, "container_mounts", existing_mounts + auto_mounts
+                        )
 
             if task_operator is None:
                 operator_cls = get_operator_class(op_conf.type)
@@ -1683,7 +1706,9 @@ def build_task_graph(
 
     # Third pass: resolve `${{ task.* }}` expressions in task scripts now that all tasks are built.
     # This enables referencing other tasks' assigned nodes and GPUs.
-    tasks_ctx = _build_tasks_ctx(task_graph, state.backends or {}, replica_names_by_base)
+    tasks_ctx = _build_tasks_ctx(
+        task_graph, state.backends or {}, replica_names_by_base
+    )
     task_ctx: dict[str, Any] = {
         "task": tasks_ctx,
         "variables": variables_ctx,

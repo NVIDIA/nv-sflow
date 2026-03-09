@@ -129,5 +129,3 @@ def http_cache_path(uri: str, *, cache_dir: Path) -> Path:
     """
     h = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:16]
     return cache_dir / f"http_{h}"
-
-
