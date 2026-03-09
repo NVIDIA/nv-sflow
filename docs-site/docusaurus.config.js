@@ -12,12 +12,14 @@ function readReleasedDocVersions() {
   }
 }
 
+const baseUrl = process.env.DOCS_BASE_URL || "/";
+
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: "sflow",
   tagline: "Workflow Orchestrator with Pluggable Backends",
   url: "https://nvidia.github.io",
-  baseUrl: "/nv-sflow/",
+  baseUrl,
   trailingSlash: false,
   favicon: "img/sflow-logo.ico",
   onBrokenLinks: "throw",

@@ -32,8 +32,20 @@ jobs:
         working-directory: docs-site
         run: npm install
 
+      - name: Detect base URL from repo visibility
+        id: baseurl
+        run: |
+          VISIBILITY="${{ github.event.repository.visibility }}"
+          if [ "$VISIBILITY" = "public" ]; then
+            echo "base_url=/${{ github.event.repository.name }}/" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_url=/" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build Docusaurus site
         working-directory: docs-site
+        env:
+          DOCS_BASE_URL: ${{ steps.baseurl.outputs.base_url }}
         run: npm run build
 
       - name: Upload Pages artifact
