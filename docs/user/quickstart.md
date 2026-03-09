@@ -153,7 +153,7 @@ sflow batch --file workflow.yaml --sbatch-path run_workflow.sh -e '--exclusive' 
 
 ```bash
 sflow batch \
-  --file examples/slurm_sglang_qwen3_32b.yaml \
+  --file examples/slurm_sglang_server_client.yaml \
   --partition gpu \
   --account myaccount \
   --time 02:00:00 \

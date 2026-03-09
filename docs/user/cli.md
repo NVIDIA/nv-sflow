@@ -107,7 +107,7 @@ sflow sample hello_local --force
 Available sample categories:
 
 - **Local**: `hello_local` – minimal local workflow
-- **Slurm**: `slurm_sglang_qwen3_32b` – Slurm-based inference workflow
+- **Slurm**: `slurm_sglang_server_client` – Slurm-based inference workflow
 - **Dynamo**: `dynamo_sglang_qwen3_32b`, `dynamo_vllm_qwen3_32b`, `dynamo_trtllm_qwen3_32b`, etc. – disaggregated inference workflows
 
 Common options:
