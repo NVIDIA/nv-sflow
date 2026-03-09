@@ -5,7 +5,7 @@ sidebar_position: 12
 
 This page contains sample workflow configurations that you can use as starting points for your own workflows. You can also access these samples using the `sflow sample` command.
 
-> 📁 **View original sample files**: [src/sflow/samples](../../src/sflow/samples)
+> 📁 **View original sample files**: [src/sflow/samples](https://github.com/NVIDIA/nv-sflow/tree/main/src/sflow/samples)
 
 ## Listing Available Samples
 

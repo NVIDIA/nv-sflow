@@ -60,7 +60,7 @@ sflow sample --list
 sflow sample slurm_dynamo_trtllm_disagg
 ```
 
-Or create a minimal Slurm config manually (based on [`tests/integration/guide/sflow_slurm_backend.yaml`](tests/integration/guide/sflow_slurm_backend.yaml)):
+Or create a minimal Slurm config manually (based on [`tests/integration/guide/sflow_slurm_backend.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_slurm_backend.yaml)):
 
 ```yaml
 version: "0.1"
@@ -99,7 +99,7 @@ Notes:
 sflow run --file tests/integration/guide/sflow_slurm_backend.yaml --tui
 ```
 
-> 📄 See [`sflow_slurm_backend.yaml`](tests/integration/guide/sflow_slurm_backend.yaml)
+> 📄 See [`sflow_slurm_backend.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_slurm_backend.yaml)
 
 The TUI shows:
 
@@ -243,7 +243,7 @@ Get a starter workflow using `sflow sample`:
 sflow sample local_hello_world
 ```
 
-Or create a minimal config manually (based on [`tests/integration/guide/sflow_minimal.yaml`](tests/integration/guide/sflow_minimal.yaml)):
+Or create a minimal config manually (based on [`tests/integration/guide/sflow_minimal.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_minimal.yaml)):
 
 ```yaml
 version: "0.1"
@@ -264,7 +264,7 @@ flowchart TD
 
 Notes:
 
-- This uses defaults (local backend + inline script). If you prefer being explicit, see [`sflow_explicit_local_backend.yaml`](tests/integration/guide/sflow_explicit_local_backend.yaml).
+- This uses defaults (local backend + inline script). If you prefer being explicit, see [`sflow_explicit_local_backend.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_explicit_local_backend.yaml).
 
 ## 2) Run Locally
 
@@ -272,7 +272,7 @@ Notes:
 sflow run --file tests/integration/guide/sflow_minimal.yaml --tui
 ```
 
-> 📄 See [`sflow_minimal.yaml`](tests/integration/guide/sflow_minimal.yaml)
+> 📄 See [`sflow_minimal.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_minimal.yaml)
 
 Default output structure:
 
@@ -285,7 +285,7 @@ The minimal example runs a single task. Below is the smallest "real workflow" ex
 
 - `prepare_data` → `preprocess` → `train` → (`evaluate_on_dataset1`, `evaluate_on_dataset2`) → `export_model`
 
-This is based on [`tests/integration/guide/sflow_quickstart_dag.yaml`](tests/integration/guide/sflow_quickstart_dag.yaml) and also demonstrates variables in both forms:
+This is based on [`tests/integration/guide/sflow_quickstart_dag.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_quickstart_dag.yaml) and also demonstrates variables in both forms:
 
 - expression: `${{ variables.MODEL_NAME }}`
 - env var (in task script): `${MODEL_NAME}`
@@ -364,7 +364,7 @@ Run it:
 sflow run --file tests/integration/guide/sflow_quickstart_dag.yaml
 ```
 
-> 📄 See [`sflow_quickstart_dag.yaml`](tests/integration/guide/sflow_quickstart_dag.yaml)
+> 📄 See [`sflow_quickstart_dag.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_quickstart_dag.yaml)
 
 If you want to visualize the DAG without running it:
 
@@ -378,6 +378,6 @@ sflow visualize --file tests/integration/guide/sflow_quickstart_dag.yaml --forma
 sflow run --file tests/integration/guide/sflow_minimal.yaml --dry-run
 ```
 
-> 📄 See [`sflow_minimal.yaml`](tests/integration/guide/sflow_minimal.yaml)
+> 📄 See [`sflow_minimal.yaml`](https://github.com/NVIDIA/nv-sflow/blob/main/tests/integration/guide/sflow_minimal.yaml)
 
 Dry-run does not create output directories/files. It prints the execution plan and computed output paths.
