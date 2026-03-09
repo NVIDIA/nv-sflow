@@ -103,18 +103,18 @@ def sample(
     try:
         shutil.copy2(sample_path, output)
         typer.echo(f"✓ Sample copied to: {output}")
-        typer.echo(f"\nYou can use it with below options:")
+        typer.echo("\nYou can use it with below options:")
         if "slurm" in output.name.lower():
-            typer.echo(f"\nValidate the workflow with:")
+            typer.echo("\nValidate the workflow with:")
             typer.echo(f"  sflow run --file {output.name} --set SLURM_ACCOUNT=YOUR_SLURM_ACCOUNT --set SLURM_PARTITION=YOUR_SLURM_PARTITION --set SLURM_NODES=NUMBER_OF_NODES --dry-run")
-            typer.echo(f"\nRun it interactively with:")
+            typer.echo("\nRun it interactively with:")
             typer.echo(f"  sflow run --file {output.name} --set SLURM_ACCOUNT=YOUR_SLURM_ACCOUNT --set SLURM_PARTITION=YOUR_SLURM_PARTITION --set SLURM_NODES=NUMBER_OF_NODES --tui")
-            typer.echo(f"\nSubmit it to Slurm cluster with:")
+            typer.echo("\nSubmit it to Slurm cluster with:")
             typer.echo(f"  sflow batch --file {output.name} -J sflow-job-{output.name.replace('.yaml', '')} -A YOUR_SLURM_ACCOUNT -p YOUR_SLURM_PARTITION -N NUMBER_OF_NODES -o sflow-sbatch-{output.name.replace('.yaml', '')}.sh --submit")
         else:
-            typer.echo(f"\nValidate the workflow with:")
+            typer.echo("\nValidate the workflow with:")
             typer.echo(f"  sflow run --file {output.name} --dry-run")
-            typer.echo(f"\nRun it interactively with:")
+            typer.echo("\nRun it interactively with:")
             typer.echo(f"  sflow run --file {output.name} --tui")
     except Exception as e:
         _logger.exception(f"Failed to copy sample: {e}")

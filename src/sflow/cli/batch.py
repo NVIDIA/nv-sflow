@@ -274,7 +274,7 @@ def batch(
         f"#SBATCH --job-name={job_name}",
         f"#SBATCH --output={sbatch_output}",
         f"#SBATCH --error={sbatch_error}",
-        f"#SBATCH --mem=0",
+        "#SBATCH --mem=0",
         f"#SBATCH --partition={partition}",
         f"#SBATCH --account={account}",
         f"#SBATCH --nodes={nodes}",

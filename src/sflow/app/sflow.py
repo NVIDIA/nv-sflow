@@ -390,7 +390,7 @@ class SflowApp:
                                 )
                                 if scheme == "file":
                                     warnings.append(
-                                        f"\tBut you can ignore this warning since 'file' type artifact will be created at runtime."
+                                        "\tBut you can ignore this warning since 'file' type artifact will be created at runtime."
                                     )
                         return warnings
 

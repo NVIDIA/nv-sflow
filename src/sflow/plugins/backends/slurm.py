@@ -110,8 +110,6 @@ class SlurmBackend(Backend):
         Runs `srun --nodelist=<nodelist> --ntasks-per-node=1 bash -c 'echo $(hostname):$(hostname -i)'`
         and parses the output.
         """
-        import os
-
         # Build srun command
         cmd: list[str] = ["srun", "--nodelist", nodelist, "--ntasks-per-node=1"]
 
