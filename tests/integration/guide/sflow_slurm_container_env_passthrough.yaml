@@ -1,0 +1,71 @@
+version: "0.1"
+
+variables:
+  # Override these via `--set` as needed for your cluster.
+  SLURM_ACCOUNT:
+    value: edmundw
+  SLURM_PARTITION:
+    value: your_slurm_partition
+  SLURM_TIME:
+    value: "00:05:00"
+  SLURM_NODES:
+    value: 1
+  GPUS_PER_NODE:
+    value: 1
+
+  # Env passthrough assertion value
+  ENV_CHECK:
+    value: "hello from sflow"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: ${{ variables.SLURM_NODES }}
+
+operators:
+  - name: pyxis_py
+    type: srun
+    # Uses Pyxis if configured in your Slurm cluster.
+    container_image: python:3.13-slim
+    container_mount_home: true
+    container_writable: true
+
+workflow:
+  name: slurm_container_env_passthrough
+
+  tasks:
+    - name: env_check
+      operator: pyxis_py
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - |
+          python - <<'PY'
+          import os
+
+          # 1) User variable injected into task env
+          expected = "hello from sflow"
+          got = os.environ.get("ENV_CHECK")
+          assert got == expected, f"ENV_CHECK not propagated into container: got={got!r} expected={expected!r}"
+
+          # 2) Built-in envs injected by sflow
+          for k in ("SFLOW_WORKSPACE_DIR", "SFLOW_OUTPUT_DIR", "SFLOW_WORKFLOW_OUTPUT_DIR", "SFLOW_TASK_OUTPUT_DIR"):
+              v = os.environ.get(k)
+              assert v, f"Missing built-in env in container: {k}"
+
+          # 3) Sanity: workflow dir exists and we can write a marker file
+          wf_out = os.environ["SFLOW_WORKFLOW_OUTPUT_DIR"]
+          marker = os.path.join(wf_out, "env_passthrough_ok.txt")
+          with open(marker, "w", encoding="utf-8") as f:
+              f.write("ok\n")
+
+          print("env passthrough OK")
+          print("SFLOW_WORKFLOW_OUTPUT_DIR=", wf_out)
+          print("marker=", marker)
+          PY

@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: sflow integration dynamo.yaml",
+            "type": "python",
+            "request": "launch",
+            "module": "sflow",
+            "args": [
+                "run",
+                "-f",
+                "${workspaceFolder}/examples/dynamo_trtllm_qwen3_32b.yaml",
+                "--tui"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}

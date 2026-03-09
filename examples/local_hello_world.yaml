@@ -1,0 +1,13 @@
+version: "0.1"
+
+variables:
+  WHO:
+    description: "who to greet"
+    value: Nvidia
+
+workflow:
+  name: hello_local
+  tasks:
+    - name: hello
+      script:
+        - echo "Hello ${WHO}"

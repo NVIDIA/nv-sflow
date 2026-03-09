@@ -1,0 +1,40 @@
+version: "0.1"
+
+variables:
+  - name: MSG
+    type: string
+    value: hello
+
+workflow:
+  name: wf
+  tasks:
+    # Root task: writes a shared file into workflow output dir.
+    - name: t1
+      script:
+        - echo "t1 start"
+        - echo "jinja=${{ variables.MSG }}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/msg.txt
+        - echo "shell=${MSG}" >> ${SFLOW_WORKFLOW_OUTPUT_DIR}/msg.txt
+
+    # Fan-out branch A
+    - name: t2
+      depends_on: [t1]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/msg.txt
+        - grep -q "jinja=hello" ${SFLOW_WORKFLOW_OUTPUT_DIR}/msg.txt
+        - echo "t2 ok" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/t2.txt
+
+    # Fan-out branch B
+    - name: t3
+      depends_on: [t1]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/msg.txt
+        - grep -q "shell=hello" ${SFLOW_WORKFLOW_OUTPUT_DIR}/msg.txt
+        - echo "t3 ok" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/t3.txt
+
+    # Fan-in: depends on both branches
+    - name: t4
+      depends_on: [t2, t3]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/t2.txt
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/t3.txt
+        - echo "t4 ok" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/done.txt

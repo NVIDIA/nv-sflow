@@ -1,0 +1,13 @@
+version: "0.1"
+
+backends:
+  - name: local
+    type: local
+    default: true
+
+workflow:
+  name: wf
+  tasks:
+    - name: hello
+      script:
+        - echo hello

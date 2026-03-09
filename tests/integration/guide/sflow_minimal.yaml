@@ -1,0 +1,8 @@
+version: "0.1"
+
+workflow:
+  name: wf
+  tasks:
+    - name: hello
+      script:
+        - echo hello

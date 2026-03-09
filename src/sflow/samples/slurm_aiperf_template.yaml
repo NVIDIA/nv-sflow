@@ -1,0 +1,128 @@
+version: "0.1"
+
+variables:
+  # Variables has 2 ways of access, and can be overridden by --set flag in sflow batch / sflow run command
+  # 1. In YAML expressions: `${{ variables.NAME }}`, sflow will automatically resolve the expression and inject the value before the workflow is executed, it works across any fields in the yaml file, such as backends, operators, workflow, tasks, scripts, etc.
+  # 2. In task scripts (as env var): `${NAME}`, the variable can also be accessed as an environment variable in the task script
+  
+  # Slurm Configuration - These will be skipped if you use 'sflow batch -f sflow.yaml --submit' to launch the workflow and overwrite the variables in cli args
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: 60
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    value: 4
+  SLURM_NODES:
+    description: "Number of nodes"
+    value: 1
+  
+  # Model Configuration
+  HF_MODEL_NAME:
+    description: "HF model name"
+    value: Qwen/Qwen3-0.6B-FP8
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: Qwen3-0-6B-FP8
+  LOCAL_MODEL_PATH:
+    description: "Local model path"
+    value: /tmp/models/Qwen3-0.6B-FP8
+  
+  
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 32
+  
+  # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # In some cluster like Corewaeve / OCI, you may need to add --gpus-per-node=N directive to the sbatch / salloc command
+    # For GB200 / GB300 clusters, you may need to add --segment=N directive to make sure allocated nodes are in same network domain
+    # extra_args:
+    #   - "--gpus-per-node=${{ variables.GPUS_PER_NODE }}"
+    #   - "--segment=${{ variables.SLURM_NODES }}"
+
+operators:
+  - name: aiperf
+    type: srun
+    container_name: aiperf
+    container_writable: true
+    mpi: pmix
+    extra_args:
+      - --container-image=${{ variables.AIPERF_IMAGE }}
+
+workflow:
+  name: aiperf
+  timeout: 60m
+  variables:
+    HEAD_NODE_IP:
+      description: "Head node IP"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+  tasks:
+    - name: benchmark
+      operator:
+        name: aiperf
+        ntasks: 1
+      script:
+        - set -x
+        - export COLUMNS=200
+        - pip install aiperf==0.3.0
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ variables.HF_MODEL_NAME }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --workers-max 1
+          --record-processors 1
+          --ui none
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]

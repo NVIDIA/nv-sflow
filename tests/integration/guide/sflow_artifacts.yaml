@@ -1,0 +1,24 @@
+version: "0.1"
+
+artifacts:
+  INLINE:
+    # Relative file:// paths with inline content are written under the workflow output dir.
+    uri: "file://artifacts/inline.txt"
+    # Inline content is materialized only in non-dry-run runs.
+    content: |
+      hello from inline artifact
+
+workflow:
+  name: artifacts
+  variables:
+    INLINE_PATH:
+      value: "${{ artifacts.INLINE.path }}"
+  tasks:
+    - name: check
+      script:
+        - set -euo pipefail
+        - echo "inline_ctx=${{ artifacts.INLINE.path }}" > "$SFLOW_TASK_OUTPUT_DIR/result.txt"
+        - echo "inline_env=$INLINE" >> "$SFLOW_TASK_OUTPUT_DIR/result.txt"
+        - cat "$INLINE" >> "$SFLOW_TASK_OUTPUT_DIR/result.txt"
+        - echo "" >> "$SFLOW_TASK_OUTPUT_DIR/result.txt"
+        - echo "var_inline_path=${{ variables.INLINE_PATH }}" >> "$SFLOW_TASK_OUTPUT_DIR/result.txt"

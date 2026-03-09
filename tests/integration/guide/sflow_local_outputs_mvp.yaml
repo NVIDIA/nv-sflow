@@ -1,0 +1,33 @@
+version: "0.1"
+
+backends:
+  - name: local
+    type: local
+    default: true
+    nodes: 1
+
+workflow:
+  name: local_outputs_mvp
+
+  tasks:
+    - name: t1
+      script:
+        - |
+          echo "hello"
+          echo "TTFT: 42.4 ms"
+          echo "TTFT: 42.3 ms"
+          echo "TTFT: 42.1 ms"
+      outputs:
+        - pattern: "TTFT: {ttft:f} ms"
+          source: stdout
+
+    - name: t2_verify
+      depends_on: [t1]
+      script:
+        - |
+          set -euo pipefail
+          test -f "${SFLOW_WORKFLOW_OUTPUT_DIR}/t1/outputs.json"
+          grep -q '42.4' "${SFLOW_WORKFLOW_OUTPUT_DIR}/t1/outputs.json"
+          grep -q '42.3' "${SFLOW_WORKFLOW_OUTPUT_DIR}/t1/outputs.json"
+          grep -q '42.1' "${SFLOW_WORKFLOW_OUTPUT_DIR}/t1/outputs.json"
+          echo "outputs.json OK"

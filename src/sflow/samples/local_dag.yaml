@@ -1,0 +1,48 @@
+version: "0.1"
+
+variables:
+  - name: MODEL_NAME
+    type: string
+    value: tiny-transformer
+
+workflow:
+  name: quickstart_dag
+  tasks:
+    - name: prepare_data
+      script:
+        - echo "prepare_data start"
+        - echo "model(jinja)=${{ variables.MODEL_NAME }}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+        - echo "model(shell)=${MODEL_NAME}" >> ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+
+    - name: preprocess
+      depends_on: [prepare_data]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+        - grep -q "model(jinja)=tiny-transformer" ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+        - grep -q "model(shell)=tiny-transformer" ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+        - echo "encoded_data ok" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
+
+    - name: train
+      depends_on: [preprocess]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
+        - echo "checkpoint for ${MODEL_NAME}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+
+    - name: evaluate_on_dataset1
+      depends_on: [train]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+        - echo "accuracy=0.99 dataset=dataset1" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
+
+    - name: evaluate_on_dataset2
+      depends_on: [train]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+        - echo "accuracy=0.88 dataset=dataset2" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
+
+    - name: export_model
+      depends_on: [evaluate_on_dataset1, evaluate_on_dataset2]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset1/metrics.txt
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset2/metrics.txt
+        - echo "exported ${MODEL_NAME}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/model.onnx

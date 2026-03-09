@@ -1,0 +1,37 @@
+{
+  // Editor
+  "editor.formatOnSave": true,
+  "editor.rulers": [120],
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+
+  "files.autoSave": "onFocusChange",
+
+  "prettier.tabWidth": 2,
+  "prettier.printWidth": 120,
+
+  // Python environment
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.envFile": "${workspaceFolder}/.env",
+
+  // Formatting
+  "[python]": {
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+
+  // Testing
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["--capture=no", "-vv"],
+
+  "yaml.schemaStore.enable": false,
+  "yaml.schemas": {
+    "gitlab-ci.schema.json": [".gitlab-ci.yml"]
+  },
+  "svg.preview.background": "dark-transparent",
+  "[svg]": {
+    "editor.defaultFormatter": "jock.svg"
+  }
+}

@@ -1,0 +1,23 @@
+version: "0.1"
+
+variables:
+  - name: GPU_COUNT
+    type: integer
+    value: 2
+  - name: REPLICA_COUNT
+    type: integer
+    value: 3
+
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo "hello from replica ${SFLOW_REPLICA_INDEX}"
+        - echo "I have ${GPU_COUNT} GPUs"
+      replicas:
+        count: "${{ variables.REPLICA_COUNT }}"
+        policy: parallel
+      resources:
+        gpus:
+          count: "${{ variables.GPU_COUNT }}"

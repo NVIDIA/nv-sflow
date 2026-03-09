@@ -1,0 +1,378 @@
+version: "0.1"
+
+variables:
+  # Slurm Configuration
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: "120"
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    value: 4
+  SLURM_NODES:
+    description: "Number of nodes"
+    value: 2
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: gpt-oss-120B
+
+  # Prefill Server Configuration
+  NUM_CTX_SERVERS:
+    description: "Number of context/prefill servers"
+    value: 4
+  CTX_TP_SIZE:
+    description: "Context tensor parallel size"
+    value: 1
+  CTX_BATCH_SIZE:
+    description: "Context batch size"
+    value: 64
+  CTX_MAX_NUM_TOKENS:
+    description: "Context max number of tokens"
+    value: 20000
+  CTX_MAX_SEQ_LEN:
+    description: "Context max sequence length"
+    value: 1227
+
+  # Decode Server Configuration
+  NUM_GEN_SERVERS:
+    description: "Number of generation/decode servers"
+    value: 2
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size"
+    value: 2
+  GEN_BATCH_SIZE:
+    description: "Generation batch size"
+    value: 1024
+  GEN_MAX_NUM_TOKENS:
+    description: "Generation max number of tokens"
+    value: 20000
+  GEN_MAX_SEQ_LEN:
+    description: "Generation max sequence length"
+    value: 2251
+
+  # Extra Arguments
+  EXTRA_PREFILL_ARGS:
+    description: "Extra prefill arguments"
+    value: ""
+  EXTRA_DECODE_ARGS:
+    description: "Extra decode arguments"
+    value: ""
+
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CTX_ENABLE_ATTENTION_DP:
+    description: "Context enable attention DP"
+    value: false
+  GEN_ENABLE_ATTENTION_DP:
+    description: "Generation enable attention DP"
+    value: true
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 16
+    domain: [16, 32]
+
+artifacts:
+  - name: DYNAMO_IMAGE
+    description: "Dynamo TRTLLM container image"
+    uri: fs:///path/to/dynamo-trtllm-runtime.sqsh
+  - name: AIPERF_IMAGE
+    description: "AIPerf container image"
+    uri: fs:///path/to/aiperf.sqsh
+  - name: MODEL_PATH
+    description: "Model path"
+    uri: fs:///path/to/your/model
+  - name: PREFILL_CONFIG
+    uri: file://prefill_config.yaml
+    content: |
+      max_batch_size: 64
+      max_num_tokens: ${{ variables.CTX_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.CTX_MAX_SEQ_LEN }}
+      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      enable_attention_dp: ${{ variables.CTX_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: 1
+      cuda_graph_config: null
+      print_iter_log: true
+      disable_overlap_scheduler: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: 0.9
+        dtype: fp8
+      cache_transceiver_config:
+        max_tokens_in_buffer: 20000
+        backend: DEFAULT
+  - name: DECODE_CONFIG
+    uri: file://decode_config.yaml
+    content: |
+      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      enable_attention_dp: ${{ variables.GEN_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: 1
+      max_batch_size: 1024
+      max_num_tokens: ${{ variables.GEN_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.GEN_MAX_SEQ_LEN }}
+      cuda_graph_config:
+        enable_padding: true
+        batch_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        - 128
+        - 256
+        - 384
+        - 512
+        - 768
+        - 1024
+      print_iter_log: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: 0.9
+        dtype: fp8
+      moe_config:
+        backend: CUTLASS
+      cache_transceiver_config:
+        max_tokens_in_buffer: 20000
+        backend: DEFAULT
+      stream_interval: 20
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    extra_args:
+      - "--gpus-per-node=${{ variables.GPUS_PER_NODE }}"
+      - "--exclude=excluded-node-01"
+
+operators:
+  - name: dynamo_trtllm
+    type: srun
+    container_image: "${{ artifacts.DYNAMO_IMAGE.path }}"
+    container_name: dynamo_trtllm
+    container_writable: true
+    container_mount_home: false
+    mpi: pmix
+    extra_args:
+      - "--overlap"
+  - name: aiperf
+    type: srun
+    container_image: "${{ artifacts.AIPERF_IMAGE.path }}"
+    container_name: aiperf
+    container_writable: true
+    mpi: pmix
+    extra_args:
+      - "--overlap"
+
+workflow:
+  name: dynamo
+  timeout: 115m # Slightly less than SLURM_TIMELIMIT
+
+  variables:
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: nats_server
+      operator: dynamo_trtllm
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 60
+          interval: 2
+
+    - name: etcd_server
+      operator: dynamo_trtllm
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 60
+          interval: 2
+
+    - name: frontend_server
+      operator: dynamo_trtllm
+      script:
+        - python3 -m dynamo.frontend --http-port 8000
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 120
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: prefill_server
+      operator:
+        name: dynamo_trtllm
+        ntasks: ${{ variables.CTX_TP_SIZE }}
+        ntasks_per_node: ${{ variables.CTX_TP_SIZE }}
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: parallel
+      script:
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - export MODEL_PATH=${{ artifacts.MODEL_PATH.path }}
+        - env | grep TLLM
+        - env | grep UCX
+        - sleep 10
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${MODEL_PATH}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode prefill
+          --extra-engine-args ${PREFILL_CONFIG} ${EXTRA_PREFILL_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.CTX_TP_SIZE }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Setting PyTorch memory fraction"
+          timeout: 600
+          interval: 10
+      retries:
+        count: 3
+        interval: 10
+        backoff: 2
+
+    - name: decode_server
+      operator:
+        name: dynamo_trtllm
+        ntasks: ${{ variables.GEN_TP_SIZE }}
+        ntasks_per_node: ${{ variables.GEN_TP_SIZE }}
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: parallel
+      script:
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - env | grep TLLM
+        - env | grep UCX
+        - sleep 10
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${MODEL_PATH}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode decode
+          --extra-engine-args ${DECODE_CONFIG} ${EXTRA_DECODE_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.GEN_TP_SIZE }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Setting PyTorch memory fraction"
+          timeout: 600
+          interval: 10
+      retries:
+        count: 3
+        interval: 10
+        backoff: 2
+
+    - name: benchmark
+      operator:
+        name: aiperf
+        ntasks: 1
+      script:
+        - set -x
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${SERVED_MODEL_NAME}
+          --tokenizer ${MODEL_PATH}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${HEAD_NODE_IP}:8000
+          --synthetic-input-tokens-mean ${ISL}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${OSL}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${OSL}"
+          --extra-inputs "min_tokens:${OSL}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${MULTI_ROUND}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --conversation-num $((2*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      depends_on:
+        - prefill_server
+        - decode_server

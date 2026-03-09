@@ -1,0 +1,19 @@
+version: "0.1"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    # Required for slurm backends (used by sflow for GPU packing/validation).
+    gpus_per_node: 1
+    account: "edmundw"
+    partition: "your_slurm_partition"
+    time: "00:10:00"
+    nodes: 1
+
+workflow:
+  name: wf
+  tasks:
+    - name: slurm_task
+      script:
+        - echo hello

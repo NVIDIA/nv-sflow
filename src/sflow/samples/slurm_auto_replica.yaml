@@ -1,0 +1,138 @@
+version: "0.1"
+
+variables:
+  # Variables has 2 ways of access, and can be overridden by --set flag in sflow batch / sflow run command
+  # 1. In YAML expressions: `${{ variables.NAME }}`, sflow will automatically resolve the expression and inject the value before the workflow is executed, it works across any fields in the yaml file, such as backends, operators, workflow, tasks, scripts, etc.
+  # 2. In task scripts (as env var): `${NAME}`, the variable can also be accessed as an environment variable in the task script
+  
+  # Slurm Configuration - These will be skipped if you use 'sflow batch -f sflow.yaml --submit' to launch the workflow and overwrite the variables in cli args
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: 60
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    value: 4
+  SLURM_NODES:
+    description: "Number of nodes"
+    value: 6
+  
+  # Task Resources
+  PREFILL_SERVER_COUNT:
+    description: "Number of prefill servers"
+    value: 4
+  PREFILL_GPUS_PER_SERVER:
+    description: "GPUs per prefill server"
+    value: 2
+  DECODE_SERVER_COUNT:
+    description: "Number of decode servers"
+    value: 2
+  DECODE_GPUS_PER_SERVER:
+    description: "GPUs per decode server"
+    value: 8
+
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: srun_no_container
+    type: srun
+    ntasks_per_node: 1
+    mpi: pmix
+
+workflow:
+  name: auto_replica
+  tasks:
+    - name: prefill_server
+      replicas:
+        count: ${{ variables.PREFILL_SERVER_COUNT }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.PREFILL_GPUS_PER_SERVER }}
+      script:
+        - echo "Starting prefill server ${SFLOW_REPLICA_INDEX} on nodes ${SFLOW_TASK_ASSIGNED_NODE_NAMES} with GPU ${CUDA_VISIBLE_DEVICES}"
+        - echo "Assigned IPs - ${SFLOW_TASK_ASSIGNED_NODE_IPS}"
+
+    - name: decode_server
+      replicas:
+        count: ${{ variables.DECODE_SERVER_COUNT }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.DECODE_GPUS_PER_SERVER }}
+      script:
+        # Use SFLOW_TASK_ASSIGNED_* env vars to access this task's own assigned nodes
+        - echo "Starting decode server ${SFLOW_REPLICA_INDEX} on nodes ${SFLOW_TASK_ASSIGNED_NODE_NAMES} with GPU ${CUDA_VISIBLE_DEVICES}"
+        - echo "Assigned IPs - ${SFLOW_TASK_ASSIGNED_NODE_IPS}"
+    
+    - name: client
+      resources:
+        nodes:
+          indices: [2]
+      script:
+        # Access each replica by index
+        - echo "Prefill 0 IP - ${{ task.prefill_server[0].nodes[0].ip_address }}"
+        - echo "Prefill 1 IP - ${{ task.prefill_server[1].nodes[0].ip_address }}"
+        - echo "Prefill 2 IP - ${{ task.prefill_server[2].nodes[0].ip_address }}"
+        - echo "Prefill 3 IP - ${{ task.prefill_server[3].nodes[0].ip_address }}"
+        - echo "Prefill 0 Name - ${{ task.prefill_server[0].nodes[0].name }}"
+        - echo "Prefill 1 Name - ${{ task.prefill_server[1].nodes[0].name }}"
+        - echo "Prefill 2 Name - ${{ task.prefill_server[2].nodes[0].name }}"
+        - echo "Prefill 3 Name - ${{ task.prefill_server[3].nodes[0].name }}"
+        - echo "Prefill 0 GPUs - ${{ task.prefill_server[0].gpus }}"
+        - echo "Prefill 1 GPUs - ${{ task.prefill_server[1].gpus }}"
+        - echo "Prefill 2 GPUs - ${{ task.prefill_server[2].gpus }}"
+        - echo "Prefill 3 GPUs - ${{ task.prefill_server[3].gpus }}"
+        - echo "Prefill 0 Resources - ${{ task.prefill_server[0].nodes }}"
+        - echo "Prefill 1 Resources - ${{ task.prefill_server[1].nodes }}"
+        - echo "Prefill 2 Resources - ${{ task.prefill_server[2].nodes }}"
+        - echo "Prefill 3 Resources - ${{ task.prefill_server[3].nodes }}"
+        - echo "Prefill 0 Backend - ${{ task.prefill_server[0].backend }}"
+        - echo "Prefill 1 Backend - ${{ task.prefill_server[1].backend }}"
+        - echo "Prefill 2 Backend - ${{ task.prefill_server[2].backend }}"
+        - echo "Prefill 3 Backend - ${{ task.prefill_server[3].backend }}"
+        - echo "Prefill 0 Operator - ${{ task.prefill_server[0].operator }}"
+        - echo "Prefill 1 Operator - ${{ task.prefill_server[1].operator }}"
+        - echo "Prefill 2 Operator - ${{ task.prefill_server[2].operator }}"
+        - echo "Prefill 3 Operator - ${{ task.prefill_server[3].operator }}"
+
+        - echo "Decode 0 Node 0 IP - ${{ task.decode_server[0].nodes[0].ip_address }}"
+        - echo "Decode 0 Node 1 IP - ${{ task.decode_server[0].nodes[1].ip_address }}"
+        - echo "Decode 1 Node 0 IP - ${{ task.decode_server[1].nodes[0].ip_address }}"
+        - echo "Decode 1 Node 1 IP - ${{ task.decode_server[1].nodes[1].ip_address }}"
+        - echo "Decode 0 Node 0 Name - ${{ task.decode_server[0].nodes[0].name }}"
+        - echo "Decode 0 Node 1 Name - ${{ task.decode_server[0].nodes[1].name }}"
+        - echo "Decode 1 Node 0 Name - ${{ task.decode_server[1].nodes[0].name }}"
+        - echo "Decode 1 Node 1 Name - ${{ task.decode_server[1].nodes[1].name }}"
+        - echo "Decode 0 GPUs - ${{ task.decode_server[0].gpus }}"
+        - echo "Decode 1 GPUs - ${{ task.decode_server[1].gpus }}"
+        - echo "Decode 0 Resources - ${{ task.decode_server[0].nodes }}"
+        - echo "Decode 1 Resources - ${{ task.decode_server[1].nodes }}"
+        - echo "Decode 0 Backend - ${{ task.decode_server[0].backend }}"
+        - echo "Decode 1 Backend - ${{ task.decode_server[1].backend }}"
+        - echo "Decode 0 Operator - ${{ task.decode_server[0].operator }}"
+        - echo "Decode 1 Operator - ${{ task.decode_server[1].operator }}"
+        
+        - echo "Client Task Nodes - ${{ task.client.nodes }}"
+        - echo "Client Task Nodes[0] IP - ${{ task.client.nodes[0].ip_address }}"
+        - echo "Client Task Nodes[0] Name - ${{ task.client.nodes[0].name }}"
+        - echo "Client Task Nodes[0] GPUs - ${{ task.client.nodes[0].num_gpus }}"
+        - echo "Client Task Backend - ${{ task.client.backend }}"
+        - echo "Client Task Operator - ${{ task.client.operator }}"
+      depends_on:
+        - prefill_server
+        - decode_server

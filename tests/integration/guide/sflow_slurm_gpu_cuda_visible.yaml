@@ -1,0 +1,63 @@
+version: "0.1"
+
+variables:
+  # Override via `--set` as needed.
+  SLURM_ACCOUNT:
+    value: edmundw
+  SLURM_PARTITION:
+    value: your_slurm_partition
+  SLURM_TIME:
+    value: "00:05:00"
+  SLURM_NODES:
+    value: 2
+  GPUS_PER_NODE:
+    value: 4
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    # Used by sflow to pack/slice CUDA_VISIBLE_DEVICES
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: ${{ variables.SLURM_NODES }}
+
+operators:
+  - name: srun
+    type: srun
+    container_image: python:3.13-slim
+    container_mount_home: false
+
+workflow:
+  name: slurm_gpu_cuda_visible
+
+  tasks:
+    # Expectation with SLURM_NODES=2 and GPUS_PER_NODE=4:
+    # - sflow will pin base tasks to distinct nodes by default (t2 -> node0, t4 -> node1).
+    # - t2_0: CUDA_VISIBLE_DEVICES=0,1
+    # - t2_1: CUDA_VISIBLE_DEVICES=2,3
+    - name: t2
+      replicas:
+        count: 2
+        policy: parallel
+      resources:
+        gpus:
+          count: 2
+      script:
+        - echo "task=t2 replica=$SFLOW_REPLICA_INDEX CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+        - nvidia-smi -L || true
+
+    # Expectation with GPUS_PER_NODE=4:
+    # - t4_0..t4_3 each gets a single GPU index (0/1/2/3).
+    - name: t4
+      replicas:
+        count: 4
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+      script:
+        - echo "task=t4 replica=$SFLOW_REPLICA_INDEX CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+        - nvidia-smi -L || true

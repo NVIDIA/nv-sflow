@@ -1,0 +1,527 @@
+version: "0.1"
+
+variables:
+  # Variables has 2 ways of access, and can be overridden by --set flag in sflow batch / sflow run command
+  # 1. In YAML expressions: `${{ variables.NAME }}`, sflow will automatically resolve the expression and inject the value before the workflow is executed, it works across any fields in the yaml file, such as backends, operators, workflow, tasks, scripts, etc.
+  # 2. In task scripts (as env var): `${NAME}`, the variable can also be accessed as an environment variable in the task script
+  
+  # Slurm Configuration - These will be skipped if you use 'sflow batch -f sflow.yaml --submit' to launch the workflow and overwrite the variables in cli args
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: 120
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    value: 4
+  SLURM_NODES:
+    description: "Number of nodes"
+    value: 1
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: Qwen3-0-6B-FP8
+  MODEL_NAME:
+    description: "Model path"
+    value: Qwen/Qwen3-0.6B-FP8
+
+  # Prefill Server Configuration
+  NUM_CTX_SERVERS:
+    description: "Number of context/prefill servers"
+    type: integer
+    value: 1
+  CTX_TP_SIZE:
+    description: "Context tensor parallel size"
+    type: integer
+    value: 2
+  CTX_DP_SIZE:
+    description: "Context data parallel size"
+    type: integer
+    value: 1
+  CTX_EP_SIZE:
+    description: "Context expert parallel size"
+    type: integer
+    value: 1
+  CTX_MOE_TP_SIZE:
+    description: "Context MOE tensor parallel size"
+    type: integer
+    value: 1
+  CTX_PP_SIZE:
+    description: "Context pipeline parallel size"
+    type: integer
+    value: 1
+  CTX_REPLICAS_POLICY:
+    description: "Context replicas policy, sequential means one server after another once previous server is ready, parallel means all servers start at the same time"
+    value: "parallel"
+  CTX_BATCH_SIZE:
+    description: "Context batch size"
+    type: integer
+    value: 128
+  CTX_MAX_NUM_TOKENS:
+    description: "Context max number of tokens"
+    type: integer
+    value: 4096
+  CTX_MAX_SEQ_LEN:
+    description: "Context max sequence length"
+    type: integer
+    value: 1280
+  CTX_FREE_GPU_MEMORY_FRACTION:
+    description: "Context free GPU memory fraction"
+    value: 0.9
+  CTX_ENABLE_ATTENTION_DP:
+    description: "Context enable attention DP"
+    value: ""
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+
+  # Decode Server Configuration
+  NUM_GEN_SERVERS:
+    description: "Number of generation/decode servers"
+    type: integer
+    value: 1
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size"
+    type: integer
+    value: 2
+  GEN_DP_SIZE:
+    description: "Generation data parallel size"
+    type: integer
+    value: 1
+  GEN_EP_SIZE:
+    description: "Generation expert parallel size"
+    type: integer
+    value: 1
+  GEN_MOE_TP_SIZE:
+    description: "Generation MOE tensor parallel size"
+    type: integer
+    value: 1
+  GEN_PP_SIZE:
+    description: "Generation pipeline parallel size"
+    type: integer
+    value: 1
+  GEN_REPLICAS_POLICY:
+    description: "Generation replicas policy"
+    value: "parallel"
+  GEN_BATCH_SIZE:
+    description: "Generation batch size"
+    type: integer
+    value: 128
+  GEN_MAX_NUM_TOKENS:
+    description: "Generation max number of tokens"
+    type: integer
+    value: 4096
+  GEN_MAX_SEQ_LEN:
+    description: "Generation max sequence length"
+    type: integer
+    value: 2304
+  GEN_FREE_GPU_MEMORY_FRACTION:
+    description: "Generation free GPU memory fraction"
+    value: 0.9
+  GEN_ENABLE_ATTENTION_DP:
+    description: "Generation enable attention DP"
+    value: ""
+
+  # Extra Arguments - You can append any optional arguments to the trtllm-llmapi-launch command
+  EXTRA_FRONTEND_ARGS:
+    description: "Extra frontend arguments"
+    value: ""
+  EXTRA_PREFILL_ARGS:
+    description: "Extra prefill arguments"
+    value: ""
+  EXTRA_DECODE_ARGS:
+    description: "Extra decode arguments"
+    value: ""
+
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 128
+    domain: [128]
+  
+  # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: <your-aiperf-container-image>
+  DYNAMO_IMAGE:
+    description: "Dynamo TRTLLM container image"
+    value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+
+  # Network device information, change per your cluster or comment out if not needed
+  # NCCL_SOCKET_IFNAME:
+  #   description: "NCCL socket interface name"
+  #   value: enP5p9s0
+  # GLOO_SOCKET_IFNAME:
+  #   description: "Gloo socket interface name"
+  #   value: enP5p9s0
+
+artifacts:
+  # file type artifacts will be generated by sflow with the content defined in this yaml file, accessible as `${{ artifacts.NAME.path }}` in task scripts
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: dynamo_vllm
+    type: srun
+    container_image: ${{ variables.DYNAMO_IMAGE }}
+    container_writable: true
+    mpi: pmix
+  - name: aiperf
+    type: srun
+    container_image: ${{ variables.AIPERF_IMAGE }}
+    container_writable: true
+    mpi: pmix
+
+workflow:
+  name: dynamo_vllm_disagg
+  variables:
+    # Workflow level variables will overwrite the variables defined in global variables section if using same name
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: load_image
+      operator: 
+        name: dynamo_vllm
+        ntasks: ${{ variables.SLURM_NODES }}
+        ntasks_per_node: 1
+      script:
+        - echo "Image Loaded"
+        - sleep 3600
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Image Loaded"
+            match_count: ${{ variables.SLURM_NODES }}
+          timeout: 1200
+          interval: 2
+    
+    - name: install_aiperf
+      operator: 
+        name: aiperf
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - pip install aiperf==0.3.0
+        - echo "AIPerf installed"
+        - sleep 3600
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "AIPerf installed"
+          timeout: 1200
+          interval: 2
+    
+    - name: gpu_monitor
+      operator: 
+        name: dynamo_vllm
+        ntasks: ${{ variables.SLURM_NODES }}
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: ${{ variables.SLURM_NODES }}
+      script:
+        - echo "Starting gpu monitor"
+        - >
+          nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used 
+          --format=csv,noheader,nounits -lms 2000 | 
+          while IFS= read -r input || [ -n "$input" ] ; 
+          do timestamp=$(date +%s%3N); 
+          printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}" "${input}"; 
+          done 
+          >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Starting gpu monitor"
+          timeout: 60
+          interval: 2
+      depends_on:
+        - load_image
+        - install_aiperf
+
+    - name: nats_server
+      operator: dynamo_vllm
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 60
+          interval: 2
+      depends_on:
+        - load_image
+        - install_aiperf
+
+    - name: etcd_server
+      operator: dynamo_vllm
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 60
+          interval: 2
+      depends_on:
+        - load_image
+        - install_aiperf
+    
+    - name: frontend_server
+      operator: dynamo_vllm
+      script:
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 120
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: prefill_server
+      operator:
+        name: dynamo_vllm
+        ntasks_per_node: 1
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: ${{ variables.CTX_REPLICAS_POLICY }}
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
+        - export GPUS_PER_WORKER=${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+        - export NODES_PER_WORKER=$(python3 -c "print(max(int(${GPUS_PER_WORKER} // ${GPUS_PER_NODE}), 1))")
+        - export NODE_RANK=${SLURM_NODEID}
+        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+            if [[ "${SLURM_NODEID}" == "0" ]]; then
+              unset CUDA_VISIBLE_DEVICES
+              ray start --head --port=6379
+            else
+              export RAY_worker_register_timeout_seconds=1200 # This to avoid master node load image slower than worker node
+              ray start --address ${FIRST_NODE_IP}:6379
+            fi
+            # wait until GPU string appears in ray status output
+            while true; do
+              if ray status | grep "${GPUS_PER_WORKER}.0 GPU"; then
+                break
+              else
+                echo "Waiting for Ray cluster GPUs to be available in ray status..."
+                sleep 5
+              fi
+            done
+            echo "Ray cluster GPUs are now available."
+          else
+            echo "Do not need to setup ray cluster because worker only needs ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
+          fi
+        - >
+          if [[ "${SLURM_NODEID}" == "0" ]]; then
+            EXTRA_RAY_ARGS=""
+            if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+              EXTRA_RAY_ARGS="--distributed-executor-backend ray"
+            fi
+            python3 -m dynamo.vllm --model ${{ artifacts.LOCAL_MODEL_PATH.path }} \
+            --served-model-name ${{ variables.SERVED_MODEL_NAME }} \
+            --tensor-parallel-size ${CTX_TP_SIZE} \
+            --pipeline-parallel-size ${CTX_PP_SIZE} \
+            --data-parallel-size ${CTX_DP_SIZE} \
+            --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }} \
+            --is-prefill-worker \
+            --no-enable-prefix-caching \
+            --block-size 128 \
+            --max-num-seqs ${CTX_BATCH_SIZE} \
+            --max-num-batched-tokens ${CTX_MAX_NUM_TOKENS} ${EXTRA_RAY_ARGS} ${EXTRA_PREFILL_ARGS}
+          else
+            echo "This is a worker node, do not need to run vllm launch cmd, but remember to setup ray cluster and launch in the master node"
+            sleep 3600
+          fi
+      resources:
+        gpus:
+          count: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "VllmEngineMonitor initialized and health check task started"
+          timeout: 600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: "Traceback (most recent call last)"
+          interval: 10
+
+    - name: decode_server
+      operator:
+        name: dynamo_vllm
+        ntasks_per_node: 1
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: ${{ variables.GEN_REPLICAS_POLICY }}
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
+        - export GPUS_PER_WORKER=${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+        - export NODES_PER_WORKER=$(python3 -c "print(max(int(${GPUS_PER_WORKER} // ${GPUS_PER_NODE}), 1))")
+        - export NODE_RANK=${SLURM_NODEID}
+        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+            if [[ "${SLURM_NODEID}" == "0" ]]; then
+              unset CUDA_VISIBLE_DEVICES
+              ray start --head --port=6379
+            else
+              export RAY_worker_register_timeout_seconds=1200 # This to avoid master node load image slower than worker node
+              ray start --address ${FIRST_NODE_IP}:6379
+            fi
+            # wait until GPU string appears in ray status output
+            while true; do
+              if ray status | grep "${GPUS_PER_WORKER}.0 GPU"; then
+                break
+              else
+                echo "Waiting for Ray cluster GPUs to be available in ray status..."
+                sleep 5
+              fi
+            done
+            echo "Ray cluster GPUs are now available."
+          else
+            echo "Do not need to setup ray cluster because worker only needs ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
+          fi
+        - >
+          if [[ "${SLURM_NODEID}" == "0" ]]; then
+            EXTRA_RAY_ARGS=""
+            if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+              EXTRA_RAY_ARGS="--distributed-executor-backend ray"
+            fi
+            python3 -m dynamo.vllm --model ${{ artifacts.LOCAL_MODEL_PATH.path }} \
+            --served-model-name ${{ variables.SERVED_MODEL_NAME }} \
+            --tensor-parallel-size ${GEN_TP_SIZE} \
+            --pipeline-parallel-size ${GEN_PP_SIZE} \
+            --data-parallel-size ${GEN_DP_SIZE} \
+            --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }} \
+            --no-enable-prefix-caching \
+            --block-size 128 \
+            --max-num-seqs ${GEN_BATCH_SIZE} \
+            --max-num-batched-tokens ${GEN_MAX_NUM_TOKENS} ${EXTRA_RAY_ARGS} ${EXTRA_DECODE_ARGS}
+          else
+            echo "This is a worker node, do not need to run vllm launch cmd, but remember to setup ray cluster and launch in the master node"
+            sleep 3600
+          fi
+      resources:
+        gpus:
+          count: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "VllmEngineMonitor initialized and health check task started"
+          timeout: 600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: "Traceback (most recent call last)"
+          interval: 10
+
+    - name: benchmark
+      operator:
+        name: aiperf
+        ntasks: 1
+      script:
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      depends_on:
+        - prefill_server
+        - decode_server
+        - frontend_server

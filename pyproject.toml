@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=69.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sflow"
+version = "0.1.0"
+description = "A Python CLI tool designed to automate and manage benchmarking workflows on multiple backends."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jinja2>=3.1.6",
+    "mermaid-py>=0.8.0",
+    "parse==1.16.0",
+    "pydantic>=2.11.10",
+    "pyyaml>=6.0.3",
+    "rich>=13.7.0",
+    "typer>=0.19.2",
+]
+
+[project.scripts]
+sflow = "sflow.cli:app"
+
+[project.optional-dependencies]
+dev = [
+    "ipython>=8.37.0",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "pytest-subprocess>=1.5.3",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"sflow.samples" = ["*.yaml"]
+
+[dependency-groups]
+dev = [
+    "ipython>=8.37.0",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "pytest-subprocess>=1.5.3",
+]
+
+
+[tool.ruff.lint]
+exclude = [
+    "tests/*",
+    "tests/**/*",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "tests/*",
+    "*/tests/*",
+    "*/__init__.py",
+    "*/site-packages/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+show_missing = true
+skip_covered = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--cov=src",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+]
+
+
