@@ -133,6 +133,22 @@ Notes:
 
 - Update `account/partition/time/nodes` to match your cluster.
 - If you're already inside a Slurm allocation, `sflow` will reuse it; otherwise it will call `salloc` first.
+- The backend also supports `extra_args` to pass arbitrary flags to `salloc`:
+
+```yaml
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: "your_slurm_account"
+    partition: "your_slurm_partition"
+    time: "01:00:00"
+    nodes: 2
+    extra_args:
+      - "--exclusive"
+      - "--gpus-per-node=8"
+      - "--segment=8"
+```
 
 ### 4. Operators & srun — How Your Script Actually Runs
 
@@ -154,6 +170,20 @@ Operator config fields map **directly** to srun flags, so you never have to hand
 | `container_image` | `--container-image` | Pyxis container (enroot) |
 | `mpi` | `--mpi` | MPI type (e.g. `pmix`) |
 | `extra_args` | *(pass-through)* | Any other srun flag |
+
+`extra_args` is a list that passes arbitrary srun flags not covered by the named fields:
+
+```yaml
+operators:
+  - name: custom_worker
+    type: srun
+    ntasks_per_node: 1
+    extra_args:
+      - --exclusive
+      - --mem-per-gpu=80G
+      - --container-image=nvcr.io/nvidia/pytorch:24.05-py3
+      - --container-mounts=/data:/data:ro
+```
 
 You can define **named operators** once and reference them by name in tasks — or override individual fields per task:
 
@@ -192,6 +222,21 @@ sflow builds this command for you from the declarative config.
 
 ### 5. Run on Slurm (Interactive)
 
+Before running, make sure you have updated the workflow YAML for your environment:
+
+- **Slurm settings**: set `account` and `partition` to values valid on your cluster
+- **Model paths**: update any model or data paths to locations accessible from your compute nodes
+- **Container images**: if the workflow uses a container operator, update the image tag to the version you need
+- **Extra args**: Some of the cluster need to add --gpus-per-node flag when requesting GPU partition, remember to add this in backend.extra_args which accepts a list of extra args 
+
+**Validate first with a dry-run** to catch config errors without allocating nodes:
+
+```bash
+sflow run --file sflow.yaml --dry-run
+```
+
+Once validation passes, launch the workflow:
+
 ```bash
 sflow run --file sflow.yaml --tui
 ```
@@ -206,6 +251,16 @@ For headless mode (automated jobs), run without `--tui`:
 ```bash
 sflow run --file sflow.yaml
 ```
+
+:::tip Container Registry Authentication
+If your workflow pulls images from a private registry (e.g. `nvcr.io`), you need to configure enroot credentials on the cluster **before** running. Create or edit `~/.config/enroot/.credentials`:
+
+```
+machine nvcr.io login $oauthtoken password <your-ngc-api-key>
+```
+
+Replace the machine/credentials for whichever registry your images come from. Without this file, `srun --container-image` will fail to pull private images.
+:::
 
 ### 6. Batch Mode: Fire-and-Forget Slurm Jobs
 
