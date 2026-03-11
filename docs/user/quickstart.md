@@ -3,6 +3,103 @@ title: Quickstart
 sidebar_position: 2
 ---
 
+## One-Minute Mindset
+
+`sflow` lets you describe a multi-step workflow in a single YAML file and run it on **any compute backend** — your laptop today, a Slurm cluster tomorrow — without rewriting scripts.
+
+**Core ideas:**
+
+| Concept | What it does | Example |
+|---------|-------------|---------|
+| **Backend** | Declares *where* tasks run. Swap one line to move between local and Slurm. | `type: slurm`, `partition: gpu` |
+| **Operator** | Declares *how* a task's script is launched. Each backend has a default (local → `bash`, Slurm → `srun`). Define named operators to preset flags and reuse them across tasks. | `type: srun`, `ntasks: 4` |
+| **Variable** | A named value reusable everywhere — scripts, resource counts, backend config. Override from the CLI with `--set`. | `NUM_GPUS: 8` |
+| **Task & DAG** | Each task is a unit of work with a script. `depends_on` wires them into a directed graph so sflow runs them in the right order. | `depends_on: [train]` |
+| **Resource placement** | sflow assigns nodes and GPUs automatically after allocation and exposes them as variables. | `${{ backends.slurm_cluster.nodes[0].ip_address }}` |
+
+### Operators & srun — how your script actually runs
+
+On a Slurm backend the default operator is **srun**. sflow takes your task's `script:` lines and wraps them into:
+
+```bash
+srun [flags from operator config] bash -c "<your script lines>"
+```
+
+Operator config fields map **directly** to srun flags, so you never have to hand-craft srun commands:
+
+| Operator config | srun flag | Purpose |
+|-----------------|-----------|---------|
+| `ntasks` | `--ntasks` | Number of task slots |
+| `ntasks_per_node` | `--ntasks-per-node` | Tasks per node |
+| `gpus_per_task` | `--gpus-per-task` | GPUs per task slot |
+| `cpus_per_task` | `--cpus-per-task` | CPU cores per task |
+| `nodes` | `--nodes` | Node count for this step |
+| `container_image` | `--container-image` | Pyxis container (enroot) |
+| `mpi` | `--mpi` | MPI type (e.g. `pmix`) |
+| `extra_args` | *(pass-through)* | Any other srun flag |
+
+You can define **named operators** once and reference them by name in tasks — or override individual fields per task:
+
+```yaml
+operators:
+  - name: gpu_worker
+    type: srun
+    ntasks_per_node: 1
+    gpus_per_task: 1
+    container_image: nvcr.io/nvidia/pytorch:24.05-py3
+
+workflow:
+  tasks:
+    - name: train
+      operator: gpu_worker          # uses the preset above
+      script:
+        - torchrun train.py
+
+    - name: inference
+      operator:                     # inline override
+        name: gpu_worker
+        ntasks: 8                   # override just this field
+      script:
+        - python infer.py
+```
+
+Without sflow, the equivalent `train` task would require you to manually write:
+
+```bash
+srun --jobid=$SLURM_JOB_ID --nodes=1 --ntasks-per-node=1 --gpus-per-task=1 \
+     --container-image=nvcr.io/nvidia/pytorch:24.05-py3 \
+     bash -c "torchrun train.py"
+```
+
+sflow builds this command for you from the declarative config.
+
+**How it works (Slurm example):**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  workflow.yaml                                          │
+│                                                         │
+│  variables:          backends:          workflow:        │
+│    NUM_GPUS: 8         type: slurm        tasks:        │
+│    MODEL: llama        partition: gpu       - train     │
+│                        nodes: 2            - evaluate   │
+│                                            - export     │
+└──────────────────────────┬──────────────────────────────┘
+                           │  sflow run -f workflow.yaml
+                           ▼
+              ┌────────────────────────┐
+              │  1. Resolve variables  │
+              │  2. Allocate (salloc)  │
+              │  3. Place tasks on GPUs│
+              │  4. Execute DAG        │
+              └────────────────────────┘
+```
+
+**Why not just write a bash script?**
+A bash script hard-wires node names, GPU indices, and execution order. With sflow you declare what you want; it handles allocation, node discovery, GPU assignment, dependency ordering, log collection, and retries — the same YAML works locally for debugging and on Slurm for production.
+
+---
+
 This guide covers two ways to run `sflow`:
 
 - **Part I: Slurm Cluster** – Production workflows on HPC clusters (recommended for most users)
