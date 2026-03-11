@@ -5,9 +5,18 @@ sidebar_position: 1
 
 `sflow` is a **workflow orchestrator**: you describe _what to run_ in a `sflow.yaml` (tasks, dependencies, how to launch each task, and required resources). `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure.
 
-## Who is this for?
+## Use Cases
 
-- **Complex deployment workflow inside Slurm cluster** Sflow streamlines workflow orchestration within Slurm clusters, offering built-in features like automatic hostname/IP detection, precise workload distribution across nodes and GPUs, runtime readiness/failure checks, and seamless replica scaling. Simply define what you want to run—no more cumbersome bash scripts to manage resource placement or ensure processes are on the right nodes and GPUs, see example of dynamo PD disaggregation LLM inference service.
+### Complex Slurm Workflows
+
+sflow streamlines orchestration within Slurm clusters with built-in support for:
+
+- Automatic hostname/IP detection after allocation
+- Workload distribution across nodes and GPUs
+- Runtime readiness and failure checks (probes)
+- Replica scaling (parallel workers, sweeps)
+
+Define what you want to run — no more hand-crafted bash scripts to manage resource placement or ensure processes land on the right nodes and GPUs. Below is an example DAG for a Dynamo PD disaggregated LLM inference service:
 
 ```mermaid
 graph TD
@@ -54,38 +63,49 @@ graph TD
 
 ```
 
-- **Workflow orchestration across environments**: codify "startup order + replica scale + readiness probes + log capture" in YAML and run it locally or on a cluster via a backend (e.g. Slurm).
-- **Benchmarking / experiment automation**: standardize how you launch runs, capture logs/artifacts, and structure outputs so results are reproducible.
-- **Local development**: use the `local` backend + `bash` operator to validate the DAG and scripts on your machine before moving to a cluster backend.
+### Cross-Environment Orchestration
 
-## Core concepts (minimal set)
+Codify startup order, replica scale, readiness probes, and log capture in YAML — then run the same file locally or on a cluster by switching the backend.
 
-- **workflow**: a set of tasks + a DAG (dependencies declared via `depends_on`).
-- **task**: an executable unit; the key field is `script` (a list of lines joined into a bash script).
-- **backend**: where compute comes from. Built-ins in v0.1:
-  - `slurm`: allocates resources via `salloc`
-  - `local`: no allocation; simulates nodes on the local machine
-- **operator**: how a task is launched. Built-ins in v0.1: `bash` / `srun`
-- **expressions**: `${{ ... }}` inside YAML to reference variables/backend info (e.g. `${{ variables.SLURM_PARTITION }}`).
+### Benchmarking & Experiment Automation
 
-## Current version boundaries (important)
+Standardize how you launch runs, capture logs/artifacts, and structure outputs so results are reproducible across teams and machines.
 
-The following are **explicitly not implemented** in the current CLI/implementation:
+### Local Development & Testing
 
-- `sflow run --resume ...`: raises `NotImplementedError`
-- `sflow run --task ...`: raises `BadParameter`
+Use the `local` backend with the `bash` operator to validate your DAG and scripts on your laptop before moving to a Slurm cluster.
 
-This user guide is based on **actual code behavior**. Not all planned features may be available in the current release.
+## Core Concepts
 
-## Next steps
+| Concept | Description |
+|---------|-------------|
+| **Workflow** | A set of tasks wired into a DAG via `depends_on`. |
+| **Task** | An executable unit. The key field is `script` — a list of lines joined into a bash script. |
+| **Backend** | Where compute comes from. Built-ins: `slurm` (allocates via `salloc`) and `local` (simulates nodes on the local machine). |
+| **Operator** | How a task is launched. Built-ins: `bash` and `srun`. Named operators let you preset flags and reuse them across tasks. |
+| **Variable** | A named value referenced as `${{ variables.NAME }}` in YAML or `${NAME}` in scripts. Override from the CLI with `--set`. |
+| **Expression** | `${{ ... }}` syntax inside YAML to reference variables, backend info, task metadata, and more (e.g. `${{ backends.slurm.nodes[0].ip_address }}`). |
 
-- Run a minimal local example: [Quickstart](./quickstart.md)
-- Learn variables (expressions, env injection, replicas): [Variables](./variables.md)
-- Learn named inputs (paths, container images, etc.): [Artifacts](./artifacts.md)
-- Learn where compute comes from (local, Slurm, ...): [Backends](./backends.md)
-- Learn how tasks are launched (bash/srun/container): [Operators](./operators.md)
-- Learn resource placement (nodes/GPUs, CUDA_VISIBLE_DEVICES): [Resources](./resources.md)
-- Learn readiness/failure gates for service workflows: [Probes](./probes.md)
-- Learn where logs and outputs go: [Outputs & logs](./outputs.md)
-- Learn the full `sflow.yaml` schema: [Configuration](./configuration.md)
-- See CLI options: [CLI reference](./cli.md)
+## Known Limitations
+
+The following features are **not yet implemented** in the current release:
+
+- `sflow run --resume` — raises `NotImplementedError`
+- `sflow run --task` — raises `BadParameter`
+
+This user guide reflects actual code behavior. Not all planned features may be available yet.
+
+## Next Steps
+
+| Topic | Page |
+|-------|------|
+| Run a minimal example | [Quickstart](./quickstart.md) |
+| Variables, expressions, env injection | [Variables](./variables.md) |
+| Named inputs (paths, images, etc.) | [Artifacts](./artifacts.md) |
+| Compute backends (local, Slurm) | [Backends](./backends.md) |
+| Task launch methods (bash, srun, containers) | [Operators](./operators.md) |
+| Node/GPU placement, CUDA_VISIBLE_DEVICES | [Resources](./resources.md) |
+| Readiness/failure gates for services | [Probes](./probes.md) |
+| Log and output directory structure | [Outputs & Logs](./outputs.md) |
+| Full sflow.yaml schema | [Configuration](./configuration.md) |
+| CLI options | [CLI Reference](./cli.md) |

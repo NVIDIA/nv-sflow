@@ -107,11 +107,11 @@ This guide covers two ways to run `sflow`:
 
 ---
 
-# Part I: Slurm Cluster
+## Part I: Slurm Cluster
 
 Most `sflow` users run workflows on Slurm clusters. This section gets you started with Slurm.
 
-## 1) Setup Python Environment and uv
+### 1. Setup Python Environment and uv
 
 Login to your cluster login node, and open a bash terminal.
 
@@ -133,7 +133,7 @@ pip install uv
 uv --help
 ```
 
-## 2) Install sflow
+### 2. Install sflow
 
 Create a venv for sflow and install python wheels.
 
@@ -145,7 +145,7 @@ uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
 sflow --help
 ```
 
-## 3) Prepare a Slurm Workflow
+### 3. Prepare a Slurm Workflow
 
 You can use `sflow sample` to quickly get a starter workflow:
 
@@ -190,7 +190,7 @@ Notes:
 - Update `account/partition/time/nodes` to match your cluster.
 - If you're already inside a Slurm allocation, `sflow` will reuse it; otherwise it will call `salloc` first.
 
-## 4) Run on Slurm (Interactive)
+### 4. Run on Slurm (Interactive)
 
 ```bash
 sflow run --file sflow.yaml --tui
@@ -207,18 +207,18 @@ For headless mode (automated jobs), run without `--tui`:
 sflow run --file sflow.yaml
 ```
 
-## 5) Batch Mode: Fire-and-Forget Slurm Jobs
+### 5. Batch Mode: Fire-and-Forget Slurm Jobs
 
 For long-running or production workflows, `sflow batch` generates a complete sbatch script with proper environment setup and job submission. This is the **recommended way** to run production workloads.
 
-### Why Use Batch Mode?
+#### Why Use Batch Mode?
 
 - **Fire-and-forget**: Submit the job and disconnect; it runs headlessly
 - **Automatic environment setup**: Creates/activates a Python venv on compute nodes, this solves the python and lib difference often seen in clusters (e.g., login vs compute nodes)
 - **Dry-run validation**: Validates the workflow before running to fail early
 - **Portable scripts**: Generated scripts can be saved, reviewed, and resubmitted
 
-### Basic Usage
+#### Basic Usage
 
 Generate an sbatch script to stdout:
 
@@ -244,7 +244,7 @@ Add extra slurm flags if required when submitting jobs in some cluster:
 sflow batch --file workflow.yaml --sbatch-path run_workflow.sh -e '--exclusive' -e '--gpus-per-node=8' -e '--segment=8'
 ```
 
-### Full Example with Slurm Options
+#### Full Example with Slurm Options
 
 ```bash
 sflow batch \
@@ -259,7 +259,7 @@ sflow batch \
   --submit
 ```
 
-### With Variable Overrides
+#### With Variable Overrides
 
 Override workflow variables at submission time:
 
@@ -271,7 +271,7 @@ sflow batch \
   --sbatch-path run.sh
 ```
 
-### Custom Virtual Environment
+#### Custom Virtual Environment
 
 If you have a pre-configured venv (important for clusters with different architectures like x86 login nodes and arm64 compute nodes):
 
@@ -282,14 +282,14 @@ sflow batch \
   --sbatch-path run.sh
 ```
 
-### What the Generated Script Does
+#### What the Generated Script Does
 
 1. **Sets sbatch directives**: job name, output/error files, partition, account, time limit
 2. **Activates or creates a Python venv**: Uses existing `.sflow_venv/` or creates one with sflow installed
 3. **Runs dry-run validation**: Catches configuration errors before the full run
 4. **Executes the workflow**: Runs `sflow run` with all provided options
 
-### Common Options
+#### Common Options
 
 | Option | Description |
 |--------|-------------|
@@ -306,7 +306,7 @@ sflow batch \
 | `--artifact`, `-a` | Override artifact URI (can be repeated) |
 | `--sflow-venv-path`, `-v` | Path to existing Python venv |
 
-### Monitoring Batch Jobs
+#### Monitoring Batch Jobs
 
 After submission, monitor your job with standard Slurm commands:
 
@@ -316,7 +316,7 @@ scancel <job_id>          # Cancel a job
 tail -f sflow_output/sflow-<job_id>.out  # Follow output logs
 ```
 
-## 6) Validate Only (Dry-Run)
+### 6. Validate Only (Dry-Run)
 
 ```bash
 sflow run --file sflow.yaml --dry-run
@@ -326,11 +326,11 @@ Dry-run does not create output directories/files. It prints the execution plan a
 
 ---
 
-# Part II: Local Backend
+## Part II: Local Backend
 
 For testing and development, you can run workflows locally without Slurm.
 
-## 1) Prepare a Minimal Local Workflow
+### 1. Prepare a Minimal Local Workflow
 
 Get a starter workflow using `sflow sample`:
 
@@ -361,7 +361,7 @@ Notes:
 
 - This uses defaults (local backend + inline script). See the [backends](backends.md) page for explicit backend configuration.
 
-## 2) Run Locally
+### 2. Run Locally
 
 ```bash
 sflow run --file sflow.yaml --tui
@@ -372,7 +372,7 @@ Default output structure:
 - `./sflow_output/<run_id>/`: per-run root directory
 - `./sflow_output/<run_id>/<task_name>/`: per-task directory (stdout/stderr go to `<task_name>.log`)
 
-## 3) Example: DAG Workflow with `depends_on`
+### 3. Example: DAG Workflow with `depends_on`
 
 The minimal example runs a single task. Below is the smallest "real workflow" example showing a DAG using training-style step names:
 
@@ -463,7 +463,7 @@ If you want to visualize the DAG without running it:
 sflow visualize --file local_dag.yaml --format mermaid
 ```
 
-## 4) Validate Only (Dry-Run)
+### 4. Validate Only (Dry-Run)
 
 ```bash
 sflow run --file sflow.yaml --dry-run
