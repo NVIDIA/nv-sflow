@@ -17,62 +17,6 @@ sidebar_position: 2
 | **Task & DAG** | Each task is a unit of work with a script. `depends_on` wires them into a directed graph so sflow runs them in the right order. | `depends_on: [train]` |
 | **Resource placement** | sflow assigns nodes and GPUs automatically after allocation and exposes them as variables. | `${{ backends.slurm_cluster.nodes[0].ip_address }}` |
 
-### Operators & srun — how your script actually runs
-
-On a Slurm backend the default operator is **srun**. sflow takes your task's `script:` lines and wraps them into:
-
-```bash
-srun [flags from operator config] bash -c "<your script lines>"
-```
-
-Operator config fields map **directly** to srun flags, so you never have to hand-craft srun commands:
-
-| Operator config | srun flag | Purpose |
-|-----------------|-----------|---------|
-| `ntasks` | `--ntasks` | Number of task slots |
-| `ntasks_per_node` | `--ntasks-per-node` | Tasks per node |
-| `gpus_per_task` | `--gpus-per-task` | GPUs per task slot |
-| `cpus_per_task` | `--cpus-per-task` | CPU cores per task |
-| `nodes` | `--nodes` | Node count for this step |
-| `container_image` | `--container-image` | Pyxis container (enroot) |
-| `mpi` | `--mpi` | MPI type (e.g. `pmix`) |
-| `extra_args` | *(pass-through)* | Any other srun flag |
-
-You can define **named operators** once and reference them by name in tasks — or override individual fields per task:
-
-```yaml
-operators:
-  - name: gpu_worker
-    type: srun
-    ntasks_per_node: 1
-    gpus_per_task: 1
-    container_image: nvcr.io/nvidia/pytorch:24.05-py3
-
-workflow:
-  tasks:
-    - name: train
-      operator: gpu_worker          # uses the preset above
-      script:
-        - torchrun train.py
-
-    - name: inference
-      operator:                     # inline override
-        name: gpu_worker
-        ntasks: 8                   # override just this field
-      script:
-        - python infer.py
-```
-
-Without sflow, the equivalent `train` task would require you to manually write:
-
-```bash
-srun --jobid=$SLURM_JOB_ID --nodes=1 --ntasks-per-node=1 --gpus-per-task=1 \
-     --container-image=nvcr.io/nvidia/pytorch:24.05-py3 \
-     bash -c "torchrun train.py"
-```
-
-sflow builds this command for you from the declarative config.
-
 **How it works (Slurm example):**
 
 ```
@@ -190,7 +134,63 @@ Notes:
 - Update `account/partition/time/nodes` to match your cluster.
 - If you're already inside a Slurm allocation, `sflow` will reuse it; otherwise it will call `salloc` first.
 
-### 4. Run on Slurm (Interactive)
+### 4. Operators & srun — How Your Script Actually Runs
+
+On a Slurm backend the default operator is **srun**. sflow takes your task's `script:` lines and wraps them into:
+
+```bash
+srun [flags from operator config] bash -c "<your script lines>"
+```
+
+Operator config fields map **directly** to srun flags, so you never have to hand-craft srun commands:
+
+| Operator config | srun flag | Purpose |
+|-----------------|-----------|---------|
+| `ntasks` | `--ntasks` | Number of task slots |
+| `ntasks_per_node` | `--ntasks-per-node` | Tasks per node |
+| `gpus_per_task` | `--gpus-per-task` | GPUs per task slot |
+| `cpus_per_task` | `--cpus-per-task` | CPU cores per task |
+| `nodes` | `--nodes` | Node count for this step |
+| `container_image` | `--container-image` | Pyxis container (enroot) |
+| `mpi` | `--mpi` | MPI type (e.g. `pmix`) |
+| `extra_args` | *(pass-through)* | Any other srun flag |
+
+You can define **named operators** once and reference them by name in tasks — or override individual fields per task:
+
+```yaml
+operators:
+  - name: gpu_worker
+    type: srun
+    ntasks_per_node: 1
+    gpus_per_task: 1
+    container_image: nvcr.io/nvidia/pytorch:24.05-py3
+
+workflow:
+  tasks:
+    - name: train
+      operator: gpu_worker          # uses the preset above
+      script:
+        - torchrun train.py
+
+    - name: inference
+      operator:                     # inline override
+        name: gpu_worker
+        ntasks: 8                   # override just this field
+      script:
+        - python infer.py
+```
+
+Without sflow, the equivalent `train` task would require you to manually write:
+
+```bash
+srun --jobid=$SLURM_JOB_ID --nodes=1 --ntasks-per-node=1 --gpus-per-task=1 \
+     --container-image=nvcr.io/nvidia/pytorch:24.05-py3 \
+     bash -c "torchrun train.py"
+```
+
+sflow builds this command for you from the declarative config.
+
+### 5. Run on Slurm (Interactive)
 
 ```bash
 sflow run --file sflow.yaml --tui
@@ -207,7 +207,7 @@ For headless mode (automated jobs), run without `--tui`:
 sflow run --file sflow.yaml
 ```
 
-### 5. Batch Mode: Fire-and-Forget Slurm Jobs
+### 6. Batch Mode: Fire-and-Forget Slurm Jobs
 
 For long-running or production workflows, `sflow batch` generates a complete sbatch script with proper environment setup and job submission. This is the **recommended way** to run production workloads.
 
@@ -316,7 +316,7 @@ scancel <job_id>          # Cancel a job
 tail -f sflow_output/sflow-<job_id>.out  # Follow output logs
 ```
 
-### 6. Validate Only (Dry-Run)
+### 7. Validate Only (Dry-Run)
 
 ```bash
 sflow run --file sflow.yaml --dry-run
