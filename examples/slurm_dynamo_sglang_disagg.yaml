@@ -363,7 +363,7 @@ workflow:
           --max-prefill-tokens ${{ variables.CTX_MAX_NUM_TOKENS }} 
           ${{ variables.CTX_ENABLE_ATTENTION_DP }} 
           --disaggregation-mode prefill 
-          --disaggregation-bootstrap-port $(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()") 
+          --disaggregation-bootstrap-port $((8998 + ${FIRST_CUDA_DEVICE})) 
           --disaggregation-transfer-backend nixl 
           --load-balance-method round_robin 
           --trust-remote-code 
@@ -428,7 +428,7 @@ workflow:
           --max-prefill-tokens ${{ variables.GEN_MAX_NUM_TOKENS }} 
           ${{ variables.GEN_ENABLE_ATTENTION_DP }} 
           --disaggregation-mode decode 
-          --disaggregation-bootstrap-port $(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()") 
+          --disaggregation-bootstrap-port $((8998 + ${FIRST_CUDA_DEVICE})) 
           --disaggregation-transfer-backend nixl 
           --prefill-round-robin-balance 
           --trust-remote-code 
