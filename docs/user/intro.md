@@ -5,6 +5,8 @@ sidebar_position: 1
 
 `sflow` is a **workflow orchestrator**: you describe _what to run_ in a `sflow.yaml` (tasks, dependencies, how to launch each task, and required resources). `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure.
 
+![sflow TUI](/img/sflow_tui.gif)
+
 ## Use Cases
 
 ### Complex Slurm Workflows

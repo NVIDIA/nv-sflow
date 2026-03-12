@@ -246,6 +246,8 @@ The TUI shows:
 - Left: task status table + backend allocation summary
 - Right: auto-tail logs (timestamp + level + module/logger)
 
+![sflow TUI](/img/sflow_tui.gif)
+
 For headless mode (automated jobs), run without `--tui`:
 
 ```bash
