@@ -6,6 +6,8 @@
 
 A Python CLI workflow orchestrator with **pluggable backends** (e.g. local, Slurm) for running declarative YAML DAGs, collecting logs, and organizing outputs consistently.
 
+![sflow TUI](docs-site/static/img/sflow_tui.gif)
+
 Define _what to run_ in a `sflow.yaml` — tasks, dependencies, how to launch each task, and required resources. `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure. Example of a dynamo PD disaggregation LLM inference service workflow:
 
 <p align="center">
