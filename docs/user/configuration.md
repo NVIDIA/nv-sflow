@@ -16,6 +16,10 @@ workflow: ...
 
 This page follows the **current schema in code** (`src/sflow/config/schema.py`).
 
+:::tip
+Looking for a quick lookup of all config fields? See the [Quick Reference](./quick-reference.md) table.
+:::
+
 ## version
 
 Currently supported:
