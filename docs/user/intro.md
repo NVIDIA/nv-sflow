@@ -88,6 +88,113 @@ Use the `local` backend with the `bash` operator to validate your DAG and script
 | **Variable** | A named value referenced as `${{ variables.NAME }}` in YAML or `${NAME}` in scripts. Override from the CLI with `--set`. |
 | **Expression** | `${{ ... }}` syntax inside YAML to reference variables, backend info, task metadata, and more (e.g. `${{ backends.slurm.nodes[0].ip_address }}`). |
 
+## Architecture
+
+```mermaid
+graph TB
+  subgraph CLI["CLI Layer"]
+    run["sflow run"]
+    batch["sflow batch"]
+    sample["sflow sample"]
+    visualize["sflow visualize"]
+  end
+
+  subgraph App["Application"]
+    sflowapp["SflowApp"]
+    assembly["Assembly Pipeline"]
+  end
+
+  subgraph Config["Configuration"]
+    loader["Config Loader\n(YAML + Pydantic)"]
+    resolver["Expression Resolver\n(Jinja2 ${{ }})"]
+    schema["Schema Models"]
+  end
+
+  subgraph Plugins["Plugins (Pluggable)"]
+    subgraph Backends
+      local_be["local"]
+      slurm_be["slurm"]
+    end
+    subgraph Operators
+      bash_op["bash"]
+      srun_op["srun"]
+      docker_op["docker"]
+      ssh_op["ssh"]
+    end
+    subgraph Probes
+      tcp["TCP Port"]
+      http["HTTP Get/Post"]
+      logwatch["Log Watch"]
+    end
+    subgraph Artifacts
+      fs_art["fs://"]
+      file_art["file://"]
+      http_art["http://"]
+      hf_art["hf://"]
+    end
+  end
+
+  subgraph Core["Core Engine"]
+    state["SflowState\n(variables, backends,\nartifacts, workflow)"]
+    taskgraph["Task Graph (DAG)"]
+    orchestrator["Orchestrator\n(poll loop)"]
+    launcher["Subprocess Launcher"]
+  end
+
+  subgraph Output["Output"]
+    tui["TUI (Rich)"]
+    logs["Logs & Outputs\nsflow_output/"]
+  end
+
+  CLI --> sflowapp
+  sflowapp --> assembly
+  assembly --> loader
+  assembly --> resolver
+  loader --> schema
+  assembly --> Backends
+  assembly --> Operators
+  assembly --> Artifacts
+  assembly --> state
+  state --> taskgraph
+  taskgraph --> orchestrator
+  orchestrator --> launcher
+  orchestrator --> Probes
+  launcher --> logs
+  sflowapp --> tui
+```
+
+## How to Use sflow (General Workflow)
+
+```mermaid
+flowchart TD
+  A["1. Write sflow.yaml\n(variables, backends,\noperators, tasks)"] --> B["2. Validate\nsflow run -f sflow.yaml --dry-run"]
+  B --> C{Errors?}
+  C -- Yes --> A
+  C -- No --> D{Environment?}
+
+  D -- Local testing --> E["3a. Run locally\nsflow run -f sflow.yaml --tui"]
+  D -- Slurm interactive --> F["3b. Run on Slurm\nsflow run -f sflow.yaml --tui"]
+  D -- Slurm production --> G["3c. Generate sbatch\nsflow batch -f sflow.yaml\n-o run.sh --submit"]
+
+  E --> H["4. sflow resolves variables\nand builds task graph"]
+  F --> H
+  G --> H
+
+  H --> I["5. Backend allocates resources\n(salloc for Slurm,\nsynthetic nodes for local)"]
+  I --> J["6. Orchestrator executes DAG\n• Launches tasks via operators\n• Monitors probes\n• Handles retries"]
+  J --> K["7. Collect outputs & logs\nsflow_output/<run_id>/"]
+
+  K --> L{All tasks\npassed?}
+  L -- Yes --> M(("Done ✓"))
+  L -- No --> N["Check logs, fix config,\nre-run"]
+  N --> A
+
+  style A fill:#4a9eff,color:#fff
+  style M fill:#22c55e,color:#fff
+  style C fill:#f59e0b,color:#fff
+  style L fill:#f59e0b,color:#fff
+```
+
 ## Known Limitations
 
 The following features are **not yet implemented** in the current release:
