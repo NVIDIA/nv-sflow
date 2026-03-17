@@ -3,7 +3,15 @@ title: Introduction
 sidebar_position: 1
 ---
 
-`sflow` is a **workflow orchestrator**: you describe _what to run_ in a `sflow.yaml` (tasks, dependencies, how to launch each task, and required resources). `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure.
+`sflow` is a **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_.
+
+An application's deployment steps are usually logically the same regardless of the underlying infrastructure. Take [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) as an example: you start etcd and NATS, launch a frontend server, spin up workers that register to the frontend, and the service is up. That logical flow never changes — but making it actually run on Slurm, Docker Compose, or Kubernetes requires a different set of infrastructure-specific scripts, resource management, and networking tweaks each time, and the effort must be repeated for every new platform.
+
+`sflow` is trying to eliminate this duplication. You describe the workflow once in a portable YAML format — tasks, dependencies, resources, and launch methods — and `sflow` delegates execution to the target infrastructure through swappable backends, leveraging each platform's native ecosystem rather than reimplementing it (e.g. Kubernetes, Helm charts, Argo Workflows).
+
+Pluggable extensions such as probes and artifacts integrate naturally without coupling your workflow to any specific platform. Write one `sflow.yaml` and run it across environments with minimal changes.
+
+The current focus is **Slurm**, which — unlike Kubernetes or Docker — lacks a built-in workflow orchestration layer, making multi-step deployments especially cumbersome. Docker and Kubernetes backends are planned to follow.
 
 ![sflow TUI](/img/sflow_tui.gif)
 
