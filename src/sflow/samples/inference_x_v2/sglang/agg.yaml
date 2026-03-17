@@ -1,0 +1,118 @@
+# SGLang aggregated (non-disaggregated) server task and its configuration.
+# Merge all files for a complete run:
+#   sflow compose slurm_config.yaml common_workflow.yaml sglang/agg.yaml benchmark_aiperf.yaml \
+#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0 \
+#     --missable-tasks prefill_server --missable-tasks decode_server
+
+version: "0.1"
+
+variables:
+  # Aggregated Server Configuration
+  NUM_AGG_SERVERS:
+    description: "Number of aggregated servers"
+    type: integer
+    value: 1
+  AGG_TP_SIZE:
+    description: "Tensor parallel size"
+    type: integer
+    value: 4
+  AGG_DP_SIZE:
+    description: "Data parallel size"
+    type: integer
+    value: 1
+  AGG_EP_SIZE:
+    description: "Expert parallel size"
+    type: integer
+    value: 1
+  AGG_MOE_TP_SIZE:
+    description: "MOE tensor parallel size"
+    type: integer
+    value: 1
+  AGG_PP_SIZE:
+    description: "Pipeline parallel size"
+    type: integer
+    value: 1
+  AGG_GPUS_PER_WORKER:
+    description: "GPUs per aggregated worker"
+    type: integer
+    value: ${{ (variables.AGG_TP_SIZE * variables.AGG_DP_SIZE * variables.AGG_PP_SIZE) if variables.AGG_ENABLE_ATTENTION_DP == '' else (variables.AGG_TP_SIZE * variables.AGG_PP_SIZE) }}
+  AGG_NODES_PER_WORKER:
+    description: "Nodes per aggregated worker"
+    type: integer
+    value: ${{ [variables.AGG_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
+  AGG_BATCH_SIZE:
+    description: "Batch size"
+    type: integer
+    value: 128
+  AGG_MAX_NUM_TOKENS:
+    description: "Max number of tokens"
+    type: integer
+    value: 4096
+  AGG_ENABLE_ATTENTION_DP:
+    description: "Enable attention DP (pass --enable-dp-attention flag, leave empty to disable)"
+    value: ""
+  EXTRA_AGG_ARGS:
+    description: "Extra aggregated server arguments"
+    value: ""
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: agg_server
+      operator:
+        name: dynamo
+        ntasks_per_node: 1
+      replicas:
+        count: ${{ variables.NUM_AGG_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export NODE_RANK=${SLURM_NODEID}
+        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          if [ "${AGG_NODES_PER_WORKER}" -gt 1 ]; then
+            export MULTI_NODE_EXTRA_ARGS="--dist-init-addr ${FIRST_NODE_IP}:29500 --nnodes ${AGG_NODES_PER_WORKER} --node-rank ${NODE_RANK}"
+          else
+            export MULTI_NODE_EXTRA_ARGS=""
+          fi
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
+        - export DYN_SYSTEM_PORT=$((8082 + ${FIRST_CUDA_DEVICE}))
+        - >
+          python3 -m dynamo.sglang
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --tensor-parallel-size  ${{ variables.AGG_TP_SIZE }}
+          --pipeline-parallel-size ${{ variables.AGG_PP_SIZE }}
+          --data-parallel-size ${{ variables.AGG_DP_SIZE }}
+          --expert-parallel-size ${{ variables.AGG_EP_SIZE }}
+          --moe-dense-tp-size ${{ variables.AGG_MOE_TP_SIZE }}
+          --max-running-requests ${{ variables.AGG_BATCH_SIZE }}
+          --max-prefill-tokens ${{ variables.AGG_MAX_NUM_TOKENS }}
+          ${{ variables.AGG_ENABLE_ATTENTION_DP }}
+          --trust-remote-code
+          --skip-tokenizer-init
+          --cuda-graph-max-bs ${{ variables.AGG_BATCH_SIZE }}
+          ${MULTI_NODE_EXTRA_ARGS}
+          --host 0.0.0.0
+          ${EXTRA_AGG_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.AGG_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
+          timeout: 600
+          interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30

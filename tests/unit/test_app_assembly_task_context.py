@@ -424,7 +424,248 @@ def test_task_context_undefined_task_raises_error():
         ),
     )
 
-    with pytest.raises(ValueError, match=r"Failed to resolve task expression"):
+    with pytest.raises(
+        ValueError,
+        match=r"task\.nonexistent\.nodes\[0\]\.ip_address",
+    ):
+        build_task_graph(config, state)
+
+
+def test_task_context_undefined_task_shows_available_tasks():
+    """Error for undefined task should list available tasks."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="server",
+                    script=["echo server"],
+                ),
+                TaskConfig(
+                    name="client",
+                    script=[
+                        "connect ${{ task.missing_task.nodes[0].ip_address }}",
+                    ],
+                    depends_on=["server"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"not defined.*available tasks.*server"):
+        build_task_graph(config, state)
+
+
+def test_task_context_replicated_task_without_index_shows_hint():
+    """Accessing a replicated task without index should suggest indexed access."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=8),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="server",
+                    script=["echo server"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=1)),
+                    replicas={"count": 2, "policy": "parallel"},
+                ),
+                TaskConfig(
+                    name="client",
+                    script=[
+                        "connect ${{ task.server.nodes[0].ip_address }}",
+                    ],
+                    depends_on=["server"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"replicated task.*2 replica.*server\[0\]"):
+        build_task_graph(config, state)
+
+
+def test_task_context_error_shows_only_failing_expression():
+    """Error message should show only the failing ${{ task.* }} expression, not the whole script."""
+    state = _state()
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    long_script_line = (
+        "python3 benchmark.py "
+        "--model foo "
+        "--url http://${{ task.nonexistent.nodes[0].ip_address }}:8000 "
+        "--other-arg bar"
+    )
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=[long_script_line],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        build_task_graph(config, state)
+
+    msg = str(exc_info.value)
+    assert "task.nonexistent.nodes[0].ip_address" in msg
+    assert "python3 benchmark.py" not in msg
+
+
+def test_task_context_invalid_attribute_shows_available():
+    """Accessing an invalid attribute (e.g. script) should list available attributes."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="server",
+                    script=["echo server"],
+                ),
+                TaskConfig(
+                    name="client",
+                    script=[
+                        "echo ${{ task.server.script[0] }}",
+                    ],
+                    depends_on=["server"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"'script' is not an available task attribute.*nodes.*gpus.*backend.*operator"):
+        build_task_graph(config, state)
+
+
+def test_task_context_replicated_invalid_attribute_shows_available():
+    """Accessing an invalid attribute on a replicated task (with index) should list available attributes."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="server",
+                    script=["echo server"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=1)),
+                    replicas={"count": 2, "policy": "parallel"},
+                ),
+                TaskConfig(
+                    name="client",
+                    script=[
+                        "echo ${{ task.server[0].script[0] }}",
+                    ],
+                    depends_on=["server"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"'script' is not an available task attribute"):
+        build_task_graph(config, state)
+
+
+def test_task_context_invalid_node_attribute_shows_available():
+    """Accessing an invalid node attribute should list available node attributes."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="server",
+                    script=["echo server"],
+                ),
+                TaskConfig(
+                    name="client",
+                    script=[
+                        "echo ${{ task.server.nodes[0].hostname }}",
+                    ],
+                    depends_on=["server"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"'hostname' is not an available node attribute.*name.*ip_address"):
         build_task_graph(config, state)
 
 

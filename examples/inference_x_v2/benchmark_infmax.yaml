@@ -1,0 +1,80 @@
+# Benchmark task and its configuration.
+# Merge with backends_operators.yaml + workflow.yaml + prefill_task.yaml + decode_task.yaml for a complete run:
+#   sflow run -f backends_operators.yaml -f workflow.yaml -f prefill_task.yaml -f decode_task.yaml -f benchmark_task.yaml
+
+version: "0.1"
+
+variables:
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 16
+    domain: [16]
+  EXTRA_BENCHMARK_ARGS:
+    description: "Extra benchmark arguments"
+    value: ""
+  BENCHMARK_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: benchmark_infmax
+      operator:
+        name: dynamo
+        ntasks: 1
+        extra_args:
+          - --container-remap-root
+      script:
+        - set -x
+        - apt-get update
+        - apt-get install -y curl
+        - curl -L -o InferenceX.tar.gz https://github.com/SemiAnalysisAI/InferenceX/archive/89ce6098ef2bc4576a735c43f39c7d972b091cfc.tar.gz
+        - tar xf InferenceX.tar.gz
+        - mv InferenceX-89ce6098ef2bc4576a735c43f39c7d972b091cfc InferenceX
+        - |
+          python3 InferenceX/utils/bench_serving/benchmark_serving.py \
+            --model ${{ variables.SERVED_MODEL_NAME }} \
+            --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }} \
+            --backend openai-chat \
+            --base-url http://${{ variables.HEAD_NODE_IP }}:8000 \
+            --endpoint /v1/chat/completions \
+            --dataset-name random \
+            --seed 100 \
+            --random-input-len ${{ variables.ISL }} \
+            --random-output-len ${{ variables.OSL }} \
+            --random-range-ratio 1.0 \
+            --num-prompts $((${{ variables.MULTI_ROUND }}*${CONCURRENCY})) \
+            --max-concurrency ${CONCURRENCY} \
+            --request-rate inf \
+            --ignore-eos \
+            --save-result \
+            --num-warmups "$((2 * ${CONCURRENCY}))" \
+            --percentile-metrics 'ttft,tpot,itl,e2el' ${{ variables.EXTRA_BENCHMARK_ARGS }} \
+            --result-dir ${SFLOW_TASK_OUTPUT_DIR} \
+            --result-filename benchmark_serving_isl_${{ variables.ISL }}_osl_${{ variables.OSL }}_concurrency_${CONCURRENCY}.json
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      depends_on:
+        - prefill_server
+        - decode_server
+        - agg_server
+        - frontend_server
+        - load_image

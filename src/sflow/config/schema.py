@@ -9,7 +9,6 @@ from pydantic import (
     BaseModel,
     BeforeValidator,
     ConfigDict,
-    HttpUrl,
     PositiveInt,
     field_validator,
     model_validator,
@@ -168,15 +167,34 @@ class TcpPortProbeConfig(StrictBaseModel):
 
 
 class HttpProbeConfig(StrictBaseModel):
-    url: HttpUrl
+    url: Resolvable[str]
     headers: Optional[Dict[str, str]] = None
     body: Optional[str] = None
 
 
 class LogWatchProbeConfig(StrictBaseModel):
-    regex_pattern: str
+    regex_pattern: Optional[str] = None
+    match_pattern: Optional[str] = None
     logger: Optional[str] = None
     match_count: Optional[Resolvable[int]] = 1
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_pattern_exclusivity(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            has_regex = data.get("regex_pattern") is not None
+            has_match = data.get("match_pattern") is not None
+            if has_regex and has_match:
+                raise ValueError("Only one of 'regex_pattern' or 'match_pattern' may be set, not both")
+            if not has_regex and not has_match:
+                raise ValueError("Either 'regex_pattern' or 'match_pattern' must be set")
+        return data
+
+    @model_validator(mode="after")
+    def normalize_pattern(self) -> "LogWatchProbeConfig":
+        if self.regex_pattern is None and self.match_pattern is not None:
+            self.regex_pattern = self.match_pattern
+        return self
 
 
 class ProbeConfig(StrictBaseModel):
@@ -228,6 +246,7 @@ class NodeResourceConfig(StrictBaseModel):
 
     indices: Optional[List[Resolvable[int]]] = None  # Can be [0, 1] or ["${{ ... }}"]
     count: Optional[Resolvable[int]] = None  # Can be int or expression
+    exclude: Optional[Union[List[Resolvable[int]], Resolvable[int]]] = None
 
 
 class GpuResourceConfig(StrictBaseModel):
@@ -439,3 +458,88 @@ class SflowConfig(StrictBaseModel):
         for item in v:
             out.append(adapter.validate_python(item))
         return out
+
+
+def validate_node_exclude_indices(config: SflowConfig) -> None:
+    """Validate resources.nodes.exclude indices against backend node count.
+
+    Must be called **after** variable overrides are applied so that the
+    resolved node count reflects ``--set`` / CSV overrides.  Resolves
+    ``${{ variables.X }}`` expressions using the config's own variable
+    definitions.  Skips values that cannot be resolved statically.
+    """
+    import re as _re
+
+    if not config.backends:
+        return
+
+    var_map: dict[str, Any] = {}
+    for v in config.variables or []:
+        var_map[v.name] = v.value
+    for v in config.workflow.variables or []:
+        var_map[v.name] = v.value
+
+    _VAR_RE = _re.compile(r"^\$\{\{\s*variables\.(\w+)\s*\}\}$")
+
+    def _try_resolve_int(val: Any) -> int | None:
+        if val is None:
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, str):
+            m = _VAR_RE.match(val)
+            if m:
+                ref = var_map.get(m.group(1))
+                if ref is not None and not is_expression(ref):
+                    try:
+                        return int(ref)
+                    except (ValueError, TypeError):
+                        return None
+                return None
+            if is_expression(val):
+                return None
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    backend_map: dict[str, Any] = {}
+    default_backend: Any = None
+    for b in config.backends:
+        backend_map[b.name] = b
+        if b.default:
+            default_backend = b
+
+    for task in config.workflow.tasks:
+        if not task.resources or not task.resources.nodes:
+            continue
+        exclude = task.resources.nodes.exclude
+        if exclude is None:
+            continue
+
+        backend = default_backend
+        if task.backend is not None:
+            if isinstance(task.backend, str):
+                backend = backend_map.get(task.backend)
+            else:
+                continue
+
+        if backend is None:
+            continue
+
+        total_nodes = _try_resolve_int(getattr(backend, "nodes", None))
+        if total_nodes is None:
+            continue
+
+        raw_list = exclude if isinstance(exclude, list) else [exclude]
+        for idx_val in raw_list:
+            idx = _try_resolve_int(idx_val)
+            if idx is None:
+                continue
+            if idx < 0 or idx >= total_nodes:
+                raise ValueError(
+                    f"Task '{task.name}' resources.nodes.exclude contains index "
+                    f"{idx} out of range for {total_nodes} allocated node(s) "
+                    f"(valid: 0..{total_nodes - 1})"
+                )

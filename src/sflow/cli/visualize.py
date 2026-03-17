@@ -6,12 +6,13 @@ CLI command for visualizing workflows.
 """
 
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, List, Optional
 
 import typer
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
+from sflow.config.resolver import enrich_error_with_location
 from sflow.logging import get_logger
 
 _logger = get_logger(__name__)
@@ -21,19 +22,30 @@ _sflow_app = SflowApp()
 
 @app.command(epilog=f"Documentation: {DOCS_URL}")
 def visualize(
-    file: Annotated[
-        Path,
-        typer.Option(
-            "-f",
-            "--file",
-            help="Path to the sflow.yaml workflow file",
+    src_files: Annotated[
+        Optional[List[Path]],
+        typer.Argument(
+            help="Workflow YAML file(s). Multiple files are merged into a single workflow.",
             exists=True,
             file_okay=True,
             dir_okay=False,
             readable=True,
             resolve_path=True,
         ),
-    ] = Path("sflow.yaml"),
+    ] = None,
+    file: Annotated[
+        Optional[List[Path]],
+        typer.Option(
+            "-f",
+            "--file",
+            help="Path to sflow YAML workflow file(s). Can be specified multiple times to merge configs.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ] = None,
     output_path: Annotated[
         Optional[Path],
         typer.Option(
@@ -69,6 +81,32 @@ def visualize(
             resolve_path=True,
         ),
     ] = None,
+    set_var: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--set",
+            "-s",
+            help="Override variable value (format: KEY=VALUE). Can be used multiple times.",
+        ),
+    ] = None,
+    artifact: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--artifact",
+            "-a",
+            help="Override artifact URI (format: NAME=URI, can be used multiple times)",
+        ),
+    ] = None,
+    missable_tasks: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--missable-tasks",
+            "-M",
+            help="Task names or glob patterns (e.g. 'prefill_*') that may be absent when composing "
+            "modular configs from multiple files. Absent missable tasks are removed from depends_on "
+            "and probes with a warning. Only valid with multiple input files. Repeatable.",
+        ),
+    ] = None,
     show_variables: Annotated[
         bool,
         typer.Option(
@@ -90,12 +128,24 @@ def visualize(
         sflow visualize --file workflow.yaml --format svg --output dag.svg
     """
     try:
+        files = list(src_files or []) + list(file or [])
+        if not files:
+            files = [Path("sflow.yaml").resolve()]
+        if missable_tasks and len(files) < 2:
+            typer.echo(
+                "Error: --missable-tasks is only valid with multiple input files (modular configs).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
         _logger.info(f"Generating {format.upper()} visualization...")
         result = _sflow_app.visualize(
-            file=file,
+            file=files,
             output_path=output_path,
             format=format,
             show_variables=show_variables,
+            variable_overrides=set_var,
+            artifact_overrides=artifact,
+            missable_tasks=missable_tasks,
             workspace_dir=workspace_dir,
             output_dir=output_dir,
         )
@@ -113,8 +163,9 @@ def visualize(
         return
 
     except ValueError as e:
-        _logger.error(f"Configuration error: {e}")
-        typer.echo(f"✗ Configuration error: {e}", err=True)
+        msg = enrich_error_with_location(str(e), files)
+        _logger.error(f"Configuration error: {msg}")
+        typer.echo(f"✗ Configuration error: {msg}", err=True)
         raise typer.Exit(code=1)
     except FileNotFoundError as e:
         _logger.error(f"File not found: {e}")

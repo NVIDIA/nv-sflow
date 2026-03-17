@@ -1,9 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
 from pydantic import ValidationError
 
-from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
+from sflow.plugins.operators.srun import (
+    SrunOperator,
+    SrunOperatorConfig,
+    _is_valid_container_image,
+)
 
 
 def test_srun_operator_supports_pyxis_container_image_flags_and_common_args():
@@ -218,3 +223,99 @@ def test_srun_operator_container_mounts_only_from_extra_args():
     s = str(op.build_command(task_name="t1", script=["echo hi"], envs={}))
     assert "--container-mounts /extra:/cextra" in s
     assert s.count("--container-mounts") == 1
+
+
+# ---------------------------------------------------------------------------
+# Container image validation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "nvcr.io/nvidia/pytorch:24.01-py3",
+        "docker.io/library/ubuntu:latest",
+        "ghcr.io/owner/image:v1.0",
+        "registry.example.com:5000/org/repo:tag",
+        "ubuntu:latest",
+        "nvidia/cuda:12.0-runtime",
+        "python:3.11",
+        "my-image",
+        "my-image:1",
+        "nvcr.io/a/b@sha256:abcdef1234567890",
+        "/path/to/image.sqsh",
+        "./relative/image.sqsh",
+        "image.sqsh",
+        "/opt/containers/my-container.sqsh",
+        "${{ variables.IMG }}",
+        "${MY_IMAGE}",
+    ],
+)
+def test_valid_container_images(image: str):
+    assert _is_valid_container_image(image), f"Expected valid: {image}"
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "",
+        "   ",
+        "has space:latest",
+        "!invalid",
+        "*glob*",
+    ],
+)
+def test_invalid_container_images(image: str):
+    assert not _is_valid_container_image(image), f"Expected invalid: {image}"
+
+
+def test_srun_operator_rejects_invalid_container_image():
+    with pytest.raises(ValidationError, match="container_image.*does not look like"):
+        SrunOperatorConfig(name="op", container_image="not a valid image!!")
+
+
+def test_srun_operator_accepts_valid_registry_image():
+    cfg = SrunOperatorConfig(
+        name="op", container_image="nvcr.io/nvidia/pytorch:24.01-py3"
+    )
+    assert cfg.container_image == "nvcr.io/nvidia/pytorch:24.01-py3"
+
+
+def test_srun_operator_accepts_sqsh_image():
+    cfg = SrunOperatorConfig(name="op", container_image="/opt/images/my.sqsh")
+    assert cfg.container_image == "/opt/images/my.sqsh"
+
+
+def test_srun_operator_accepts_template_variable_image():
+    cfg = SrunOperatorConfig(
+        name="op", container_image="${{ variables.CONTAINER_IMAGE }}"
+    )
+    assert cfg.container_image == "${{ variables.CONTAINER_IMAGE }}"
+
+
+def test_srun_operator_rejects_placeholder_image():
+    with pytest.raises(ValidationError, match="container_image.*does not look like"):
+        SrunOperatorConfig(name="op", container_image="<your-container-image>")
+
+
+def test_srun_operator_rejects_invalid_image_in_extra_args_equals():
+    with pytest.raises(ValidationError, match="extra_args.*does not look like"):
+        SrunOperatorConfig(
+            name="op",
+            extra_args=["--container-image=not a valid image!!"],
+        )
+
+
+def test_srun_operator_rejects_invalid_image_in_extra_args_space():
+    with pytest.raises(ValidationError, match="extra_args.*does not look like"):
+        SrunOperatorConfig(
+            name="op",
+            extra_args=["--container-image", "not a valid image!!"],
+        )
+
+
+def test_srun_operator_accepts_valid_image_in_extra_args():
+    cfg = SrunOperatorConfig(
+        name="op",
+        extra_args=["--container-image=nvcr.io/nvidia/pytorch:24.01-py3"],
+    )
+    assert "--container-image=nvcr.io/nvidia/pytorch:24.01-py3" in cfg.extra_args

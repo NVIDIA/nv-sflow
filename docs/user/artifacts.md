@@ -53,7 +53,41 @@ Notes:
 
 - `--artifact` can only override artifacts that already exist in `artifacts:` (otherwise it errors).
 
-## Inline `content` (current limitation)
+## Variable expressions in artifact URIs
+
+Artifact URIs can use `${{ }}` expressions to reference variables:
+
+```yaml
+variables:
+  MODEL_DIR:
+    value: /data/models/Qwen3-8B-FP8
+
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs://${{ variables.MODEL_DIR }}
+```
+
+The expression is resolved before the artifact path is validated. This means:
+
+- If the variable resolves to a valid path, the `fs://` path check verifies it exists
+- If the variable itself is an unresolved expression (e.g. references another computed variable), the path check is skipped and deferred to runtime
+- Shell variable references (e.g. `$HOME`) in URIs are also skipped during validation
+
+### Path validation
+
+`fs://` artifact paths are validated during dry-run to catch missing paths early (before allocating Slurm nodes):
+
+- **`fs://` paths**: must exist on disk. If missing, the dry-run fails with an error.
+- **`file://` paths with `content`**: skipped (the file is generated at runtime from the inline content).
+- **URIs with unresolved expressions**: skipped (validated later during full resolution).
+
+To override an artifact path at runtime:
+
+```bash
+sflow run -f workflow.yaml --artifact LOCAL_MODEL_PATH=fs:///actual/path/to/model
+```
+
+## Inline `content`
 
 The schema allows:
 
@@ -65,5 +99,5 @@ artifacts:
       key: value
 ```
 
-But in v0.1, `content` is only validated (must be `file://...`) and is **not materialized to disk yet**.
-If you reference `${CONFIG_YAML}`, make sure the file already exists in your workspace.
+Artifacts with `content` are materialized to disk under the workflow output directory at runtime.
+The content can use `${{ }}` expressions that are resolved before writing.

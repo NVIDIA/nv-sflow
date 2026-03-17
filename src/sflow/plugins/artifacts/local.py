@@ -55,6 +55,9 @@ class _FileArtifactResolver:
             if not Path(raw).is_absolute():
                 path = output_dir / raw
 
+            _logger.info(
+                f"Artifact '{name}' (file://) with inline content will be written to: {path}"
+            )
             if materialize:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")

@@ -3,6 +3,7 @@
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
@@ -36,6 +37,65 @@ class ValidationResult:
         return self.valid
 
 
+_LOCATION_HINT_RE = re.compile(r"\(line \d+ in ")
+_QUOTED_STRING_RE = re.compile(r"'([^']+)'")
+
+
+def find_lines_in_files(
+    search_text: str, source_files: List[Path]
+) -> List[str]:
+    """Search *source_files* for *search_text* and return location hints like ``line 5 in foo.yaml``."""
+    search_text = search_text.strip()
+    if not search_text or not source_files:
+        return []
+    hits: List[str] = []
+    for fpath in source_files:
+        try:
+            lines = fpath.read_text().splitlines()
+            for i, line in enumerate(lines, start=1):
+                if search_text in line:
+                    hits.append(f"line {i} in {fpath.name}")
+        except OSError:
+            continue
+    return hits
+
+
+def enrich_error_with_location(
+    error_msg: str, source_files: List[Path]
+) -> str:
+    """Append YAML source location hints to *error_msg* if not already present.
+
+    Extracts quoted strings and ``${{ }}`` expressions from the message,
+    searches *source_files* for them, and appends the best match found
+    (fewest hits = most specific).
+    """
+    if not source_files or _LOCATION_HINT_RE.search(error_msg):
+        return error_msg
+
+    candidates: List[str] = []
+    # ${{ ... }} expressions
+    for m in re.finditer(r"\$\{\{(.+?)\}\}", error_msg):
+        candidates.append("${{" + m.group(1) + "}}")
+    # Single-quoted values — longer strings are more specific, so sort descending
+    quoted = []
+    for m in _QUOTED_STRING_RE.finditer(error_msg):
+        val = m.group(1)
+        if len(val) >= 3 and not val.startswith("${{"):
+            quoted.append(val)
+    quoted.sort(key=len, reverse=True)
+    candidates.extend(quoted)
+
+    best_hits: List[str] | None = None
+    for candidate in candidates:
+        hits = find_lines_in_files(candidate, source_files)
+        if hits and (best_hits is None or len(hits) < len(best_hits)):
+            best_hits = hits
+
+    if best_hits:
+        return error_msg + "\n  Source: " + ", ".join(best_hits)
+    return error_msg
+
+
 class ExpressionResolver:
     """
     Uses Jinja2 engine to evaluate expressions and handles complex constraint logic.
@@ -55,6 +115,7 @@ class ExpressionResolver:
             variable_start_string="${{",
             variable_end_string="}}",
         )
+        self.source_files: List[Path] = []
 
     def has_expression(self, value: Any) -> bool:
         """Check if a value contains any ${{ }} expressions."""
@@ -147,17 +208,56 @@ class ExpressionResolver:
         else:
             return value
 
+    def _find_expression_in_sources(self, expression: str) -> str:
+        """Search source YAML files for an expression and return a location hint."""
+        hits = find_lines_in_files(expression, self.source_files)
+        if hits:
+            return " (" + ", ".join(hits) + ")"
+        return ""
+
     def _resolve_string(self, value: str, context: Dict[str, Any]) -> Any:
         try:
             template = self._env.from_string(value)
             resolved = template.render(**context)
             return resolved
         except UndefinedError as e:
-            raise ValueError(f"Undefined variable in expression '{value}': {e}")
+            failing = self._pinpoint_failing_expression(value, context)
+            location = self._find_expression_in_sources(failing)
+            raise ValueError(
+                f"Undefined variable in expression {failing}{location}: {e}"
+            ) from e
         except TemplateSyntaxError as e:
-            raise ValueError(f"Invalid expression syntax in '{value}': {e}")
+            location = self._find_expression_in_sources(value)
+            raise ValueError(
+                f"Invalid expression syntax in '{value}'{location}: {e}"
+            ) from e
         except Exception as e:
-            raise ValueError(f"Error evaluating expression '{value}': {e}")
+            failing = self._pinpoint_failing_expression(value, context)
+            location = self._find_expression_in_sources(failing)
+            raise ValueError(
+                f"Error evaluating expression {failing}{location}: {e}"
+            ) from e
+
+    def _pinpoint_failing_expression(
+        self, value: str, context: Dict[str, Any]
+    ) -> str:
+        """Identify which specific ${{ }} expression(s) in *value* fail to resolve."""
+        matches = self.VARIABLE_PATTERN.findall(value)
+        if not matches:
+            return repr(value)
+
+        failing: list[str] = []
+        for expr_body in matches:
+            test_str = "${{ " + expr_body.strip() + " }}"
+            try:
+                tpl = self._env.from_string(test_str)
+                tpl.render(**context)
+            except Exception:
+                failing.append("${{ " + expr_body.strip() + " }}")
+
+        if failing:
+            return ", ".join(failing)
+        return ", ".join("${{ " + m.strip() + " }}" for m in matches)
 
     def resolve_with_partial_context(
         self, value: Any, context: Dict[str, Any], ignore_undefined: bool = False

@@ -24,7 +24,7 @@ class SlurmBackendConfig(BackendConfig):
     type: Literal["slurm"] = "slurm"
     account: Resolvable[str]
     partition: Resolvable[str]
-    time: Resolvable[str]
+    time: Resolvable[str | int]
     nodes: Resolvable[int]
     # Slurm backend requires GPUs-per-node to be specified so we can correctly
     # populate ComputeNode.num_gpus for scheduling/packing/validation.

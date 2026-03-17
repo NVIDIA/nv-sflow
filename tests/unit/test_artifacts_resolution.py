@@ -247,3 +247,127 @@ def test_resolve_artifacts_with_backend_expression_in_uri(tmp_path: Path):
     a = state.artifacts["REMOTE_MODEL"]
     # The URI should have the placeholder IP resolved.
     assert a.uri == "http://0.0.0.1:8000/model.bin"
+
+
+# ---------------------------------------------------------------------------
+# Preflight artifact path validation tests
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_fs_artifact_with_existing_path_passes(tmp_path: Path):
+    """fs:// artifact pointing to an existing path should pass dry-run."""
+    from sflow.app.sflow import SflowApp
+
+    model_dir = tmp_path / "models" / "test-model"
+    model_dir.mkdir(parents=True)
+
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        f'version: "0.1"\n'
+        f"artifacts:\n"
+        f"  - name: MODEL\n"
+        f"    uri: fs://{model_dir}\n"
+        f"workflow:\n"
+        f"  name: wf\n"
+        f"  tasks:\n"
+        f"    - name: t1\n"
+        f"      script:\n"
+        f"        - echo hi\n"
+    )
+    result = SflowApp().run(file=wf, dry_run=True)
+    assert result is None
+
+
+def test_preflight_fs_artifact_with_missing_path_fails(tmp_path: Path):
+    """fs:// artifact pointing to a non-existent path should fail dry-run."""
+    from sflow.app.sflow import SflowApp
+
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "artifacts:\n"
+        "  - name: MODEL\n"
+        "    uri: fs:///nonexistent/path/to/model\n"
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    with pytest.raises(ValueError, match="does not exist"):
+        SflowApp().run(file=wf, dry_run=True)
+
+
+def test_preflight_fs_artifact_with_variable_expression_resolved(tmp_path: Path):
+    """fs:// artifact URI using ${{ variables.X }} should resolve and validate the path."""
+    from sflow.app.sflow import SflowApp
+
+    model_dir = tmp_path / "models" / "test-model"
+    model_dir.mkdir(parents=True)
+
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        f'version: "0.1"\n'
+        f"variables:\n"
+        f"  - name: MODEL_DIR\n"
+        f"    value: {model_dir}\n"
+        f"artifacts:\n"
+        f"  - name: MODEL\n"
+        f'    uri: "fs://${{{{ variables.MODEL_DIR }}}}"\n'
+        f"workflow:\n"
+        f"  name: wf\n"
+        f"  tasks:\n"
+        f"    - name: t1\n"
+        f"      script:\n"
+        f"        - echo hi\n"
+    )
+    result = SflowApp().run(file=wf, dry_run=True)
+    assert result is None
+
+
+def test_preflight_fs_artifact_with_variable_expression_missing_path_fails(tmp_path: Path):
+    """fs:// artifact URI resolved from variable to a missing path should fail."""
+    from sflow.app.sflow import SflowApp
+
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: MODEL_DIR\n"
+        "    value: /nonexistent/variable/path\n"
+        "artifacts:\n"
+        "  - name: MODEL\n"
+        '    uri: "fs://${{ variables.MODEL_DIR }}"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    with pytest.raises(ValueError, match="does not exist"):
+        SflowApp().run(file=wf, dry_run=True)
+
+
+def test_preflight_fs_artifact_with_unresolvable_expression_skipped(tmp_path: Path):
+    """fs:// artifact URI with unresolvable expression should pass preflight
+    (the expression is skipped in path validation). The downstream resolver
+    will raise on the undefined variable, which is expected."""
+    from sflow.app.sflow import SflowApp
+
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "artifacts:\n"
+        "  - name: MODEL\n"
+        '    uri: "fs://${{ variables.UNDEFINED_VAR }}"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    with pytest.raises(ValueError, match="Undefined variable"):
+        SflowApp().run(file=wf, dry_run=True)

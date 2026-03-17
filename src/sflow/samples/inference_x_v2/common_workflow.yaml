@@ -1,0 +1,353 @@
+# Workflow definition with shared variables, artifacts, and infrastructure tasks.
+# Merge with slurm_config.yaml + prefill_task.yaml + decode_task.yaml + benchmark_task.yaml for a complete run:
+#   sflow run -f slurm_config.yaml -f common_workflow.yaml -f trtllm_prefill.yaml -f trtllm_decode.yaml -f benchmark_aiperf.yaml
+#
+# If using OSS framework images without dynamo/nats/etcd pre-installed, also merge install_deps.yaml:
+#   sflow run -f slurm_config.yaml -f common_workflow.yaml -f install_deps.yaml -f ...
+#
+# Multi-frontend support:
+#   NUM_FRONTENDS=1 (default): single frontend on node 0, port 8000, no nginx.
+#   NUM_FRONTENDS>1: frontends on nodes 1..N (port 8180), nginx on node 0 proxies port 8000.
+#   Benchmarks always target node 0 port 8000 in both modes.
+
+version: "0.1"
+
+variables:
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: Qwen3-0-6B-FP8
+  MODEL_NAME:
+    description: "Model path"
+    value: Qwen/Qwen3-0.6B-FP8
+
+  # Extra Arguments
+  DYN_REQUEST_PLANE:
+    description: "Dynamo request plane"
+    value: "nats"
+  EXTRA_FRONTEND_ARGS:
+    description: "Extra frontend arguments"
+    value: ""
+
+  # Shared engine config
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+
+  # Container Images
+  DYNAMO_IMAGE:
+    description: "Dynamo container image"
+    value: <your-dynamo-container-image>
+  NGINX_IMAGE:
+    description: "Nginx container image (only used when NUM_FRONTENDS > 1)"
+    value: nginx:latest
+
+  # Frontend scaling
+  NUM_FRONTENDS:
+    description: "Number of frontend instances (1 = direct on node 0, >1 = nginx load-balanced)"
+    type: integer
+    value: 1
+  FRONTEND_PORT:
+    description: "Frontend listening port (auto: 8180 behind nginx when multi-frontend, 8000 when single)"
+    value: "${{ 8180 if variables.NUM_FRONTENDS > 1 else 8000 }}"
+
+  # Dependencies versions
+  DYNAMO_VERSION:
+    description: "Dynamo version to install when missing from the container image"
+    value: 0.8.0
+  NATS_VERSION:
+    description: "NATS server version to install when missing"
+    value: v2.10.28
+  ETCD_VERSION:
+    description: "ETCD version to install when missing"
+    value: v3.5.21
+
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
+operators:
+  - name: dynamo
+    type: srun
+    container_name: dynamo_image
+    container_writable: true
+    mpi: pmix
+    extra_args:
+      - --container-image=${{ variables.DYNAMO_IMAGE }}
+  - name: nginx
+    type: srun
+    container_image: ${{ variables.NGINX_IMAGE }}
+    container_writable: true
+
+workflow:
+  name: dynamo_benchmark
+  timeout: 115m
+
+  variables:
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
+    ALL_NODE_IPS:
+      description: "Comma-separated IPs of all allocated nodes (for nginx config generation)"
+      value: "${{ backends.slurm_cluster.nodes | map(attribute='ip_address') | join(',') }}"
+
+  tasks:
+    - name: load_image
+      operator:
+        name: dynamo
+        ntasks: ${{ variables.SLURM_NODES }}
+        ntasks_per_node: 1
+      script:
+        - echo "Image Loaded"
+        - sleep 3600
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Image Loaded"
+            match_count: ${{ variables.SLURM_NODES }}
+          timeout: 1200
+          interval: 2
+
+    - name: install_dependency
+      operator:
+        name: dynamo
+        ntasks: ${{ variables.SLURM_NODES }}
+        ntasks_per_node: 1
+      script:
+        - set -x
+        - |
+          echo "Checking for dynamo, nats-server, and etcd..."
+
+          # Install dynamo if missing (check for the base dynamo.frontend module which all backends use)
+          if ! python3 -c "import dynamo" >/dev/null 2>&1; then
+            echo "dynamo not found, installing ai-dynamo packages (${DYNAMO_VERSION})..."
+            pip install --break-system-packages --quiet ai-dynamo-runtime==${DYNAMO_VERSION} ai-dynamo==${DYNAMO_VERSION}
+          else
+            echo "dynamo already installed."
+          fi
+
+          # Install nats-server if missing
+          if ! command -v nats-server >/dev/null 2>&1; then
+            mkdir -p configs
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)  ARCH_SHORT="amd64" ;;
+              aarch64) ARCH_SHORT="arm64" ;;
+              *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+            esac
+            echo "Downloading NATS (${NATS_VERSION}) for $ARCH_SHORT..."
+            NATS_DEB="nats-server-${NATS_VERSION}-$ARCH_SHORT.deb"
+            NATS_URL="https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/${NATS_DEB}"
+            wget -q --tries=3 --waitretry=5 "$NATS_URL" -O "configs/${NATS_DEB}"
+            TMP_DIR=$(mktemp -d)
+            dpkg-deb -x "configs/${NATS_DEB}" "$TMP_DIR"
+            if [ -f "$TMP_DIR/usr/local/bin/nats-server" ]; then
+              cp "$TMP_DIR/usr/local/bin/nats-server" configs/
+            elif [ -f "$TMP_DIR/usr/bin/nats-server" ]; then
+              cp "$TMP_DIR/usr/bin/nats-server" configs/
+            else
+              echo "Could not find nats-server binary in .deb package"; exit 1
+            fi
+            chmod +x configs/nats-server
+            rm -rf "$TMP_DIR" "configs/${NATS_DEB}"
+            export PATH="$PWD/configs:$PATH"
+            echo "nats-server installed."
+          else
+            echo "nats-server already installed."
+          fi
+
+          # Install etcd if missing
+          if ! command -v etcd >/dev/null 2>&1; then
+            mkdir -p configs
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)  ARCH_SHORT="amd64" ;;
+              aarch64) ARCH_SHORT="arm64" ;;
+              *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+            esac
+            echo "Downloading ETCD (${ETCD_VERSION}) for $ARCH_SHORT..."
+            ETCD_TAR="etcd-${ETCD_VERSION}-linux-$ARCH_SHORT.tar.gz"
+            ETCD_URL="https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/${ETCD_TAR}"
+            wget -q --tries=3 --waitretry=5 "$ETCD_URL" -O "configs/${ETCD_TAR}"
+            tar -xzf "configs/${ETCD_TAR}" --strip-components=1 -C configs \
+              etcd-${ETCD_VERSION}-linux-$ARCH_SHORT/etcd \
+              etcd-${ETCD_VERSION}-linux-$ARCH_SHORT/etcdctl
+            chmod +x configs/etcd configs/etcdctl
+            rm "configs/${ETCD_TAR}"
+            export PATH="$PWD/configs:$PATH"
+            echo "etcd installed."
+          else
+            echo "etcd already installed."
+          fi
+
+          echo "All dependencies checked."
+          sleep 3600
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "All dependencies checked."
+            match_count: ${{ variables.SLURM_NODES }}
+          timeout: 1200
+          interval: 2
+      depends_on:
+        - load_image
+    
+    - name: gpu_monitor
+      operator:
+        name: dynamo
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: ${{ variables.SLURM_NODES }}
+      script:
+        - echo "Starting gpu monitor"
+        - >
+          nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used
+          --format=csv,noheader,nounits -lms 2000 |
+          while IFS= read -r input || [ -n "$input" ] ;
+          do timestamp=$(date +%s%3N);
+          printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}" "${input}";
+          done
+          >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Starting gpu monitor"
+          timeout: 60
+          interval: 2
+      depends_on:
+        - load_image
+
+    - name: nats_server
+      operator: dynamo
+      script:
+        - export PATH="$PWD/configs:$PATH" # in case the etcd binary is not in the PATH
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 60
+          interval: 2
+      depends_on:
+        - load_image
+        - install_dependency
+
+    - name: etcd_server
+      operator: dynamo
+      script:
+        - export PATH="$PWD/configs:$PATH" # in case the etcd binary is not in the PATH
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 60
+          interval: 2
+      depends_on:
+        - load_image
+        - install_dependency
+
+    # Frontend server(s).
+    # NUM_FRONTENDS=1: single frontend on node 0, port 8000 (no nginx needed).
+    # NUM_FRONTENDS>1: replicated frontends on nodes 0..N-1, port 8180, nginx on node 0 proxies port 8000.
+    - name: frontend_server
+      operator: dynamo
+      replicas:
+        count: ${{ variables.NUM_FRONTENDS }}
+        policy: "parallel"
+      script:
+        - python3 -m dynamo.frontend --http-port ${FRONTEND_PORT} ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          count: 1
+      probes:
+        readiness:
+          tcp_port:
+            port: ${{ variables.FRONTEND_PORT }}
+          timeout: 120
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    # Nginx load balancer for multi-frontend mode (NUM_FRONTENDS > 1).
+    # Generates nginx.conf at runtime from the allocated node IPs and proxies
+    # port 8000 to all frontend instances on FRONTEND_PORT.
+    # When NUM_FRONTENDS=1, exits immediately (frontend serves port 8000 directly).
+    - name: nginx_server
+      operator: nginx
+      script:
+        - |
+          if [ "${NUM_FRONTENDS}" -le 1 ]; then
+            echo "Single frontend mode (NUM_FRONTENDS=${NUM_FRONTENDS}), nginx not needed."
+            echo "Frontend is directly serving on port 8000 on this node."
+            exit 0
+          fi
+
+          NGINX_CONF=${SFLOW_TASK_OUTPUT_DIR}/nginx.conf
+          cat > $NGINX_CONF << 'CONF_HEADER'
+          worker_processes auto;
+          events {
+              worker_connections 65535;
+              multi_accept on;
+              use epoll;
+          }
+          http {
+              access_log off;
+              upstream backend_servers {
+          CONF_HEADER
+
+          # Build upstream entries from frontend node IPs.
+          # Frontend replicas are assigned to nodes 0..NUM_FRONTENDS-1 via count=1.
+          IFS=',' read -ra NODE_ARRAY <<< "${ALL_NODE_IPS}"
+          for i in $(seq 0 $((NUM_FRONTENDS - 1))); do
+              echo "        server ${NODE_ARRAY[$i]}:${FRONTEND_PORT};" >> $NGINX_CONF
+          done
+
+          cat >> $NGINX_CONF << 'CONF_FOOTER'
+              }
+              server {
+                  listen 8000;
+                  location / {
+                      proxy_pass http://backend_servers;
+                      proxy_buffering off;
+                      proxy_read_timeout 24h;
+                      proxy_send_timeout 24h;
+                  }
+              }
+          }
+          CONF_FOOTER
+
+          echo "Generated nginx.conf:"
+          cat $NGINX_CONF
+          /usr/sbin/nginx -c $NGINX_CONF -g 'daemon off;'
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 120
+          interval: 5
+      depends_on:
+        - frontend_server

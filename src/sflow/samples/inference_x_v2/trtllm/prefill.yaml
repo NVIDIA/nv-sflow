@@ -1,0 +1,126 @@
+# Prefill server task and its configuration.
+# Merge all files for a complete run:
+#   sflow run -f backends_operators.yaml -f workflow.yaml -f prefill_task.yaml -f decode_task.yaml -f benchmark_task.yaml
+
+version: "0.1"
+
+variables:
+  # Prefill Server Configuration
+  NUM_CTX_SERVERS:
+    description: "Number of context/prefill servers"
+    value: 1
+  CTX_TP_SIZE:
+    description: "Context tensor parallel size"
+    type: integer
+    value: 2
+  CTX_DP_SIZE:
+    description: "Context data parallel size"
+    type: integer
+    value: 1
+  CTX_EP_SIZE:
+    description: "Context expert parallel size"
+    type: integer
+    value: 1
+  CTX_MOE_TP_SIZE:
+    description: "Context MOE tensor parallel size"
+    type: integer
+    value: 1
+  CTX_PP_SIZE:
+    description: "Context pipeline parallel size"
+    type: integer
+    value: 1
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+  CTX_BATCH_SIZE:
+    description: "Context batch size"
+    value: 128
+  CTX_MAX_NUM_TOKENS:
+    description: "Context max number of tokens"
+    value: 4096
+  CTX_MAX_SEQ_LEN:
+    description: "Context max sequence length"
+    value: 1280
+  CTX_FREE_GPU_MEMORY_FRACTION:
+    description: "Context free GPU memory fraction"
+    value: 0.9
+  CTX_ENABLE_ATTENTION_DP:
+    description: "Context enable attention DP"
+    value: false
+  EXTRA_PREFILL_ARGS:
+    description: "Extra prefill arguments"
+    value: ""
+
+artifacts:
+  - name: PREFILL_CONFIG
+    uri: file://prefill_config.yaml
+    content: |
+      max_batch_size: ${{ variables.CTX_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.CTX_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.CTX_MAX_SEQ_LEN }}
+      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      enable_attention_dp: ${{ variables.CTX_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: ${{ variables.CTX_PP_SIZE }}
+      cuda_graph_config: null
+      print_iter_log: true
+      disable_overlap_scheduler: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.CTX_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
+        backend: DEFAULT
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: prefill_server
+      operator:
+        name: dynamo
+        ntasks: ${{ variables.CTX_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.CTX_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode prefill
+          --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
+          timeout: 600
+          interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+      retries:
+        count: 3
+        interval: 30
+        backoff: 2

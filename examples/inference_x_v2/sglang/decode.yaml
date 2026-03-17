@@ -1,0 +1,121 @@
+# SGLang decode server task and its configuration.
+# Merge all files for a complete run:
+#   sflow run -f slurm_config.yaml -f common_workflow.yaml -f sglang_prefill.yaml -f sglang_decode.yaml -f benchmark_aiperf.yaml \
+#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0
+
+version: "0.1"
+
+variables:
+  # Decode Server Configuration
+  NUM_GEN_SERVERS:
+    description: "Number of generation/decode servers"
+    type: integer
+    value: 1
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size"
+    type: integer
+    value: 2
+  GEN_DP_SIZE:
+    description: "Generation data parallel size"
+    type: integer
+    value: 1
+  GEN_EP_SIZE:
+    description: "Generation expert parallel size"
+    type: integer
+    value: 1
+  GEN_MOE_TP_SIZE:
+    description: "Generation MOE tensor parallel size"
+    type: integer
+    value: 1
+  GEN_PP_SIZE:
+    description: "Generation pipeline parallel size"
+    type: integer
+    value: 1
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ (variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE) if variables.GEN_ENABLE_ATTENTION_DP == '' else (variables.GEN_TP_SIZE * variables.GEN_PP_SIZE) }}
+  GEN_NODES_PER_WORKER:
+    description: "Nodes per decode worker"
+    type: integer
+    value: ${{ [variables.GEN_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
+  GEN_BATCH_SIZE:
+    description: "Generation batch size (max running requests)"
+    type: integer
+    value: 128
+  GEN_MAX_NUM_TOKENS:
+    description: "Generation max prefill tokens"
+    type: integer
+    value: 4096
+  GEN_ENABLE_ATTENTION_DP:
+    description: "Generation enable attention DP (pass --enable-dp-attention flag, leave empty to disable)"
+    value: ""
+  EXTRA_DECODE_ARGS:
+    description: "Extra decode arguments"
+    value: ""
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: decode_server
+      operator:
+        name: dynamo
+        ntasks_per_node: 1
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export NODE_RANK=${SLURM_NODEID}
+        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          if [ "${GEN_NODES_PER_WORKER}" -gt 1 ]; then
+            export MULTI_NODE_EXTRA_ARGS="--dist-init-addr ${FIRST_NODE_IP}:29500 --nnodes ${GEN_NODES_PER_WORKER} --node-rank ${NODE_RANK}"
+          else
+            export MULTI_NODE_EXTRA_ARGS=""
+          fi
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
+        - export DYN_SYSTEM_PORT=$((8082 + ${FIRST_CUDA_DEVICE}))
+        - >
+          python3 -m dynamo.sglang
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --tensor-parallel-size  ${{ variables.GEN_TP_SIZE }}
+          --pipeline-parallel-size ${{ variables.GEN_PP_SIZE }}
+          --data-parallel-size ${{ variables.GEN_DP_SIZE }}
+          --expert-parallel-size ${{ variables.GEN_EP_SIZE }}
+          --moe-dense-tp-size ${{ variables.GEN_MOE_TP_SIZE }}
+          --max-running-requests ${{ variables.GEN_BATCH_SIZE }}
+          --max-prefill-tokens ${{ variables.GEN_MAX_NUM_TOKENS }}
+          ${{ variables.GEN_ENABLE_ATTENTION_DP }}
+          --disaggregation-mode decode
+          --disaggregation-bootstrap-port $((8998 + ${FIRST_CUDA_DEVICE}))
+          --disaggregation-transfer-backend nixl
+          --prefill-round-robin-balance
+          --trust-remote-code
+          --skip-tokenizer-init
+          --cuda-graph-max-bs ${{ variables.GEN_BATCH_SIZE }}
+          ${MULTI_NODE_EXTRA_ARGS}
+          --host 0.0.0.0
+          ${EXTRA_DECODE_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
+          timeout: 600
+          interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30

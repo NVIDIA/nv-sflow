@@ -17,6 +17,7 @@ variables:
     value: 120
   GPUS_PER_NODE:
     description: "GPUs per node"
+    type: integer
     value: 4
   SLURM_NODES:
     description: "Number of nodes"
@@ -33,19 +34,24 @@ variables:
     value: 1
   CTX_TP_SIZE:
     description: "Context tensor parallel size"
+    type: integer
     value: 4
   CTX_DP_SIZE:
     description: "Context data parallel size"
+    type: integer
     value: 1
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE }}
   CTX_EP_SIZE:
     description: "Context expert parallel size"
+    type: integer
     value: 1
   CTX_MOE_TP_SIZE:
     description: "Context MOE tensor parallel size"
+    type: integer
     value: 1
-  CTX_REPLICAS_POLICY:
-    description: "Context replicas policy, sequential means one server after another once previous server is ready, parallel means all servers start at the same time"
-    value: "parallel"
   CTX_BATCH_SIZE:
     description: "Context batch size"
     value: 1
@@ -71,19 +77,24 @@ variables:
     value: 1
   GEN_TP_SIZE:
     description: "Generation tensor parallel size"
+    type: integer
     value: 8
   GEN_DP_SIZE:
     description: "Generation data parallel size"
+    type: integer
     value: 1
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE }}
   GEN_EP_SIZE:
     description: "Generation expert parallel size"
+    type: integer
     value: 1
   GEN_MOE_TP_SIZE:
     description: "Generation MOE tensor parallel size"
+    type: integer
     value: 1
-  GEN_REPLICAS_POLICY:
-    description: "Generation replicas policy"
-    value: "parallel"
   GEN_BATCH_SIZE:
     description: "Generation batch size"
     value: 128
@@ -239,7 +250,7 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Image Loaded"
+            match_pattern: "Image Loaded"
             match_count: ${{ variables.SLURM_NODES }}
           timeout: 1200
           interval: 2
@@ -264,7 +275,7 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Starting gpu monitor"
+            match_pattern: "Starting gpu monitor"
           timeout: 60
           interval: 2
       depends_on:
@@ -328,11 +339,11 @@ workflow:
     - name: prefill_server
       operator:
         name: dynamo_trtllm
-        ntasks: ${{ variables.CTX_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.CTX_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
+        ntasks: ${{ variables.CTX_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.CTX_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
       replicas:
         count: ${{ variables.NUM_CTX_SERVERS }}
-        policy: ${{ variables.CTX_REPLICAS_POLICY }}
+        policy: "parallel"
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
@@ -344,34 +355,38 @@ workflow:
         - unset UCX_TLS
         - >
           trtllm-llmapi-launch python3 -m dynamo.trtllm
-          --model-path ${LOCAL_MODEL_PATH}
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${SERVED_MODEL_NAME}
           --disaggregation-mode prefill
           --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
       resources:
         gpus:
-          count: ${{ variables.CTX_TP_SIZE }}
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
       depends_on:
         - frontend_server
       probes:
         readiness:
-          log_watch:
-            regex_pattern: "Setting PyTorch memory fraction"
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
           timeout: 600
           interval: 10
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-          interval: 10
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
     - name: decode_server
       operator:
         name: dynamo_trtllm
-        ntasks: ${{ variables.GEN_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.GEN_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
+        ntasks: ${{ variables.GEN_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.GEN_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
       replicas:
         count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: ${{ variables.GEN_REPLICAS_POLICY }}
+        policy: "parallel"
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
@@ -383,25 +398,29 @@ workflow:
         - unset UCX_TLS
         - >
           trtllm-llmapi-launch python3 -m dynamo.trtllm
-          --model-path ${LOCAL_MODEL_PATH}
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${SERVED_MODEL_NAME}
           --disaggregation-mode decode
           --extra-engine-args ${{ artifacts.DECODE_CONFIG.path }} ${EXTRA_DECODE_ARGS}
       resources:
         gpus:
-          count: ${{ variables.GEN_TP_SIZE }}
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
       depends_on:
         - frontend_server
       probes:
         readiness:
-          log_watch:
-            regex_pattern: "Setting PyTorch memory fraction"
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
           timeout: 600
           interval: 10
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-          interval: 10
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
     - name: benchmark
       operator:

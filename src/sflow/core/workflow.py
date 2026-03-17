@@ -23,4 +23,8 @@ class Workflow:
         return self.task_graph.get_submittable_tasks()
 
     def get_tasks_to_sync(self) -> list[Task]:
-        return [task for task in self.get_tasks() if task.status == TaskStatus.RUNNING]
+        return [
+            task
+            for task in self.get_tasks()
+            if task.status in (TaskStatus.RUNNING, TaskStatus.READY)
+        ]

@@ -15,7 +15,255 @@ sidebar_position: 2
 | **Operator** | Declares *how* a task's script is launched. Each backend has a default (local → `bash`, Slurm → `srun`). Define named operators to preset flags and reuse them across tasks. | `type: srun`, `ntasks: 4` |
 | **Variable** | A named value reusable everywhere — scripts, resource counts, backend config. Override from the CLI with `--set`. | `NUM_GPUS: 8` |
 | **Task & DAG** | Each task is a unit of work with a script. `depends_on` wires them into a directed graph so sflow runs them in the right order. | `depends_on: [train]` |
-| **Resource placement** | sflow assigns nodes and GPUs automatically after allocation and exposes them as variables. | `${{ backends.slurm_cluster.nodes[0].ip_address }}` |
+| **Probe** | A readiness or failure check attached to a task. Downstream tasks wait until the probe passes. Built-ins: TCP port, HTTP endpoint, log pattern match. | `type: tcp_port`, `port: 8080` |
+| **Resource placement** | Topology-aware: sflow assigns nodes and GPUs automatically after allocation, packing tasks contiguously to respect node boundaries. Assigned resources are exposed as variables. | `${{ backends.slurm_cluster.nodes[0].ip_address }}` |
+
+**Why not just write a bash script?**
+A bash script hard-wires node names, GPU indices, and execution order. With sflow you declare what you want; it handles allocation, node discovery, GPU assignment, dependency ordering, log collection, and retries — the same YAML works locally for debugging and on Slurm for production.
+
+---
+
+## Install sflow
+
+```bash
+mkdir -p sflow_workspace && cd sflow_workspace
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv --python python3
+source .venv/bin/activate
+uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
+sflow --help
+```
+
+If `curl` is unavailable (e.g. on some locked-down clusters), install `uv` via pip instead:
+
+```bash
+pip install uv
+```
+
+---
+
+This guide teaches sflow in two parts:
+
+- **Part I: Learn the Basics Locally** – Write workflows, build DAGs, add variables — no cluster needed
+- **Part II: Run on Slurm** – Take the same config to a real HPC cluster
+
+---
+
+## Part I: Learn the Basics Locally
+
+Start here to learn sflow concepts without needing a Slurm cluster.
+
+### 1. Start with a Plain-Text Config
+
+The fastest way to learn sflow is to start with **hardcoded values** — no variables, no expressions. Get the workflow logic right first.
+
+```yaml
+version: "0.1"
+
+workflow:
+  name: wf
+  tasks:
+    - name: hello
+      script:
+        - echo hello
+```
+
+```mermaid
+flowchart TD
+  start((start)) --> hello[hello]
+  hello --> stop((stop))
+```
+
+Validate and run:
+
+```bash
+sflow run --file sflow.yaml --dry-run   # validate first
+sflow run --file sflow.yaml --tui       # run with TUI
+```
+
+Default output structure:
+
+- `./sflow_output/<run_id>/`: per-run root directory
+- `./sflow_output/<run_id>/<task_name>/`: per-task directory (stdout/stderr go to `<task_name>.log`)
+
+### 2. Build a DAG with `depends_on`
+
+Add multiple tasks and wire them with `depends_on`. Start with plain text — hardcode everything:
+
+```yaml
+version: "0.1"
+
+workflow:
+  name: training_pipeline
+  tasks:
+    - name: prepare_data
+      script:
+        - echo "Downloading cifar10..."
+        - echo "cifar10" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+
+    - name: preprocess
+      depends_on: [prepare_data]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+        - echo "encoded_data ok" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
+
+    - name: train
+      depends_on: [preprocess]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
+        - echo "checkpoint for tiny-transformer" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+
+    - name: evaluate_on_dataset1
+      depends_on: [train]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+        - echo "accuracy=0.99 dataset=dataset1" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
+
+    - name: evaluate_on_dataset2
+      depends_on: [train]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+        - echo "accuracy=0.88 dataset=dataset2" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
+
+    - name: export_model
+      depends_on: [evaluate_on_dataset1, evaluate_on_dataset2]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset1/metrics.txt
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset2/metrics.txt
+        - echo "exported tiny-transformer" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/model.onnx
+```
+
+```mermaid
+flowchart TD
+  prepare_data[prepare_data] --> preprocess[preprocess]
+  preprocess --> train[train]
+  train --> evaluate_on_dataset1[evaluate_on_dataset1]
+  train --> evaluate_on_dataset2[evaluate_on_dataset2]
+  evaluate_on_dataset1 --> export_model[export_model]
+  evaluate_on_dataset2 --> export_model
+```
+
+Always validate first, then run:
+
+```bash
+sflow run --file pipeline.yaml --dry-run
+sflow run --file pipeline.yaml --tui
+```
+
+Visualize the DAG without running:
+
+```bash
+sflow visualize --file pipeline.yaml --format mermaid
+```
+
+### 3. Extract Variables for Reusability
+
+Once the plain-text config works, identify values that you'd want to change between runs
+and extract them into `variables`. This makes the config reusable without editing the YAML each time.
+
+**Before (hardcoded):**
+```yaml
+    - name: train
+      script:
+        - echo "checkpoint for tiny-transformer" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+```
+
+**After (parameterized):**
+```yaml
+variables:
+  MODEL_NAME:
+    description: "Model to train"
+    value: tiny-transformer
+
+workflow:
+  tasks:
+    - name: train
+      script:
+        - echo "checkpoint for ${MODEL_NAME}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+```
+
+Now you can override the value from the CLI without touching the file:
+
+```bash
+sflow run -f pipeline.yaml --set MODEL_NAME=large-transformer --tui
+```
+
+Variables can be used in two ways:
+- **In YAML fields** (resolved before execution): `${{ variables.MODEL_NAME }}`
+- **In scripts** (as env var at runtime): `${MODEL_NAME}`
+
+Here's the full parameterized version (or get it via `sflow sample local_dag`):
+
+```yaml
+version: "0.1"
+
+variables:
+  MODEL_NAME:
+    description: "Model to train"
+    value: tiny-transformer
+
+workflow:
+  name: quickstart_dag
+  tasks:
+    - name: prepare_data
+      script:
+        - echo "prepare_data start"
+        - echo "model=${{ variables.MODEL_NAME }}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+
+    - name: preprocess
+      depends_on: [prepare_data]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
+        - echo "encoded_data ok" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
+
+    - name: train
+      depends_on: [preprocess]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
+        - echo "checkpoint for ${MODEL_NAME}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+
+    - name: evaluate_on_dataset1
+      depends_on: [train]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+        - echo "accuracy=0.99 dataset=dataset1" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
+
+    - name: evaluate_on_dataset2
+      depends_on: [train]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
+        - echo "accuracy=0.88 dataset=dataset2" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
+
+    - name: export_model
+      depends_on: [evaluate_on_dataset1, evaluate_on_dataset2]
+      script:
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset1/metrics.txt
+        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset2/metrics.txt
+        - echo "exported ${MODEL_NAME}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/model.onnx
+```
+
+:::tip Recommended Approach
+**Plain text first, variables second.** Start every new workflow with hardcoded values.
+Once it runs successfully, extract the values you want to change into `variables`.
+This makes debugging much easier — you know the recipe works before adding abstraction.
+:::
+
+### 4. Validate Only (Dry-Run)
+
+```bash
+sflow run --file sflow.yaml --dry-run
+```
+
+Dry-run does not create output directories/files. It prints the execution plan and computed output paths.
+
+---
+
+## Part II: Slurm Cluster
+
+Take the same workflow concepts to a real HPC cluster. Make sure you have already installed sflow (see [Install sflow](#install-sflow) above).
+
+### 1. Prepare a Slurm Workflow
+
 
 **How it works (Slurm example):**
 
@@ -23,9 +271,9 @@ sidebar_position: 2
 ┌─────────────────────────────────────────────────────────┐
 │  workflow.yaml                                          │
 │                                                         │
-│  variables:          backends:          workflow:        │
+│  variables:          backends:          workflow:       │
 │    NUM_GPUS: 8         type: slurm        tasks:        │
-│    MODEL: llama        partition: gpu       - train     │
+│    MODEL: llama        partition: gpu      - train      │
 │                        nodes: 2            - evaluate   │
 │                                            - export     │
 └──────────────────────────┬──────────────────────────────┘
@@ -39,69 +287,7 @@ sidebar_position: 2
               └────────────────────────┘
 ```
 
-**Why not just write a bash script?**
-A bash script hard-wires node names, GPU indices, and execution order. With sflow you declare what you want; it handles allocation, node discovery, GPU assignment, dependency ordering, log collection, and retries — the same YAML works locally for debugging and on Slurm for production.
-
----
-
-This guide covers two ways to run `sflow`:
-
-- **Part I: Slurm Cluster** – Production workflows on HPC clusters (recommended for most users)
-- **Part II: Local Backend** – Testing and development without Slurm
-
----
-
-## Part I: Slurm Cluster
-
-Most `sflow` users run workflows on Slurm clusters. This section gets you started with Slurm.
-
-### 1. Setup Python Environment and uv
-
-Login to your cluster login node, and open a bash terminal.
-
-```bash
-# Make sure your cluster have python 3.10 or newer
-mkdir -p sflow_workspace
-cd sflow_workspace
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv --help
-```
-
-If you meet problems with curl way of installing uv, try pip instead, this might not work on some high security level clusters
-
-```bash
-# You don't need to run this if above sh install for uv worked fine
-mkdir -p sflow_workspace
-cd sflow_workspace
-pip install uv
-uv --help
-```
-
-### 2. Install sflow
-
-Create a venv for sflow and install python wheels.
-
-```bash
-uv venv --python python3
-source .venv/bin/activate
-# Install the latest sflow version
-uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
-sflow --help
-```
-
-### 3. Prepare a Slurm Workflow
-
-You can use `sflow sample` to quickly get a starter workflow:
-
-```bash
-# List all available samples
-sflow sample --list
-
-# Copy a sample to your current directory
-sflow sample slurm_dynamo_trtllm_disagg
-```
-
-Or create a minimal Slurm config manually:
+Start with a plain-text config — hardcode your actual cluster values. No variables yet.
 
 ```yaml
 version: "0.1"
@@ -150,7 +336,16 @@ backends:
       - "--segment=8"
 ```
 
-### 4. Operators & srun — How Your Script Actually Runs
+Once the plain-text config works, you can extract account, partition, nodes, etc. into variables (same pattern as Part I step 4) to make it reusable across clusters.
+
+You can also use `sflow sample` to get starter workflows with variables already set up:
+
+```bash
+sflow sample --list
+sflow sample slurm_dynamo_trtllm_disagg
+```
+
+### 2. Operators & srun — How Your Script Actually Runs
 
 On a Slurm backend the default operator is **srun**. sflow takes your task's `script:` lines and wraps them into:
 
@@ -220,7 +415,7 @@ srun --jobid=$SLURM_JOB_ID --nodes=1 --ntasks-per-node=1 --gpus-per-task=1 \
 
 sflow builds this command for you from the declarative config.
 
-### 5. Run on Slurm (Interactive)
+### 3. Run on Slurm (Interactive)
 
 Before running, make sure you have updated the workflow YAML for your environment:
 
@@ -264,7 +459,7 @@ machine nvcr.io login $oauthtoken password <your-ngc-api-key>
 Replace the machine/credentials for whichever registry your images come from. Without this file, `srun --container-image` will fail to pull private images.
 :::
 
-### 6. Batch Mode: Fire-and-Forget Slurm Jobs
+### 4. Batch Mode: Fire-and-Forget Slurm Jobs
 
 For long-running or production workflows, `sflow batch` generates a complete sbatch script with proper environment setup and job submission. This is the **recommended way** to run production workloads.
 
@@ -310,11 +505,13 @@ sflow batch \
   --account myaccount \
   --time 02:00:00 \
   --nodes 2 \
-  --gpus-per-node 8 \
+  --gpus-per-node 4 \
   --job-name my-inference-job \
   --sbatch-path run_inference.sh \
   --submit
 ```
+
+> Note: `--gpus-per-node` (`-G`) sets the cluster topology for sflow's resource planning (default: 4). It does NOT add a `#SBATCH --gpus-per-node` directive. If your cluster requires that directive, add it via `-e '--gpus-per-node=4'`.
 
 #### With Variable Overrides
 
@@ -373,157 +570,3 @@ scancel <job_id>          # Cancel a job
 tail -f sflow_output/sflow-<job_id>.out  # Follow output logs
 ```
 
-### 7. Validate Only (Dry-Run)
-
-```bash
-sflow run --file sflow.yaml --dry-run
-```
-
-Dry-run does not create output directories/files. It prints the execution plan and computed output paths.
-
----
-
-## Part II: Local Backend
-
-For testing and development, you can run workflows locally without Slurm.
-
-### 1. Prepare a Minimal Local Workflow
-
-Get a starter workflow using `sflow sample`:
-
-```bash
-sflow sample local_hello_world
-```
-
-Or create a minimal config manually:
-
-```yaml
-version: "0.1"
-
-workflow:
-  name: wf
-  tasks:
-    - name: hello
-      script:
-        - echo hello
-```
-
-```mermaid
-flowchart TD
-  start((start)) --> hello[hello]
-  hello --> stop((stop))
-```
-
-Notes:
-
-- This uses defaults (local backend + inline script). See the [backends](backends.md) page for explicit backend configuration.
-
-### 2. Run Locally
-
-```bash
-sflow run --file sflow.yaml --tui
-```
-
-Default output structure:
-
-- `./sflow_output/<run_id>/`: per-run root directory
-- `./sflow_output/<run_id>/<task_name>/`: per-task directory (stdout/stderr go to `<task_name>.log`)
-
-### 3. Example: DAG Workflow with `depends_on`
-
-The minimal example runs a single task. Below is the smallest "real workflow" example showing a DAG using training-style step names:
-
-- `prepare_data` → `preprocess` → `train` → (`evaluate_on_dataset1`, `evaluate_on_dataset2`) → `export_model`
-
-This also demonstrates variables in both forms:
-
-- expression: `${{ variables.MODEL_NAME }}`
-- env var (in task script): `${MODEL_NAME}`
-
-Or get it directly using `sflow sample`:
-
-```bash
-sflow sample local_dag
-```
-
-
-```yaml
-version: "0.1"
-
-variables:
-  - name: MODEL_NAME
-    type: string
-    value: tiny-transformer
-
-workflow:
-  name: quickstart_dag
-  tasks:
-    - name: prepare_data
-      script:
-        - echo "prepare_data start"
-        - echo "model(jinja)=${{ variables.MODEL_NAME }}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
-        - echo "model(shell)=${MODEL_NAME}" >> ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
-
-    - name: preprocess
-      depends_on: [prepare_data]
-      script:
-        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
-        - grep -q "model(jinja)=tiny-transformer" ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
-        - grep -q "model(shell)=tiny-transformer" ${SFLOW_WORKFLOW_OUTPUT_DIR}/dataset.txt
-        - echo "encoded_data ok" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
-
-    - name: train
-      depends_on: [preprocess]
-      script:
-        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/encoded.txt
-        - echo "checkpoint for ${MODEL_NAME}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
-
-    - name: evaluate_on_dataset1
-      depends_on: [train]
-      script:
-        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
-        - echo "accuracy=0.99 dataset=dataset1" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
-
-    - name: evaluate_on_dataset2
-      depends_on: [train]
-      script:
-        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/checkpoint.pt
-        - echo "accuracy=0.88 dataset=dataset2" > ${SFLOW_TASK_OUTPUT_DIR}/metrics.txt
-
-    - name: export_model
-      depends_on: [evaluate_on_dataset1, evaluate_on_dataset2]
-      script:
-        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset1/metrics.txt
-        - test -f ${SFLOW_WORKFLOW_OUTPUT_DIR}/evaluate_on_dataset2/metrics.txt
-        - echo "exported ${MODEL_NAME}" > ${SFLOW_WORKFLOW_OUTPUT_DIR}/model.onnx
-```
-
-```mermaid
-flowchart TD
-  prepare_data[prepare_data] --> preprocess[preprocess]
-  preprocess --> train[train]
-  train --> evaluate_on_dataset1[evaluate_on_dataset1]
-  train --> evaluate_on_dataset2[evaluate_on_dataset2]
-  evaluate_on_dataset1 --> export_model[export_model]
-  evaluate_on_dataset2 --> export_model
-```
-
-Run it:
-
-```bash
-sflow run --file local_dag.yaml
-```
-
-If you want to visualize the DAG without running it:
-
-```bash
-sflow visualize --file local_dag.yaml --format mermaid
-```
-
-### 4. Validate Only (Dry-Run)
-
-```bash
-sflow run --file sflow.yaml --dry-run
-```
-
-Dry-run does not create output directories/files. It prints the execution plan and computed output paths.

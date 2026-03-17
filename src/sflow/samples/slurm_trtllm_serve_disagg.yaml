@@ -17,6 +17,7 @@ variables:
     value: 120
   GPUS_PER_NODE:
     description: "GPUs per node"
+    type: integer
     value: 4
   SLURM_NODES:
     description: "Number of nodes"
@@ -36,19 +37,24 @@ variables:
     value: 1
   CTX_TP_SIZE:
     description: "Context tensor parallel size"
+    type: integer
     value: 2
   CTX_DP_SIZE:
     description: "Context data parallel size"
+    type: integer
     value: 1
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE }}
   CTX_EP_SIZE:
     description: "Context expert parallel size"
+    type: integer
     value: 1
   CTX_MOE_TP_SIZE:
     description: "Context MOE tensor parallel size"
+    type: integer
     value: 1
-  CTX_REPLICAS_POLICY:
-    description: "Context replicas policy, sequential means one server after another once previous server is ready, parallel means all servers start at the same time"
-    value: "parallel"
   CTX_START_PORT:
     description: "Context start port"
     value: 8536
@@ -77,19 +83,24 @@ variables:
     value: 1
   GEN_TP_SIZE:
     description: "Generation tensor parallel size"
+    type: integer
     value: 2
   GEN_DP_SIZE:
     description: "Generation data parallel size"
+    type: integer
     value: 1
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE }}
   GEN_EP_SIZE:
     description: "Generation expert parallel size"
+    type: integer
     value: 1
   GEN_MOE_TP_SIZE:
     description: "Generation MOE tensor parallel size"
+    type: integer
     value: 1
-  GEN_REPLICAS_POLICY:
-    description: "Generation replicas policy"
-    value: "parallel"
   GEN_START_PORT:
     description: "Context start port"
     value: 8336
@@ -278,26 +289,8 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Image Loaded"
+            match_pattern: "Image Loaded"
             match_count: ${{ variables.SLURM_NODES }}
-          timeout: 1200
-          interval: 2
-    
-    - name: install_aiperf
-      operator: 
-        name: aiperf
-        ntasks: 1
-      resources:
-        nodes:
-          indices: [0]
-      script:
-        - pip install aiperf==0.3.0
-        - echo "AIPerf installed"
-        - sleep 3600
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "AIPerf installed"
           timeout: 1200
           interval: 2
     
@@ -321,7 +314,7 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Starting gpu monitor"
+            match_pattern: "Starting gpu monitor"
           timeout: 60
           interval: 2
       depends_on:
@@ -343,7 +336,7 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Application startup complete"
+            match_pattern: "Application startup complete"
           timeout: 120
           interval: 2
       depends_on:
@@ -353,11 +346,11 @@ workflow:
     - name: prefill_server
       operator:
         name: trtllm_container
-        ntasks: ${{ variables.CTX_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.CTX_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
+        ntasks: ${{ variables.CTX_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.CTX_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
       replicas:
         count: ${{ variables.NUM_CTX_SERVERS }}
-        policy: ${{ variables.CTX_REPLICAS_POLICY }}
+        policy: "parallel"
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
@@ -381,28 +374,29 @@ workflow:
           --extra_llm_api_options ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
       resources:
         gpus:
-          count: ${{ variables.CTX_TP_SIZE }}
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
       depends_on:
         - load_image
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Application startup complete"
+            match_pattern: "Application startup complete"
           timeout: 600
           interval: 10
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-          interval: 10
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
     - name: decode_server
       operator:
         name: trtllm_container
-        ntasks: ${{ variables.GEN_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.GEN_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
+        ntasks: ${{ variables.GEN_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.GEN_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
       replicas:
         count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: ${{ variables.GEN_REPLICAS_POLICY }}
+        policy: "parallel"
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
@@ -426,25 +420,27 @@ workflow:
           --extra_llm_api_options ${{ artifacts.DECODE_CONFIG.path }} ${EXTRA_DECODE_ARGS}
       resources:
         gpus:
-          count: ${{ variables.GEN_TP_SIZE }}
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
       depends_on:
         - load_image
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Application startup complete"
+            match_pattern: "Application startup complete"
           timeout: 600
           interval: 10
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-          interval: 10
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
     - name: benchmark
       operator:
         name: aiperf
         ntasks: 1
       script:
+        - pip install aiperf==0.3.0
         - set -x
         - export COLUMNS=200
         - >
