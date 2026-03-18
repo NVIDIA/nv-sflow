@@ -127,7 +127,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="prog" id="prog"></div>
 <div class="tmr" id="tmr"></div>
 <nav class="dots" id="dots"></nav>
-<div class="badge" id="badge">PAUSED &mdash; click or press P to resume</div>
+<div class="badge" id="badge">click or press P to enable auto-scroll</div>
 
 <!-- 1: Title -->
 <section class="sec" id="s1">
@@ -544,7 +544,7 @@ networking config match SGLang disagg routing.</div>
 var D=6500,secs=document.querySelectorAll('.sec'),
 dotsEl=document.getElementById('dots'),prog=document.getElementById('prog'),
 tmr=document.getElementById('tmr'),badge=document.getElementById('badge'),
-N=secs.length,cur=0,paused=false,timer=null;
+N=secs.length,cur=0,paused=true,timer=null;
 for(var i=0;i<N;i++){var d=document.createElement('button');d.className='dot';d.setAttribute('data-i',i);d.onclick=function(){go(+this.getAttribute('data-i'))};dotsEl.appendChild(d)}
 var dots=dotsEl.querySelectorAll('.dot');
 function activate(i){for(var j=0;j<N;j++)secs[j].classList.remove('on');secs[i].classList.add('on');for(var j=0;j<N;j++)dots[j].classList.toggle('on',j===i);prog.style.width=((i+1)/N*100)+'%';startTimer()}
@@ -552,11 +552,11 @@ function startTimer(){tmr.style.transition='none';tmr.style.width='0%';requestAn
 function go(i){cur=((i%N)+N)%N;secs[cur].scrollIntoView({behavior:'smooth'});activate(cur);resetAuto()}
 function next(){if(!paused)go(cur+1)}
 function resetAuto(){clearInterval(timer);if(!paused)timer=setInterval(next,D)}
-document.addEventListener('click',function(e){if(e.target.closest('.dot'))return;paused=!paused;badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()});
+document.addEventListener('click',function(e){if(e.target.closest('.dot'))return;paused=!paused;badge.textContent=paused?'click or press P to enable auto-scroll':'AUTO-SCROLL ON \u2014 click or press P to pause';badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()});
 document.addEventListener('keydown',function(e){if(e.key==='p'||e.key==='P'){document.body.click();return}if(['ArrowDown',' ','ArrowRight','PageDown'].indexOf(e.key)>=0){e.preventDefault();go(cur+1)}else if(['ArrowUp','ArrowLeft','PageUp'].indexOf(e.key)>=0){e.preventDefault();go(cur-1)}});
 var obs=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){for(var i=0;i<N;i++)if(secs[i]===e.target){cur=i;activate(i);break}}})},{threshold:.4});
 for(var i=0;i<N;i++)obs.observe(secs[i]);
-activate(0);timer=setInterval(next,D);
+activate(0);badge.style.opacity='1';
 })();
 </script>
 </body>
