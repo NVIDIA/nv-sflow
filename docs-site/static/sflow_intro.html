@@ -352,10 +352,10 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 Model: DeepSeek R1 FP8 | 2 nodes &times; 8 GPUs | ISL=8192, OSL=1024
 
 <span class="hi">Allocation Map</span>
-&#9500;&#9472; <span class="gr">prenyx0007</span> (node 0)
+&#9500;&#9472; <span class="gr">slurm-node-01</span> (node 0)
 &#9474;   GPU 0-7: <span class="cy">prefill_server_0</span> (TP=8)
 &#9474;   Also: load_image, nats, etcd, frontend, benchmark_*
-&#9492;&#9472; <span class="gr">prenyx0239</span> (node 1)
+&#9492;&#9472; <span class="gr">slurm-node-02</span> (node 1)
     GPU 0-7: <span class="yl">decode_server_0</span> (TP=8)
     Also: load_image, gpu_monitor
 
