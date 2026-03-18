@@ -109,7 +109,10 @@ def sample(
         if sample_path.is_dir():
             if output.exists() and force:
                 shutil.rmtree(output)
-            shutil.copytree(sample_path, output)
+            shutil.copytree(
+                sample_path, output,
+                ignore=shutil.ignore_patterns("__init__.py", "__pycache__"),
+            )
             typer.echo(f"✓ Modular sample folder copied to: {output}/")
             yaml_files = sorted(f.name for f in output.glob("*.yaml"))
             _skip_dirs = {"__pycache__", "sflow_output", ".git"}
