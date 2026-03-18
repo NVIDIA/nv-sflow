@@ -1,0 +1,125 @@
+# TensorRT-LLM aggregated (non-disaggregated) server task and its configuration.
+# Merge all files for a complete run:
+#   sflow compose slurm_config.yaml common_workflow.yaml trtllm/agg.yaml benchmark_aiperf.yaml \
+#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.8.0 \
+#     --missable-tasks prefill_server --missable-tasks decode_server
+
+version: "0.1"
+
+variables:
+  # Aggregated Server Configuration
+  NUM_AGG_SERVERS:
+    description: "Number of aggregated servers"
+    type: integer
+    value: 1
+  AGG_TP_SIZE:
+    description: "Tensor parallel size"
+    type: integer
+    value: 4
+  AGG_DP_SIZE:
+    description: "Data parallel size"
+    type: integer
+    value: 1
+  AGG_EP_SIZE:
+    description: "Expert parallel size"
+    type: integer
+    value: 1
+  AGG_MOE_TP_SIZE:
+    description: "MOE tensor parallel size"
+    type: integer
+    value: 1
+  AGG_PP_SIZE:
+    description: "Pipeline parallel size"
+    type: integer
+    value: 1
+  AGG_GPUS_PER_WORKER:
+    description: "GPUs per aggregated worker"
+    type: integer
+    value: ${{ variables.AGG_TP_SIZE * variables.AGG_DP_SIZE * variables.AGG_PP_SIZE }}
+  AGG_BATCH_SIZE:
+    description: "Batch size"
+    type: integer
+    value: 128
+  AGG_MAX_NUM_TOKENS:
+    description: "Max number of tokens"
+    type: integer
+    value: 4096
+  AGG_MAX_SEQ_LEN:
+    description: "Max sequence length"
+    type: integer
+    value: 2304
+  AGG_FREE_GPU_MEMORY_FRACTION:
+    description: "Free GPU memory fraction"
+    value: 0.9
+  AGG_ENABLE_ATTENTION_DP:
+    description: "Enable attention DP"
+    value: false
+  EXTRA_AGG_ARGS:
+    description: "Extra aggregated server arguments"
+    value: ""
+
+artifacts:
+  - name: AGG_CONFIG
+    uri: file://agg_config.yaml
+    content: |
+      max_batch_size: ${{ variables.AGG_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.AGG_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.AGG_MAX_SEQ_LEN }}
+      tensor_parallel_size: ${{ variables.AGG_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.AGG_TP_SIZE }}
+      enable_attention_dp: ${{ variables.AGG_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: ${{ variables.AGG_PP_SIZE }}
+      cuda_graph_config:
+        enable_padding: true
+        max_batch_size: ${{ variables.AGG_BATCH_SIZE }}
+      print_iter_log: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.AGG_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: agg_server
+      operator:
+        name: dynamo
+        ntasks: ${{ variables.AGG_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.AGG_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
+      replicas:
+        count: ${{ variables.NUM_AGG_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --extra-engine-args ${{ artifacts.AGG_CONFIG.path }} ${EXTRA_AGG_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.AGG_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 600
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30

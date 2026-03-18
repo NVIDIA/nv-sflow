@@ -1,0 +1,86 @@
+# Benchmark task and its configuration.
+# Merge with backends_operators.yaml + workflow.yaml + prefill_task.yaml + decode_task.yaml for a complete run:
+#   sflow run -f backends_operators.yaml -f workflow.yaml -f prefill_task.yaml -f decode_task.yaml -f benchmark_task.yaml
+
+version: "0.1"
+
+variables:
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 16
+    domain: [16]
+  EXTRA_BENCHMARK_ARGS:
+    description: "Extra benchmark arguments"
+    value: ""
+  BENCHMARK_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+
+operators:
+  - name: benchmark
+    type: srun
+    container_image: ${{ variables.BENCHMARK_IMAGE }}
+    container_writable: true
+    mpi: pmix
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: benchmark_aiperf
+      operator:
+        name: benchmark
+        ntasks: 1
+      script:
+        - set -x
+        - pip install aiperf==0.3.0
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple ${{ variables.EXTRA_BENCHMARK_ARGS }}
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      depends_on:
+        - prefill_server
+        - decode_server
+        - agg_server
+        - frontend_server

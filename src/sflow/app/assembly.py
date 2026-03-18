@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import math
+import re
 import shutil
 from typing import Any, Literal
 
@@ -141,6 +142,97 @@ def _build_tasks_ctx(
     return tasks_ctx
 
 
+_TASK_EXPR_RE = re.compile(r"\$\{\{\s*(task\.[^}]+?)\s*\}\}")
+
+_TASK_AVAILABLE_ATTRS = ("nodes", "gpus", "backend", "operator")
+_TASK_NODE_ATTRS = ("name", "ip_address", "index", "num_gpus")
+
+
+def _extract_task_expressions(line: str) -> list[str]:
+    """Extract ``${{ task.* }}`` expressions from a script line."""
+    return ["${{ " + m.strip() + " }}" for m in _TASK_EXPR_RE.findall(line)]
+
+
+def _build_task_expression_hint(
+    task_exprs: list[str],
+    tasks_ctx: dict[str, Any],
+    replica_names_by_base: dict[str, list[str]] | None,
+) -> str | None:
+    """Return a human-readable hint for common task-expression resolution errors."""
+    for expr in task_exprs:
+        inner = expr.strip().removeprefix("${{").removesuffix("}}").strip()
+        parts = inner.split(".")
+        if len(parts) < 3 or parts[0] != "task":
+            continue
+
+        raw_task_ref = parts[1]
+        bracket_match = re.match(r"(\w+)\[", raw_task_ref)
+        has_index = bracket_match is not None
+        task_ref = bracket_match.group(1) if bracket_match else raw_task_ref
+
+        ctx_val = tasks_ctx.get(task_ref)
+
+        if isinstance(ctx_val, list) and not has_index:
+            rest = ".".join(parts[2:])
+            replicas = (
+                replica_names_by_base.get(task_ref, []) if replica_names_by_base else []
+            )
+            replica_display = ", ".join(replicas) if replicas else "N/A"
+            return (
+                f"'{task_ref}' is a replicated task with "
+                f"{len(ctx_val)} replica(s). "
+                "Use indexed access like "
+                "${{ task."
+                + task_ref
+                + "[0]."
+                + rest
+                + " }}"
+                + (
+                    " or a full replica name like "
+                    "${{ task." + replicas[0] + "." + rest + " }}"
+                    if replicas
+                    else ""
+                )
+                + f" (replicas: {replica_display})"
+            )
+
+        if ctx_val is not None:
+            accessed_attr = parts[2].split("[")[0] if len(parts) > 2 else None
+            if accessed_attr and accessed_attr not in _TASK_AVAILABLE_ATTRS:
+                hint = (
+                    f"'{accessed_attr}' is not an available task attribute to resolve. "
+                    f"Available attributes: {', '.join(_TASK_AVAILABLE_ATTRS)}"
+                )
+                if accessed_attr == "nodes" or accessed_attr in _TASK_NODE_ATTRS:
+                    pass
+                else:
+                    hint += ". Each node exposes: " + ", ".join(_TASK_NODE_ATTRS)
+                return hint
+            if accessed_attr == "nodes" and len(parts) > 3:
+                node_attr = parts[3].split("[")[0]
+                if node_attr not in _TASK_NODE_ATTRS:
+                    return (
+                        f"'{node_attr}' is not an available node attribute. "
+                        f"Available node attributes: "
+                        f"{', '.join(_TASK_NODE_ATTRS)}"
+                    )
+
+        if ctx_val is None:
+            available = [k for k, v in tasks_ctx.items() if not isinstance(v, list)]
+            replicated = [k for k, v in tasks_ctx.items() if isinstance(v, list)]
+            parts_hint = []
+            if available:
+                parts_hint.append("available tasks: " + ", ".join(sorted(available)))
+            if replicated:
+                parts_hint.append(
+                    "replicated tasks (use index): " + ", ".join(sorted(replicated))
+                )
+            return f"Task '{task_ref}' is not defined. " + (
+                "; ".join(parts_hint) if parts_hint else "No tasks found in context."
+            )
+    return None
+
+
 def preflight_validate_backends(state: SflowState) -> None:
     """
     REQ-5.1 Pre-flight Validation (MVP):
@@ -165,6 +257,133 @@ def preflight_validate_backends(state: SflowState) -> None:
                 f"{', '.join(missing)}. "
                 "Ensure Slurm client tools are installed and available on PATH (e.g., load the Slurm module)."
             )
+
+
+def preflight_validate_container_images(config: SflowConfig, state: SflowState) -> None:
+    """
+    Validate container image references in srun operators before allocating cluster resources.
+
+    Resolves ``${{ }}`` expressions using currently available variables (global variables
+    are resolved at this point; workflow variables may not be) and checks that
+    ``container_image`` values look like valid registry references or ``.sqsh`` paths.
+
+    This runs before ``allocate_backends`` so that obviously invalid images are caught
+    before ``salloc`` consumes cluster resources.
+    """
+    from sflow.plugins.operators.srun import _is_valid_container_image
+
+    variables_ctx: dict[str, Any] = {
+        name: var.value for name, var in (state.variables or {}).items()
+    }
+    ctx: dict[str, Any] = {"variables": variables_ctx, **variables_ctx}
+
+    def _try_resolve(raw: Any) -> str:
+        if raw is None:
+            return ""
+        try:
+            return (
+                str(resolver.resolve(raw, ctx))
+                if resolver.has_expression(raw)
+                else str(raw)
+            )
+        except Exception:
+            return str(raw)
+
+    _invalid_hint = (
+        "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag') "
+        "or a local .sqsh file path (e.g. '/path/to/image.sqsh')"
+    )
+
+    def _check_image(image_val: str, *, source: str) -> None:
+        if not image_val:
+            return
+        if "${{" in image_val or "${" in image_val:
+            return
+        if not _is_valid_container_image(image_val):
+            raise ValueError(
+                f"Pre-flight validation failed: {source} has invalid container image. "
+                f"{_invalid_hint}, got: '{image_val}'"
+            )
+
+    def _check_extra_args(extra_args: list, *, source: str) -> None:
+        for i, arg in enumerate(extra_args):
+            arg_str = str(arg)
+            raw_val: str | None = None
+            if arg_str.startswith("--container-image="):
+                raw_val = arg_str.split("=", 1)[1]
+            elif arg_str == "--container-image" and i + 1 < len(extra_args):
+                raw_val = str(extra_args[i + 1])
+            if raw_val is not None:
+                _check_image(_try_resolve(raw_val), source=f"{source} extra_args")
+
+    for op_conf in config.operators or []:
+        if getattr(op_conf, "type", None) != "srun":
+            continue
+        raw_image = getattr(op_conf, "container_image", None)
+        if raw_image is not None:
+            _check_image(_try_resolve(raw_image), source=f"operator '{op_conf.name}'")
+        extra_args = list(getattr(op_conf, "extra_args", None) or [])
+        _check_extra_args(extra_args, source=f"operator '{op_conf.name}'")
+
+    for t_conf in config.workflow.tasks or []:
+        if t_conf.operator is None or isinstance(t_conf.operator, str):
+            continue
+        overrides = t_conf.operator.model_dump(exclude={"name"}, exclude_none=True)
+        raw_image = overrides.get("container_image")
+        if raw_image is not None:
+            _check_image(
+                _try_resolve(raw_image),
+                source=f"task '{t_conf.name}' operator override",
+            )
+        override_extra = overrides.get("extra_args")
+        if override_extra:
+            _check_extra_args(
+                list(override_extra),
+                source=f"task '{t_conf.name}' operator override",
+            )
+
+
+def preflight_validate_task_graph(
+    config: SflowConfig,
+    state: SflowState,
+    *,
+    workspace_dir: Any | None = None,
+    output_dir: Any | None = None,
+) -> None:
+    """
+    Validate task planning against placeholder backend allocations before real allocation.
+
+    This reuses the normal graph-building and GPU-packing logic with deterministic placeholder
+    nodes so capacity/configuration errors surface before `salloc` consumes cluster resources.
+    """
+    planning_state = SflowState(
+        workflow=Workflow(name=config.workflow.name, task_graph=TaskGraph()),
+        variables=dict(state.variables),
+        artifacts=dict(state.artifacts),
+        backends=dict(state.backends),
+        default_backend=state.default_backend,
+    )
+    original_allocations = {
+        name: backend.allocation for name, backend in planning_state.backends.items()
+    }
+    try:
+        planning_state = _seed_placeholder_backend_allocations(planning_state)
+        planning_state = resolve_artifacts(
+            config,
+            planning_state,
+            workspace_dir=workspace_dir,
+            output_dir=output_dir,
+            materialize=False,
+        )
+        planning_state = resolve_workflow_variables(
+            config,
+            planning_state,
+            workspace_dir=workspace_dir,
+        )
+        build_task_graph(config, planning_state, workspace_dir=workspace_dir)
+    finally:
+        for name, backend in planning_state.backends.items():
+            backend.allocation = original_allocations.get(name)
 
 
 def _artifacts_ctx(
@@ -417,7 +636,10 @@ def _resolve_and_update_variables(
     for _ in range(max_passes):
         progress = False
 
-        ctx: dict[str, Any] = {"variables": resolved_values, **resolved_values}
+        ctx_values = {
+            k: v for k, v in resolved_values.items() if not resolver.has_expression(v)
+        }
+        ctx: dict[str, Any] = {"variables": ctx_values, **ctx_values}
         if extra_ctx:
             ctx.update(extra_ctx)
 
@@ -429,11 +651,14 @@ def _resolve_and_update_variables(
             try:
                 new_value = resolver.resolve(current, ctx)
             except ValueError as e:
-                if "Undefined variable" in str(e):
+                err = str(e)
+                if "Undefined variable" in err or "Error evaluating expression" in err:
                     continue
                 raise
 
             if new_value != current:
+                if not resolver.has_expression(new_value):
+                    new_value = _cast_variable_value(name, new_value, var.type)
                 var.value = new_value
                 resolved_values[name] = new_value
                 progress = True
@@ -916,16 +1141,34 @@ def build_task_graph(
 
         if getattr(p_conf, "http_get", None) is not None:
             http = p_conf.http_get
+            url_raw = str(http.url)
+            url = (
+                str(resolver.resolve(url_raw, ctx))
+                if resolver.has_expression(url_raw)
+                else url_raw
+            )
             return HttpGetProbe(
-                url=str(http.url), headers=getattr(http, "headers", None), **common
+                url=url, headers=getattr(http, "headers", None), **common
             )
 
         if getattr(p_conf, "http_post", None) is not None:
             http = p_conf.http_post
+            url_raw = str(http.url)
+            url = (
+                str(resolver.resolve(url_raw, ctx))
+                if resolver.has_expression(url_raw)
+                else url_raw
+            )
+            body_raw = getattr(http, "body", None)
+            body = (
+                str(resolver.resolve(body_raw, ctx))
+                if body_raw is not None and resolver.has_expression(body_raw)
+                else body_raw
+            )
             return HttpPostProbe(
-                url=str(http.url),
+                url=url,
                 headers=getattr(http, "headers", None),
-                body=getattr(http, "body", None),
+                body=body,
                 **common,
             )
 
@@ -968,13 +1211,15 @@ def build_task_graph(
         replica_policy: str,
         nodes_indices_raw: list[Any] | None,
         nodes_count_raw: Any | None,
+        nodes_exclude_raw: Any | None,
         gpus_count_raw: Any | None,
     ) -> tuple[list[str], bool]:
         """
         Choose a subset of allocation nodes for this task replica.
 
         Rules:
-        - If nodes.indices is set: select exactly those allocation indices.
+        - If nodes.exclude is set: filter out those indices from the pool first.
+        - If nodes.indices is set: select exactly those (post-exclude) indices.
         - Else if nodes.count is set: compact allocation slice.
           - parallel replicas: disjoint contiguous slices by replica_index
           - sequential replicas: reuse the first slice (replica_index ignored)
@@ -986,6 +1231,34 @@ def build_task_graph(
         alloc_nodes = list(runtime_backend.allocation.nodes)
         if not alloc_nodes:
             return [], False
+
+        if nodes_exclude_raw is not None:
+            raw = (
+                nodes_exclude_raw
+                if isinstance(nodes_exclude_raw, list)
+                else [nodes_exclude_raw]
+            )
+            exclude_indices = set(
+                _resolve_int_list(
+                    task_name, field="resources.nodes.exclude", values=raw
+                )
+            )
+            out_of_range = {
+                i for i in exclude_indices if i < 0 or i >= len(alloc_nodes)
+            }
+            if out_of_range:
+                raise ValueError(
+                    f"Task '{task_name}' resources.nodes.exclude contains index(es) "
+                    f"{sorted(out_of_range)} out of range for {len(alloc_nodes)} allocated node(s) "
+                    f"(valid: 0..{len(alloc_nodes) - 1})"
+                )
+            alloc_nodes = [
+                n for i, n in enumerate(alloc_nodes) if i not in exclude_indices
+            ]
+            if not alloc_nodes:
+                raise ValueError(
+                    f"Task '{task_name}' resources.nodes.exclude removed all nodes from the pool"
+                )
 
         if nodes_indices_raw is not None and nodes_count_raw is not None:
             raise ValueError(
@@ -1164,6 +1437,38 @@ def build_task_graph(
                 f"Task '{task_name}' resources.gpus.count must be > 0, got {count}"
             )
 
+        def _backend_gpu_state_summary() -> str:
+            if not runtime_backend.allocation:
+                return ""
+            gpu_nodes: list[tuple[str, int]] = []
+            for node in runtime_backend.allocation.nodes:
+                num_gpus = getattr(node, "num_gpus", None)
+                if num_gpus is None:
+                    continue
+                try:
+                    gpu_nodes.append((node.name, int(num_gpus)))
+                except Exception:
+                    continue
+            if not gpu_nodes:
+                return ""
+
+            caps = [cap for _name, cap in gpu_nodes]
+            total_capacity = sum(caps)
+            total_allocated = sum(
+                min(gpu_next.get((runtime_backend.name, n_name), 0), cap)
+                for n_name, cap in gpu_nodes
+            )
+            total_remaining = total_capacity - total_allocated
+            if len(set(caps)) == 1:
+                per_node_str = f"gpus_per_node={caps[0]}"
+            else:
+                per_node_str = f"per_node_capacities={caps}"
+            return (
+                f"backend_gpu_state=(nodes={len(gpu_nodes)}, {per_node_str}, "
+                f"total_capacity={total_capacity}, already_allocated={total_allocated}, "
+                f"remaining={total_remaining})"
+            )
+
         # Planning-time global GPU allocation (single-node case):
         # If we know the node GPU capacity, allocate a non-overlapping slice across tasks.
         if runtime_backend.allocation and assigned_nodes and len(assigned_nodes) == 1:
@@ -1180,9 +1485,14 @@ def build_task_graph(
                 cursor_key = (runtime_backend.name, n_name)
                 start = gpu_next.get(cursor_key, 0)
                 if start + count > cap:
+                    available = cap - start
+                    still_needed = count - available
+                    backend_gpu_state = _backend_gpu_state_summary()
                     raise ValueError(
-                        f"Task '{task_name}' requests {count} GPUs on node '{n_name}', but only {cap - start} GPUs "
-                        f"remain available (capacity={cap}, already_allocated={start}). "
+                        f"Task '{task_name}' requests {count} GPUs on node '{n_name}', but only {available} GPUs "
+                        f"remain available (total_capacity={cap}, already_allocated={start}, "
+                        f"still_needed={still_needed})"
+                        f"{', ' + backend_gpu_state if backend_gpu_state else ''}. "
                         f"Consider increasing backend nodes or reducing concurrent GPU requests."
                     )
 
@@ -1206,8 +1516,10 @@ def build_task_graph(
             if caps:
                 total_cap = sum(caps)
                 if count > total_cap:
+                    backend_gpu_state = _backend_gpu_state_summary()
                     raise ValueError(
                         f"Task '{task_name}' requests {count} GPUs but assigned nodes have only {total_cap} GPUs total"
+                        f"{', ' + backend_gpu_state if backend_gpu_state else ''}"
                     )
                 per_node = min(min(caps), math.ceil(count / len(assigned_nodes)))
                 if per_node <= 0:
@@ -1230,9 +1542,14 @@ def build_task_graph(
                 start0 = starts[0]
                 for n_name, cap in zip(assigned_nodes, caps, strict=True):
                     if start0 + per_node > cap:
+                        available = cap - start0
+                        still_needed = per_node - available
+                        backend_gpu_state = _backend_gpu_state_summary()
                         raise ValueError(
                             f"Task '{task_name}' requests {per_node} GPUs per node starting at {start0} on node "
-                            f"'{n_name}', but only {cap - start0} GPUs remain available (capacity={cap})."
+                            f"'{n_name}', but only {available} GPUs remain available "
+                            f"(total_capacity={cap}, already_allocated={start0}, still_needed={still_needed})"
+                            f"{', ' + backend_gpu_state if backend_gpu_state else ''}."
                         )
                 for k in cursor_keys:
                     gpu_next[k] = start0 + per_node
@@ -1253,9 +1570,11 @@ def build_task_graph(
                 if getattr(n, "num_gpus", None) is None:
                     continue
                 if start + count > int(n.num_gpus):
+                    backend_gpu_state = _backend_gpu_state_summary()
                     raise ValueError(
                         f"Task '{task_name}' requests GPUs [{start}..{start + count - 1}] "
                         f"but node '{n_name}' has only {n.num_gpus} GPUs"
+                        f"{', ' + backend_gpu_state if backend_gpu_state else ''}."
                     )
 
         return ",".join(str(i) for i in range(start, start + count))
@@ -1387,11 +1706,13 @@ def build_task_graph(
             # Apply resources -> runtime node subset + CUDA_VISIBLE_DEVICES env
             nodes_indices_raw = None
             nodes_count_raw = None
+            nodes_exclude_raw = None
             gpus_count_raw = None
             if t_conf.resources:
                 if t_conf.resources.nodes:
                     nodes_indices_raw = t_conf.resources.nodes.indices
                     nodes_count_raw = t_conf.resources.nodes.count
+                    nodes_exclude_raw = t_conf.resources.nodes.exclude
                 if t_conf.resources.gpus:
                     gpus_count_raw = t_conf.resources.gpus.count
 
@@ -1403,6 +1724,7 @@ def build_task_graph(
                 replica_policy=replica_policy,
                 nodes_indices_raw=nodes_indices_raw,
                 nodes_count_raw=nodes_count_raw,
+                nodes_exclude_raw=nodes_exclude_raw,
                 gpus_count_raw=gpus_count_raw,
             )
 
@@ -1426,6 +1748,10 @@ def build_task_graph(
                     )
 
                 merged = base_op.model_dump()
+                if "extra_args" in operator_overrides and merged.get("extra_args"):
+                    operator_overrides["extra_args"] = list(
+                        merged["extra_args"]
+                    ) + list(operator_overrides["extra_args"])
                 merged.update(operator_overrides)
                 merged["name"] = operator_name
                 merged = _resolve_value(merged)
@@ -1719,7 +2045,6 @@ def build_task_graph(
     }
 
     for task in task_graph.get_tasks():
-        # Check if any script line still has unresolved task.* expressions
         new_script: list[str] = []
         for line in task.script:
             if resolver.has_expression(line) and "task." in line:
@@ -1727,9 +2052,21 @@ def build_task_graph(
                     resolved = str(resolver.resolve(line, task_ctx))
                     new_script.append(resolved)
                 except Exception as e:
-                    raise ValueError(
-                        f"Failed to resolve task expression in '{task.name}' script: {e}"
-                    ) from e
+                    task_exprs = _extract_task_expressions(line)
+                    hint = _build_task_expression_hint(
+                        task_exprs, tasks_ctx, replica_names_by_base
+                    )
+                    exprs_display = ", ".join(task_exprs) if task_exprs else "(unknown)"
+                    location = resolver._find_expression_in_sources(
+                        task_exprs[0] if task_exprs else line
+                    )
+                    msg = (
+                        f"Failed to resolve task expression in "
+                        f"'{task.name}' script{location}: {exprs_display}"
+                    )
+                    if hint:
+                        msg += f"\n  Hint: {hint}"
+                    raise ValueError(msg) from e
             else:
                 new_script.append(line)
         task.script = new_script
@@ -1743,12 +2080,18 @@ async def build_state(
     allocate: bool = True,
     workspace_dir: Any | None = None,
     output_dir: Any | None = None,
+    source_files: list[Any] | None = None,
 ) -> SflowState:
     """
     Build runtime state from configuration (composition root).
 
     This is intentionally kept out of core to avoid core importing plugins.
     """
+    from pathlib import Path
+
+    if source_files:
+        resolver.source_files = [Path(f) for f in source_files]
+
     # Seed an empty workflow/state; we will populate task graph after resolution/allocation.
     wf = Workflow(name=config.workflow.name, task_graph=TaskGraph())
     state = SflowState(workflow=wf)
@@ -1761,6 +2104,13 @@ async def build_state(
     if allocate:
         # REQ-5.1: fail fast before consuming cluster resources.
         preflight_validate_backends(state)
+        preflight_validate_container_images(config, state)
+        preflight_validate_task_graph(
+            config,
+            state,
+            workspace_dir=workspace_dir,
+            output_dir=output_dir,
+        )
         state = await allocate_backends(state)
     else:
         # Populate placeholder allocations (for any remaining unallocated backends)

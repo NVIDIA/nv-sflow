@@ -1,0 +1,122 @@
+# vLLM decode server task and its configuration.
+# Merge all files for a complete run:
+#   sflow run -f slurm_config.yaml -f common_workflow.yaml -f vllm_prefill.yaml -f vllm_decode.yaml -f benchmark_aiperf.yaml \
+#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+
+version: "0.1"
+
+variables:
+  # Decode Server Configuration
+  NUM_GEN_SERVERS:
+    description: "Number of generation/decode servers"
+    type: integer
+    value: 1
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size"
+    type: integer
+    value: 2
+  GEN_DP_SIZE:
+    description: "Generation data parallel size"
+    type: integer
+    value: 1
+  GEN_PP_SIZE:
+    description: "Generation pipeline parallel size"
+    type: integer
+    value: 1
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+  GEN_NODES_PER_WORKER:
+    description: "Nodes per decode worker"
+    type: integer
+    value: ${{ [variables.GEN_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
+  GEN_BATCH_SIZE:
+    description: "Generation batch size (max num seqs)"
+    type: integer
+    value: 128
+  GEN_MAX_NUM_TOKENS:
+    description: "Generation max number of batched tokens"
+    type: integer
+    value: 4096
+  EXTRA_DECODE_ARGS:
+    description: "Extra decode arguments"
+    value: ""
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: decode_server
+      operator:
+        name: dynamo
+        ntasks_per_node: 1
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
+        - export NODE_RANK=${SLURM_NODEID}
+        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          if [ "${GEN_NODES_PER_WORKER}" -gt 1 ]; then
+            if [[ "${SLURM_NODEID}" == "0" ]]; then
+              unset CUDA_VISIBLE_DEVICES
+              ray start --head --port=6379
+            else
+              export RAY_worker_register_timeout_seconds=1200
+              ray start --address ${FIRST_NODE_IP}:6379
+            fi
+            while true; do
+              if ray status | grep "${GEN_GPUS_PER_WORKER}.0 GPU"; then
+                break
+              else
+                echo "Waiting for Ray cluster GPUs to be available in ray status..."
+                sleep 5
+              fi
+            done
+            echo "Ray cluster GPUs are now available."
+          else
+            echo "Do not need to setup ray cluster because worker only needs ${GEN_GPUS_PER_WORKER} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
+          fi
+        - >
+          if [[ "${SLURM_NODEID}" == "0" ]]; then
+            EXTRA_RAY_ARGS=""
+            if [ "${GEN_NODES_PER_WORKER}" -gt 1 ]; then
+              EXTRA_RAY_ARGS="--distributed-executor-backend ray"
+            fi
+            python3 -m dynamo.vllm --model ${{ artifacts.LOCAL_MODEL_PATH.path }} \
+            --served-model-name ${{ variables.SERVED_MODEL_NAME }} \
+            --tensor-parallel-size ${GEN_TP_SIZE} \
+            --pipeline-parallel-size ${GEN_PP_SIZE} \
+            --data-parallel-size ${GEN_DP_SIZE} \
+            --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }} \
+            --no-enable-prefix-caching \
+            --block-size 128 \
+            --max-num-seqs ${GEN_BATCH_SIZE} \
+            --max-num-batched-tokens ${GEN_MAX_NUM_TOKENS} ${EXTRA_RAY_ARGS} ${EXTRA_DECODE_ARGS}
+          else
+            echo "This is a worker node, do not need to run vllm launch cmd, but remember to setup ray cluster and launch in the master node"
+            sleep 3600
+          fi
+      resources:
+        gpus:
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 600
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30

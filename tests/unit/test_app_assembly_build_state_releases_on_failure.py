@@ -54,10 +54,15 @@ def test_build_state_releases_backends_when_build_task_graph_raises(monkeypatch)
         # Keep as no-op; allocate_backends will populate backends.
         return state
 
-    def _fake_build_task_graph(config: SflowConfig, state: SflowState) -> TaskGraph:
+    def _fake_build_task_graph(
+        config: SflowConfig, state: SflowState, *, workspace_dir=None
+    ) -> TaskGraph:
         raise ValueError("boom")
 
     monkeypatch.setattr(assembly_mod, "resolve_backends", _fake_resolve_backends)
+    monkeypatch.setattr(
+        assembly_mod, "preflight_validate_task_graph", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(assembly_mod, "allocate_backends", _fake_allocate_backends)
     monkeypatch.setattr(assembly_mod, "build_task_graph", _fake_build_task_graph)
 

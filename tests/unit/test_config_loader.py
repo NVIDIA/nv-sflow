@@ -131,3 +131,96 @@ workflow:
     loader = ConfigLoader()
     with pytest.raises(ValueError, match="Invalid variable override format"):
         loader.load_config(p, variable_overrides=["X"])
+
+
+# ---------------------------------------------------------------------------
+# strip_missable_tasks tests
+# ---------------------------------------------------------------------------
+
+from sflow.config.loader import strip_missable_tasks
+
+
+def test_strip_missable_removes_absent_depends_on():
+    config = {
+        "workflow": {
+            "tasks": [
+                {"name": "t1", "script": ["echo"]},
+                {"name": "t2", "depends_on": ["t1", "missing"], "script": ["echo"]},
+            ]
+        }
+    }
+    strip_missable_tasks(config, ["missing"])
+    assert config["workflow"]["tasks"][1].get("depends_on") == ["t1"]
+
+
+def test_strip_missable_keeps_present_tasks():
+    config = {
+        "workflow": {
+            "tasks": [
+                {"name": "t1", "script": ["echo"]},
+                {"name": "t2", "depends_on": ["t1"], "script": ["echo"]},
+            ]
+        }
+    }
+    strip_missable_tasks(config, ["t1"])
+    assert config["workflow"]["tasks"][1]["depends_on"] == ["t1"]
+
+
+def test_strip_missable_glob_pattern():
+    config = {
+        "workflow": {
+            "tasks": [
+                {"name": "t1", "script": ["echo"]},
+                {
+                    "name": "bench",
+                    "depends_on": ["t1", "prefill_server", "decode_server"],
+                    "script": ["echo"],
+                },
+            ]
+        }
+    }
+    strip_missable_tasks(config, ["prefill_*", "decode_*"])
+    assert config["workflow"]["tasks"][1]["depends_on"] == ["t1"]
+
+
+def test_strip_missable_removes_empty_depends_on():
+    config = {
+        "workflow": {
+            "tasks": [
+                {"name": "t1", "depends_on": ["missing"], "script": ["echo"]},
+            ]
+        }
+    }
+    strip_missable_tasks(config, ["missing"])
+    assert "depends_on" not in config["workflow"]["tasks"][0]
+
+
+def test_strip_missable_removes_probe_logger():
+    config = {
+        "workflow": {
+            "tasks": [
+                {
+                    "name": "t1",
+                    "script": ["echo"],
+                    "probes": {
+                        "readiness": {
+                            "log_watch": {
+                                "regex_pattern": "ready",
+                                "logger": "missing_task",
+                            }
+                        }
+                    },
+                },
+            ]
+        }
+    }
+    strip_missable_tasks(config, ["missing_task"])
+    lw = config["workflow"]["tasks"][0]["probes"]["readiness"]["log_watch"]
+    assert "logger" not in lw
+
+
+def test_strip_missable_noop_without_workflow():
+    config = {"version": "0.1"}
+    stripped = strip_missable_tasks(config, ["anything"])
+    assert stripped == []
+    assert config == {"version": "0.1"}

@@ -1425,3 +1425,202 @@ def test_build_task_graph_srun_explicit_nodes_overrides_computed():
 
     # Explicit nodes=3 should be preserved, not overridden by 8/4=2
     assert t1.operator.config.nodes == 3
+
+
+# ---------------------------------------------------------------------------
+# resources.nodes.exclude tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_task_graph_resources_nodes_exclude_single_int():
+    """exclude: 0 removes the first node, task gets remaining nodes."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="exc1",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(exclude=0)),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n2", "n3"]
+
+
+def test_build_task_graph_resources_nodes_exclude_list():
+    """exclude: [0, 2] removes first and third nodes."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="exc2",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(exclude=[0, 2])),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n2", "n4"]
+
+
+def test_build_task_graph_resources_nodes_exclude_with_count():
+    """exclude + count: count operates on the filtered pool."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="exc3",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(exclude=[0], count=2)
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    # Pool after exclude: [n2, n3, n4], count=2 takes first 2
+    assert t1.operator.config.nodelist == ["n2", "n3"]
+    assert t1.operator.config.nodes == 2
+
+
+def test_build_task_graph_resources_nodes_exclude_with_gpus():
+    """exclude + gpus.count: GPU packing runs on filtered pool."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="exc4",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1, num_gpus=4),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(exclude=[0]),
+                        gpus=GpuResourceConfig(count=2),
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    # Pool after exclude: only n2. GPU packing should place task on n2.
+    assert t1.operator.config.nodelist == ["n2"]
+    assert t1.envs.get("CUDA_VISIBLE_DEVICES") == "0,1"
+
+
+def test_build_task_graph_resources_nodes_exclude_all_raises():
+    """Excluding all nodes should raise an error."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="exc5",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(exclude=[0]),
+                    ),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="removed all nodes"):
+        build_task_graph(config, state)

@@ -46,14 +46,31 @@ flowchart TD
 
 ## Readiness: log watch probe (+ retries)
 
-Example:
+`log_watch` scans a task's log file for a matching string.
 
-`log_watch` looks for a pattern in a task log file:
+**Pattern field** — use one of (not both):
 
-- default: watches the task's own log
-- optional: watch another task's log by setting `logger` (must be a valid task name)
-- by default: the pattern is treated as a **literal string match**
-- to use a real regex: prefix the pattern with `re:` (or `regex:`)
+| Field | Description |
+|-------|-------------|
+| `regex_pattern` | Original field name |
+| `match_pattern` | Alias (identical behavior, for forward compatibility) |
+
+**Matching behavior:**
+
+- By default the pattern is treated as a **literal string match** — characters like `(`, `)`, `.`, `*` are matched as-is, no escaping needed.
+- To use a real regex, prefix the pattern with `re:` (or `regex:`).
+
+| Pattern value | What it matches |
+|---------------|-----------------|
+| `"server started"` | Literal text `server started` |
+| `"Traceback (most recent call last)"` | Literal text including the parentheses |
+| `"re:worker_\\d+ ready"` | Regex: `worker_` followed by one or more digits, then ` ready` |
+| `"regex:ERROR\|FATAL"` | Regex: `ERROR` or `FATAL` |
+
+**Other options:**
+
+- `logger`: watch another task's log instead of the current task's (must be a valid task name)
+- `match_count`: number of times the pattern must appear before the probe passes (default `1`)
 
 ```yaml
 workflow:

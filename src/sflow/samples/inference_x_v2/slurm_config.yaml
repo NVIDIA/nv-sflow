@@ -1,0 +1,35 @@
+# Backends and operators configuration for Dynamo TRTLLM disaggregated inference.
+# Merge all files for a complete run:
+#   sflow run -f backends_operators.yaml -f workflow.yaml -f prefill_task.yaml -f decode_task.yaml -f benchmark_task.yaml
+
+version: "0.1"
+
+variables:
+  # Slurm Configuration
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: 120
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 4
+  SLURM_NODES:
+    description: "Number of nodes"
+    value: 1
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+

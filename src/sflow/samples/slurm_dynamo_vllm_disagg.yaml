@@ -17,6 +17,7 @@ variables:
     value: 120
   GPUS_PER_NODE:
     description: "GPUs per node"
+    type: integer
     value: 4
   SLURM_NODES:
     description: "Number of nodes"
@@ -55,9 +56,14 @@ variables:
     description: "Context pipeline parallel size"
     type: integer
     value: 1
-  CTX_REPLICAS_POLICY:
-    description: "Context replicas policy, sequential means one server after another once previous server is ready, parallel means all servers start at the same time"
-    value: "parallel"
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+  CTX_NODES_PER_WORKER:
+    description: "Nodes per prefill worker"
+    type: integer
+    value: ${{ [variables.CTX_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
   CTX_BATCH_SIZE:
     description: "Context batch size"
     type: integer
@@ -105,9 +111,14 @@ variables:
     description: "Generation pipeline parallel size"
     type: integer
     value: 1
-  GEN_REPLICAS_POLICY:
-    description: "Generation replicas policy"
-    value: "parallel"
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+  GEN_NODES_PER_WORKER:
+    description: "Nodes per decode worker"
+    type: integer
+    value: ${{ [variables.GEN_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
   GEN_BATCH_SIZE:
     description: "Generation batch size"
     type: integer
@@ -156,7 +167,7 @@ variables:
   # Container Images
   AIPERF_IMAGE:
     description: "AIPerf container image"
-    value: <your-aiperf-container-image>
+    value: python:3.12-slim
   DYNAMO_IMAGE:
     description: "Dynamo TRTLLM container image"
     value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
@@ -222,26 +233,8 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Image Loaded"
+            match_pattern: "Image Loaded"
             match_count: ${{ variables.SLURM_NODES }}
-          timeout: 1200
-          interval: 2
-    
-    - name: install_aiperf
-      operator: 
-        name: aiperf
-        ntasks_per_node: 1
-      resources:
-        nodes:
-          indices: [0]
-      script:
-        - pip install aiperf==0.3.0
-        - echo "AIPerf installed"
-        - sleep 3600
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "AIPerf installed"
           timeout: 1200
           interval: 2
     
@@ -266,12 +259,11 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Starting gpu monitor"
+            match_pattern: "Starting gpu monitor"
           timeout: 60
           interval: 2
       depends_on:
         - load_image
-        - install_aiperf
 
     - name: nats_server
       operator: dynamo_vllm
@@ -288,7 +280,6 @@ workflow:
           interval: 2
       depends_on:
         - load_image
-        - install_aiperf
 
     - name: etcd_server
       operator: dynamo_vllm
@@ -311,7 +302,6 @@ workflow:
           interval: 2
       depends_on:
         - load_image
-        - install_aiperf
     
     - name: frontend_server
       operator: dynamo_vllm
@@ -336,18 +326,16 @@ workflow:
         ntasks_per_node: 1
       replicas:
         count: ${{ variables.NUM_CTX_SERVERS }}
-        policy: ${{ variables.CTX_REPLICAS_POLICY }}
+        policy: "parallel"
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
         - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
         - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
-        - export GPUS_PER_WORKER=${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
-        - export NODES_PER_WORKER=$(python3 -c "print(max(int(${GPUS_PER_WORKER} // ${GPUS_PER_NODE}), 1))")
         - export NODE_RANK=${SLURM_NODEID}
         - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
         - >
-          if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+          if [ "${CTX_NODES_PER_WORKER}" -gt 1 ]; then
             if [[ "${SLURM_NODEID}" == "0" ]]; then
               unset CUDA_VISIBLE_DEVICES
               ray start --head --port=6379
@@ -357,7 +345,7 @@ workflow:
             fi
             # wait until GPU string appears in ray status output
             while true; do
-              if ray status | grep "${GPUS_PER_WORKER}.0 GPU"; then
+              if ray status | grep "${CTX_GPUS_PER_WORKER}.0 GPU"; then
                 break
               else
                 echo "Waiting for Ray cluster GPUs to be available in ray status..."
@@ -366,12 +354,12 @@ workflow:
             done
             echo "Ray cluster GPUs are now available."
           else
-            echo "Do not need to setup ray cluster because worker only needs ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
+            echo "Do not need to setup ray cluster because worker only needs ${CTX_GPUS_PER_WORKER} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
           fi
         - >
           if [[ "${SLURM_NODEID}" == "0" ]]; then
             EXTRA_RAY_ARGS=""
-            if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+            if [ "${CTX_NODES_PER_WORKER}" -gt 1 ]; then
               EXTRA_RAY_ARGS="--distributed-executor-backend ray"
             fi
             python3 -m dynamo.vllm --model ${{ artifacts.LOCAL_MODEL_PATH.path }} \
@@ -391,19 +379,23 @@ workflow:
           fi
       resources:
         gpus:
-          count: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
       depends_on:
         - frontend_server
       probes:
         readiness:
-          log_watch:
-            regex_pattern: "VllmEngineMonitor initialized and health check task started"
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
           timeout: 600
-          interval: 10
+          interval: 20
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-          interval: 10
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
     - name: decode_server
       operator:
@@ -411,18 +403,16 @@ workflow:
         ntasks_per_node: 1
       replicas:
         count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: ${{ variables.GEN_REPLICAS_POLICY }}
+        policy: "parallel"
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
         - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
         - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
-        - export GPUS_PER_WORKER=${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
-        - export NODES_PER_WORKER=$(python3 -c "print(max(int(${GPUS_PER_WORKER} // ${GPUS_PER_NODE}), 1))")
         - export NODE_RANK=${SLURM_NODEID}
         - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
         - >
-          if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+          if [ "${GEN_NODES_PER_WORKER}" -gt 1 ]; then
             if [[ "${SLURM_NODEID}" == "0" ]]; then
               unset CUDA_VISIBLE_DEVICES
               ray start --head --port=6379
@@ -432,7 +422,7 @@ workflow:
             fi
             # wait until GPU string appears in ray status output
             while true; do
-              if ray status | grep "${GPUS_PER_WORKER}.0 GPU"; then
+              if ray status | grep "${GEN_GPUS_PER_WORKER}.0 GPU"; then
                 break
               else
                 echo "Waiting for Ray cluster GPUs to be available in ray status..."
@@ -441,12 +431,12 @@ workflow:
             done
             echo "Ray cluster GPUs are now available."
           else
-            echo "Do not need to setup ray cluster because worker only needs ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
+            echo "Do not need to setup ray cluster because worker only needs ${GEN_GPUS_PER_WORKER} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
           fi
         - >
           if [[ "${SLURM_NODEID}" == "0" ]]; then
             EXTRA_RAY_ARGS=""
-            if [ "${NODES_PER_WORKER}" -gt 1 ]; then
+            if [ "${GEN_NODES_PER_WORKER}" -gt 1 ]; then
               EXTRA_RAY_ARGS="--distributed-executor-backend ray"
             fi
             python3 -m dynamo.vllm --model ${{ artifacts.LOCAL_MODEL_PATH.path }} \
@@ -465,25 +455,30 @@ workflow:
           fi
       resources:
         gpus:
-          count: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
       depends_on:
         - frontend_server
       probes:
         readiness:
-          log_watch:
-            regex_pattern: "VllmEngineMonitor initialized and health check task started"
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
           timeout: 600
-          interval: 10
+          interval: 20
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-          interval: 10
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
     - name: benchmark
       operator:
         name: aiperf
         ntasks: 1
       script:
+        - pip install aiperf==0.3.0
         - set -x
         - export COLUMNS=200
         - >

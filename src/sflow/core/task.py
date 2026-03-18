@@ -109,6 +109,8 @@ class Task:
     next_retry_at: float = 0.0
     # Exit code from the most recent subprocess execution (None if never finished yet).
     exit_code: int | None = None
+    # Set to True when the task was terminated by a failure probe (not a process crash).
+    failed_by_probe: bool = False
 
     @cached_property
     def launch_command(self) -> Command:

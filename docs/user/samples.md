@@ -367,7 +367,7 @@ sflow run -f slurm_sglang_server_client.yaml \
 
 # Submit to Slurm
 sflow batch -f slurm_sglang_server_client.yaml \
-  -A your_account -p your_partition -N 1 \
+  -A your_account -p your_partition -N 1 -G 4 \
   --sbatch-path sglang_job.sh --submit
 ```
 
@@ -599,7 +599,7 @@ sflow run -f slurm_dynamo_trtllm_disagg.yaml \
 
 # Submit to Slurm
 sflow batch -f slurm_dynamo_trtllm_disagg.yaml \
-  -A your_account -p your_partition -N 1 \
+  -A your_account -p your_partition -N 1 -G 4 \
   --sbatch-path dynamo_job.sh --submit
 ```
 
@@ -863,7 +863,7 @@ sflow run -f slurm_trtllm_serve_disagg.yaml \
 
 # Submit to Slurm
 sflow batch -f slurm_trtllm_serve_disagg.yaml \
-  -A your_account -p your_partition -N 1 \
+  -A your_account -p your_partition -N 1 -G 4 \
   --sbatch-path trtllm_disagg_job.sh --submit
 ```
 
@@ -1135,7 +1135,7 @@ sflow run -f slurm_infmax_v1_ds_r1.yaml \
 
 # Submit to Slurm (multi-node)
 sflow batch -f slurm_infmax_v1_ds_r1.yaml \
-  -A your_account -p your_partition -N 3 \
+  -A your_account -p your_partition -N 3 -G 4 \
   --sbatch-path infmax_job.sh --submit
 ```
 
@@ -1154,8 +1154,110 @@ sflow batch -f slurm_infmax_v1_ds_r1.yaml \
 | `slurm_auto_replica` | Auto replica detection, task context, node/GPU assignment |
 | `slurm_aiperf_template` | AIPerf benchmarking template, simple single-task workflow |
 
+---
+
+## Modular Samples (Folder-based)
+
+Modular samples are folders containing multiple composable YAML files. Instead of one monolithic config, the workflow is split into reusable building blocks.
+
+### inference_x_v2
+
+A modular inference benchmark setup supporting multiple frameworks (SGLang, vLLM, TensorRT-LLM) with disaggregated prefill/decode servers.
+
+**Structure:**
+
+```
+inference_x_v2/
+├── slurm_config.yaml          # Slurm backend configuration
+├── common_workflow.yaml       # Shared tasks (load_image, nats, etcd, frontend)
+├── benchmark_aiperf.yaml      # AIPerf benchmark task
+├── benchmark_infmax.yaml      # InfMax benchmark task
+├── bulk_input.csv             # CSV for bulk batch jobs (disagg + agg rows)
+├── sglang/
+│   ├── prefill.yaml           # SGLang prefill server task (disaggregated)
+│   ├── decode.yaml            # SGLang decode server task (disaggregated)
+│   └── agg.yaml               # SGLang aggregated server task
+├── vllm/
+│   ├── prefill.yaml           # vLLM prefill server task (disaggregated)
+│   ├── decode.yaml            # vLLM decode server task (disaggregated)
+│   └── agg.yaml               # vLLM aggregated server task
+└── trtllm/
+    ├── prefill.yaml           # TRT-LLM prefill server task (disaggregated)
+    ├── decode.yaml            # TRT-LLM decode server task (disaggregated)
+    └── agg.yaml               # TRT-LLM aggregated server task
+```
+
+The `bulk_input.csv` supports both disaggregated and aggregated workflows using the `missable_tasks` column:
+- Disagg rows include `prefill.yaml + decode.yaml` and set `missable_tasks=agg_server`
+- Agg rows include `agg.yaml` and set `missable_tasks=prefill_server decode_server`
+
+**Copy the modular sample:**
+
+```bash
+sflow sample inference_x_v2
+```
+
+**Usage Option A: Bulk batch (CSV-driven)**
+
+Each row in `bulk_input.csv` defines a job with its own config files and variable overrides:
+
+```bash
+# Preview (no submission)
+sflow batch --bulk-input inference_x_v2/bulk_input.csv \
+  -a LOCAL_MODEL_PATH=fs:///path/to/model -G 4 -A ACCOUNT -p PARTITION
+
+# Submit all jobs
+sflow batch --bulk-input inference_x_v2/bulk_input.csv \
+  -a LOCAL_MODEL_PATH=fs:///path/to/model -G 4 -A ACCOUNT -p PARTITION --submit
+```
+
+**Usage Option B: Compose + Submit (step-by-step)**
+
+```bash
+# Step 1: Compose modular files into a complete config
+sflow compose inference_x_v2/slurm_config.yaml \
+              inference_x_v2/common_workflow.yaml \
+              inference_x_v2/trtllm/prefill.yaml \
+              inference_x_v2/trtllm/decode.yaml \
+              inference_x_v2/benchmark_aiperf.yaml \
+              -o composed.yaml
+
+# Step 2: Validate, run, or submit
+sflow run -f composed.yaml --dry-run                          # validate
+sflow run -f composed.yaml --tui                               # run interactively
+sflow batch -f composed.yaml -N 1 -G 4 -p PARTITION -A ACCOUNT \
+            -o run.sh --submit                                 # submit to Slurm
+```
+
+**Computed variables:**
+
+The modular samples use chained computed variables to simplify GPU/node calculations:
+
+```yaml
+variables:
+  CTX_TP_SIZE:
+    type: integer
+    value: 2
+  CTX_DP_SIZE:
+    type: integer
+    value: 1
+  CTX_PP_SIZE:
+    type: integer
+    value: 1
+  CTX_GPUS_PER_WORKER:
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+  CTX_NODES_PER_WORKER:
+    type: integer
+    value: ${{ [variables.CTX_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
+```
+
+---
+
 ## Tips
 
 1. **Always validate first**: Use `--dry-run` before actual execution
 2. **Override variables**: Use `--set KEY=VALUE` to customize configurations
-3. **Check sample source**: Samples are located in `src/sflow/samples/` in the sflow package
+3. **Override model path**: Use `--artifact LOCAL_MODEL_PATH=fs:///path/to/model` to point to your actual model
+4. **Use `--resolve`**: Add `--resolve` to `sflow compose` or `sflow batch --bulk-input` to inline all variables into literal values for a fully-baked config
+5. **Check sample source**: Samples are located in `src/sflow/samples/` in the sflow package

@@ -28,6 +28,8 @@ def _register_commands() -> None:
         batch,  # noqa: F401
         visualize,  # noqa: F401
         sample,  # noqa: F401
+        compose,  # noqa: F401
+        skill,  # noqa: F401
     )
 
 

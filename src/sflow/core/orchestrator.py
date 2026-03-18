@@ -162,9 +162,25 @@ class Orchestrator:
                         if t.status == TaskStatus.FAILED
                     ]
                     if failed:
-                        failed_names = ", ".join(t.name for t in failed)
+                        probe_failed = [
+                            t for t in failed if getattr(t, "failed_by_probe", False)
+                        ]
+                        process_failed = [
+                            t
+                            for t in failed
+                            if not getattr(t, "failed_by_probe", False)
+                        ]
+                        parts: list[str] = []
+                        if probe_failed:
+                            parts.append(
+                                f"failure probe terminated: {', '.join(t.name for t in probe_failed)}"
+                            )
+                        if process_failed:
+                            parts.append(
+                                f"process exited with error: {', '.join(t.name for t in process_failed)}"
+                            )
                         _logger.error(
-                            f"Fail-fast: task(s) failed: {failed_names}. Cancelling remaining tasks."
+                            f"Fail-fast: {'; '.join(parts)}. Cancelling remaining tasks."
                         )
 
                         # Cancel all running subprocess tasks (best-effort).
@@ -208,6 +224,16 @@ class Orchestrator:
                 task.status = TaskStatus.READY
             elif probe.type == ProbeType.FAILURE:
                 task.status = TaskStatus.FAILED
+                task.failed_by_probe = True
+                probe_detail = (
+                    getattr(probe, "_pattern_display", None) or type(probe).__name__
+                )
+                _logger.error(
+                    f"Failure probe triggered for task '{task.name}': "
+                    f"pattern matched: '{probe_detail}'. "
+                    f"The workflow will be terminated because of this probe — "
+                    f"the task process was still running when the failure was detected."
+                )
 
     async def _launch_task_with_timeout(self, task: Task, timeout: int | None = None):
         if timeout:

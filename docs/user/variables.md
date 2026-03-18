@@ -152,6 +152,62 @@ Available task properties:
 - `task.<name>.backend` - Name of the backend used by the task
 - `task.<name>.operator` - Name of the operator used by the task
 
+### sflow Reserved Environment Variables
+
+sflow automatically injects these environment variables into every task script:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `SFLOW_WORKSPACE_DIR` | Workspace root directory | `/home/user/project` |
+| `SFLOW_OUTPUT_DIR` | Output root directory | `/home/user/project/sflow_output` |
+| `SFLOW_WORKFLOW_OUTPUT_DIR` | Workflow-specific output directory | `sflow_output/12345-wf-20260315-abcdef` |
+| `SFLOW_TASK_OUTPUT_DIR` | Task-specific output directory | `sflow_output/12345-wf-20260315-abcdef/task_name` |
+| `SFLOW_REPLICA_INDEX` | Replica index (0-based) for replicated tasks | `0`, `1`, `2` |
+| `SFLOW_TASK_ASSIGNED_NODE_NAMES` | Comma-separated hostnames assigned to this task | `node0,node1` |
+| `SFLOW_TASK_ASSIGNED_NODE_IPS` | Comma-separated IPs assigned to this task | `10.0.0.1,10.0.0.2` |
+
+In addition, all user-defined variables are available as environment variables by their name (e.g. `${SLURM_NODES}`, `${MODEL_NAME}`).
+
+#### Output directory variables
+
+Use these to write output files to the correct location:
+
+```yaml
+script:
+  - echo "results" > ${SFLOW_TASK_OUTPUT_DIR}/results.txt
+  - cp model.pt ${SFLOW_WORKFLOW_OUTPUT_DIR}/final_model.pt
+```
+
+#### Replica index
+
+For replicated tasks, `SFLOW_REPLICA_INDEX` identifies which replica is running (0-based). Use it to differentiate replicas:
+
+```yaml
+tasks:
+  - name: server
+    replicas:
+      count: 3
+      policy: parallel
+    script:
+      - echo "I am replica ${SFLOW_REPLICA_INDEX}"
+      - export MY_PORT=$((8000 + ${SFLOW_REPLICA_INDEX}))
+      - start_server --port ${MY_PORT}
+```
+
+When a task uses `replicas.variables` for domain sweeps, the sweep variable values are also injected as env vars:
+
+```yaml
+tasks:
+  - name: benchmark
+    replicas:
+      variables:
+        - CONCURRENCY    # each value from domain: [64, 128, 256]
+      policy: sequential
+    script:
+      - echo "Running with concurrency=${CONCURRENCY}"
+      - benchmark --concurrency ${CONCURRENCY}
+```
+
 ### Task-Assigned Node Environment Variables
 
 Each task automatically receives environment variables with its assigned node information:
@@ -356,3 +412,98 @@ flowchart TD
   t1_1 --> stop
   t1_2 --> stop
 ```
+
+## Chained (recursive) variable resolution
+
+Variables can reference other computed variables. The resolver iterates multiple passes until all resolvable variables are fully resolved.
+
+```yaml
+variables:
+  AGG_TP_SIZE:
+    type: integer
+    value: 4
+  AGG_DP_SIZE:
+    type: integer
+    value: 1
+  AGG_PP_SIZE:
+    type: integer
+    value: 1
+  GPUS_PER_NODE:
+    type: integer
+    value: 8
+
+  # Computed from TP * DP * PP
+  AGG_GPUS_PER_WORKER:
+    type: integer
+    value: ${{ variables.AGG_TP_SIZE * variables.AGG_DP_SIZE * variables.AGG_PP_SIZE }}
+
+  # References AGG_GPUS_PER_WORKER (chained)
+  AGG_NODES_PER_WORKER:
+    type: integer
+    value: ${{ [variables.AGG_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
+```
+
+In this example:
+
+1. `AGG_GPUS_PER_WORKER` is computed from `TP * DP * PP = 4`
+2. `AGG_NODES_PER_WORKER` references `AGG_GPUS_PER_WORKER` (chained) and computes `max(4 // 8, 1) = 1`
+
+The resolver handles this by:
+
+- Only including fully-resolved variables in the evaluation context for each pass
+- Retrying unresolved variables on subsequent passes until all dependencies are satisfied
+- Variables with `type: integer` are automatically cast to integers after resolution (important for arithmetic in chained expressions)
+
+### Tips for computed variables
+
+- Always declare `type: integer` on variables used in arithmetic expressions. Without it, values are treated as strings and arithmetic will fail.
+- Computed variables are available as environment variables in task scripts (e.g. `${AGG_GPUS_PER_WORKER}`), eliminating the need for inline calculations in bash.
+- When using `sflow compose --resolve`, computed variables are resolved to their literal values and removed from the output.
+
+### The `--resolve` flag and replica variables
+
+When you use `sflow compose --resolve` or `sflow batch --bulk-input --resolve`, all resolvable variables are inlined to literal values and removed from the variables section. However, **variables referenced by `replicas.variables` (sweep variables) are never resolved**, even with `--resolve`. This is intentional:
+
+```yaml
+variables:
+  CONCURRENCY:
+    value: 64
+    domain: [64, 128, 256]
+
+workflow:
+  tasks:
+    - name: benchmark
+      replicas:
+        variables:
+          - CONCURRENCY    # sweep over domain values
+        policy: sequential
+      script:
+        - benchmark --concurrency ${CONCURRENCY}
+```
+
+After `--resolve`, `CONCURRENCY` stays in the variables section because:
+
+- Its value changes per replica (each replica gets a different domain value)
+- Resolving it would collapse the sweep into a single value, losing the scalability
+
+Variables referenced by `replicas.count` expressions are also preserved. For example:
+
+```yaml
+variables:
+  NUM_CTX_SERVERS:
+    type: integer
+    value: 2
+
+workflow:
+  tasks:
+    - name: prefill_server
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: parallel
+```
+
+Here `NUM_CTX_SERVERS` is kept after `--resolve` because it controls how many replicas are created. Resolving it would make the config less flexible -- you wouldn't be able to override it with `--set NUM_CTX_SERVERS=4` at run time.
+
+This ensures the composed config remains a valid, scalable workflow template even after resolution.
+
+Similarly, variables that depend on runtime contexts (e.g. `${{ backends.slurm_cluster.nodes[0].ip_address }}`) cannot be resolved at compose time and are kept as expressions.

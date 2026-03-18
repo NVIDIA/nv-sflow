@@ -37,6 +37,10 @@ variables:
     value: 8
 
 
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
 backends:
   - name: slurm_cluster
     type: slurm

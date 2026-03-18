@@ -3,7 +3,15 @@ title: Introduction
 sidebar_position: 1
 ---
 
-`sflow` is a **workflow orchestrator**: you describe _what to run_ in a `sflow.yaml` (tasks, dependencies, how to launch each task, and required resources). `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure.
+`sflow` is a **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_.
+
+An application's deployment steps are usually logically the same regardless of the underlying infrastructure. Take [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) as an example: you start etcd and NATS, launch a frontend server, spin up workers that register to the frontend, and the service is up. That logical flow never changes — but making it actually run on Slurm, Docker Compose, or Kubernetes requires a different set of infrastructure-specific scripts, resource management, and networking tweaks each time, and the effort must be repeated for every new platform.
+
+`sflow` is trying to eliminate this duplication. You describe the workflow once in a portable YAML format — tasks, dependencies, resources, and launch methods — and `sflow` delegates execution to the target infrastructure through swappable backends, leveraging each platform's native ecosystem rather than reimplementing it (e.g. Kubernetes, Helm charts, Argo Workflows).
+
+Pluggable extensions such as probes and artifacts integrate naturally without coupling your workflow to any specific platform. Write one `sflow.yaml` and run it across environments with minimal changes.
+
+The current focus is **Slurm**, which — unlike Kubernetes or Docker — lacks a built-in workflow orchestration layer, making multi-step deployments especially cumbersome. Docker and Kubernetes backends are planned to follow.
 
 ![sflow TUI](/img/sflow_tui.gif)
 
@@ -84,116 +92,89 @@ Use the `local` backend with the `bash` operator to validate your DAG and script
 | **Workflow** | A set of tasks wired into a DAG via `depends_on`. |
 | **Task** | An executable unit. The key field is `script` — a list of lines joined into a bash script. |
 | **Backend** | Where compute comes from. Built-ins: `slurm` (allocates via `salloc`) and `local` (simulates nodes on the local machine). |
-| **Operator** | How a task is launched. Built-ins: `bash` and `srun`. Named operators let you preset flags and reuse them across tasks. |
+| **Operator** | How a task is launched. Built-ins: `bash`, `srun`, `docker`, `ssh`, `python`. Named operators let you preset flags and reuse them across tasks. |
 | **Variable** | A named value referenced as `${{ variables.NAME }}` in YAML or `${NAME}` in scripts. Override from the CLI with `--set`. |
-| **Expression** | `${{ ... }}` syntax inside YAML to reference variables, backend info, task metadata, and more (e.g. `${{ backends.slurm.nodes[0].ip_address }}`). |
+| **Expression** | Jinja2-based `${{ ... }}` syntax inside YAML to reference variables, backend info, task metadata, and more (e.g. `${{ backends.slurm.nodes[0].ip_address }}`). Supports filters (`${{ [a, b] \| min }}`), conditionals, and list indexing. |
+| **Artifact** | A named external resource (model, config, dataset) referenced by URI and resolved to a local path at runtime. |
+| **Probe** | A health-check gate. Readiness probes block dependents until a service is live; failure probes terminate the workflow when a fatal condition is detected. |
+| **Replica** | A task can be replicated N times (parallel or sequential) with per-replica variable overrides for sweeps. |
 
-## Architecture
-
-```mermaid
-graph TB
-  subgraph CLI["CLI Layer"]
-    run["sflow run"]
-    batch["sflow batch"]
-    sample["sflow sample"]
-    visualize["sflow visualize"]
-  end
-
-  subgraph App["Application"]
-    sflowapp["SflowApp"]
-    assembly["Assembly Pipeline"]
-  end
-
-  subgraph Config["Configuration"]
-    loader["Config Loader\n(YAML + Pydantic)"]
-    resolver["Expression Resolver\n(Jinja2 ${{ }})"]
-    schema["Schema Models"]
-  end
-
-  subgraph Plugins["Plugins (Pluggable)"]
-    subgraph Backends
-      local_be["local"]
-      slurm_be["slurm"]
-    end
-    subgraph Operators
-      bash_op["bash"]
-      srun_op["srun"]
-      docker_op["docker"]
-      ssh_op["ssh"]
-    end
-    subgraph Probes
-      tcp["TCP Port"]
-      http["HTTP Get/Post"]
-      logwatch["Log Watch"]
-    end
-    subgraph Artifacts
-      fs_art["fs://"]
-      file_art["file://"]
-      http_art["http://"]
-      hf_art["hf://"]
-    end
-  end
-
-  subgraph Core["Core Engine"]
-    state["SflowState\n(variables, backends,\nartifacts, workflow)"]
-    taskgraph["Task Graph (DAG)"]
-    orchestrator["Orchestrator\n(poll loop)"]
-    launcher["Subprocess Launcher"]
-  end
-
-  subgraph Output["Output"]
-    tui["TUI (Rich)"]
-    logs["Logs & Outputs\nsflow_output/"]
-  end
-
-  CLI --> sflowapp
-  sflowapp --> assembly
-  assembly --> loader
-  assembly --> resolver
-  loader --> schema
-  assembly --> Backends
-  assembly --> Operators
-  assembly --> Artifacts
-  assembly --> state
-  state --> taskgraph
-  taskgraph --> orchestrator
-  orchestrator --> launcher
-  orchestrator --> Probes
-  launcher --> logs
-  sflowapp --> tui
-```
+For detailed architecture diagrams, execution flow, assembly pipeline, orchestrator internals, plugin reference, and output structure, see [Architecture](./architecture.md).
 
 ## How to Use sflow (General Workflow)
 
 ```mermaid
 flowchart TD
-  A["1. Write sflow.yaml\n(variables, backends,\noperators, tasks)"] --> B["2. Validate\nsflow run -f sflow.yaml --dry-run"]
-  B --> C{Errors?}
-  C -- Yes --> A
-  C -- No --> D{Environment?}
+  write["1. Write sflow.yaml"] --> validate["2. Validate (--dry-run)"]
+  validate --> errCheck{Errors?}
+  errCheck -- Yes --> write
+  errCheck -- No --> envChoice{Environment?}
 
-  D -- Local testing --> E["3a. Run locally\nsflow run -f sflow.yaml --tui"]
-  D -- Slurm interactive --> F["3b. Run on Slurm\nsflow run -f sflow.yaml --tui"]
-  D -- Slurm production --> G["3c. Generate sbatch\nsflow batch -f sflow.yaml\n-o run.sh --submit"]
+  envChoice -- Local --> runLocal["3a. sflow run --tui"]
+  envChoice -- Slurm interactive --> runSlurm["3b. sflow run --tui"]
+  envChoice -- Slurm production --> runBatch["3c. sflow batch --submit"]
 
-  E --> H["4. sflow resolves variables\nand builds task graph"]
-  F --> H
-  G --> H
+  runLocal --> resolve["4. Resolve variables\nbuild task graph"]
+  runSlurm --> resolve
+  runBatch --> resolve
 
-  H --> I["5. Backend allocates resources\n(salloc for Slurm,\nsynthetic nodes for local)"]
-  I --> J["6. Orchestrator executes DAG\n• Launches tasks via operators\n• Monitors probes\n• Handles retries"]
-  J --> K["7. Collect outputs & logs\nsflow_output/<run_id>/"]
+  resolve --> allocate["5. Allocate resources"]
+  allocate --> execute["6. Execute DAG\n(operators + probes)"]
+  execute --> collect["7. Collect outputs & logs"]
 
-  K --> L{All tasks\npassed?}
-  L -- Yes --> M(("Done ✓"))
-  L -- No --> N["Check logs, fix config,\nre-run"]
-  N --> A
-
-  style A fill:#4a9eff,color:#fff
-  style M fill:#22c55e,color:#fff
-  style C fill:#f59e0b,color:#fff
-  style L fill:#f59e0b,color:#fff
+  collect --> passCheck{All tasks passed?}
+  passCheck -- Yes --> done(("Done"))
+  passCheck -- No --> fix["Check logs & re-run"]
+  fix --> write
 ```
+
+## Modular Workflow
+
+For larger projects, split config into composable modules and pass them directly to `sflow run` or `sflow batch` -- no separate compose step required. This enables framework swapping, benchmark mixing, and CSV-driven parameter sweeps. See [Modular Workflows](./modular-workflows.md) for details.
+
+```mermaid
+flowchart TD
+  modules["1. Write modular YAMLs\n(base, servers, benchmark)"] --> validate["2. Validate (--dry-run)\nsflow run -f a.yaml -f b.yaml --dry-run"]
+  validate --> errCheck{Errors?}
+  errCheck -- Yes --> modules
+  errCheck -- No --> runChoice{Run mode?}
+
+  runChoice -- Single run --> run["3a. sflow run\n-f a.yaml -f b.yaml --tui"]
+  runChoice -- Batch submit --> batch["3b. sflow batch\n-f a.yaml -f b.yaml --submit"]
+  runChoice -- Parameter sweep --> bulk["3c. sflow batch\n--bulk-input sweep.csv"]
+
+  run --> done(("Done"))
+  batch --> done
+  bulk --> done
+```
+
+### Config Merging Rules
+
+When multiple YAML files are provided:
+
+| Section | Merge Strategy |
+|---------|---------------|
+| `version` | Must match across all files |
+| `variables` | Merge by name (later overrides earlier) |
+| `artifacts` | Merge by name |
+| `backends` | Merge by name |
+| `operators` | Merge by name |
+| `workflow.tasks` | Concatenated (later files append tasks) |
+| `workflow.name` | Last non-null wins |
+
+## Expression System
+
+The `${{ ... }}` expression syntax (powered by Jinja2) provides access to the full runtime context:
+
+| Namespace | Example | Description |
+|-----------|---------|-------------|
+| `variables` | `${{ variables.MODEL_NAME }}` | Resolved variable value |
+| `artifacts` | `${{ artifacts.MODEL.path }}` | Artifact local path |
+| `backends` | `${{ backends.slurm.nodes[0].ip_address }}` | Backend node info |
+| `task` | `${{ task.assigned_nodes }}` | Current task's node assignment |
+| Filters | `${{ [a, b] \| min }}` | Jinja2 filters |
+
+Expressions are resolved in phases — variables first, then backends, then artifacts, then task-level — so later phases can reference earlier results.
 
 ## Known Limitations
 
@@ -201,6 +182,7 @@ The following features are **not yet implemented** in the current release:
 
 - `sflow run --resume` — raises `NotImplementedError`
 - `sflow run --task` — raises `BadParameter`
+- `hf://` and `docker://` artifact materialization — raises `NotImplementedError`
 
 This user guide reflects actual code behavior. Not all planned features may be available yet.
 
@@ -208,13 +190,17 @@ This user guide reflects actual code behavior. Not all planned features may be a
 
 | Topic | Page |
 |-------|------|
+| Architecture, execution flow, plugins | [Architecture](./architecture.md) |
 | Run a minimal example | [Quickstart](./quickstart.md) |
 | Variables, expressions, env injection | [Variables](./variables.md) |
 | Named inputs (paths, images, etc.) | [Artifacts](./artifacts.md) |
 | Compute backends (local, Slurm) | [Backends](./backends.md) |
 | Task launch methods (bash, srun, containers) | [Operators](./operators.md) |
 | Node/GPU placement, CUDA_VISIBLE_DEVICES | [Resources](./resources.md) |
+| Parallel/sequential replicas, sweeps | [Replicas](./replicas.md) |
+| Composable configs, sweeps, missable tasks | [Modular Workflows](./modular-workflows.md) |
 | Readiness/failure gates for services | [Probes](./probes.md) |
 | Log and output directory structure | [Outputs & Logs](./outputs.md) |
 | Full sflow.yaml schema | [Configuration](./configuration.md) |
 | CLI options | [CLI Reference](./cli.md) |
+| Frequently asked questions | [FAQ](./faq.md) |

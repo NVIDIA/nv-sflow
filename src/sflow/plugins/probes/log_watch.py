@@ -37,6 +37,7 @@ class LogWatchProbe(Probe):
         # This avoids surprising behavior when users include characters like "()", "[]", ".", "*", etc.
         # If you need true regex semantics, prefix the pattern with "re:" (or "regex:").
         p = str(regex_pattern)
+        self._pattern_display = p
         if p.startswith(self._REGEX_PREFIXES):
             p = p.split(":", 1)[1]
             self._regex = re.compile(p)

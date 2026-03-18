@@ -61,6 +61,7 @@ def test_sflow_app_releases_backend_allocation_on_success(tmp_path, monkeypatch)
         allocate: bool = True,
         workspace_dir=None,
         output_dir=None,
+        source_files=None,
     ) -> SflowState:
         return state
 
@@ -109,6 +110,7 @@ def test_sflow_app_raises_on_failed_tasks_and_still_releases_backends(
         allocate: bool = True,
         workspace_dir=None,
         output_dir=None,
+        source_files=None,
     ) -> SflowState:
         return state
 
@@ -146,6 +148,7 @@ def test_sflow_app_does_not_release_when_dry_run(tmp_path, monkeypatch):
         allocate: bool = True,
         workspace_dir=None,
         output_dir=None,
+        source_files=None,
     ) -> SflowState:
         return state
 
@@ -188,6 +191,7 @@ def test_sflow_app_mounts_sflow_dirs_for_srun_container_tasks(tmp_path, monkeypa
         allocate: bool = True,
         workspace_dir=None,
         output_dir=None,
+        source_files=None,
     ) -> SflowState:
         return state
 

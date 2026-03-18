@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sflow — Declarative Workflow Descriptor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Archivo+Black&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-snap-type:y mandatory;scroll-behavior:smooth;height:100%;overflow-x:hidden}
+body{font-family:'Consolas',monospace;background:#060a10;color:#dce3ed;height:100%}
+:root{
+  --cy:#00d4ff;--gr:#76ff02;--bg:#060a10;--card:#0d1420;--card-h:#141e2e;
+  --txt:#dce3ed;--dim:#6b7d95;--bdr:rgba(0,212,255,0.12);
+  --grad:linear-gradient(135deg,#00d4ff,#76ff03);
+  --t:clamp(2rem,5.5vw,4.5rem);--h:clamp(1.6rem,3.8vw,3.0rem);
+  --b:clamp(1.2rem,2vw,1.5rem);--s:clamp(.72rem,1.1vw,.95rem);
+  --pad:clamp(1rem,4vw,4rem);--gap:clamp(.5rem,1.8vw,1.6rem);
+}
+.sec{width:100vw;min-height:100vh;height:100dvh;overflow:hidden;scroll-snap-align:start;position:relative;display:flex;align-items:center;justify-content:center}
+.inner{position:relative;z-index:2;width:100%;max-width:1200px;padding:var(--pad);display:flex;flex-direction:column;gap:var(--gap)}
+h1{font-family:'Syne',sans-serif;font-weight:800;font-size:var(--t);letter-spacing:-.03em;line-height:1.1;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+h2{font-family:'Consolas',monospace;font-weight:700;font-size:var(--h);color:var(--txt);line-height:1.2}
+h3{font-family:'Consolas',monospace;font-weight:600;font-size:clamp(.95rem,1.4vw,1.15rem);color:var(--txt);margin-bottom:.15rem}
+p,li{font-size:var(--b);color:var(--dim);line-height:1.6}
+code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
+.accent{color:var(--cy)}.green{color:var(--gr)}
+
+/* === ANIMATIONS (only run on visible slides) === */
+@keyframes fu{from{opacity:0;transform:translateY(50px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fl{from{opacity:0;transform:translateX(-60px)}to{opacity:1;transform:translateX(0)}}
+@keyframes fr{from{opacity:0;transform:translateX(60px)}to{opacity:1;transform:translateX(0)}}
+@keyframes si{from{opacity:0;transform:scale(.8)}to{opacity:1;transform:scale(1)}}
+@keyframes pi{from{opacity:0;transform:scale(.4)}to{opacity:1;transform:scale(1)}}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes ri{from{opacity:0;transform:translateX(-30px)}to{opacity:1;transform:translateX(0)}}
+
+.r{opacity:0;animation-fill-mode:forwards;animation-play-state:paused}
+.sec.on .r{animation-play-state:running}
+.au{animation:fu .8s cubic-bezier(.16,1,.3,1) forwards}
+.al{animation:fl .8s cubic-bezier(.16,1,.3,1) forwards}
+.ar{animation:fr .9s cubic-bezier(.16,1,.3,1) forwards}
+.as{animation:si .8s cubic-bezier(.16,1,.3,1) forwards}
+.ap{animation:pi .6s cubic-bezier(.34,1.56,.64,1) forwards}
+.d0{animation-delay:0s}.d1{animation-delay:.12s}.d2{animation-delay:.24s}
+.d3{animation-delay:.36s}.d4{animation-delay:.48s}.d5{animation-delay:.6s}
+.d6{animation-delay:.72s}.d7{animation-delay:.84s}.d8{animation-delay:.96s}
+
+/* === BACKGROUNDS (static — no animated blur or grid movement) === */
+.gbg{position:absolute;inset:0;z-index:0;background-image:linear-gradient(rgba(0,212,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.03) 1px,transparent 1px);background-size:60px 60px}
+.orb{position:absolute;border-radius:50%;z-index:0;pointer-events:none;opacity:.1}
+.oc{background:radial-gradient(circle,var(--cy),transparent 70%)}.og{background:radial-gradient(circle,var(--gr),transparent 70%)}
+
+/* === LAYOUT === */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:clamp(1rem,3vw,3rem);align-items:start}
+@media(max-width:768px){.two{grid-template-columns:1fr}}
+.fg{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(.5rem,1.2vw,1rem)}
+@media(max-width:900px){.fg{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:550px){.fg{grid-template-columns:1fr}}
+
+/* === COMPONENTS === */
+.pill{display:inline-block;padding:.2em .8em;border-radius:999px;font-size:var(--b);font-weight:500;border:1px solid}
+.pc{border-color:var(--cy);color:var(--cy)}.pg{border-color:var(--gr);color:var(--gr)}
+
+.fc{background:var(--card);border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.1rem);position:relative;overflow:hidden;transition:transform .4s,border-color .4s,background .4s}
+.fc:hover{transform:translateY(-4px);border-color:var(--cy);background:var(--card-h)}
+.fc .ic{font-size:clamp(1.1rem,1.8vw,1.6rem);display:block;margin-bottom:.2rem}
+.fc p{font-size:var(--s);margin:0;line-height:1.35}
+
+/* === TERMINAL BLOCK === */
+.term{background:#0d1117;border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.2rem);font-family:'Consolas',monospace;font-size:clamp(.6rem,1vw,.88rem);line-height:1.55;color:#8b949e;position:relative;overflow:hidden;white-space:pre;overflow-x:auto}
+.term .hi{color:var(--txt)}.term .cy{color:var(--cy)}.term .gr{color:var(--gr)}
+.term .rd{color:#ff7b72}.term .yl{color:#e3b341}.term .wh{color:#c9d1d9}
+
+/* === DAG FLOWCHART === */
+.dag{display:flex;flex-direction:column;align-items:center;gap:clamp(.3rem,.6vw,.5rem);font-family:'Consolas',monospace;font-size:clamp(.6rem,1vw,.85rem)}
+.dag-row{display:flex;gap:clamp(.3rem,.8vw,.6rem);justify-content:center;flex-wrap:wrap}
+.dag-node{border:1px solid #3d444d;border-radius:4px;padding:.25em .7em;color:#c9d1d9;background:#161b22;white-space:nowrap;transition:border-color .3s,box-shadow .3s}
+.dag-node:hover{border-color:var(--cy);box-shadow:0 0 10px rgba(0,212,255,.15)}
+.dag-arrow{color:#3d444d;font-size:clamp(.6rem,1vw,.8rem);display:flex;justify-content:center}
+
+/* === MINI TABLE === */
+.mtbl{border-collapse:collapse;font-size:var(--s);width:100%}
+.mtbl th,.mtbl td{padding:clamp(.25rem,.5vw,.4rem) clamp(.4rem,.8vw,.7rem);text-align:left;border-bottom:1px solid var(--bdr)}
+.mtbl th{color:var(--cy);font-family:'Syne',sans-serif;font-weight:600}
+.mtbl code{background:#161b22;padding:.1em .4em;border-radius:3px;font-size:.85em}
+.sec.on .mtbl tbody tr{animation:ri .5s ease forwards;opacity:0}
+.sec.on .mtbl tbody tr:nth-child(1){animation-delay:.2s}
+.sec.on .mtbl tbody tr:nth-child(2){animation-delay:.3s}
+.sec.on .mtbl tbody tr:nth-child(3){animation-delay:.4s}
+.sec.on .mtbl tbody tr:nth-child(4){animation-delay:.5s}
+.sec.on .mtbl tbody tr:nth-child(5){animation-delay:.6s}
+.sec.on .mtbl tbody tr:nth-child(6){animation-delay:.7s}
+.mtbl tbody tr{opacity:0;transition:background .3s}
+.mtbl tbody tr:hover{background:rgba(0,212,255,.04)}
+
+/* === LOGO === */
+.logo{width:clamp(80px,12vw,160px);height:auto;border-radius:16px;margin-bottom:var(--gap)}
+
+/* === NAV / CHROME === */
+.sn{position:absolute;top:clamp(.6rem,2vh,1.2rem);right:clamp(.6rem,2vw,1.2rem);font-size:var(--s);color:var(--dim);opacity:.3;z-index:3}
+.prog{position:fixed;top:0;left:0;height:3px;z-index:300;background:var(--grad);width:0%;transition:width .4s}
+.tmr{position:fixed;top:3px;left:0;height:2px;z-index:301;background:rgba(255,255,255,.2);width:0%}
+.dots{position:fixed;right:clamp(.3rem,1vw,.6rem);top:50%;transform:translateY(-50%);z-index:300;display:flex;flex-direction:column;gap:7px}
+.dot{width:5px;height:5px;border-radius:50%;background:var(--dim);opacity:.2;cursor:pointer;border:none;padding:0;transition:all .4s cubic-bezier(.34,1.56,.64,1)}
+.dot.on{background:var(--cy);opacity:1;height:18px;border-radius:3px;box-shadow:0 0 10px rgba(0,212,255,.5)}
+.badge{position:fixed;bottom:clamp(.6rem,2vh,1.2rem);left:50%;transform:translateX(-50%);z-index:300;background:rgba(0,0,0,.75);border:1px solid var(--bdr);border-radius:999px;padding:.3em 1em;font-size:var(--s);color:var(--dim);opacity:0;transition:opacity .3s;pointer-events:none}
+.doc-btn{display:inline-flex;align-items:center;justify-content:center;margin-top:var(--gap);padding:.6em 1.6em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--b);font-family:'Syne',sans-serif;font-weight:600;transition:all .3s;cursor:pointer;z-index:10;position:relative;height:clamp(2.4rem,4vw,3.2rem);line-height:1}
+.doc-btn:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.3)}
+.doc-btn svg{flex-shrink:0}
+.gh-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(.6rem,2vw,1.2rem);z-index:400;padding:.3em .5em;border:1px solid rgba(255,255,255,.2);border-radius:50%;color:rgba(255,255,255,.6);text-decoration:none;background:rgba(255,255,255,.06);backdrop-filter:blur(8px);transition:all .3s;display:flex;align-items:center;justify-content:center}
+.gh-corner:hover{border-color:#fff;color:#fff;background:rgba(255,255,255,.15);box-shadow:0 0 12px rgba(255,255,255,.15)}
+.doc-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(3.2rem,6vw,4.5rem);z-index:400;padding:.35em .9em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--s);font-family:'Syne',sans-serif;font-weight:600;background:rgba(0,212,255,.08);backdrop-filter:blur(8px);transition:all .3s;box-shadow:0 0 8px rgba(0,212,255,.15)}
+.doc-corner:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.35)}
+.mb{margin-bottom:var(--gap)}.ms{margin-bottom:calc(var(--gap)*.4)}
+@media(max-height:700px){:root{--pad:clamp(.6rem,2.5vw,1.5rem);--gap:clamp(.3rem,1vw,.7rem);--t:clamp(1.5rem,4.5vw,2.8rem);--h:clamp(1.3rem,3.2vw,2.1rem)}}
+@media(max-height:550px){.dots{display:none}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.15s!important}html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<a href="https://github.com/NVIDIA/nv-sflow" class="gh-corner" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+</a>
+<a href="docs/user/intro" class="doc-corner" onclick="event.stopPropagation()">Docs &rarr;</a>
+<div class="prog" id="prog"></div>
+<div class="tmr" id="tmr"></div>
+<nav class="dots" id="dots"></nav>
+<div class="badge" id="badge">PAUSED &mdash; click or press P to resume</div>
+
+<!-- 1: Title -->
+<section class="sec" id="s1">
+<div class="gbg"></div>
+<div class="orb oc" style="width:450px;height:450px;top:-120px;left:-120px"></div>
+<div class="orb og" style="width:320px;height:320px;bottom:-80px;right:-80px"></div>
+<span class="sn">01 / 12</span>
+<div class="inner" style="align-items:center;text-align:center">
+<img class="logo r as d0" src="img/sflow-logo.jpg" alt="sflow logo">
+<h1 class="r as d1" style="font-family:'Archivo Black',sans-serif;font-size:clamp(2.5rem,7vw,5.5rem);text-transform:uppercase;letter-spacing:.02em">NV-sflow</h1>
+<h2 class="r au d2" style="font-size:var(--h)">Declarative Workflow Descriptor</h2>
+<p class="r au d3" style="font-size:var(--b);color:var(--dim);margin-top:var(--gap)">Describe once. Run anywhere.<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
+<div class="r au d4" style="display:flex;gap:clamp(.5rem,1.5vw,1rem);flex-wrap:wrap;justify-content:center;margin-top:var(--gap)">
+<a href="docs/user/intro" class="doc-btn" onclick="event.stopPropagation()">View Documentation &rarr;</a>
+<a href="https://github.com/NVIDIA/nv-sflow" class="doc-btn gh-btn" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;margin-right:.4em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+</div>
+</div>
+</section>
+
+<!-- 2: Problem -->
+<section class="sec" id="s2">
+<div class="gbg"></div>
+<div class="orb oc" style="width:280px;height:280px;top:60%;right:-60px"></div>
+<span class="sn">02 / 12</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">The Problem</span>
+<h2 class="r al d1 mb">Same workflow. Different infra. Rewrite everything.</h2>
+<p class="r au d2" style="max-width:720px">Take <span class="accent">NVIDIA Dynamo</span> &mdash; start etcd &amp; NATS, launch a frontend, spin up workers, service is up. That logical flow never changes.</p>
+<p class="r au d3" style="max-width:720px;margin-top:var(--gap)">But making it run on <span class="accent">Slurm</span>, <span class="accent">Docker Compose</span>, or <span class="accent">Kubernetes</span> requires platform-specific scripts, networking, and resource management &mdash; repeated for every new platform.</p>
+</div>
+</section>
+
+<!-- 3: Solution -->
+<section class="sec" id="s3">
+<div class="gbg"></div>
+<div class="orb og" style="width:350px;height:350px;top:15%;right:-100px"></div>
+<span class="sn">03 / 12</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">The Solution</span>
+<h2 class="r al d1 mb">Separate <span class="accent">what</span> to deploy from <span class="green">where</span></h2>
+<div class="fg">
+<div class="fc r au d2"><span class="ic">&#9998;</span><h3>Describe Once</h3><p>Portable YAML &mdash; tasks, deps, resources, launch methods</p></div>
+<div class="fc r au d3"><span class="ic">&#8644;</span><h3>Swappable Backends</h3><p>Slurm now. Docker &amp; K8S planned.</p></div>
+<div class="fc r au d4"><span class="ic">&#9881;</span><h3>Pluggable Plugins</h3><p>Probes, artifacts, replicas &mdash; no platform coupling.</p></div>
+</div>
+<div class="r as d5" style="width:100%;max-width:700px;margin:0 auto">
+<svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
+<defs>
+<linearGradient id="wg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#00d4ff"/></linearGradient>
+<filter id="gl"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+</defs>
+<!-- Left column: K8S, Docker, Slurm -->
+<rect x="20" y="15" width="110" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="75" y="40" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="13" font-weight="600">K8S</text>
+<rect x="20" y="85" width="110" height="40" rx="6" fill="#0d1420" stroke="#6b7d95" stroke-width="1" opacity="0.6"/>
+<text x="75" y="110" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="13">Docker</text>
+<rect x="20" y="158" width="110" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="75" y="183" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="13" font-weight="600">Slurm</text>
+<!-- Right column: Docker, K8S, Slurm -->
+<rect x="570" y="15" width="110" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="625" y="40" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="13" font-weight="600">Docker</text>
+<rect x="570" y="85" width="110" height="40" rx="6" fill="#0d1420" stroke="#6b7d95" stroke-width="1" opacity="0.6"/>
+<text x="625" y="110" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="13">K8S</text>
+<rect x="570" y="158" width="110" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="625" y="183" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="13" font-weight="600">Slurm</text>
+<!-- Dashed wires: all left boxes -> sflow center (behind) -->
+<path d="M130,35 C220,35 280,105 310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M130,105 L310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M130,178 C220,178 280,115 310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<!-- Dashed wires: sflow center -> all right boxes (behind) -->
+<path d="M390,110 C420,105 480,35 570,35" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M390,110 L570,105" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M390,110 C420,115 480,178 570,178" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<!-- Arrow heads on dashed wires (into sflow) -->
+<polygon points="315,105 305,110 315,115" fill="#6b7d95" opacity="0.4"/>
+<!-- Arrow heads on dashed wires (out of sflow) -->
+<polygon points="565,30 575,35 565,40" fill="#6b7d95" opacity="0.4"/>
+<polygon points="565,100 575,105 565,110" fill="#6b7d95" opacity="0.4"/>
+<polygon points="565,173 575,178 565,183" fill="#6b7d95" opacity="0.4"/>
+<!-- Solid green wire 1: K8S(left) -> sflow -> Slurm(right) -->
+<path id="w1" d="M130,35 C230,35 280,108 350,110 C420,112 470,178 570,178" fill="none" stroke="#76ff03" stroke-width="3" opacity="0.8"/>
+<circle r="5" fill="#76ff03" filter="url(#gl)"><animateMotion dur="2.5s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
+<circle r="4" fill="#00d4ff" filter="url(#gl)"><animateMotion dur="2.5s" begin="1.25s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
+<!-- Solid green wire 2: Slurm(left) -> sflow -> Docker(right) — reverse direction drawn right-to-left -->
+<path id="w2" d="M570,35 C470,35 420,108 350,110 C280,112 230,178 130,178" fill="none" stroke="#76ff03" stroke-width="3" opacity="0.7"/>
+<circle r="5" fill="#76ff03" filter="url(#gl)"><animateMotion dur="2.5s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
+<circle r="4" fill="#00d4ff" filter="url(#gl)"><animateMotion dur="2.5s" begin="1.25s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
+<!-- Arrow heads on green wires -->
+<polygon points="565,173 575,178 565,183" fill="#76ff03" opacity="0.9"/>
+<polygon points="135,173 125,178 135,183" fill="#76ff03" opacity="0.8"/>
+<!-- Center: sflow circle (on top) -->
+<circle cx="350" cy="110" r="42" fill="#060a10" stroke="url(#wg)" stroke-width="2.5" filter="url(#gl)"/>
+<text x="350" y="116" text-anchor="middle" fill="#76ff03" font-family="'Archivo Black',sans-serif" font-size="16" font-weight="800">sflow</text>
+</svg>
+</div>
+</div>
+</section>
+
+<!-- 4: DAG (native CSS flowchart) -->
+<section class="sec" id="s4">
+<div class="gbg"></div>
+<div class="orb oc" style="width:240px;height:240px;top:8%;left:-70px"></div>
+<span class="sn">04 / 12</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">DAG Orchestration</span>
+<h2 class="r al d1 ms">Workflow DAG</h2>
+<div class="dag r as d2">
+<div class="dag-row"><div class="dag-node" style="border-color:var(--cy)">load_image</div></div>
+<div class="dag-arrow">&#9660;</div>
+<div class="dag-row"><div class="dag-node">install_dependency</div><div class="dag-node">gpu_monitor</div></div>
+<div class="dag-arrow">&#9660;</div>
+<div class="dag-row"><div class="dag-node">nats_server</div><div class="dag-node">etcd_server</div></div>
+<div class="dag-arrow">&#9660;</div>
+<div class="dag-row"><div class="dag-node">frontend_server_0</div><div class="dag-node">frontend_server_1</div><div class="dag-node">frontend_server_2</div></div>
+<div class="dag-arrow">&#9660;</div>
+<div class="dag-row"><div class="dag-node">nginx_server</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_0</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_1</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_2</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_3</div><div class="dag-node" style="border-color:var(--cy)">decode_server_0</div></div>
+<div class="dag-arrow">&#9660;</div>
+<div class="dag-row"><div class="dag-node" style="border-color:var(--cy)">benchmark_infmax_16</div></div>
+</div>
+</div>
+</section>
+
+<!-- 5: GPU Allocation (native terminal) -->
+<section class="sec" id="s5">
+<div class="gbg"></div>
+<div class="orb og" style="width:300px;height:300px;bottom:-90px;right:8%"></div>
+<span class="sn">05 / 12</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">Resource Planning</span>
+<h2 class="r al d1 ms">Topology-aware GPU Allocation</h2>
+<div class="term r as d2"><span class="hi">Allocation map (finalized node/GPU assignment):</span>
+  - backend '<span class="cy">slurm_cluster</span>':
+    &#9500;&#9472; node <span class="gr">slurm_cluster-node0</span>
+    &#9474;   GPU 0: <span class="cy">prefill_server_0</span>
+    &#9474;   GPU 1: <span class="cy">prefill_server_1</span>
+    &#9474;   GPU 2: <span class="cy">prefill_server_2</span>
+    &#9474;   GPU 3: <span class="cy">prefill_server_3</span>
+    &#9474;   Tasks: load_image, gpu_monitor, nats_server, etcd_server, frontend_server_0, ...
+    &#9500;&#9472; node <span class="gr">slurm_cluster-node1</span>
+    &#9474;   GPU 0: <span class="yl">decode_server_0</span>
+    &#9474;   GPU 1: <span class="yl">decode_server_0</span>
+    &#9474;   GPU 2: <span class="yl">decode_server_0</span>
+    &#9474;   GPU 3: <span class="yl">decode_server_0</span>
+    &#9474;   Tasks: load_image, gpu_monitor, frontend_server_1, decode_server_0</div>
+</div>
+</section>
+
+<!-- 6: Features -->
+<section class="sec" id="s6">
+<div class="gbg"></div>
+<div class="orb oc" style="width:200px;height:200px;top:-40px;right:28%"></div>
+<span class="sn">06 / 12</span>
+<div class="inner">
+<h2 class="r au d0 mb">Core Features</h2>
+<div class="fg">
+<div class="fc r ap d1"><span class="ic" style="color:var(--cy)">&#9829;</span><h3>Probes</h3><p>Readiness &amp; failure gates &mdash; TCP, HTTP, log watch</p></div>
+<div class="fc r ap d2"><span class="ic" style="color:var(--gr)">&#8694;</span><h3>Replicas</h3><p>Parallel / sequential, Cartesian sweeps</p></div>
+<div class="fc r ap d3"><span class="ic" style="color:var(--cy)">&#123;&#123;&#125;&#125;</span><h3>Expressions</h3><p>Jinja2 $&#123;&#123;&#125;&#125; &mdash; variables, backends</p></div>
+<div class="fc r ap d4"><span class="ic" style="color:var(--gr)">&#128230;</span><h3>Artifacts</h3><p>Named URIs: fs://, file://, http://</p></div>
+<div class="fc r ap d5"><span class="ic" style="color:var(--cy)">&#9000;</span><h3>Live TUI</h3><p>Rich terminal &mdash; task status, logs</p></div>
+<div class="fc r ap d6"><span class="ic" style="color:var(--gr)">&#128203;</span><h3>Batch Mode</h3><p>sbatch, CSV-driven bulk sweeps</p></div>
+</div>
+</div>
+</section>
+
+<!-- 7: Modular Composition (native terminal + table) -->
+<section class="sec" id="s7">
+<div class="gbg"></div>
+<div class="orb og" style="width:260px;height:260px;top:-60px;left:20%"></div>
+<span class="sn">07 / 12</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">Modular Composition</span>
+<h2 class="r al d1 ms">Split. Reuse. Swap.</h2>
+<div class="two">
+<div class="term r al d2" style="font-size:clamp(.45rem,.75vw,.65rem)"><span class="hi">Input file composition (5 files &rarr; merged workflow):</span>
+
+&#9500;&#9472; <span class="cy">inference_x_v2/slurm_config.yaml</span>
+&#9474;   variables: [<span class="gr">SLURM_ACCOUNT</span>, <span class="gr">SLURM_PARTITION</span>, <span class="gr">SLURM_TIMELIMIT</span>, ...]
+&#9474;   backends: [slurm_cluster]
+&#9500;&#9472; <span class="cy">inference_x_v2/common_workflow.yaml</span>
+&#9474;   variables: [<span class="gr">SERVED_MODEL_NAME</span>, <span class="gr">MODEL_NAME</span>, ... <span class="wh">(+7)</span>]
+&#9474;   artifacts: [LOCAL_MODEL_PATH]
+&#9474;   operators: [dynamo, nginx]
+&#9474;   workflow.tasks: [load_image, install_dependency, gpu_monitor, ...]
+&#9500;&#9472; <span class="cy">vllm/prefill.yaml</span>
+&#9474;   variables: [<span class="gr">NUM_CTX_SERVERS</span>, <span class="gr">CTX_TP_SIZE</span>, ... <span class="wh">(+4)</span>]
+&#9474;   workflow.tasks: [prefill_server]
+&#9500;&#9472; <span class="cy">vllm/decode.yaml</span>
+&#9474;   variables: [<span class="gr">NUM_GEN_SERVERS</span>, <span class="gr">GEN_TP_SIZE</span>, ... <span class="wh">(+4)</span>]
+&#9474;   workflow.tasks: [decode_server]
+&#9492;&#9472; <span class="cy">benchmark_infmax.yaml</span> &rarr; <span class="yl">dynamo_benchmark</span>
+    variables: [<span class="gr">ISL</span>, <span class="gr">OSL</span>, <span class="gr">CONCURRENCY</span>, ... <span class="wh">(+1)</span>]
+    workflow.tasks: [benchmark_infmax]</div>
+<div>
+<table class="mtbl r ar d3">
+<thead><tr><th>Benefit</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><strong style="color:var(--txt)">Reuse</strong></td><td>Shared components written once, used by all variants</td></tr>
+<tr><td><strong style="color:var(--txt)">Swap</strong></td><td>Change benchmark by swapping <code>benchmark_aiperf</code> for <code>benchmark_infmax</code></td></tr>
+<tr><td><strong style="color:var(--txt)">Mix frameworks</strong></td><td>sglang + aiperf, vllm + infmax, trtllm + aiperf, etc.</td></tr>
+<tr><td><strong style="color:var(--txt)">Smaller diffs</strong></td><td>Changes to one component only touch one file</td></tr>
+<tr><td><strong style="color:var(--txt)">Bulk testing</strong></td><td>CSV combinations, generate/submit all at once</td></tr>
+<tr><td><strong style="color:var(--txt)">Computed vars</strong></td><td><code>GPUS_PER_WORKER</code> chains across modules</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+</section>
+
+<!-- 8: Error Analysis (real example — Job 1865443) -->
+<section class="sec" id="s8">
+<div class="gbg"></div>
+<div class="orb oc" style="width:220px;height:220px;bottom:-50px;left:15%"></div>
+<span class="sn">08 / 12</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">Real-world Debugging</span>
+<h2 class="r al d1 ms">Structured Error Analysis</h2>
+<div class="two">
+<div>
+<div class="term r al d2" style="font-size:clamp(.42rem,.68vw,.58rem);margin-bottom:var(--gap)"><span class="hi">Workflow:</span> <span class="cy">b200-fp8-low-latency-tep8-1p-1d</span>
+Model: DeepSeek R1 FP8 | 2 nodes &times; 8 GPUs | ISL=8192, OSL=1024
+
+<span class="hi">Allocation Map</span>
+&#9500;&#9472; <span class="gr">slurm-node-01</span> (node 0)
+&#9474;   GPU 0-7: <span class="cy">prefill_server_0</span> (TP=8)
+&#9474;   Also: load_image, nats, etcd, frontend, benchmark_*
+&#9492;&#9472; <span class="gr">slurm-node-02</span> (node 1)
+    GPU 0-7: <span class="yl">decode_server_0</span> (TP=8)
+    Also: load_image, gpu_monitor
+
+<span class="hi">Timeline</span>
+01:57:08 &mdash; load_image + install_aiperf <span class="wh">submitted</span>
+01:59:10 &mdash; load_image <span class="gr">COMPLETED</span> on both nodes
+01:59:43 &mdash; nats_server <span class="gr">READY</span>
+01:59:45 &mdash; etcd_server <span class="gr">READY</span>
+02:00:31 &mdash; frontend_server_0 <span class="gr">READY</span> (10.52.32.8)
+02:05:14 &mdash; prefill + decode <span class="gr">READY</span> &rarr; benchmark_4 starts
+02:05:20 &mdash; <span class="rd">HTTP 500</span> &mdash; all benchmark requests fail
+02:05:41 &mdash; Workflow finished (8m 33s)
+
+<span class="rd">Error from frontend logs:</span>
+<span class="wh">Invalid TCP address 'dynamo_prefill.generate-58b49ce145f56609'</span>
+<span class="wh">Invalid TCP address 'dynamo_backend.generate-58b49ce145f5660b'</span></div>
+</div>
+<div>
+<p class="r ar d3 ms" style="font-size:var(--s);color:var(--txt)">Diagnosis &mdash; sflow orchestration vs application error</p>
+<table class="mtbl r ar d3">
+<thead><tr><th>Layer</th><th>Status</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td><span class="green">sflow</span></td><td style="color:var(--gr)">&#10003; OK</td><td>DAG executed, all tasks launched, probes passed</td></tr>
+<tr><td><span class="green">GPU alloc</span></td><td style="color:var(--gr)">&#10003; OK</td><td>8 GPUs/node, no overlap, TP=8 per server</td></tr>
+<tr><td><span class="green">Infra</span></td><td style="color:var(--gr)">&#10003; OK</td><td>etcd, NATS, frontend all READY</td></tr>
+<tr><td><span style="color:#ff7b72">Routing</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>Frontend gets service names, not host:port</td></tr>
+<tr><td><span style="color:#ff7b72">Benchmark</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>0/800 requests succeed (all HTTP 500)</td></tr>
+</tbody>
+</table>
+<div class="term r ar d5" style="font-size:clamp(.42rem,.65vw,.55rem);margin-top:var(--gap)"><span class="hi">Root Cause</span>
+Frontend receives <span class="rd">discovery service names</span>
+(e.g. dynamo_prefill.generate-58b49...)
+instead of <span class="gr">host:port</span> addresses.
+
+NATS/etcd service registry returns internal
+identifiers that the TCP router can't parse.
+
+<span class="yl">Fix:</span> Verify DYN_REQUEST_PLANE and frontend
+networking config match SGLang disagg routing.</div>
+</div>
+</div>
+</div>
+</section>
+
+<!-- 9: CLI -->
+<section class="sec" id="s9">
+<div class="gbg"></div>
+<span class="sn">09 / 12</span>
+<div class="inner">
+<h2 class="r au d0 mb">CLI at a Glance</h2>
+<table class="mtbl r au d1" style="max-width:800px">
+<thead><tr><th>Command</th><th>Purpose</th><th>Key Flags</th></tr></thead>
+<tbody>
+<tr><td><code>sflow run</code></td><td>Execute a workflow</td><td><code>--dry-run</code> <code>--tui</code> <code>--set</code></td></tr>
+<tr><td><code>sflow batch</code></td><td>Generate sbatch scripts</td><td><code>--submit</code> <code>--bulk-input</code></td></tr>
+<tr><td><code>sflow compose</code></td><td>Merge multiple YAMLs</td><td><code>--resolve</code> <code>--validate</code></td></tr>
+<tr><td><code>sflow visualize</code></td><td>Render DAG image</td><td><code>--format png/svg/mermaid</code></td></tr>
+<tr><td><code>sflow sample</code></td><td>List / copy examples</td><td><code>--list</code> <code>-o</code></td></tr>
+<tr><td><code>sflow skill</code></td><td>Export AI agent skills</td><td><code>--list</code> <code>-o</code></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- 10: AI Agent Skills -->
+<section class="sec" id="s10">
+<div class="gbg"></div>
+<div class="orb og" style="width:280px;height:280px;top:-50px;left:-60px"></div>
+<div class="pt" style="width:4px;height:4px;background:var(--cy);top:30%;left:85%;opacity:.3;animation-duration:16s;animation-delay:3s"></div>
+<span class="sn">10 / 12</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">AI-Native</span>
+<h2 class="r al d1 ms">Built-in Agent Skills</h2>
+<div class="two">
+<div>
+<p class="r au d2 ms">sflow ships with AI agent skills that teach coding assistants (Cursor, Copilot) how to write sflow YAML and debug errors &mdash; no training required.</p>
+<div class="term r al d3" style="font-size:clamp(.45rem,.75vw,.65rem)"><span class="cy">$ sflow skill --list</span>
+
+<span class="hi">Available AI agent skills:</span>
+
+  - <span class="gr">writing-sflow-yaml</span>          Schema, examples, validation
+  - <span class="gr">sflow-error-analysis</span>        Error catalog, diagnostics
+
+  + <span class="yl">AGENTS.md</span> (agent workflow guidelines)
+
+<span class="cy">$ sflow skill -o .cursor/skills</span>
+<span class="hi">Skills will be copied to: .cursor/skills/</span>
+  Note: directory exists &mdash; files will be merged.
+<span class="gr">&#10003; Skills copied to: .cursor/skills/</span></div>
+</div>
+<div>
+<p class="r ar d3 ms" style="font-size:var(--s);color:var(--txt)">What the agent learns from AGENTS.md</p>
+<table class="mtbl r ar d3">
+<thead><tr><th>Capability</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td><span class="accent">Write YAML</span></td><td>Schema-aware config authoring with validation</td></tr>
+<tr><td><span class="accent">Debug errors</span></td><td>Categorize errors, read logs, suggest fixes</td></tr>
+<tr><td><span class="accent">GPU planning</span></td><td>TP/DP/PP sizing, node allocation math</td></tr>
+<tr><td><span class="accent">Modular compose</span></td><td>Split configs, missable tasks, CSV sweeps</td></tr>
+<tr><td><span class="accent">Step-by-step</span></td><td>Hardcode first &rarr; validate &rarr; parameterize</td></tr>
+</tbody>
+</table>
+<div class="term r ar d5" style="font-size:clamp(.42rem,.65vw,.55rem);margin-top:var(--gap)"><span class="hi">AGENTS.md workflow</span>
+1. Gather cluster info (account, partition, GPUs)
+2. Write minimal plain-text config
+3. <span class="cy">sflow run --dry-run</span> to validate
+4. Run and debug with <span class="cy">--tui</span>
+5. Extract variables, parameterize
+6. Modularize for multi-framework support</div>
+</div>
+</div>
+</div>
+</section>
+
+<!-- 11: Heterogeneous Computing Vision -->
+<section class="sec" id="s11">
+<div class="gbg"></div>
+<div class="orb oc" style="width:300px;height:300px;top:-60px;left:-80px"></div>
+<div class="orb og" style="width:250px;height:250px;bottom:-70px;right:-50px"></div>
+<span class="sn">11 / 12</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">Vision</span>
+<h2 class="r al d1 ms">Heterogeneous Computing</h2>
+<p class="r au d2" style="max-width:720px">As a top-level orchestration abstraction, sflow is uniquely positioned to unify heterogeneous compute &mdash; allocating the right accelerator from the right resource pool for each stage of a disaggregated pipeline.</p>
+<div class="r as d3" style="width:100%;max-width:650px;margin:0 auto">
+<svg viewBox="0 0 650 140" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
+<defs><linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#e3b341"/></linearGradient></defs>
+<!-- Resource pools (left) -->
+<rect x="10" y="10" width="120" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="70" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="10" font-weight="600">Vera Rubin</text>
+<text x="70" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">GPU pool &bull; Prefill</text>
+<rect x="10" y="80" width="120" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="70" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="10" font-weight="600">LPU Cluster</text>
+<text x="70" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">Accelerator &bull; Decode</text>
+<!-- sflow center -->
+<circle cx="325" cy="70" r="35" fill="#060a10" stroke="url(#hg)" stroke-width="2.5"/>
+<text x="325" y="76" text-anchor="middle" fill="#76ff03" font-family="'Archivo Black',sans-serif" font-size="13" font-weight="800">sflow</text>
+<!-- Disaggregated output (right) -->
+<rect x="500" y="10" width="140" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="570" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="10" font-weight="600">prefill_server</text>
+<text x="570" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">Vera Rubin GPUs</text>
+<rect x="500" y="80" width="140" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="570" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="10" font-weight="600">decode_server</text>
+<text x="570" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">LPU accelerators</text>
+<!-- Wires: pools -> sflow -->
+<path d="M130,35 C210,35 250,65 290,70" fill="none" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
+<path d="M130,105 C210,105 250,75 290,70" fill="none" stroke="#e3b341" stroke-width="2" opacity="0.6"/>
+<!-- Wires: sflow -> tasks (animated) -->
+<path id="hw1" d="M360,62 C400,50 440,35 500,35" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
+<path id="hw2" d="M360,78 C400,90 440,105 500,105" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
+<circle r="3.5" fill="#00d4ff"><animateMotion dur="2s" repeatCount="indefinite"><mpath href="#hw1"/></animateMotion></circle>
+<circle r="3.5" fill="#e3b341"><animateMotion dur="2s" repeatCount="indefinite"><mpath href="#hw2"/></animateMotion></circle>
+<!-- Arrows -->
+<polygon points="495,30 505,35 495,40" fill="#00d4ff" opacity="0.6"/>
+<polygon points="495,100 505,105 495,110" fill="#e3b341" opacity="0.6"/>
+</svg>
+</div>
+<p class="r au d4" style="max-width:720px;font-size:var(--s)">Example: PD disaggregation &mdash; one <code>sflow.yaml</code> routes prefill to <span class="accent">Vera Rubin GPU pools</span> for maximum throughput, and decode to <span style="color:#e3b341">LPU accelerators</span> for low-latency token generation. Each task lands on the optimal hardware automatically.</p>
+</div>
+</section>
+
+<!-- 12: Closing -->
+<section class="sec" id="s12">
+<div class="gbg"></div>
+<div class="orb oc" style="width:420px;height:420px;bottom:-160px;left:28%"></div>
+<div class="orb og" style="width:280px;height:280px;top:-90px;right:18%"></div>
+<span class="sn">12 / 12</span>
+<div class="inner" style="align-items:center;text-align:center">
+<span class="pill pc r ap d0 ms">What&rsquo;s Next</span>
+<h2 class="r au d1 mb">Slurm today. Docker &amp; Kubernetes tomorrow.</h2>
+<p class="r au d2" style="max-width:620px">Slurm lacks a workflow orchestration layer &mdash; that&rsquo;s where sflow starts. Docker and K8S backends are planned, leveraging native ecosystems (Helm charts, Argo Workflows).</p>
+<div class="r au d3" style="margin-top:var(--gap);display:flex;gap:calc(var(--gap)*.6);flex-wrap:wrap;justify-content:center">
+<span class="pill pg">Slurm &#10003;</span>
+<span class="pill pc" style="opacity:.45">Docker (planned)</span>
+<span class="pill pc" style="opacity:.45">Kubernetes (planned)</span>
+</div>
+<div class="r au d4" style="margin-top:var(--gap)">
+<p style="font-size:var(--b)"><span class="accent">$</span> uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main" </p>
+<p style="font-size:var(--s);margin-top:.4em"><a href="https://github.com/NVIDIA/nv-sflow" style="color:var(--cy);text-decoration:none">github.com/NVIDIA/nv-sflow</a></p>
+</div>
+</div>
+</section>
+
+<script>
+(function(){
+var D=6500,secs=document.querySelectorAll('.sec'),
+dotsEl=document.getElementById('dots'),prog=document.getElementById('prog'),
+tmr=document.getElementById('tmr'),badge=document.getElementById('badge'),
+N=secs.length,cur=0,paused=false,timer=null;
+for(var i=0;i<N;i++){var d=document.createElement('button');d.className='dot';d.setAttribute('data-i',i);d.onclick=function(){go(+this.getAttribute('data-i'))};dotsEl.appendChild(d)}
+var dots=dotsEl.querySelectorAll('.dot');
+function activate(i){for(var j=0;j<N;j++)secs[j].classList.remove('on');secs[i].classList.add('on');for(var j=0;j<N;j++)dots[j].classList.toggle('on',j===i);prog.style.width=((i+1)/N*100)+'%';startTimer()}
+function startTimer(){tmr.style.transition='none';tmr.style.width='0%';requestAnimationFrame(function(){requestAnimationFrame(function(){tmr.style.transition='width '+D+'ms linear';tmr.style.width='100%'})})}
+function go(i){cur=((i%N)+N)%N;secs[cur].scrollIntoView({behavior:'smooth'});activate(cur);resetAuto()}
+function next(){if(!paused)go(cur+1)}
+function resetAuto(){clearInterval(timer);if(!paused)timer=setInterval(next,D)}
+document.addEventListener('click',function(e){if(e.target.closest('.dot'))return;paused=!paused;badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()});
+document.addEventListener('keydown',function(e){if(e.key==='p'||e.key==='P'){document.body.click();return}if(['ArrowDown',' ','ArrowRight','PageDown'].indexOf(e.key)>=0){e.preventDefault();go(cur+1)}else if(['ArrowUp','ArrowLeft','PageUp'].indexOf(e.key)>=0){e.preventDefault();go(cur-1)}});
+var obs=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){for(var i=0;i<N;i++)if(secs[i]===e.target){cur=i;activate(i);break}}})},{threshold:.4});
+for(var i=0;i<N;i++)obs.observe(secs[i]);
+activate(0);timer=setInterval(next,D);
+})();
+</script>
+</body>
+</html>

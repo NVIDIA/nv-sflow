@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -11,6 +12,23 @@ from pydantic import Field, model_validator
 from sflow.core.command import Command
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.operator_registry import register_operator
+
+# Matches remote registry references: [registry[:port]/][org/]name[:tag][@digest]
+_REGISTRY_IMAGE_RE = re.compile(
+    r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*(@[a-zA-Z][a-zA-Z0-9]*:[a-fA-F0-9]+)?$"
+)
+
+
+def _is_valid_container_image(image: str) -> bool:
+    """Return True if *image* looks like a remote registry reference or a local .sqsh file."""
+    if not image or not image.strip():
+        return False
+    image = image.strip()
+    if "${{" in image or "${" in image:
+        return True
+    if image.endswith(".sqsh"):
+        return True
+    return bool(_REGISTRY_IMAGE_RE.match(image))
 
 
 class SrunOperatorConfig(OperatorConfig):
@@ -75,6 +93,28 @@ class SrunOperatorConfig(OperatorConfig):
             raise ValueError(
                 "srun operator config: 'container_image' and 'container_name' cannot both be set"
             )
+
+        _invalid_img_hint = (
+            "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag') "
+            "or a local .sqsh file path (e.g. '/path/to/image.sqsh')"
+        )
+        if self.container_image and not _is_valid_container_image(self.container_image):
+            raise ValueError(
+                f"srun operator config: 'container_image' does not look like a valid "
+                f"container image. {_invalid_img_hint}, got: '{self.container_image}'"
+            )
+        for _i, _arg in enumerate(self.extra_args):
+            _img_val: str | None = None
+            if _arg.startswith("--container-image="):
+                _img_val = _arg.split("=", 1)[1]
+            elif _arg == "--container-image" and _i + 1 < len(self.extra_args):
+                _img_val = self.extra_args[_i + 1]
+            if _img_val is not None and not _is_valid_container_image(_img_val):
+                raise ValueError(
+                    f"srun operator config: '--container-image' in extra_args does not "
+                    f"look like a valid container image. {_invalid_img_hint}, "
+                    f"got: '{_img_val}'"
+                )
 
         # Coerce string values to int for numeric fields
         def _to_int(val: int | str | None) -> int | None:

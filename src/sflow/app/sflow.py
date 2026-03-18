@@ -1,15 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import logging
-from collections import deque
 import os
+from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sflow.app.assembly import build_state, release_backends
 from sflow.config.loader import ConfigLoader
 from sflow.logging import add_log_file, get_logger
+
+if TYPE_CHECKING:
+    from sflow.config.schema import SflowConfig
 
 _logger = get_logger(__name__)
 
@@ -39,6 +44,160 @@ def extract_container_mounts_from_extra_args(extra_args: list[str]) -> list[str]
     return mounts
 
 
+def parse_cuda_visible_devices(cuda_visible: str | None) -> list[int]:
+    """
+    Parse CUDA_VISIBLE_DEVICES into a list of GPU indices.
+
+    Supports comma-separated indices and simple ranges like ``0-3``.
+    Non-numeric tokens are ignored.
+    """
+    if not cuda_visible:
+        return []
+
+    indices: list[int] = []
+    for part in str(cuda_visible).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            try:
+                start_i = int(start_s)
+                end_i = int(end_s)
+            except ValueError:
+                continue
+            if start_i <= end_i:
+                indices.extend(range(start_i, end_i + 1))
+            continue
+        try:
+            indices.append(int(token))
+        except ValueError:
+            continue
+    return indices
+
+
+def build_allocation_map_lines(tasks: list[Any], backends: dict[str, Any]) -> list[str]:
+    """
+    Build a terminal-friendly allocation map for finalized node and GPU assignments.
+    """
+
+    def _unique_preserve(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
+    def _shorten(value: str, max_len: int = 18) -> str:
+        if len(value) <= max_len:
+            return value
+        return value[: max_len - 3] + "..."
+
+    lines: list[str] = []
+    for backend_name, backend in backends.items():
+        alloc = getattr(backend, "allocation", None)
+        if alloc is None or not getattr(alloc, "nodes", None):
+            continue
+
+        backend_tasks = [
+            task
+            for task in tasks
+            if getattr(task, "backend_name", None) == backend_name
+        ]
+        if not backend_tasks:
+            continue
+
+        node_map: dict[str, dict[str, Any]] = {}
+        ordered_node_names: list[str] = []
+        for node in alloc.nodes:
+            num_gpus = getattr(node, "num_gpus", None)
+            try:
+                num_gpus = int(num_gpus) if num_gpus is not None else None
+            except Exception:
+                num_gpus = None
+            node_map[node.name] = {
+                "num_gpus": num_gpus,
+                "gpu_owners": {},
+                "tasks": [],
+            }
+            ordered_node_names.append(node.name)
+
+        for task in backend_tasks:
+            assigned_nodes = list(getattr(task, "assigned_nodes", None) or [])
+            if not assigned_nodes:
+                op_conf = getattr(getattr(task, "operator", None), "config", None)
+                assigned_nodes = list(getattr(op_conf, "nodelist", None) or [])
+            if not assigned_nodes and alloc.nodes:
+                assigned_nodes = [node.name for node in alloc.nodes]
+
+            gpu_indices = parse_cuda_visible_devices(
+                getattr(task, "envs", {}).get("CUDA_VISIBLE_DEVICES")
+            )
+
+            for node_name in assigned_nodes:
+                if node_name not in node_map:
+                    node_map[node_name] = {
+                        "num_gpus": None,
+                        "gpu_owners": {},
+                        "tasks": [],
+                    }
+                    ordered_node_names.append(node_name)
+                entry = node_map[node_name]
+                entry["tasks"].append(task.name)
+                for gpu_idx in gpu_indices:
+                    owners = entry["gpu_owners"].setdefault(gpu_idx, [])
+                    owners.append(task.name)
+
+        lines.append(f"  - backend '{backend_name}':")
+        for node_name in ordered_node_names:
+            entry = node_map[node_name]
+            num_gpus = entry["num_gpus"]
+            task_names = _unique_preserve(entry["tasks"])
+            lines.append(f"    ├─ node {node_name}")
+            if num_gpus is not None and num_gpus > 0:
+                for gpu_idx in range(num_gpus):
+                    owners = _unique_preserve(entry["gpu_owners"].get(gpu_idx, []))
+                    label = _shorten("/".join(owners) if owners else ".")
+                    lines.append(f"    │  GPU {gpu_idx}: {label}")
+            else:
+                lines.append("    │  GPUs: n/a")
+            lines.append(
+                "    │  Tasks: " + (", ".join(task_names) if task_names else "(none)")
+            )
+    return lines
+
+
+def _merge_backend_extra_args(
+    config: SflowConfig,
+    cli_extra_args: list[str],
+) -> SflowConfig:
+    """Merge CLI-provided extra_args into every slurm-type backend, deduplicating."""
+    if not config.backends:
+        return config
+
+    updated_backends = []
+    merged_any = False
+    for b in config.backends:
+        if b.type != "slurm" or not hasattr(b, "extra_args"):
+            updated_backends.append(b)
+            continue
+        existing = list(b.extra_args or [])
+        existing_set = {str(a) for a in existing}
+        for arg in cli_extra_args:
+            if arg not in existing_set:
+                existing.append(arg)
+                existing_set.add(arg)
+        updated_backends.append(b.model_copy(update={"extra_args": existing}))
+        merged_any = True
+
+    if merged_any:
+        _logger.info(f"Merged CLI extra_args into slurm backend(s): {cli_extra_args}")
+        return config.model_copy(update={"backends": updated_backends})
+    return config
+
+
 class SflowApp:
     """
     Application facade used by CLI/UI integrations.
@@ -51,11 +210,16 @@ class SflowApp:
     def run(
         self,
         *,
-        file: Path,
+        file: Path | list[Path],
         dry_run: bool = False,
+        quiet: bool = False,
         resume: str | None = None,
         variable_overrides: list[str] | None = None,
         artifact_overrides: list[str] | None = None,
+        missable_tasks: list[str] | None = None,
+        backend_extra_args: list[str] | None = None,
+        slurm_nodes: int | None = None,
+        slurm_gpus_per_node: int | None = None,
         workspace_dir: Path | None = None,
         output_dir: Path | None = None,
         tui: bool = False,
@@ -79,10 +243,49 @@ class SflowApp:
         # Reset from previous runs
         self.last_workflow_output_dir = None
 
-        # load the config
-        config = ConfigLoader().load_config(
-            file, variable_overrides, artifact_overrides
+        # load the config (supports single path or multiple paths for merging)
+        files = [file] if isinstance(file, Path) else list(file)
+        _loader = ConfigLoader()
+        config = _loader.load_configs(
+            files, variable_overrides, artifact_overrides, missable_tasks
         )
+        _missable_stripped = _loader.missable_stripped
+
+        if backend_extra_args:
+            config = _merge_backend_extra_args(config, backend_extra_args)
+
+        if slurm_nodes is not None or slurm_gpus_per_node is not None:
+            for b in config.backends or []:
+                if getattr(b, "type", None) == "slurm":
+                    if slurm_nodes is not None:
+                        existing_nodes = getattr(b, "nodes", None)
+                        if (
+                            existing_nodes is not None
+                            and existing_nodes != slurm_nodes
+                            and not (
+                                isinstance(existing_nodes, str)
+                                and "${{" in existing_nodes
+                            )
+                        ):
+                            _logger.warning(
+                                f"Backend '{b.name}' has nodes={existing_nodes}, "
+                                f"overriding with CLI --nodes={slurm_nodes}"
+                            )
+                        b.nodes = slurm_nodes
+                    if slurm_gpus_per_node is not None:
+                        existing_gpn = getattr(b, "gpus_per_node", None)
+                        if (
+                            existing_gpn is not None
+                            and existing_gpn != slurm_gpus_per_node
+                            and not (
+                                isinstance(existing_gpn, str) and "${{" in existing_gpn
+                            )
+                        ):
+                            _logger.warning(
+                                f"Backend '{b.name}' has gpus_per_node={existing_gpn}, "
+                                f"overriding with CLI --gpus-per-node={slurm_gpus_per_node}"
+                            )
+                        b.gpus_per_node = slurm_gpus_per_node
 
         async def _run_async() -> Path | None:
             import atexit
@@ -195,6 +398,89 @@ class SflowApp:
                         # Not supported on some platforms / threads.
                         pass
 
+                # Pre-flight: validate artifact paths before allocation.
+                # fs:// artifacts must already exist; fail early so we never waste
+                # a Slurm allocation on a missing path.
+                def _preflight_validate_artifacts(
+                    artifact_configs: list | None,
+                    workspace_dir: Path,
+                ) -> None:
+                    from urllib.parse import urlparse
+
+                    from sflow.core.artifact_registry import (
+                        resolve_file_like_uri_to_path,
+                    )
+
+                    raw_vars: dict[str, Any] = {}
+                    for v_conf in config.variables or []:
+                        if hasattr(v_conf, "name") and hasattr(v_conf, "value"):
+                            val = v_conf.value
+                            if val is not None and not (
+                                isinstance(val, str) and "${{" in val
+                            ):
+                                raw_vars[v_conf.name] = val
+
+                    errors: list[str] = []
+                    warnings: list[str] = []
+                    for a_conf in artifact_configs or []:
+                        uri = str(a_conf.uri)
+                        if "${{" in uri:
+                            import re as _re_art
+
+                            def _resolve_var(m: _re_art.Match) -> str:
+                                ref = m.group(1).strip()
+                                if ref.startswith("variables."):
+                                    name = ref[len("variables.") :]
+                                    if name in raw_vars:
+                                        return str(raw_vars[name])
+                                return m.group(0)
+
+                            uri = _re_art.sub(r"\$\{\{(.+?)\}\}", _resolve_var, uri)
+                            if "${{" in uri:
+                                continue
+                        try:
+                            scheme = (urlparse(uri).scheme or "").lower()
+                        except Exception:
+                            continue
+                        if scheme not in {"fs", "file"}:
+                            continue
+                        # file:// artifacts with inline content are generated at runtime
+                        # under the workflow output directory — no need to check existence.
+                        if (
+                            scheme == "file"
+                            and getattr(a_conf, "content", None) is not None
+                        ):
+                            continue
+                        try:
+                            resolved = resolve_file_like_uri_to_path(
+                                uri, workspace_dir=workspace_dir
+                            )
+                        except Exception:
+                            continue
+                        path_str = str(resolved)
+                        if "$" in path_str or "{" in path_str:
+                            continue
+                        if not resolved.exists():
+                            if scheme == "fs":
+                                errors.append(
+                                    f"Artifact '{a_conf.name}' (fs://) path does not exist: {resolved}"
+                                )
+                            else:
+                                warnings.append(
+                                    f"Artifact '{a_conf.name}' (file://) path does not exist: {resolved}"
+                                )
+                    if errors:
+                        for e in errors:
+                            _logger.error(f"  ✗ {e}")
+                    if warnings:
+                        for w in warnings:
+                            _logger.warning(f"  ⚠ {w}")
+                    if errors:
+                        details = "\n".join(f"  - {e}" for e in errors)
+                        raise ValueError(f"Artifact path validation failed:\n{details}")
+
+                _preflight_validate_artifacts(config.artifacts, ws_dir)
+
                 # build the state:
                 # - dry-run: never allocates
                 allocate = not dry_run
@@ -203,6 +489,7 @@ class SflowApp:
                     build_kw: dict[str, Any] = {
                         "allocate": allocate,
                         "output_dir": workflow_out_dir,
+                        "source_files": files,
                     }
                     if workspace_dir is not None:
                         build_kw["workspace_dir"] = ws_dir
@@ -371,46 +658,6 @@ class SflowApp:
                     plan_tasks = tg.get_tasks()
                     order = tg.dag.topological_sort()
 
-                    # Validate artifact paths (fs:// and file:// schemes)
-                    def _validate_artifact_paths(
-                        artifacts: dict,
-                    ) -> list[str]:
-                        """Check if artifact filesystem paths exist."""
-                        from urllib.parse import urlparse
-
-                        warnings: list[str] = []
-                        for name, art in (artifacts or {}).items():
-                            uri = getattr(art, "uri", "") or ""
-                            try:
-                                scheme = (urlparse(str(uri)).scheme or "").lower()
-                            except Exception:
-                                scheme = ""
-                            # Only validate local filesystem artifacts
-                            if scheme not in {"fs", "file"}:
-                                continue
-                            art_path = getattr(art, "path", None)
-                            if art_path is None:
-                                continue
-                            # Skip paths with unresolved variables
-                            path_str = str(art_path)
-                            if "$" in path_str or "{" in path_str:
-                                continue
-                            if not Path(art_path).exists():
-                                warnings.append(
-                                    f"Artifact '{name}' (type: '{scheme}') path does not exist: {art_path}"
-                                )
-                                if scheme == "file":
-                                    warnings.append(
-                                        "\tBut you can ignore this warning since 'file' type artifact will be created at runtime."
-                                    )
-                        return warnings
-
-                    artifact_warnings = _validate_artifact_paths(state.artifacts)
-                    if artifact_warnings:
-                        _logger.warning("Artifact path validation warnings:")
-                        for w in artifact_warnings:
-                            _logger.warning(f"  ⚠ {w}")
-
                     # Validate container mount paths (REQ: warn users about invalid mounts)
                     def _validate_container_mounts(
                         tasks: list, *, sflow_output_dir: Path
@@ -466,6 +713,48 @@ class SflowApp:
                             if getattr(t, "backend_name", None)
                         }
                     )
+                    _logger.info("")
+                    _logger.info("─" * 60)
+                    _logger.info(f"  Dry-run: {config.workflow.name}")
+                    _logger.info("─" * 60)
+
+                    if len(files) > 1 and _loader.file_contributions:
+                        _logger.info("")
+                        _logger.info(
+                            f"Input file composition ({len(files)} files → merged workflow):"
+                        )
+                        _logger.info("")
+                        for i, contrib in enumerate(_loader.file_contributions):
+                            is_last = i == len(_loader.file_contributions) - 1
+                            fname = contrib["path"].name
+                            parent = contrib["path"].parent.name
+                            label = (
+                                f"{parent}/{fname}"
+                                if parent and parent != "."
+                                else fname
+                            )
+                            connector = "└─" if is_last else "├─"
+                            arrow = " ──►" if is_last else ""
+                            _logger.info(
+                                f"  {connector} {label}{arrow} {config.workflow.name}"
+                                if is_last
+                                else f"  {connector} {label}"
+                            )
+                            for sec_name, sec_items in contrib["sections"]:
+                                branch = " " if is_last else "│"
+                                items_str = ", ".join(sec_items[:5])
+                                if len(sec_items) > 5:
+                                    items_str += f", … (+{len(sec_items) - 5})"
+                                _logger.info(f"  {branch}    {sec_name}: [{items_str}]")
+                        _logger.info("")
+
+                    if _missable_stripped:
+                        _logger.warning(
+                            f"Missable tasks: removed {len(_missable_stripped)} reference(s) to absent tasks:"
+                        )
+                        for _ms in _missable_stripped:
+                            _logger.warning(f"  ⚠ {_ms}")
+                    _logger.info("")
                     _logger.info("Dry-run plan:")
                     _logger.info(f"- workspace_dir: {ws_dir}")
                     _logger.info(f"- output_dir: {out_dir}")
@@ -516,9 +805,43 @@ class SflowApp:
                                 f"  - backend {b_name}: type={b_type}, allocated=yes, allocation_id={alloc.allocation_id}, nodes={nodes}"
                             )
 
-                    # Collect and print all container mounts across tasks
-                    # Skip sflow auto-generated output directory mounts
-                    # Also extract --container-mounts from extra_args
+                        b_conf = getattr(backend, "config", None)
+                        if (
+                            b_conf is not None
+                            and getattr(b_conf, "type", None) == "slurm"
+                        ):
+                            details: list[tuple[str, str]] = []
+                            for attr in (
+                                "account",
+                                "partition",
+                                "nodes",
+                                "gpus_per_node",
+                                "time",
+                                "job_name",
+                            ):
+                                val = getattr(b_conf, attr, None)
+                                if val is not None:
+                                    details.append((attr, str(val)))
+                            b_extra = getattr(b_conf, "extra_args", None)
+                            if b_extra:
+                                details.append(("extra_args", str(list(b_extra))))
+                            if details:
+                                _logger.info(
+                                    f"    Slurm cluster details for '{b_name}':"
+                                )
+                                for i, (key, val) in enumerate(details):
+                                    prefix = "└─" if i == len(details) - 1 else "├─"
+                                    _logger.info(f"      {prefix} {key}: {val}")
+
+                    allocation_map_lines = build_allocation_map_lines(
+                        plan_tasks, state.backends
+                    )
+                    if allocation_map_lines:
+                        _logger.info("")
+                        _logger.info("Allocation map (finalized node/GPU assignment):")
+                        for line in allocation_map_lines:
+                            _logger.info(line)
+
                     all_mounts: set[str] = set()
                     for task_name in order:
                         task = tg.get_task(task_name)
@@ -526,15 +849,12 @@ class SflowApp:
                             getattr(task, "operator", None), "config", None
                         )
                         if task_op_conf is not None:
-                            # Get mounts from container_mounts field
                             mounts = getattr(task_op_conf, "container_mounts", None)
                             if mounts:
                                 for mount in mounts:
-                                    # Skip sflow output directory mounts (auto-generated)
                                     if "sflow_output" in mount.lower():
                                         continue
                                     all_mounts.add(mount)
-                            # Also get mounts from extra_args
                             extra_args = getattr(task_op_conf, "extra_args", None)
                             if extra_args:
                                 for mount in extract_container_mounts_from_extra_args(
@@ -549,119 +869,240 @@ class SflowApp:
                         for mount in sorted(all_mounts):
                             _logger.info(f"  - {mount}")
 
-                    # Tasks detail
                     _logger.info("")
-                    _logger.info("=" * 60)
-                    _logger.info("Tasks:")
-                    _logger.info("=" * 60)
-                    for idx, name in enumerate(order, 1):
-                        t = tg.get_task(name)
-                        deps = tg.dag.get_dependencies(name)
-                        op_conf = getattr(getattr(t, "operator", None), "config", None)
-                        op_type_str = getattr(op_conf, "type", None) or "unknown"
+                    _logger.info("Workflow DAG:")
+                    dag_lines = tg.dag.render_ascii()
+                    for dag_line in dag_lines:
+                        _logger.info(f"  {dag_line}")
 
-                        # Resources are best-effort inferred from runtime/envs for display.
-                        nodelist = getattr(op_conf, "nodelist", None) or []
-                        cuda_visible = t.envs.get("CUDA_VISIBLE_DEVICES")
-                        task_out_dir = t.envs.get("SFLOW_TASK_OUTPUT_DIR")
-                        retry = getattr(t, "retries", None)
-                        retry_str = (
-                            f"{retry.count}x, interval={retry.interval}, backoff={retry.backoff}"
-                            if retry is not None
-                            else "none"
-                        )
-
-                        # Task header
+                    if not quiet:
                         _logger.info("")
-                        _logger.info(f"  [{idx}] {t.name}")
-                        _logger.info(
-                            f"      ├─ backend: {getattr(t, 'backend_name', None)}"
-                        )
-                        _logger.info(f"      ├─ operator: {op_type_str}")
-                        _logger.info(f"      ├─ deps: {list(deps) if deps else '[]'}")
-                        _logger.info(f"      ├─ nodelist: {nodelist}")
-                        if cuda_visible:
+                        _logger.info("=" * 60)
+                        _logger.info("Tasks:")
+                        _logger.info("=" * 60)
+                        for idx, name in enumerate(order, 1):
+                            t = tg.get_task(name)
+                            deps = tg.dag.get_dependencies(name)
+                            op_conf = getattr(
+                                getattr(t, "operator", None), "config", None
+                            )
+                            op_type_str = getattr(op_conf, "type", None) or "unknown"
+
+                            nodelist = getattr(op_conf, "nodelist", None) or []
+                            cuda_visible = t.envs.get("CUDA_VISIBLE_DEVICES")
+                            task_out_dir = t.envs.get("SFLOW_TASK_OUTPUT_DIR")
+                            retry = getattr(t, "retries", None)
+                            retry_str = (
+                                f"{retry.count}x, interval={retry.interval}, backoff={retry.backoff}"
+                                if retry is not None
+                                else "none"
+                            )
+
+                            _logger.info("")
+                            _logger.info(f"  [{idx}] {t.name}")
                             _logger.info(
-                                f"      ├─ CUDA_VISIBLE_DEVICES: {cuda_visible}"
+                                f"      ├─ backend: {getattr(t, 'backend_name', None)}"
                             )
-                        _logger.info(f"      ├─ task_output_dir: {task_out_dir}")
-                        _logger.info(f"      ├─ retries: {retry_str}")
-
-                        # Sweep variables
-                        if t.sweep_variables:
-                            sweep_vals = {
-                                k: t.envs.get(k, "") for k in t.sweep_variables
-                            }
-                            sweep_items = ", ".join(
-                                f"{k}={v}" for k, v in sweep_vals.items()
+                            _logger.info(f"      ├─ operator: {op_type_str}")
+                            _logger.info(
+                                f"      ├─ depends_on: {list(deps) if deps else '[]'}"
                             )
-                            _logger.info(f"      ├─ sweep_vars: {{{sweep_items}}}")
+                            _logger.info(f"      ├─ nodelist: {nodelist}")
+                            if cuda_visible:
+                                _logger.info(
+                                    f"      ├─ CUDA_VISIBLE_DEVICES: {cuda_visible}"
+                                )
+                            _logger.info(f"      ├─ task_output_dir: {task_out_dir}")
+                            _logger.info(f"      ├─ retries: {retry_str}")
 
-                        # Operator config details
-                        if op_conf is not None:
-                            op_details: list[tuple[str, str]] = []
-                            # Common srun operator fields
-                            if getattr(op_conf, "nodes", None) is not None:
-                                op_details.append(("nodes", str(op_conf.nodes)))
-                            if getattr(op_conf, "ntasks", None) is not None:
-                                op_details.append(("ntasks", str(op_conf.ntasks)))
-                            if getattr(op_conf, "ntasks_per_node", None) is not None:
-                                op_details.append(
-                                    ("ntasks_per_node", str(op_conf.ntasks_per_node))
+                            if t.sweep_variables:
+                                sweep_vals = {
+                                    k: t.envs.get(k, "") for k in t.sweep_variables
+                                }
+                                sweep_items = ", ".join(
+                                    f"{k}={v}" for k, v in sweep_vals.items()
                                 )
-                            if getattr(op_conf, "cpus_per_task", None) is not None:
-                                op_details.append(
-                                    ("cpus_per_task", str(op_conf.cpus_per_task))
-                                )
-                            if getattr(op_conf, "gpus", None) is not None:
-                                op_details.append(("gpus", str(op_conf.gpus)))
-                            if getattr(op_conf, "gpus_per_task", None) is not None:
-                                op_details.append(
-                                    ("gpus_per_task", str(op_conf.gpus_per_task))
-                                )
-                            if getattr(op_conf, "container_image", None) is not None:
-                                op_details.append(
-                                    ("container_image", op_conf.container_image)
-                                )
-                            if getattr(op_conf, "container_name", None) is not None:
-                                op_details.append(
-                                    ("container_name", op_conf.container_name)
-                                )
-                            if getattr(op_conf, "container_mounts", None):
-                                mounts = op_conf.container_mounts
-                                if len(mounts) <= 3:
-                                    op_details.append(("container_mounts", str(mounts)))
-                                else:
-                                    op_details.append(
-                                        ("container_mounts", f"[{len(mounts)} mounts]")
+                                _logger.info(f"      ├─ sweep_vars: {{{sweep_items}}}")
+
+                            if t.probes:
+                                _logger.info("      ├─ probes:")
+                                for pi, probe in enumerate(t.probes):
+                                    is_last_probe = pi == len(t.probes) - 1
+                                    p_prefix = "└─" if is_last_probe else "├─"
+                                    probe_type = str(probe.type)
+                                    cls_name = probe.__class__.__name__
+                                    details: list[str] = []
+                                    if hasattr(probe, "_host") and hasattr(
+                                        probe, "_port"
+                                    ):
+                                        kind = "tcp_port"
+                                        details.append(
+                                            f"host={probe._host} (fake ip when dry-run, real ip when running)"
+                                        )
+                                        details.append(f"port={probe._port}")
+                                        on_node = getattr(probe, "_on_node", None)
+                                        if on_node:
+                                            details.append(f"on_node={on_node}")
+                                    elif hasattr(probe, "_url"):
+                                        kind = (
+                                            "http_get"
+                                            if "Get" in cls_name
+                                            else "http_post"
+                                        )
+                                        details.append(
+                                            f"url={probe._url} (fake ip when dry-run, real ip when running)"
+                                        )
+                                    elif hasattr(probe, "_regex"):
+                                        kind = "log_watch"
+                                        pat = (
+                                            getattr(probe, "_pattern_display", None)
+                                            or probe._regex.pattern
+                                        )
+                                        details.append(f"pattern={pat}")
+                                        mc = getattr(probe, "_match_count", 1)
+                                        if mc != 1:
+                                            details.append(f"match_count={mc}")
+                                        logger_name = getattr(
+                                            probe, "_logger_task_name", None
+                                        )
+                                        if logger_name:
+                                            details.append(f"logger={logger_name}")
+                                    else:
+                                        kind = cls_name
+                                    detail_str = (
+                                        f" ({', '.join(details)})" if details else ""
                                     )
-                            if getattr(op_conf, "mpi", None) is not None:
-                                op_details.append(("mpi", op_conf.mpi))
-                            if (
-                                getattr(op_conf, "job_id", None) is not None
-                                and getattr(op_conf, "job_id", None) != "0"
+                                    timing = (
+                                        f"delay={probe.delay}s, timeout={probe.timeout}s, "
+                                        f"interval={probe.interval}s"
+                                    )
+                                    connector = "   " if is_last_probe else "│  "
+                                    _logger.info(
+                                        f"         {p_prefix} {probe_type}: {kind}{detail_str}"
+                                    )
+                                    _logger.info(f"         {connector}  {timing}")
+
+                            if op_conf is not None:
+                                op_details: list[tuple[str, str]] = []
+                                if getattr(op_conf, "nodes", None) is not None:
+                                    op_details.append(("nodes", str(op_conf.nodes)))
+                                if getattr(op_conf, "ntasks", None) is not None:
+                                    op_details.append(("ntasks", str(op_conf.ntasks)))
+                                if (
+                                    getattr(op_conf, "ntasks_per_node", None)
+                                    is not None
+                                ):
+                                    op_details.append(
+                                        (
+                                            "ntasks_per_node",
+                                            str(op_conf.ntasks_per_node),
+                                        )
+                                    )
+                                if getattr(op_conf, "cpus_per_task", None) is not None:
+                                    op_details.append(
+                                        ("cpus_per_task", str(op_conf.cpus_per_task))
+                                    )
+                                if getattr(op_conf, "gpus", None) is not None:
+                                    op_details.append(("gpus", str(op_conf.gpus)))
+                                if getattr(op_conf, "gpus_per_task", None) is not None:
+                                    op_details.append(
+                                        ("gpus_per_task", str(op_conf.gpus_per_task))
+                                    )
+                                if (
+                                    getattr(op_conf, "container_image", None)
+                                    is not None
+                                ):
+                                    op_details.append(
+                                        ("container_image", op_conf.container_image)
+                                    )
+                                if getattr(op_conf, "container_name", None) is not None:
+                                    op_details.append(
+                                        ("container_name", op_conf.container_name)
+                                    )
+                                if getattr(op_conf, "container_mounts", None):
+                                    mounts = op_conf.container_mounts
+                                    if len(mounts) <= 3:
+                                        op_details.append(
+                                            ("container_mounts", str(mounts))
+                                        )
+                                    else:
+                                        op_details.append(
+                                            (
+                                                "container_mounts",
+                                                f"[{len(mounts)} mounts]",
+                                            )
+                                        )
+                                if getattr(op_conf, "mpi", None) is not None:
+                                    op_details.append(("mpi", op_conf.mpi))
+                                if (
+                                    getattr(op_conf, "job_id", None) is not None
+                                    and getattr(op_conf, "job_id", None) != "0"
+                                ):
+                                    op_details.append(("job_id", str(op_conf.job_id)))
+                                if getattr(op_conf, "extra_args", None):
+                                    extra_args_list = list(op_conf.extra_args)
+                                    if len(extra_args_list) <= 5:
+                                        op_details.append(
+                                            ("extra_args", str(extra_args_list))
+                                        )
+                                    else:
+                                        op_details.append(
+                                            (
+                                                "extra_args",
+                                                f"[{len(extra_args_list)} args]",
+                                            )
+                                        )
+
+                                if op_details:
+                                    _logger.info("      └─ operator config:")
+                                    for i, (key, val) in enumerate(op_details):
+                                        prefix = (
+                                            "└─" if i == len(op_details) - 1 else "├─"
+                                        )
+                                        _logger.info(f"         {prefix} {key}: {val}")
+                                else:
+                                    _logger.info("      └─ operator config: (default)")
+                        _logger.info("")
+                        _logger.info("=" * 60)
+
+                    # Check enroot credentials for srun operators using containers
+                    def _check_enroot_credentials(tasks: list) -> str | None:
+                        """Warn if any srun task uses a container but enroot credentials are missing."""
+                        uses_container = False
+                        for task in tasks:
+                            op_conf = getattr(
+                                getattr(task, "operator", None), "config", None
+                            )
+                            if op_conf is None:
+                                continue
+                            if getattr(op_conf, "type", None) != "srun":
+                                continue
+                            if getattr(op_conf, "container_image", None) or getattr(
+                                op_conf, "container_name", None
                             ):
-                                op_details.append(("job_id", str(op_conf.job_id)))
-                            if getattr(op_conf, "extra_args", None):
-                                extra_args_list = list(op_conf.extra_args)
-                                if len(extra_args_list) <= 5:
-                                    op_details.append(
-                                        ("extra_args", str(extra_args_list))
-                                    )
-                                else:
-                                    op_details.append(
-                                        ("extra_args", f"[{len(extra_args_list)} args]")
-                                    )
+                                uses_container = True
+                                break
+                        if not uses_container:
+                            return None
+                        creds_path = Path.home() / ".config" / "enroot" / ".credentials"
+                        if not creds_path.exists():
+                            return (
+                                f"srun operator uses container images but enroot credentials "
+                                f"file not found at {creds_path}. "
+                                f"Container pulls from authenticated registries (e.g. nvcr.io) "
+                                f"may fail. See: https://github.com/NVIDIA/enroot/blob/master/doc/cmd/import.md"
+                            )
+                        return None
 
-                            if op_details:
-                                _logger.info("      └─ operator config:")
-                                for i, (key, val) in enumerate(op_details):
-                                    prefix = "└─" if i == len(op_details) - 1 else "├─"
-                                    _logger.info(f"         {prefix} {key}: {val}")
-                            else:
-                                _logger.info("      └─ operator config: (default)")
+                    enroot_warning = _check_enroot_credentials(plan_tasks)
+                    if enroot_warning:
+                        _logger.warning(f"  ⚠ {enroot_warning}")
+
                     _logger.info("")
-                    _logger.info("=" * 60)
+                    _logger.info("─" * 60)
+                    _logger.info(f"  Dry-run complete: {config.workflow.name}")
+                    _logger.info("─" * 60)
+
                     return None  # dry-run: no actual output directory created
 
                 # run the workflow and always release backend allocations
@@ -720,10 +1161,13 @@ class SflowApp:
     def visualize(
         self,
         *,
-        file: Path,
+        file: Path | list[Path],
         output_path: Path | None = None,
         format: str = "mermaid",
         show_variables: bool = False,
+        variable_overrides: list[str] | None = None,
+        artifact_overrides: list[str] | None = None,
+        missable_tasks: list[str] | None = None,
         workspace_dir: Path | None = None,
         output_dir: Path | None = None,
     ):
@@ -754,7 +1198,10 @@ class SflowApp:
             saved_path: str | None = None
             format: str | None = None
 
-        config = ConfigLoader().load_config(file)
+        files = [file] if isinstance(file, Path) else list(file)
+        config = ConfigLoader().load_configs(
+            files, variable_overrides, artifact_overrides, missable_tasks
+        )
         ws_dir = Path(workspace_dir) if workspace_dir is not None else Path.cwd()
         state = asyncio.run(build_state(config, allocate=False, workspace_dir=ws_dir))
         tg: TaskGraph = state.workflow.task_graph

@@ -13,6 +13,7 @@ import typer
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
+from sflow.config.resolver import enrich_error_with_location
 from sflow.logging import configure_logging, get_logger
 
 _logger = get_logger(__name__)
@@ -22,19 +23,30 @@ _sflow_app = SflowApp()
 
 @app.command(epilog=f"Documentation: {DOCS_URL}")
 def run(
-    file: Annotated[
-        Path,
-        typer.Option(
-            "-f",
-            "--file",
-            help="Path to the sflow.yaml workflow file",
+    src_files: Annotated[
+        Optional[List[Path]],
+        typer.Argument(
+            help="Workflow YAML file(s). Multiple files are merged into a single workflow.",
             exists=True,
             file_okay=True,
             dir_okay=False,
             readable=True,
             resolve_path=True,
         ),
-    ] = Path("sflow.yaml"),
+    ] = None,
+    file: Annotated[
+        Optional[List[Path]],
+        typer.Option(
+            "-f",
+            "--file",
+            help="Path to sflow YAML workflow file(s). Can be specified multiple times to merge configs.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option(
@@ -78,6 +90,24 @@ def run(
             "--artifact",
             "-a",
             help="Override artifact URI (format: NAME=URI, can be used multiple times)",
+        ),
+    ] = None,
+    missable_tasks: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--missable-tasks",
+            "-M",
+            help="Task names or glob patterns (e.g. 'prefill_*') that may be absent when composing "
+            "modular configs from multiple files. Absent missable tasks are removed from depends_on "
+            "and probes with a warning. Only valid with multiple -f files. Repeatable.",
+        ),
+    ] = None,
+    extra_args: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--extra-args",
+            "-e",
+            help="Extra args to pass to slurm backend (e.g. --gpus-per-node=4). Merged with config extra_args and deduplicated.",
         ),
     ] = None,
     verbose: Annotated[
@@ -132,22 +162,40 @@ def run(
     ] = 2,
 ):
     """
-    Run a workflow from a sflow.yaml file.
+    Run a workflow from one or more sflow YAML files.
+
+    When multiple files are given, they are merged into a single workflow
+    (variables/artifacts/backends/operators merge by name; tasks concatenate).
 
     Examples:
         # Basic workflow execution
-        sflow run --file workflow.yaml
+        sflow run workflow.yaml
+
+        # Merge multiple config files (space-separated)
+        sflow run backends.yaml tasks.yaml overrides.yaml
+
+        # Merge multiple config files (repeated -f)
+        sflow run -f backends.yaml -f tasks.yaml -f overrides.yaml
 
         # Dry run - validation only
-        sflow run --file workflow.yaml --dry-run
+        sflow run workflow.yaml --dry-run
 
         # Run with variable overrides
-        sflow run --file workflow.yaml --set SLURM_PARTITION=debug --set NUM_GPUS=4
+        sflow run workflow.yaml --set SLURM_PARTITION=debug --set NUM_GPUS=4
 
         # Run with artifact override
-        sflow run --file workflow.yaml --artifact MODEL=fs:///path/to/model
+        sflow run workflow.yaml --artifact MODEL=fs:///path/to/model
     """
     try:
+        files = list(src_files or []) + list(file or [])
+        if not files:
+            files = [Path("sflow.yaml").resolve()]
+        if missable_tasks and len(files) < 2:
+            typer.echo(
+                "Error: --missable-tasks is only valid with multiple input files (modular configs).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
         tui_enabled = bool(tui) and not bool(dry_run)
         if tui and dry_run:
             typer.echo("⚠ --tui is ignored in --dry-run mode (no live execution).")
@@ -181,11 +229,13 @@ def run(
         workflow_out_dir = None
         try:
             workflow_out_dir = _sflow_app.run(
-                file=file,
+                file=files,
                 dry_run=dry_run,
                 resume=resume,
                 variable_overrides=set_var,
                 artifact_overrides=artifact,
+                missable_tasks=missable_tasks,
+                backend_extra_args=extra_args,
                 workspace_dir=workspace_dir,
                 output_dir=output_dir,
                 tui=tui_enabled,
@@ -206,8 +256,9 @@ def run(
                 typer.echo(f"  Output folder: {workflow_out_dir}")
 
     except ValueError as e:
-        _logger.error(f"Configuration error: {e}")
-        typer.echo(f"✗ Configuration error: {e}", err=True)
+        msg = enrich_error_with_location(str(e), files)
+        _logger.error(f"Configuration error: {msg}")
+        typer.echo(f"✗ Configuration error: {msg}", err=True)
         if _sflow_app.last_workflow_output_dir:
             typer.echo(
                 f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True
