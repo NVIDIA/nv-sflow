@@ -24,7 +24,14 @@ from pathlib import Path
 
 import yaml
 
-ALLOWED_TOP_LEVEL_KEYS = {"version", "variables", "artifacts", "backends", "operators", "workflow"}
+ALLOWED_TOP_LEVEL_KEYS = {
+    "version",
+    "variables",
+    "artifacts",
+    "backends",
+    "operators",
+    "workflow",
+}
 EXPRESSION_PATTERN = re.compile(r"\$\{\{(.+?)\}\}", re.DOTALL)
 UNCLOSED_EXPRESSION_PATTERN = re.compile(r"\$\{\{(?!.*\}\})")
 
@@ -98,10 +105,7 @@ def _extract_operator_names(config: dict) -> set[str]:
     operators = config.get("operators", [])
     if not isinstance(operators, list):
         return set()
-    return {
-        o["name"] for o in operators
-        if isinstance(o, dict) and "name" in o
-    }
+    return {o["name"] for o in operators if isinstance(o, dict) and "name" in o}
 
 
 def _extract_backend_names(config: dict) -> set[str]:
@@ -109,10 +113,7 @@ def _extract_backend_names(config: dict) -> set[str]:
     backends = config.get("backends", [])
     if not isinstance(backends, list):
         return set()
-    return {
-        b["name"] for b in backends
-        if isinstance(b, dict) and "name" in b
-    }
+    return {b["name"] for b in backends if isinstance(b, dict) and "name" in b}
 
 
 def _extract_artifact_names(config: dict) -> set[str]:
@@ -120,10 +121,7 @@ def _extract_artifact_names(config: dict) -> set[str]:
     artifacts = config.get("artifacts", [])
     if not isinstance(artifacts, list):
         return set()
-    return {
-        a["name"] for a in artifacts
-        if isinstance(a, dict) and "name" in a
-    }
+    return {a["name"] for a in artifacts if isinstance(a, dict) and "name" in a}
 
 
 def _find_expressions(obj, path: str = "") -> list[tuple[str, str]]:
@@ -272,7 +270,13 @@ def check_operator_references(config: dict, result: ValidationResult) -> None:
         op = task.get("operator")
         if op is None:
             continue
-        op_name = op if isinstance(op, str) else op.get("name") if isinstance(op, dict) else None
+        op_name = (
+            op
+            if isinstance(op, str)
+            else op.get("name")
+            if isinstance(op, dict)
+            else None
+        )
         if op_name and "${{" not in str(op_name) and op_name not in operator_names:
             result.warn(
                 f"Task '{name}': references operator '{op_name}' "
@@ -295,9 +299,7 @@ def check_artifact_fs_paths(config: dict, result: ValidationResult) -> None:
         if uri.startswith("fs://"):
             fs_path = uri[5:]
             if fs_path and not Path(fs_path).exists():
-                result.warn(
-                    f"Artifact '{name}': fs:// path does not exist: {fs_path}"
-                )
+                result.warn(f"Artifact '{name}': fs:// path does not exist: {fs_path}")
 
 
 def check_gpu_consistency(config: dict, result: ValidationResult) -> None:
@@ -324,7 +326,9 @@ def check_gpu_consistency(config: dict, result: ValidationResult) -> None:
         if tp is not None and dp is not None and pp is not None:
             try:
                 expected_gpus = int(tp) * int(dp) * int(pp)
-                gpus_var = _resolve_variable_value(variables, f"{prefix}_GPUS_PER_WORKER")
+                gpus_var = _resolve_variable_value(
+                    variables, f"{prefix}_GPUS_PER_WORKER"
+                )
                 if gpus_var is not None and int(gpus_var) != expected_gpus:
                     result.warn(
                         f"{label}: {prefix}_GPUS_PER_WORKER={gpus_var} but "
@@ -377,7 +381,11 @@ def check_common_mistakes(config: dict, result: ValidationResult) -> None:
             readiness = probes.get("readiness", {})
             if isinstance(readiness, dict):
                 timeout = readiness.get("timeout")
-                if timeout is not None and isinstance(timeout, (int, float)) and timeout < 10:
+                if (
+                    timeout is not None
+                    and isinstance(timeout, (int, float))
+                    and timeout < 10
+                ):
                     result.warn(
                         f"Task '{name}': readiness probe timeout is very short ({timeout}s). "
                         f"Consider at least 60s for container-based tasks."
@@ -401,7 +409,9 @@ def check_common_mistakes(config: dict, result: ValidationResult) -> None:
     if isinstance(backends, list):
         defaults = [b for b in backends if isinstance(b, dict) and b.get("default")]
         if len(defaults) > 1:
-            result.error(f"Multiple default backends declared ({len(defaults)}). At most one allowed.")
+            result.error(
+                f"Multiple default backends declared ({len(defaults)}). At most one allowed."
+            )
 
 
 def validate_file(filepath: str) -> ValidationResult:

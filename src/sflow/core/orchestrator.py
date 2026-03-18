@@ -162,8 +162,14 @@ class Orchestrator:
                         if t.status == TaskStatus.FAILED
                     ]
                     if failed:
-                        probe_failed = [t for t in failed if getattr(t, "failed_by_probe", False)]
-                        process_failed = [t for t in failed if not getattr(t, "failed_by_probe", False)]
+                        probe_failed = [
+                            t for t in failed if getattr(t, "failed_by_probe", False)
+                        ]
+                        process_failed = [
+                            t
+                            for t in failed
+                            if not getattr(t, "failed_by_probe", False)
+                        ]
                         parts: list[str] = []
                         if probe_failed:
                             parts.append(
@@ -219,7 +225,9 @@ class Orchestrator:
             elif probe.type == ProbeType.FAILURE:
                 task.status = TaskStatus.FAILED
                 task.failed_by_probe = True
-                probe_detail = getattr(probe, "_pattern_display", None) or type(probe).__name__
+                probe_detail = (
+                    getattr(probe, "_pattern_display", None) or type(probe).__name__
+                )
                 _logger.error(
                     f"Failure probe triggered for task '{task.name}': "
                     f"pattern matched: '{probe_detail}'. "

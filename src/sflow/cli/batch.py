@@ -247,8 +247,14 @@ def _generate_sbatch_script(
         ]
     )
 
-    effective_output_dir = shlex.quote(str(output_dir)) if output_dir else shlex.quote(
-        str(workspace_dir / "sflow_output") if workspace_dir else str(Path.cwd() / "sflow_output")
+    effective_output_dir = (
+        shlex.quote(str(output_dir))
+        if output_dir
+        else shlex.quote(
+            str(workspace_dir / "sflow_output")
+            if workspace_dir
+            else str(Path.cwd() / "sflow_output")
+        )
     )
 
     script_lines.extend(
@@ -263,11 +269,14 @@ def _generate_sbatch_script(
             "# Copy sbatch logs and sflow config(s) to workflow output directory for reference",
             f'SFLOW_WF_DIR=$(find {effective_output_dir} -maxdepth 1 -type d -name "${{SLURM_JOB_ID}}-*" 2>/dev/null | head -1)',
             'if [ -n "$SFLOW_WF_DIR" ] && [ -d "$SFLOW_WF_DIR" ]; then',
-            f'    SBATCH_OUT={effective_output_dir}/${{SLURM_JOB_ID}}-sflow-submit.out',
-            f'    SBATCH_ERR={effective_output_dir}/${{SLURM_JOB_ID}}-sflow-submit.err',
+            f"    SBATCH_OUT={effective_output_dir}/${{SLURM_JOB_ID}}-sflow-submit.out",
+            f"    SBATCH_ERR={effective_output_dir}/${{SLURM_JOB_ID}}-sflow-submit.err",
             '    cp "$SBATCH_OUT" "$SFLOW_WF_DIR/" 2>/dev/null || true',
             '    cp "$SBATCH_ERR" "$SFLOW_WF_DIR/" 2>/dev/null || true',
-            *[f'    cp {shlex.quote(str(f))} "$SFLOW_WF_DIR/" 2>/dev/null || true' for f in files],
+            *[
+                f'    cp {shlex.quote(str(f))} "$SFLOW_WF_DIR/" 2>/dev/null || true'
+                for f in files
+            ],
             "fi",
             "",
         ]
@@ -409,8 +418,7 @@ class _RowNamingCtx:
         self.cli_nodes = cli_nodes
 
         all_stem_sets = [
-            {_path_to_stem(p) for p in r["sflow_config_file"].split()}
-            for r in all_rows
+            {_path_to_stem(p) for p in r["sflow_config_file"].split()} for r in all_rows
         ]
         self.common_stems: set[str] = (
             set.intersection(*all_stem_sets) if all_stem_sets else set()
@@ -518,7 +526,9 @@ def _submit_sbatch(script_path: Path) -> str:
     return result.stdout.strip()
 
 
-def _build_var_map(data: dict, cli_overrides: list[str] | None = None) -> dict[str, Any]:
+def _build_var_map(
+    data: dict, cli_overrides: list[str] | None = None
+) -> dict[str, Any]:
     """Build a variable name->value map from raw sflow YAML data.
 
     Handles both variable formats:
@@ -856,7 +866,11 @@ def _run_bulk_submit(
         # Derive gpus_per_node: config value wins over CLI
         config_gpus = _derive_gpus_per_node([yaml_file], cli_overrides=cli_set_var)
         row_gpus = config_gpus if config_gpus is not None else gpus_per_node
-        if gpus_per_node is not None and config_gpus is not None and gpus_per_node != config_gpus:
+        if (
+            gpus_per_node is not None
+            and config_gpus is not None
+            and gpus_per_node != config_gpus
+        ):
             typer.echo(
                 f"  Warning: --gpus-per-node={gpus_per_node} overridden by "
                 f"{yaml_file.name} config value ({config_gpus})",
@@ -882,13 +896,15 @@ def _run_bulk_submit(
             err_short = str(e).split("\n")[0]
             summary.append(f"  [{idx}] {yaml_file.name}: SKIPPED (dry-run failed)")
             failures.append(f"  [{idx}] {yaml_file.name}: {err_short}")
-            result_rows.append({
-                "sflow_config_file": str(yaml_file),
-                "job_name": job_name,
-                "slurm_job_id": "FAILED",
-                "sflow_output_dir": "",
-                "status": "dry-run failed",
-            })
+            result_rows.append(
+                {
+                    "sflow_config_file": str(yaml_file),
+                    "job_name": job_name,
+                    "slurm_job_id": "FAILED",
+                    "sflow_output_dir": "",
+                    "status": "dry-run failed",
+                }
+            )
             continue
 
         # Determine node count from config if not given via CLI
@@ -945,14 +961,21 @@ def _run_bulk_submit(
             from sflow.cli.compose import _compose_files
 
             yaml_output = _compose_files(
-                [yaml_file], cli_set_var or None, cli_artifact or None, log_level,
-                resolve=resolve, missable_tasks=missable_tasks,
+                [yaml_file],
+                cli_set_var or None,
+                cli_artifact or None,
+                log_level,
+                resolve=resolve,
+                missable_tasks=missable_tasks,
                 quiet_missable=True,
             )
             yaml_path = bulk_dir / f"{job_name}.yaml"
             yaml_path.write_text(yaml_output)
         except Exception as e:
-            typer.echo(f"  Warning: could not generate composed config for {yaml_file.name}: {e}", err=True)
+            typer.echo(
+                f"  Warning: could not generate composed config for {yaml_file.name}: {e}",
+                err=True,
+            )
 
         status = "saved"
         job_id = ""
@@ -968,13 +991,19 @@ def _run_bulk_submit(
 
         sflow_output_dir = f"{effective_output}/{job_id}-*" if job_id else ""
         summary.append(f"  [{idx}] {script_path.name}: {yaml_file.name} -> {status}")
-        result_rows.append({
-            "sflow_config_file": str(yaml_file),
-            "job_name": job_name,
-            "slurm_job_id": job_id if job_id else ("not submitted" if not submit else "FAILED"),
-            "sflow_output_dir": sflow_output_dir if sflow_output_dir else ("not submitted" if not submit else ""),
-            "status": status,
-        })
+        result_rows.append(
+            {
+                "sflow_config_file": str(yaml_file),
+                "job_name": job_name,
+                "slurm_job_id": job_id
+                if job_id
+                else ("not submitted" if not submit else "FAILED"),
+                "sflow_output_dir": sflow_output_dir
+                if sflow_output_dir
+                else ("not submitted" if not submit else ""),
+                "status": status,
+            }
+        )
 
     generated = len(yaml_files) - failed_count
     typer.echo(
@@ -995,7 +1024,13 @@ def _run_bulk_submit(
         import csv
 
         results_csv = bulk_dir / "results.csv"
-        fieldnames = ["sflow_config_file", "job_name", "slurm_job_id", "sflow_output_dir", "status"]
+        fieldnames = [
+            "sflow_config_file",
+            "job_name",
+            "slurm_job_id",
+            "sflow_output_dir",
+            "status",
+        ]
         with open(results_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -1005,9 +1040,7 @@ def _run_bulk_submit(
     typer.echo(f"Scripts directory: {bulk_dir}")
 
     if not submit and generated > 0:
-        typer.echo(
-            "\n(Scripts generated but not submitted. To submit, add: --submit)"
-        )
+        typer.echo("\n(Scripts generated but not submitted. To submit, add: --submit)")
 
 
 def _run_bulk_edit(
@@ -1165,7 +1198,11 @@ def _run_bulk_edit(
         # Derive gpus_per_node: config/CSV value wins over CLI
         config_gpus = _derive_gpus_per_node(config_files, cli_overrides=set_var)
         row_gpus = config_gpus if config_gpus is not None else gpus_per_node
-        if gpus_per_node is not None and config_gpus is not None and gpus_per_node != config_gpus:
+        if (
+            gpus_per_node is not None
+            and config_gpus is not None
+            and gpus_per_node != config_gpus
+        ):
             typer.echo(
                 f"  Warning: --gpus-per-node={gpus_per_node} overridden by "
                 f"config value ({config_gpus}) for row {idx}",
@@ -1200,12 +1237,19 @@ def _run_bulk_edit(
             from sflow.cli.compose import _compose_files
 
             yaml_output = _compose_files(
-                config_files, set_var or None, artifacts or None, log_level,
-                resolve=resolve, missable_tasks=effective_missable,
+                config_files,
+                set_var or None,
+                artifacts or None,
+                log_level,
+                resolve=resolve,
+                missable_tasks=effective_missable,
                 quiet_missable=True,
             )
         except Exception as e:
-            typer.echo(f"  Warning: could not generate merged config for row {idx}: {e}", err=True)
+            typer.echo(
+                f"  Warning: could not generate merged config for row {idx}: {e}",
+                err=True,
+            )
             yaml_output = None
 
         row_nodes = nodes
@@ -1306,9 +1350,7 @@ def _run_bulk_edit(
     typer.echo(f"Scripts directory: {bulk_dir}")
 
     if not submit and generated > 0:
-        typer.echo(
-            "\n(Scripts generated but not submitted. To submit, add: --submit)"
-        )
+        typer.echo("\n(Scripts generated but not submitted. To submit, add: --submit)")
 
 
 @app.command(epilog=f"Documentation: {DOCS_URL}")
@@ -1700,7 +1742,10 @@ def batch(
             all_paths.extend(file)
         yaml_files = _scan_sflow_yamls(all_paths)
         if not yaml_files:
-            typer.echo("Error: no valid sflow YAML files found in the provided paths.", err=True)
+            typer.echo(
+                "Error: no valid sflow YAML files found in the provided paths.",
+                err=True,
+            )
             raise typer.Exit(code=1)
         typer.echo(f"Found {len(yaml_files)} sflow YAML config(s):")
         for yf in yaml_files:
@@ -1827,8 +1872,12 @@ def batch(
             from sflow.cli.compose import _compose_files
 
             yaml_output = _compose_files(
-                files, set_var or None, artifact or None, log_level,
-                resolve=resolve, missable_tasks=missable_tasks,
+                files,
+                set_var or None,
+                artifact or None,
+                log_level,
+                resolve=resolve,
+                missable_tasks=missable_tasks,
                 quiet_missable=True,
             )
             yaml_path = sbatch_path.with_suffix(".yaml")

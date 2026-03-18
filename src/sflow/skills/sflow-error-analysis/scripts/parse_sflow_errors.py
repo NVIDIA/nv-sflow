@@ -23,6 +23,7 @@ from pathlib import Path
 # Error pattern definitions
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ErrorPattern:
     category: str
@@ -43,7 +44,7 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         category="config",
         pattern=re.compile(r"Configuration file is empty:\s*(.+)"),
         description="Empty configuration file",
-        fix="Add valid sflow YAML content. At minimum: version: \"0.1\"",
+        fix='Add valid sflow YAML content. At minimum: version: "0.1"',
     ),
     ErrorPattern(
         category="config",
@@ -63,7 +64,6 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="Expression syntax validation error",
         fix="Check ${{ }} expressions for Jinja2 syntax errors. Ensure brackets are balanced.",
     ),
-
     # Expression resolution
     ErrorPattern(
         category="expression",
@@ -83,7 +83,6 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="Expression evaluation error",
         fix="Check expression logic: division by zero, type mismatches, undefined operations.",
     ),
-
     # Variable/artifact overrides
     ErrorPattern(
         category="override",
@@ -103,7 +102,6 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="--artifact not declared in config",
         fix="Declare the artifact in the YAML 'artifacts' section first.",
     ),
-
     # Artifact validation
     ErrorPattern(
         category="artifact",
@@ -117,13 +115,12 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="Artifact path missing",
         fix="Create the path or fix the artifact URI.",
     ),
-
     # Merge errors
     ErrorPattern(
         category="merge",
         pattern=re.compile(r"Version conflict:\s*'(.+?)'\s*vs\s*'(.+?)'"),
         description="Version mismatch between merged files",
-        fix="All files must use version: \"0.1\".",
+        fix='All files must use version: "0.1".',
     ),
     ErrorPattern(
         category="merge",
@@ -137,7 +134,6 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="Incomplete merged configuration",
         fix="Ensure all required sections (version, workflow, tasks) exist across the merged files.",
     ),
-
     # SLURM
     ErrorPattern(
         category="slurm",
@@ -163,7 +159,6 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="srun execution error",
         fix="Check srun arguments, node availability, and that the SLURM allocation is still active.",
     ),
-
     # Runtime / task
     ErrorPattern(
         category="runtime",
@@ -219,7 +214,6 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="File not found at runtime",
         fix="Check file paths. Ensure model/data paths are accessible inside the container.",
     ),
-
     # Batch/CSV
     ErrorPattern(
         category="batch",
@@ -245,7 +239,6 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="Bulk dry-run validation failures",
         fix="Fix each listed config. Run sflow run -f <file> --dry-run individually for details.",
     ),
-
     # CLI
     ErrorPattern(
         category="cli",
@@ -255,7 +248,9 @@ ERROR_PATTERNS: list[ErrorPattern] = [
     ),
     ErrorPattern(
         category="cli",
-        pattern=re.compile(r"Selective task execution \(--task\) is not yet implemented"),
+        pattern=re.compile(
+            r"Selective task execution \(--task\) is not yet implemented"
+        ),
         description="--task not implemented",
         fix="Run the full workflow. Use --missable-tasks to skip optional tasks.",
     ),
@@ -305,12 +300,14 @@ class ParseResult:
         by_category: dict[str, list[dict]] = {}
         for me in self.matched_errors:
             cat = me.pattern.category
-            by_category.setdefault(cat, []).append({
-                "line": me.line_num,
-                "description": me.pattern.description,
-                "text": me.line[:200],
-                "fix": me.pattern.fix,
-            })
+            by_category.setdefault(cat, []).append(
+                {
+                    "line": me.line_num,
+                    "description": me.pattern.description,
+                    "text": me.line[:200],
+                    "fix": me.pattern.fix,
+                }
+            )
         return {
             "source": self.source,
             "total_lines": self.total_lines,
@@ -321,7 +318,9 @@ class ParseResult:
                 "line": self.matched_errors[0].line_num,
                 "description": self.matched_errors[0].pattern.description,
                 "fix": self.matched_errors[0].pattern.fix,
-            } if self.matched_errors else None,
+            }
+            if self.matched_errors
+            else None,
             "categories": {
                 CATEGORY_LABELS.get(cat, cat): errors
                 for cat, errors in by_category.items()
@@ -336,7 +335,9 @@ class ParseResult:
 def parse_log(lines: list[str], source: str = "<stdin>") -> ParseResult:
     result = ParseResult(source=source, total_lines=len(lines))
 
-    error_line_pattern = re.compile(r"^.*[\u2717✗]|^.*Error:|^.*ERROR:|^.*error:", re.IGNORECASE)
+    error_line_pattern = re.compile(
+        r"^.*[\u2717✗]|^.*Error:|^.*ERROR:|^.*error:", re.IGNORECASE
+    )
 
     for line_num, line in enumerate(lines, 1):
         stripped = line.rstrip()
@@ -347,12 +348,14 @@ def parse_log(lines: list[str], source: str = "<stdin>") -> ParseResult:
         for ep in ERROR_PATTERNS:
             m = ep.pattern.search(stripped)
             if m:
-                result.matched_errors.append(MatchedError(
-                    line_num=line_num,
-                    line=stripped,
-                    pattern=ep,
-                    match=m,
-                ))
+                result.matched_errors.append(
+                    MatchedError(
+                        line_num=line_num,
+                        line=stripped,
+                        pattern=ep,
+                        match=m,
+                    )
+                )
                 matched = True
                 break
 
@@ -411,10 +414,14 @@ def print_report(result: ParseResult) -> None:
             print()
 
     if result.unmatched_error_lines:
-        print(f"  [Unmatched Error Lines] ({len(result.unmatched_error_lines)} line(s))")
+        print(
+            f"  [Unmatched Error Lines] ({len(result.unmatched_error_lines)} line(s))"
+        )
         print(f"  {'-' * 50}")
         for line_num, line in result.unmatched_error_lines[:10]:
-            print(f"    Line {line_num}: {line[:120]}{'...' if len(line) > 120 else ''}")
+            print(
+                f"    Line {line_num}: {line[:120]}{'...' if len(line) > 120 else ''}"
+            )
         if len(result.unmatched_error_lines) > 10:
             print(f"    ... and {len(result.unmatched_error_lines) - 10} more")
         print()
@@ -426,7 +433,10 @@ def main() -> int:
 
     if len(args) < 1:
         print(f"Usage: {sys.argv[0]} [--json] <log_file>", file=sys.stderr)
-        print(f"       {sys.argv[0]} [--json] -          (read from stdin)", file=sys.stderr)
+        print(
+            f"       {sys.argv[0]} [--json] -          (read from stdin)",
+            file=sys.stderr,
+        )
         return 2
 
     filepath = args[0]

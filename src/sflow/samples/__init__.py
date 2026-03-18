@@ -32,7 +32,11 @@ def list_modular_samples() -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     _skip = {"__pycache__", "sflow_output", ".git"}
     for subdir in sorted(samples_dir.iterdir()):
-        if subdir.is_dir() and not subdir.name.startswith("_") and subdir.name not in _skip:
+        if (
+            subdir.is_dir()
+            and not subdir.name.startswith("_")
+            and subdir.name not in _skip
+        ):
             yamls = sorted([f.name for f in subdir.glob("*.yaml")])
             if yamls:
                 result[subdir.name] = yamls

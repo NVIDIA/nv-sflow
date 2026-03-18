@@ -300,7 +300,9 @@ def _extract_file_contributions(
                     contrib["sections"].append(("workflow.variables", names))
             wf_tasks = wf.get("tasks")
             if wf_tasks:
-                task_names = [t["name"] for t in _tasks_to_list(wf_tasks) if "name" in t]
+                task_names = [
+                    t["name"] for t in _tasks_to_list(wf_tasks) if "name" in t
+                ]
                 if task_names:
                     contrib["sections"].append(("workflow.tasks", task_names))
         result.append(contrib)
@@ -401,7 +403,9 @@ class ConfigLoader:
         self.source_files = list(paths)
 
         if len(paths) == 1:
-            return self.load_config(paths[0], variable_overrides, artifact_overrides, missable_tasks)
+            return self.load_config(
+                paths[0], variable_overrides, artifact_overrides, missable_tasks
+            )
 
         config_dicts: List[Dict[str, Any]] = []
         for path in paths:

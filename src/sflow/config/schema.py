@@ -185,9 +185,13 @@ class LogWatchProbeConfig(StrictBaseModel):
             has_regex = data.get("regex_pattern") is not None
             has_match = data.get("match_pattern") is not None
             if has_regex and has_match:
-                raise ValueError("Only one of 'regex_pattern' or 'match_pattern' may be set, not both")
+                raise ValueError(
+                    "Only one of 'regex_pattern' or 'match_pattern' may be set, not both"
+                )
             if not has_regex and not has_match:
-                raise ValueError("Either 'regex_pattern' or 'match_pattern' must be set")
+                raise ValueError(
+                    "Either 'regex_pattern' or 'match_pattern' must be set"
+                )
         return data
 
     @model_validator(mode="after")

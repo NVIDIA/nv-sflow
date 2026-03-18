@@ -80,12 +80,20 @@ def skill(
         output = Path.cwd() / "skills"
 
     skills_src = get_skills_dir()
-    available = [s for s in sorted(skills_src.iterdir()) if s.is_dir() and not s.name.startswith("_") and s.name not in {"__pycache__", ".git"}]
+    available = [
+        s
+        for s in sorted(skills_src.iterdir())
+        if s.is_dir()
+        and not s.name.startswith("_")
+        and s.name not in {"__pycache__", ".git"}
+    ]
 
     typer.echo(f"Skills will be copied to: {output}/")
     typer.echo(f"  Skills: {', '.join(s.name for s in available)}")
     if output.exists():
-        typer.echo(f"  Note: directory already exists — files will be merged{' (existing files will be overwritten)' if force else ' (existing files will be preserved)'}.")
+        typer.echo(
+            f"  Note: directory already exists — files will be merged{' (existing files will be overwritten)' if force else ' (existing files will be preserved)'}."
+        )
     if not typer.confirm("Proceed?", default=True):
         raise typer.Abort()
 
@@ -118,7 +126,9 @@ def skill(
         if agents_md.exists():
             typer.echo(f"\nAgent guidelines: {agents_md}")
         typer.echo()
-        typer.echo("To use with Cursor, add the skills directory to your IDE agent skill config.")
+        typer.echo(
+            "To use with Cursor, add the skills directory to your IDE agent skill config."
+        )
     except Exception as e:
         _logger.exception(f"Failed to copy skills: {e}")
         typer.echo(f"✗ Failed to copy skills: {e}", err=True)

@@ -150,9 +150,7 @@ _TASK_NODE_ATTRS = ("name", "ip_address", "index", "num_gpus")
 
 def _extract_task_expressions(line: str) -> list[str]:
     """Extract ``${{ task.* }}`` expressions from a script line."""
-    return [
-        "${{ " + m.strip() + " }}" for m in _TASK_EXPR_RE.findall(line)
-    ]
+    return ["${{ " + m.strip() + " }}" for m in _TASK_EXPR_RE.findall(line)]
 
 
 def _build_task_expression_hint(
@@ -177,16 +175,18 @@ def _build_task_expression_hint(
         if isinstance(ctx_val, list) and not has_index:
             rest = ".".join(parts[2:])
             replicas = (
-                replica_names_by_base.get(task_ref, [])
-                if replica_names_by_base
-                else []
+                replica_names_by_base.get(task_ref, []) if replica_names_by_base else []
             )
             replica_display = ", ".join(replicas) if replicas else "N/A"
             return (
                 f"'{task_ref}' is a replicated task with "
                 f"{len(ctx_val)} replica(s). "
                 "Use indexed access like "
-                "${{ task." + task_ref + "[0]." + rest + " }}"
+                "${{ task."
+                + task_ref
+                + "[0]."
+                + rest
+                + " }}"
                 + (
                     " or a full replica name like "
                     "${{ task." + replicas[0] + "." + rest + " }}"
@@ -206,10 +206,7 @@ def _build_task_expression_hint(
                 if accessed_attr == "nodes" or accessed_attr in _TASK_NODE_ATTRS:
                     pass
                 else:
-                    hint += (
-                        ". Each node exposes: "
-                        + ", ".join(_TASK_NODE_ATTRS)
-                    )
+                    hint += ". Each node exposes: " + ", ".join(_TASK_NODE_ATTRS)
                 return hint
             if accessed_attr == "nodes" and len(parts) > 3:
                 node_attr = parts[3].split("[")[0]
@@ -230,9 +227,8 @@ def _build_task_expression_hint(
                 parts_hint.append(
                     "replicated tasks (use index): " + ", ".join(sorted(replicated))
                 )
-            return (
-                f"Task '{task_ref}' is not defined. "
-                + ("; ".join(parts_hint) if parts_hint else "No tasks found in context.")
+            return f"Task '{task_ref}' is not defined. " + (
+                "; ".join(parts_hint) if parts_hint else "No tasks found in context."
             )
     return None
 
@@ -263,9 +259,7 @@ def preflight_validate_backends(state: SflowState) -> None:
             )
 
 
-def preflight_validate_container_images(
-    config: SflowConfig, state: SflowState
-) -> None:
+def preflight_validate_container_images(config: SflowConfig, state: SflowState) -> None:
     """
     Validate container image references in srun operators before allocating cluster resources.
 
@@ -327,9 +321,7 @@ def preflight_validate_container_images(
             continue
         raw_image = getattr(op_conf, "container_image", None)
         if raw_image is not None:
-            _check_image(
-                _try_resolve(raw_image), source=f"operator '{op_conf.name}'"
-            )
+            _check_image(_try_resolve(raw_image), source=f"operator '{op_conf.name}'")
         extra_args = list(getattr(op_conf, "extra_args", None) or [])
         _check_extra_args(extra_args, source=f"operator '{op_conf.name}'")
 
@@ -644,7 +636,9 @@ def _resolve_and_update_variables(
     for _ in range(max_passes):
         progress = False
 
-        ctx_values = {k: v for k, v in resolved_values.items() if not resolver.has_expression(v)}
+        ctx_values = {
+            k: v for k, v in resolved_values.items() if not resolver.has_expression(v)
+        }
         ctx: dict[str, Any] = {"variables": ctx_values, **ctx_values}
         if extra_ctx:
             ctx.update(extra_ctx)
@@ -1148,7 +1142,11 @@ def build_task_graph(
         if getattr(p_conf, "http_get", None) is not None:
             http = p_conf.http_get
             url_raw = str(http.url)
-            url = str(resolver.resolve(url_raw, ctx)) if resolver.has_expression(url_raw) else url_raw
+            url = (
+                str(resolver.resolve(url_raw, ctx))
+                if resolver.has_expression(url_raw)
+                else url_raw
+            )
             return HttpGetProbe(
                 url=url, headers=getattr(http, "headers", None), **common
             )
@@ -1156,7 +1154,11 @@ def build_task_graph(
         if getattr(p_conf, "http_post", None) is not None:
             http = p_conf.http_post
             url_raw = str(http.url)
-            url = str(resolver.resolve(url_raw, ctx)) if resolver.has_expression(url_raw) else url_raw
+            url = (
+                str(resolver.resolve(url_raw, ctx))
+                if resolver.has_expression(url_raw)
+                else url_raw
+            )
             body_raw = getattr(http, "body", None)
             body = (
                 str(resolver.resolve(body_raw, ctx))
@@ -1231,18 +1233,28 @@ def build_task_graph(
             return [], False
 
         if nodes_exclude_raw is not None:
-            raw = nodes_exclude_raw if isinstance(nodes_exclude_raw, list) else [nodes_exclude_raw]
-            exclude_indices = set(
-                _resolve_int_list(task_name, field="resources.nodes.exclude", values=raw)
+            raw = (
+                nodes_exclude_raw
+                if isinstance(nodes_exclude_raw, list)
+                else [nodes_exclude_raw]
             )
-            out_of_range = {i for i in exclude_indices if i < 0 or i >= len(alloc_nodes)}
+            exclude_indices = set(
+                _resolve_int_list(
+                    task_name, field="resources.nodes.exclude", values=raw
+                )
+            )
+            out_of_range = {
+                i for i in exclude_indices if i < 0 or i >= len(alloc_nodes)
+            }
             if out_of_range:
                 raise ValueError(
                     f"Task '{task_name}' resources.nodes.exclude contains index(es) "
                     f"{sorted(out_of_range)} out of range for {len(alloc_nodes)} allocated node(s) "
                     f"(valid: 0..{len(alloc_nodes) - 1})"
                 )
-            alloc_nodes = [n for i, n in enumerate(alloc_nodes) if i not in exclude_indices]
+            alloc_nodes = [
+                n for i, n in enumerate(alloc_nodes) if i not in exclude_indices
+            ]
             if not alloc_nodes:
                 raise ValueError(
                     f"Task '{task_name}' resources.nodes.exclude removed all nodes from the pool"
@@ -1737,9 +1749,9 @@ def build_task_graph(
 
                 merged = base_op.model_dump()
                 if "extra_args" in operator_overrides and merged.get("extra_args"):
-                    operator_overrides["extra_args"] = list(merged["extra_args"]) + list(
-                        operator_overrides["extra_args"]
-                    )
+                    operator_overrides["extra_args"] = list(
+                        merged["extra_args"]
+                    ) + list(operator_overrides["extra_args"])
                 merged.update(operator_overrides)
                 merged["name"] = operator_name
                 merged = _resolve_value(merged)
@@ -2044,9 +2056,7 @@ def build_task_graph(
                     hint = _build_task_expression_hint(
                         task_exprs, tasks_ctx, replica_names_by_base
                     )
-                    exprs_display = (
-                        ", ".join(task_exprs) if task_exprs else "(unknown)"
-                    )
+                    exprs_display = ", ".join(task_exprs) if task_exprs else "(unknown)"
                     location = resolver._find_expression_in_sources(
                         task_exprs[0] if task_exprs else line
                     )

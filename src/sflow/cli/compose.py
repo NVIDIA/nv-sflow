@@ -613,7 +613,11 @@ def _run_bulk_compose(
         out_path = bulk_dir / f"{row_name}.yaml"
         try:
             yaml_output = _compose_files(
-                config_files, set_var, artifacts, log_level, resolve=resolve,
+                config_files,
+                set_var,
+                artifacts,
+                log_level,
+                resolve=resolve,
                 missable_tasks=effective_missable,
             )
             out_path.write_text(yaml_output)
@@ -861,7 +865,11 @@ def compose(
             raise typer.Exit(code=1)
 
         yaml_output = _compose_files(
-            files, set_var, artifact, log_level, resolve=resolve,
+            files,
+            set_var,
+            artifact,
+            log_level,
+            resolve=resolve,
             missable_tasks=missable_tasks,
         )
 

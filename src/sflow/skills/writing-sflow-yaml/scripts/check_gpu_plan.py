@@ -45,13 +45,16 @@ def _load_and_merge(filepaths: list[str]) -> dict:
                 merged[key] = existing
             elif isinstance(existing, list) and isinstance(incoming, list):
                 names_seen = {
-                    item["name"] for item in existing
+                    item["name"]
+                    for item in existing
                     if isinstance(item, dict) and "name" in item
                 }
                 for item in incoming:
                     if isinstance(item, dict) and item.get("name") in names_seen:
                         existing = [
-                            item if isinstance(e, dict) and e.get("name") == item.get("name") else e
+                            item
+                            if isinstance(e, dict) and e.get("name") == item.get("name")
+                            else e
                             for e in existing
                         ]
                     else:
@@ -128,14 +131,16 @@ def _get_backend_capacity(config: dict, variables: dict) -> list[dict]:
         nodes = _resolve_value(b.get("nodes", 1), variables)
         gpn = _resolve_value(b.get("gpus_per_node", 0), variables)
         is_default = b.get("default", False)
-        results.append({
-            "name": name,
-            "type": btype,
-            "nodes": nodes,
-            "gpus_per_node": gpn,
-            "total_gpus": (nodes or 0) * (gpn or 0) if nodes and gpn else None,
-            "default": is_default,
-        })
+        results.append(
+            {
+                "name": name,
+                "type": btype,
+                "nodes": nodes,
+                "gpus_per_node": gpn,
+                "total_gpus": (nodes or 0) * (gpn or 0) if nodes and gpn else None,
+                "default": is_default,
+            }
+        )
     return results
 
 
@@ -205,17 +210,19 @@ def _get_task_gpu_plan(config: dict, variables: dict) -> list[dict]:
 
         total_gpus = gpu_count * replica_count
 
-        results.append({
-            "name": name,
-            "gpus_per_replica": gpu_count,
-            "gpu_unresolved": gpu_unresolved,
-            "replicas": replica_count,
-            "policy": policy,
-            "total_gpus": total_gpus,
-            "node_indices": node_indices,
-            "node_count": node_count,
-            "sweep_vars": sweep_vars,
-        })
+        results.append(
+            {
+                "name": name,
+                "gpus_per_replica": gpu_count,
+                "gpu_unresolved": gpu_unresolved,
+                "replicas": replica_count,
+                "policy": policy,
+                "total_gpus": total_gpus,
+                "node_indices": node_indices,
+                "node_count": node_count,
+                "sweep_vars": sweep_vars,
+            }
+        )
 
     return results
 
@@ -240,19 +247,25 @@ def print_plan(filepaths: list[str]) -> int:
 
     if backends:
         print("\n  Backends:")
-        print(f"  {'Name':<20} {'Type':<8} {'Nodes':<7} {'GPUs/Node':<10} {'Total GPUs':<10} {'Default'}")
-        print(f"  {'-'*20} {'-'*8} {'-'*7} {'-'*10} {'-'*10} {'-'*7}")
+        print(
+            f"  {'Name':<20} {'Type':<8} {'Nodes':<7} {'GPUs/Node':<10} {'Total GPUs':<10} {'Default'}"
+        )
+        print(f"  {'-' * 20} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 7}")
         for b in backends:
             nodes_str = str(b["nodes"]) if b["nodes"] is not None else "?"
             gpn_str = str(b["gpus_per_node"]) if b["gpus_per_node"] is not None else "?"
             total_str = str(b["total_gpus"]) if b["total_gpus"] is not None else "?"
             default_str = "yes" if b["default"] else ""
-            print(f"  {b['name']:<20} {b['type']:<8} {nodes_str:<7} {gpn_str:<10} {total_str:<10} {default_str}")
+            print(
+                f"  {b['name']:<20} {b['type']:<8} {nodes_str:<7} {gpn_str:<10} {total_str:<10} {default_str}"
+            )
 
     if tasks:
         print("\n  Tasks:")
-        print(f"  {'Name':<30} {'GPUs':<6} {'Replicas':<10} {'Total GPUs':<11} {'Policy':<12} {'Pinned'}")
-        print(f"  {'-'*30} {'-'*6} {'-'*10} {'-'*11} {'-'*12} {'-'*10}")
+        print(
+            f"  {'Name':<30} {'GPUs':<6} {'Replicas':<10} {'Total GPUs':<11} {'Policy':<12} {'Pinned'}"
+        )
+        print(f"  {'-' * 30} {'-' * 6} {'-' * 10} {'-' * 11} {'-' * 12} {'-' * 10}")
 
         total_gpu_demand = 0
         has_unresolved = False
@@ -289,15 +302,23 @@ def print_plan(filepaths: list[str]) -> int:
         demand_str = f"{total_gpu_demand}+" if has_unresolved else str(total_gpu_demand)
         print(f"\n  Peak concurrent GPU demand: {demand_str}")
         if has_unresolved:
-            print("  Note: some GPU counts contain unresolved expressions (shown as '?')")
+            print(
+                "  Note: some GPU counts contain unresolved expressions (shown as '?')"
+            )
             print("        Use sflow compose --resolve to get exact values")
 
-        default_backend = next((b for b in backends if b["default"]), backends[0] if backends else None)
+        default_backend = next(
+            (b for b in backends if b["default"]), backends[0] if backends else None
+        )
         if default_backend and default_backend["total_gpus"] is not None:
             capacity = default_backend["total_gpus"]
-            print(f"  Backend capacity:           {capacity} ({default_backend['name']})")
+            print(
+                f"  Backend capacity:           {capacity} ({default_backend['name']})"
+            )
             if total_gpu_demand > capacity:
-                print(f"\n  *** WARNING: GPU demand ({total_gpu_demand}) exceeds capacity ({capacity})! ***")
+                print(
+                    f"\n  *** WARNING: GPU demand ({total_gpu_demand}) exceeds capacity ({capacity})! ***"
+                )
                 print("  *** Increase nodes or reduce GPU counts / replicas. ***")
             elif total_gpu_demand == capacity:
                 print("  Status: Fully utilized (demand == capacity)")

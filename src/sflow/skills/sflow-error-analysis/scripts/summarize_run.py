@@ -97,8 +97,7 @@ def summarize_run(run_dir: Path) -> int:
         print("\n  Orchestrator log: not found")
 
     task_dirs = sorted(
-        d for d in run_dir.iterdir()
-        if d.is_dir() and not d.name.startswith(".")
+        d for d in run_dir.iterdir() if d.is_dir() and not d.name.startswith(".")
     )
 
     if not task_dirs:
@@ -110,8 +109,10 @@ def summarize_run(run_dir: Path) -> int:
     tasks_failed = 0
     tasks_unknown = 0
 
-    print(f"\n  {'Task':<35} {'Status':<10} {'Log Size':<10} {'Errors':<8} {'Last Line'}")
-    print(f"  {'-'*35} {'-'*10} {'-'*10} {'-'*8} {'-'*40}")
+    print(
+        f"\n  {'Task':<35} {'Status':<10} {'Log Size':<10} {'Errors':<8} {'Last Line'}"
+    )
+    print(f"  {'-' * 35} {'-' * 10} {'-' * 10} {'-' * 8} {'-' * 40}")
 
     failed_details: list[tuple[str, str]] = []
 
@@ -149,7 +150,9 @@ def summarize_run(run_dir: Path) -> int:
 
         print(f"  {task_name:<35} {status:<10} {size:<10} {error_count:<8} {last_line}")
 
-    print(f"\n  Summary: {tasks_passed} OK, {tasks_failed} FAILED, {tasks_unknown} unknown/warn")
+    print(
+        f"\n  Summary: {tasks_passed} OK, {tasks_failed} FAILED, {tasks_unknown} unknown/warn"
+    )
 
     if failed_details:
         print(f"\n  {'=' * 60}")
@@ -182,7 +185,10 @@ def summarize_run(run_dir: Path) -> int:
 def main() -> int:
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <run_output_dir>", file=sys.stderr)
-        print(f"  Example: {sys.argv[0]} sflow_output/my_workflow_20260318-120000/", file=sys.stderr)
+        print(
+            f"  Example: {sys.argv[0]} sflow_output/my_workflow_20260318-120000/",
+            file=sys.stderr,
+        )
         return 2
     return summarize_run(Path(sys.argv[1]))
 

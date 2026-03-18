@@ -41,9 +41,7 @@ _LOCATION_HINT_RE = re.compile(r"\(line \d+ in ")
 _QUOTED_STRING_RE = re.compile(r"'([^']+)'")
 
 
-def find_lines_in_files(
-    search_text: str, source_files: List[Path]
-) -> List[str]:
+def find_lines_in_files(search_text: str, source_files: List[Path]) -> List[str]:
     """Search *source_files* for *search_text* and return location hints like ``line 5 in foo.yaml``."""
     search_text = search_text.strip()
     if not search_text or not source_files:
@@ -60,9 +58,7 @@ def find_lines_in_files(
     return hits
 
 
-def enrich_error_with_location(
-    error_msg: str, source_files: List[Path]
-) -> str:
+def enrich_error_with_location(error_msg: str, source_files: List[Path]) -> str:
     """Append YAML source location hints to *error_msg* if not already present.
 
     Extracts quoted strings and ``${{ }}`` expressions from the message,
@@ -238,9 +234,7 @@ class ExpressionResolver:
                 f"Error evaluating expression {failing}{location}: {e}"
             ) from e
 
-    def _pinpoint_failing_expression(
-        self, value: str, context: Dict[str, Any]
-    ) -> str:
+    def _pinpoint_failing_expression(self, value: str, context: Dict[str, Any]) -> str:
         """Identify which specific ${{ }} expression(s) in *value* fail to resolve."""
         matches = self.VARIABLE_PATTERN.findall(value)
         if not matches:

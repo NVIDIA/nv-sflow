@@ -259,7 +259,14 @@ class SflowApp:
                 if getattr(b, "type", None) == "slurm":
                     if slurm_nodes is not None:
                         existing_nodes = getattr(b, "nodes", None)
-                        if existing_nodes is not None and existing_nodes != slurm_nodes and not (isinstance(existing_nodes, str) and "${{" in existing_nodes):
+                        if (
+                            existing_nodes is not None
+                            and existing_nodes != slurm_nodes
+                            and not (
+                                isinstance(existing_nodes, str)
+                                and "${{" in existing_nodes
+                            )
+                        ):
                             _logger.warning(
                                 f"Backend '{b.name}' has nodes={existing_nodes}, "
                                 f"overriding with CLI --nodes={slurm_nodes}"
@@ -267,7 +274,13 @@ class SflowApp:
                         b.nodes = slurm_nodes
                     if slurm_gpus_per_node is not None:
                         existing_gpn = getattr(b, "gpus_per_node", None)
-                        if existing_gpn is not None and existing_gpn != slurm_gpus_per_node and not (isinstance(existing_gpn, str) and "${{" in existing_gpn):
+                        if (
+                            existing_gpn is not None
+                            and existing_gpn != slurm_gpus_per_node
+                            and not (
+                                isinstance(existing_gpn, str) and "${{" in existing_gpn
+                            )
+                        ):
                             _logger.warning(
                                 f"Backend '{b.name}' has gpus_per_node={existing_gpn}, "
                                 f"overriding with CLI --gpus-per-node={slurm_gpus_per_node}"
@@ -402,7 +415,9 @@ class SflowApp:
                     for v_conf in config.variables or []:
                         if hasattr(v_conf, "name") and hasattr(v_conf, "value"):
                             val = v_conf.value
-                            if val is not None and not (isinstance(val, str) and "${{" in val):
+                            if val is not None and not (
+                                isinstance(val, str) and "${{" in val
+                            ):
                                 raw_vars[v_conf.name] = val
 
                     errors: list[str] = []
@@ -415,7 +430,7 @@ class SflowApp:
                             def _resolve_var(m: _re_art.Match) -> str:
                                 ref = m.group(1).strip()
                                 if ref.startswith("variables."):
-                                    name = ref[len("variables."):]
+                                    name = ref[len("variables.") :]
                                     if name in raw_vars:
                                         return str(raw_vars[name])
                                 return m.group(0)
@@ -713,7 +728,11 @@ class SflowApp:
                             is_last = i == len(_loader.file_contributions) - 1
                             fname = contrib["path"].name
                             parent = contrib["path"].parent.name
-                            label = f"{parent}/{fname}" if parent and parent != "." else fname
+                            label = (
+                                f"{parent}/{fname}"
+                                if parent and parent != "."
+                                else fname
+                            )
                             connector = "└─" if is_last else "├─"
                             arrow = " ──►" if is_last else ""
                             _logger.info(
@@ -726,9 +745,7 @@ class SflowApp:
                                 items_str = ", ".join(sec_items[:5])
                                 if len(sec_items) > 5:
                                     items_str += f", … (+{len(sec_items) - 5})"
-                                _logger.info(
-                                    f"  {branch}    {sec_name}: [{items_str}]"
-                                )
+                                _logger.info(f"  {branch}    {sec_name}: [{items_str}]")
                         _logger.info("")
 
                     if _missable_stripped:
@@ -859,167 +876,194 @@ class SflowApp:
                         _logger.info(f"  {dag_line}")
 
                     if not quiet:
-                      _logger.info("")
-                      _logger.info("=" * 60)
-                      _logger.info("Tasks:")
-                      _logger.info("=" * 60)
-                      for idx, name in enumerate(order, 1):
-                          t = tg.get_task(name)
-                          deps = tg.dag.get_dependencies(name)
-                          op_conf = getattr(getattr(t, "operator", None), "config", None)
-                          op_type_str = getattr(op_conf, "type", None) or "unknown"
+                        _logger.info("")
+                        _logger.info("=" * 60)
+                        _logger.info("Tasks:")
+                        _logger.info("=" * 60)
+                        for idx, name in enumerate(order, 1):
+                            t = tg.get_task(name)
+                            deps = tg.dag.get_dependencies(name)
+                            op_conf = getattr(
+                                getattr(t, "operator", None), "config", None
+                            )
+                            op_type_str = getattr(op_conf, "type", None) or "unknown"
 
-                          nodelist = getattr(op_conf, "nodelist", None) or []
-                          cuda_visible = t.envs.get("CUDA_VISIBLE_DEVICES")
-                          task_out_dir = t.envs.get("SFLOW_TASK_OUTPUT_DIR")
-                          retry = getattr(t, "retries", None)
-                          retry_str = (
-                              f"{retry.count}x, interval={retry.interval}, backoff={retry.backoff}"
-                              if retry is not None
-                              else "none"
-                          )
+                            nodelist = getattr(op_conf, "nodelist", None) or []
+                            cuda_visible = t.envs.get("CUDA_VISIBLE_DEVICES")
+                            task_out_dir = t.envs.get("SFLOW_TASK_OUTPUT_DIR")
+                            retry = getattr(t, "retries", None)
+                            retry_str = (
+                                f"{retry.count}x, interval={retry.interval}, backoff={retry.backoff}"
+                                if retry is not None
+                                else "none"
+                            )
 
-                          _logger.info("")
-                          _logger.info(f"  [{idx}] {t.name}")
-                          _logger.info(
-                              f"      ├─ backend: {getattr(t, 'backend_name', None)}"
-                          )
-                          _logger.info(f"      ├─ operator: {op_type_str}")
-                          _logger.info(
-                              f"      ├─ depends_on: {list(deps) if deps else '[]'}"
-                          )
-                          _logger.info(f"      ├─ nodelist: {nodelist}")
-                          if cuda_visible:
-                              _logger.info(
-                                  f"      ├─ CUDA_VISIBLE_DEVICES: {cuda_visible}"
-                              )
-                          _logger.info(f"      ├─ task_output_dir: {task_out_dir}")
-                          _logger.info(f"      ├─ retries: {retry_str}")
+                            _logger.info("")
+                            _logger.info(f"  [{idx}] {t.name}")
+                            _logger.info(
+                                f"      ├─ backend: {getattr(t, 'backend_name', None)}"
+                            )
+                            _logger.info(f"      ├─ operator: {op_type_str}")
+                            _logger.info(
+                                f"      ├─ depends_on: {list(deps) if deps else '[]'}"
+                            )
+                            _logger.info(f"      ├─ nodelist: {nodelist}")
+                            if cuda_visible:
+                                _logger.info(
+                                    f"      ├─ CUDA_VISIBLE_DEVICES: {cuda_visible}"
+                                )
+                            _logger.info(f"      ├─ task_output_dir: {task_out_dir}")
+                            _logger.info(f"      ├─ retries: {retry_str}")
 
-                          if t.sweep_variables:
-                              sweep_vals = {
-                                  k: t.envs.get(k, "") for k in t.sweep_variables
-                              }
-                              sweep_items = ", ".join(
-                                  f"{k}={v}" for k, v in sweep_vals.items()
-                              )
-                              _logger.info(f"      ├─ sweep_vars: {{{sweep_items}}}")
+                            if t.sweep_variables:
+                                sweep_vals = {
+                                    k: t.envs.get(k, "") for k in t.sweep_variables
+                                }
+                                sweep_items = ", ".join(
+                                    f"{k}={v}" for k, v in sweep_vals.items()
+                                )
+                                _logger.info(f"      ├─ sweep_vars: {{{sweep_items}}}")
 
-                          if t.probes:
-                              _logger.info("      ├─ probes:")
-                              for pi, probe in enumerate(t.probes):
-                                  is_last_probe = pi == len(t.probes) - 1
-                                  p_prefix = "└─" if is_last_probe else "├─"
-                                  probe_type = str(probe.type)
-                                  cls_name = probe.__class__.__name__
-                                  details: list[str] = []
-                                  if hasattr(probe, "_host") and hasattr(probe, "_port"):
-                                      kind = "tcp_port"
-                                      details.append(
-                                          f"host={probe._host} (fake ip when dry-run, real ip when running)"
-                                      )
-                                      details.append(f"port={probe._port}")
-                                      on_node = getattr(probe, "_on_node", None)
-                                      if on_node:
-                                          details.append(f"on_node={on_node}")
-                                  elif hasattr(probe, "_url"):
-                                      kind = (
-                                          "http_get" if "Get" in cls_name else "http_post"
-                                      )
-                                      details.append(f"url={probe._url} (fake ip when dry-run, real ip when running)")
-                                  elif hasattr(probe, "_regex"):
-                                      kind = "log_watch"
-                                      pat = (
-                                          getattr(probe, "_pattern_display", None)
-                                          or probe._regex.pattern
-                                      )
-                                      details.append(f"pattern={pat}")
-                                      mc = getattr(probe, "_match_count", 1)
-                                      if mc != 1:
-                                          details.append(f"match_count={mc}")
-                                      logger_name = getattr(
-                                          probe, "_logger_task_name", None
-                                      )
-                                      if logger_name:
-                                          details.append(f"logger={logger_name}")
-                                  else:
-                                      kind = cls_name
-                                  detail_str = (
-                                      f" ({', '.join(details)})" if details else ""
-                                  )
-                                  timing = (
-                                      f"delay={probe.delay}s, timeout={probe.timeout}s, "
-                                      f"interval={probe.interval}s"
-                                  )
-                                  connector = "   " if is_last_probe else "│  "
-                                  _logger.info(
-                                      f"         {p_prefix} {probe_type}: {kind}{detail_str}"
-                                  )
-                                  _logger.info(f"         {connector}  {timing}")
+                            if t.probes:
+                                _logger.info("      ├─ probes:")
+                                for pi, probe in enumerate(t.probes):
+                                    is_last_probe = pi == len(t.probes) - 1
+                                    p_prefix = "└─" if is_last_probe else "├─"
+                                    probe_type = str(probe.type)
+                                    cls_name = probe.__class__.__name__
+                                    details: list[str] = []
+                                    if hasattr(probe, "_host") and hasattr(
+                                        probe, "_port"
+                                    ):
+                                        kind = "tcp_port"
+                                        details.append(
+                                            f"host={probe._host} (fake ip when dry-run, real ip when running)"
+                                        )
+                                        details.append(f"port={probe._port}")
+                                        on_node = getattr(probe, "_on_node", None)
+                                        if on_node:
+                                            details.append(f"on_node={on_node}")
+                                    elif hasattr(probe, "_url"):
+                                        kind = (
+                                            "http_get"
+                                            if "Get" in cls_name
+                                            else "http_post"
+                                        )
+                                        details.append(
+                                            f"url={probe._url} (fake ip when dry-run, real ip when running)"
+                                        )
+                                    elif hasattr(probe, "_regex"):
+                                        kind = "log_watch"
+                                        pat = (
+                                            getattr(probe, "_pattern_display", None)
+                                            or probe._regex.pattern
+                                        )
+                                        details.append(f"pattern={pat}")
+                                        mc = getattr(probe, "_match_count", 1)
+                                        if mc != 1:
+                                            details.append(f"match_count={mc}")
+                                        logger_name = getattr(
+                                            probe, "_logger_task_name", None
+                                        )
+                                        if logger_name:
+                                            details.append(f"logger={logger_name}")
+                                    else:
+                                        kind = cls_name
+                                    detail_str = (
+                                        f" ({', '.join(details)})" if details else ""
+                                    )
+                                    timing = (
+                                        f"delay={probe.delay}s, timeout={probe.timeout}s, "
+                                        f"interval={probe.interval}s"
+                                    )
+                                    connector = "   " if is_last_probe else "│  "
+                                    _logger.info(
+                                        f"         {p_prefix} {probe_type}: {kind}{detail_str}"
+                                    )
+                                    _logger.info(f"         {connector}  {timing}")
 
-                          if op_conf is not None:
-                              op_details: list[tuple[str, str]] = []
-                              if getattr(op_conf, "nodes", None) is not None:
-                                  op_details.append(("nodes", str(op_conf.nodes)))
-                              if getattr(op_conf, "ntasks", None) is not None:
-                                  op_details.append(("ntasks", str(op_conf.ntasks)))
-                              if getattr(op_conf, "ntasks_per_node", None) is not None:
-                                  op_details.append(
-                                      ("ntasks_per_node", str(op_conf.ntasks_per_node))
-                                  )
-                              if getattr(op_conf, "cpus_per_task", None) is not None:
-                                  op_details.append(
-                                      ("cpus_per_task", str(op_conf.cpus_per_task))
-                                  )
-                              if getattr(op_conf, "gpus", None) is not None:
-                                  op_details.append(("gpus", str(op_conf.gpus)))
-                              if getattr(op_conf, "gpus_per_task", None) is not None:
-                                  op_details.append(
-                                      ("gpus_per_task", str(op_conf.gpus_per_task))
-                                  )
-                              if getattr(op_conf, "container_image", None) is not None:
-                                  op_details.append(
-                                      ("container_image", op_conf.container_image)
-                                  )
-                              if getattr(op_conf, "container_name", None) is not None:
-                                  op_details.append(
-                                      ("container_name", op_conf.container_name)
-                                  )
-                              if getattr(op_conf, "container_mounts", None):
-                                  mounts = op_conf.container_mounts
-                                  if len(mounts) <= 3:
-                                      op_details.append(("container_mounts", str(mounts)))
-                                  else:
-                                      op_details.append(
-                                          ("container_mounts", f"[{len(mounts)} mounts]")
-                                      )
-                              if getattr(op_conf, "mpi", None) is not None:
-                                  op_details.append(("mpi", op_conf.mpi))
-                              if (
-                                  getattr(op_conf, "job_id", None) is not None
-                                  and getattr(op_conf, "job_id", None) != "0"
-                              ):
-                                  op_details.append(("job_id", str(op_conf.job_id)))
-                              if getattr(op_conf, "extra_args", None):
-                                  extra_args_list = list(op_conf.extra_args)
-                                  if len(extra_args_list) <= 5:
-                                      op_details.append(
-                                          ("extra_args", str(extra_args_list))
-                                      )
-                                  else:
-                                      op_details.append(
-                                          ("extra_args", f"[{len(extra_args_list)} args]")
-                                      )
+                            if op_conf is not None:
+                                op_details: list[tuple[str, str]] = []
+                                if getattr(op_conf, "nodes", None) is not None:
+                                    op_details.append(("nodes", str(op_conf.nodes)))
+                                if getattr(op_conf, "ntasks", None) is not None:
+                                    op_details.append(("ntasks", str(op_conf.ntasks)))
+                                if (
+                                    getattr(op_conf, "ntasks_per_node", None)
+                                    is not None
+                                ):
+                                    op_details.append(
+                                        (
+                                            "ntasks_per_node",
+                                            str(op_conf.ntasks_per_node),
+                                        )
+                                    )
+                                if getattr(op_conf, "cpus_per_task", None) is not None:
+                                    op_details.append(
+                                        ("cpus_per_task", str(op_conf.cpus_per_task))
+                                    )
+                                if getattr(op_conf, "gpus", None) is not None:
+                                    op_details.append(("gpus", str(op_conf.gpus)))
+                                if getattr(op_conf, "gpus_per_task", None) is not None:
+                                    op_details.append(
+                                        ("gpus_per_task", str(op_conf.gpus_per_task))
+                                    )
+                                if (
+                                    getattr(op_conf, "container_image", None)
+                                    is not None
+                                ):
+                                    op_details.append(
+                                        ("container_image", op_conf.container_image)
+                                    )
+                                if getattr(op_conf, "container_name", None) is not None:
+                                    op_details.append(
+                                        ("container_name", op_conf.container_name)
+                                    )
+                                if getattr(op_conf, "container_mounts", None):
+                                    mounts = op_conf.container_mounts
+                                    if len(mounts) <= 3:
+                                        op_details.append(
+                                            ("container_mounts", str(mounts))
+                                        )
+                                    else:
+                                        op_details.append(
+                                            (
+                                                "container_mounts",
+                                                f"[{len(mounts)} mounts]",
+                                            )
+                                        )
+                                if getattr(op_conf, "mpi", None) is not None:
+                                    op_details.append(("mpi", op_conf.mpi))
+                                if (
+                                    getattr(op_conf, "job_id", None) is not None
+                                    and getattr(op_conf, "job_id", None) != "0"
+                                ):
+                                    op_details.append(("job_id", str(op_conf.job_id)))
+                                if getattr(op_conf, "extra_args", None):
+                                    extra_args_list = list(op_conf.extra_args)
+                                    if len(extra_args_list) <= 5:
+                                        op_details.append(
+                                            ("extra_args", str(extra_args_list))
+                                        )
+                                    else:
+                                        op_details.append(
+                                            (
+                                                "extra_args",
+                                                f"[{len(extra_args_list)} args]",
+                                            )
+                                        )
 
-                              if op_details:
-                                  _logger.info("      └─ operator config:")
-                                  for i, (key, val) in enumerate(op_details):
-                                      prefix = "└─" if i == len(op_details) - 1 else "├─"
-                                      _logger.info(f"         {prefix} {key}: {val}")
-                              else:
-                                  _logger.info("      └─ operator config: (default)")
-                      _logger.info("")
-                      _logger.info("=" * 60)
+                                if op_details:
+                                    _logger.info("      └─ operator config:")
+                                    for i, (key, val) in enumerate(op_details):
+                                        prefix = (
+                                            "└─" if i == len(op_details) - 1 else "├─"
+                                        )
+                                        _logger.info(f"         {prefix} {key}: {val}")
+                                else:
+                                    _logger.info("      └─ operator config: (default)")
+                        _logger.info("")
+                        _logger.info("=" * 60)
 
                     # Check enroot credentials for srun operators using containers
                     def _check_enroot_credentials(tasks: list) -> str | None:

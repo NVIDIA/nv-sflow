@@ -167,9 +167,7 @@ class DAG:
             for i, node in enumerate(nodes):
                 node_cx[node] = offset + i * (box_w + h_gap) + box_w // 2
 
-        all_edges = [
-            (fn, tn) for fn in order for tn in self.get_dependents(fn)
-        ]
+        all_edges = [(fn, tn) for fn in order for tn in self.get_dependents(fn)]
 
         _CHAR = {
             (True, True, True, True): "┼",
@@ -293,7 +291,9 @@ class DAG:
         for level in range(num_layers):
             for node in layer_nodes[level]:
                 dependents = self.get_dependents(node)
-                line_len = len(node) + (len(f"  → {', '.join(dependents)}") if dependents else 0)
+                line_len = len(node) + (
+                    len(f"  → {', '.join(dependents)}") if dependents else 0
+                )
                 max_content = max(max_content, line_len)
         header_len = len(f" Layer {num_layers - 1} ")
         inner_w = max(max_content + 2, header_len + 2)

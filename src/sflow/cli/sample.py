@@ -13,7 +13,12 @@ import typer
 
 from sflow.cli import DOCS_URL, app
 from sflow.logging import get_logger
-from sflow.samples import get_sample_path, get_samples_dir, list_modular_samples, list_samples
+from sflow.samples import (
+    get_sample_path,
+    get_samples_dir,
+    list_modular_samples,
+    list_samples,
+)
 
 _logger = get_logger(__name__)
 
@@ -109,8 +114,11 @@ def sample(
             yaml_files = sorted(f.name for f in output.glob("*.yaml"))
             _skip_dirs = {"__pycache__", "sflow_output", ".git"}
             sub_dirs = sorted(
-                d.name for d in output.iterdir()
-                if d.is_dir() and not d.name.startswith("_") and d.name not in _skip_dirs
+                d.name
+                for d in output.iterdir()
+                if d.is_dir()
+                and not d.name.startswith("_")
+                and d.name not in _skip_dirs
             )
             if yaml_files or sub_dirs:
                 parts = [f.replace(".yaml", "") for f in yaml_files]
@@ -120,10 +128,15 @@ def sample(
             # Detect framework subdirectories for concrete compose examples
             _skip_dirs2 = {"__pycache__", "sflow_output", ".git"}
             subdirs = sorted(
-                d.name for d in output.iterdir()
-                if d.is_dir() and not d.name.startswith("_") and d.name not in _skip_dirs2
+                d.name
+                for d in output.iterdir()
+                if d.is_dir()
+                and not d.name.startswith("_")
+                and d.name not in _skip_dirs2
             )
-            has_common = (output / "slurm_config.yaml").exists() and (output / "common_workflow.yaml").exists()
+            has_common = (output / "slurm_config.yaml").exists() and (
+                output / "common_workflow.yaml"
+            ).exists()
 
             typer.echo("\n" + "=" * 65)
             typer.echo("  Option A: Bulk batch (CSV-driven, all-in-one)")
@@ -139,7 +152,9 @@ def sample(
                     f"    sflow batch --bulk-input {output.name}/{csv_files[0]} "
                     f"-A ACCOUNT -p PARTITION --submit"
                 )
-                typer.echo("\n  Add --resolve to inline all variables into the generated configs:")
+                typer.echo(
+                    "\n  Add --resolve to inline all variables into the generated configs:"
+                )
                 typer.echo(
                     f"    sflow batch --bulk-input {output.name}/{csv_files[0]} "
                     f"-A ACCOUNT -p PARTITION --resolve"
@@ -150,7 +165,9 @@ def sample(
                 typer.echo(f"\n{'=' * 65}")
                 typer.echo("  Option B: Compose + Submit (step-by-step)")
                 typer.echo("=" * 65)
-                typer.echo("\n  Step 1 - Compose modular files into a complete workflow:")
+                typer.echo(
+                    "\n  Step 1 - Compose modular files into a complete workflow:"
+                )
                 typer.echo(
                     f"    sflow compose {output.name}/slurm_config.yaml "
                     f"{output.name}/common_workflow.yaml \\"
@@ -183,21 +200,13 @@ def sample(
             typer.echo(
                 "\n  By default, composed configs keep ${{ variables.* }} expressions"
             )
-            typer.echo(
-                "  so you can easily override values with --set at run time."
-            )
+            typer.echo("  so you can easily override values with --set at run time.")
             typer.echo(
                 "\n  Add --resolve to inline all resolvable variables into literal"
             )
-            typer.echo(
-                "  values, producing a plain-text config with no expressions."
-            )
-            typer.echo(
-                "  Use this when you want a self-contained, fully-baked recipe."
-            )
-            typer.echo(
-                "\n    sflow compose ... --resolve -o resolved.yaml"
-            )
+            typer.echo("  values, producing a plain-text config with no expressions.")
+            typer.echo("  Use this when you want a self-contained, fully-baked recipe.")
+            typer.echo("\n    sflow compose ... --resolve -o resolved.yaml")
 
             typer.echo(f"\n{'=' * 65}")
             typer.echo("  Tip: Model path")
@@ -205,24 +214,16 @@ def sample(
             typer.echo(
                 "\n  Sample configs use a placeholder model path (LOCAL_MODEL_PATH)."
             )
-            typer.echo(
-                "  Override it with --artifact to point to your actual model:"
-            )
-            typer.echo(
-                "\n    -a LOCAL_MODEL_PATH=fs:///path/to/your/model"
-            )
-            typer.echo(
-                "\n  Example:"
-            )
+            typer.echo("  Override it with --artifact to point to your actual model:")
+            typer.echo("\n    -a LOCAL_MODEL_PATH=fs:///path/to/your/model")
+            typer.echo("\n  Example:")
             typer.echo(
                 f"    sflow batch --bulk-input {output.name}/{csv_files[0] if csv_files else 'bulk_input.csv'} \\"
             )
             typer.echo(
                 "                -a LOCAL_MODEL_PATH=fs:///data/models/Llama-3.1-8B \\"
             )
-            typer.echo(
-                "                -A ACCOUNT -p PARTITION --submit"
-            )
+            typer.echo("                -A ACCOUNT -p PARTITION --submit")
         else:
             shutil.copy2(sample_path, output)
             typer.echo(f"✓ Sample copied to: {output}")
@@ -296,27 +297,69 @@ def _list_samples():
         typer.echo()
         typer.echo("  Modular workflow:")
         typer.echo()
-        typer.echo("    ┌─────────────────────────────────────────────────────────────┐")
-        typer.echo("    │  Step 1: Compose modular YAML files into complete configs   │")
-        typer.echo("    │                                                             │")
-        typer.echo("    │    sflow compose <folder>/base.yaml <folder>/task.yaml \\     │")
-        typer.echo("    │                  --resolve -o composed.yaml                 │")
-        typer.echo("    │                                                             │")
-        typer.echo("    │  Or bulk compose via CSV:                                   │")
-        typer.echo("    │    sflow compose --bulk-input <folder>/bulk_input.csv \\      │")
-        typer.echo("    │                  --resolve -o output_dir/                   │")
-        typer.echo("    ├─────────────────────────────────────────────────────────────┤")
-        typer.echo("    │                          ↓                                  │")
-        typer.echo("    ├─────────────────────────────────────────────────────────────┤")
-        typer.echo("    │  Step 2: Submit composed configs to Slurm                   │")
-        typer.echo("    │                                                             │")
-        typer.echo("    │    sflow batch --bulk-submit output_dir/ \\                   │")
-        typer.echo("    │                -p PARTITION -A ACCOUNT --submit              │")
-        typer.echo("    │                                                             │")
-        typer.echo("    │  Or directly from modular files (compose + batch in one):    │")
-        typer.echo("    │    sflow batch --bulk-input <folder>/bulk_input.csv \\         │")
-        typer.echo("    │                -p PARTITION -A ACCOUNT --submit              │")
-        typer.echo("    └─────────────────────────────────────────────────────────────┘")
+        typer.echo(
+            "    ┌─────────────────────────────────────────────────────────────┐"
+        )
+        typer.echo(
+            "    │  Step 1: Compose modular YAML files into complete configs   │"
+        )
+        typer.echo(
+            "    │                                                             │"
+        )
+        typer.echo(
+            "    │    sflow compose <folder>/base.yaml <folder>/task.yaml \\     │"
+        )
+        typer.echo(
+            "    │                  --resolve -o composed.yaml                 │"
+        )
+        typer.echo(
+            "    │                                                             │"
+        )
+        typer.echo(
+            "    │  Or bulk compose via CSV:                                   │"
+        )
+        typer.echo(
+            "    │    sflow compose --bulk-input <folder>/bulk_input.csv \\      │"
+        )
+        typer.echo(
+            "    │                  --resolve -o output_dir/                   │"
+        )
+        typer.echo(
+            "    ├─────────────────────────────────────────────────────────────┤"
+        )
+        typer.echo(
+            "    │                          ↓                                  │"
+        )
+        typer.echo(
+            "    ├─────────────────────────────────────────────────────────────┤"
+        )
+        typer.echo(
+            "    │  Step 2: Submit composed configs to Slurm                   │"
+        )
+        typer.echo(
+            "    │                                                             │"
+        )
+        typer.echo(
+            "    │    sflow batch --bulk-submit output_dir/ \\                   │"
+        )
+        typer.echo(
+            "    │                -p PARTITION -A ACCOUNT --submit              │"
+        )
+        typer.echo(
+            "    │                                                             │"
+        )
+        typer.echo(
+            "    │  Or directly from modular files (compose + batch in one):    │"
+        )
+        typer.echo(
+            "    │    sflow batch --bulk-input <folder>/bulk_input.csv \\         │"
+        )
+        typer.echo(
+            "    │                -p PARTITION -A ACCOUNT --submit              │"
+        )
+        typer.echo(
+            "    └─────────────────────────────────────────────────────────────┘"
+        )
         typer.echo()
 
     typer.echo("Usage:")
