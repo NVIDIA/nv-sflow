@@ -411,23 +411,33 @@ def _compose_files(
 
     cleaned = _strip_none_values(merged)
 
+    def _clean_multiline(text: str) -> str:
+        """Strip trailing whitespace per line so PyYAML accepts literal block style."""
+        lines = text.split("\n")
+        cleaned_lines = [line.rstrip() for line in lines]
+        result = "\n".join(cleaned_lines)
+        if not result.endswith("\n"):
+            result += "\n"
+        return result
+
     class _BlockStringDumper(yaml.Dumper):
         pass
 
-    _BlockStringDumper.add_representer(
-        str,
-        lambda dumper, data: dumper.represent_scalar(
-            "tag:yaml.org,2002:str",
-            data,
-            style="|" if "\n" in data else None,
-        ),
-    )
+    def _str_representer(dumper: yaml.Dumper, data: str) -> yaml.ScalarNode:
+        if "\n" in data:
+            data = _clean_multiline(data)
+            return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+    _BlockStringDumper.add_representer(str, _str_representer)
+
     yaml_output = yaml.dump(
         cleaned,
         Dumper=_BlockStringDumper,
         default_flow_style=False,
         sort_keys=False,
         allow_unicode=True,
+        width=2000,
     )
 
     top_level_keys = set(cleaned.keys())

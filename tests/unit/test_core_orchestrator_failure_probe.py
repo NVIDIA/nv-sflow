@@ -253,6 +253,7 @@ def test_process_exit_failure_not_marked_as_probe():
 
     class _ImmediateExitLauncher:
         async def run_async(self, command, output_logger=None, env=None, **kwargs) -> int:
+            await asyncio.sleep(0)
             return 1
 
     task = Task(
@@ -297,7 +298,7 @@ def test_mixed_probe_and_process_failure_in_fail_fast_message():
                     return -1
                 return 0
             else:
-                # "worker" crashes immediately
+                await asyncio.sleep(0)
                 return 1
 
     server = Task(
@@ -344,29 +345,12 @@ def test_failure_probe_with_match_count_requires_multiple_matches(tmp_path: Path
     wf_out = tmp_path / "wf"
     (wf_out / "svc").mkdir(parents=True)
     log_path = wf_out / "svc" / "svc.log"
-    log_path.write_text("Traceback (most recent call last):\nboom\n")
 
-    tg = TaskGraph()
-    wf = Workflow(name="wf", task_graph=tg)
-
-    probe = LogWatchProbe(
-        regex_pattern="Traceback (most recent call last)",
-        type=ProbeType.FAILURE,
-        interval=0,
-        timeout=1,
-        failure_threshold=1,
-        match_count=3,
+    two_tracebacks = (
+        "Traceback (most recent call last):\nboom\n"
+        "Traceback (most recent call last):\nboom2\n"
     )
-
-    svc = Task(
-        name="svc",
-        operator=BashOperator(BashOperatorConfig(name="bash")),
-        logger=logging.getLogger("sflow.task.svc"),
-        probes=[probe],
-    )
-    svc.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
-
-    tg.dag.add_node("svc", svc)
+    three_tracebacks = two_tracebacks + "Traceback (most recent call last):\nboom3\n"
 
     class _WriteThenHang:
         def __init__(self, log_path: Path, content: str):
@@ -381,54 +365,68 @@ def test_failure_probe_with_match_count_requires_multiple_matches(tmp_path: Path
                 return -1
             return 0
 
-    # Only 2 tracebacks — should NOT trigger (needs 3)
-    two_tracebacks = (
-        "Traceback (most recent call last):\nboom\n"
-        "Traceback (most recent call last):\nboom2\n"
-    )
-    orch = Orchestrator(
-        workflow=wf,
-        poll_interval=0,
-        launcher=_WriteThenHang(log_path, two_tracebacks),
-        fail_fast=True,
-    )
+    async def _run_both_phases():
+        # Phase 1: 2 tracebacks < match_count 3 → probe should NOT trigger
+        probe1 = LogWatchProbe(
+            regex_pattern="Traceback (most recent call last)",
+            type=ProbeType.FAILURE,
+            interval=0,
+            timeout=1,
+            failure_threshold=1,
+            match_count=3,
+        )
+        svc1 = Task(
+            name="svc",
+            operator=BashOperator(BashOperatorConfig(name="bash")),
+            logger=logging.getLogger("sflow.task.svc.p1"),
+            probes=[probe1],
+        )
+        svc1.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
+        tg1 = TaskGraph()
+        tg1.dag.add_node("svc", svc1)
+        wf1 = Workflow(name="wf1", task_graph=tg1)
+        orch1 = Orchestrator(
+            workflow=wf1,
+            poll_interval=0,
+            launcher=_WriteThenHang(log_path, two_tracebacks),
+            fail_fast=True,
+        )
+        with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            await asyncio.wait_for(orch1.run(), timeout=0.5)
+        # Let the event loop process pending cancellations from phase 1
+        for pending in asyncio.all_tasks():
+            if pending is not asyncio.current_task() and not pending.done():
+                pending.cancel()
+        await asyncio.sleep(0.05)
+        assert svc1.failed_by_probe is False
 
-    # Run briefly — should NOT finish because the probe won't trigger
-    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
-        asyncio.run(asyncio.wait_for(orch.run(), timeout=0.5))
+        # Phase 2: 3 tracebacks >= match_count 3 → probe SHOULD trigger
+        probe2 = LogWatchProbe(
+            regex_pattern="Traceback (most recent call last)",
+            type=ProbeType.FAILURE,
+            interval=0,
+            timeout=1,
+            failure_threshold=1,
+            match_count=3,
+        )
+        svc2 = Task(
+            name="svc",
+            operator=BashOperator(BashOperatorConfig(name="bash")),
+            logger=logging.getLogger("sflow.task.svc.p2"),
+            probes=[probe2],
+        )
+        svc2.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
+        tg2 = TaskGraph()
+        tg2.dag.add_node("svc", svc2)
+        wf2 = Workflow(name="wf2", task_graph=tg2)
+        orch2 = Orchestrator(
+            workflow=wf2,
+            poll_interval=0,
+            launcher=_WriteThenHang(log_path, three_tracebacks),
+            fail_fast=True,
+        )
+        await asyncio.wait_for(orch2.run(), timeout=5)
+        assert svc2.status == TaskStatus.FAILED
+        assert svc2.failed_by_probe is True
 
-    assert svc.failed_by_probe is False
-
-    # Now add a 3rd traceback and re-test with a fresh orchestrator
-    three_tracebacks = two_tracebacks + "Traceback (most recent call last):\nboom3\n"
-    probe2 = LogWatchProbe(
-        regex_pattern="Traceback (most recent call last)",
-        type=ProbeType.FAILURE,
-        interval=0,
-        timeout=1,
-        failure_threshold=1,
-        match_count=3,
-    )
-    svc2 = Task(
-        name="svc",
-        operator=BashOperator(BashOperatorConfig(name="bash")),
-        logger=logging.getLogger("sflow.task.svc"),
-        probes=[probe2],
-    )
-    svc2.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
-
-    tg2 = TaskGraph()
-    tg2.dag.add_node("svc", svc2)
-    wf2 = Workflow(name="wf2", task_graph=tg2)
-
-    orch2 = Orchestrator(
-        workflow=wf2,
-        poll_interval=0,
-        launcher=_WriteThenHang(log_path, three_tracebacks),
-        fail_fast=True,
-    )
-
-    asyncio.run(asyncio.wait_for(orch2.run(), timeout=5))
-
-    assert svc2.status == TaskStatus.FAILED
-    assert svc2.failed_by_probe is True
+    asyncio.run(_run_both_phases())

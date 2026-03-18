@@ -15,6 +15,7 @@ class _FakeLauncher:
     async def run_async(
         self, command, shell: bool = False, output_logger=None, env=None, **kwargs
     ) -> int:
+        await asyncio.sleep(0)
         return 0
 
 

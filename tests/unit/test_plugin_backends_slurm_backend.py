@@ -18,6 +18,7 @@ class _FakeSubprocessLauncher:
         self.calls: list[dict] = []
 
     async def run_async(self, command, shell: bool = False, output_logger=None) -> int:
+        await asyncio.sleep(0)
         if not self._script:
             raise AssertionError("Unexpected extra run_async() call")
 

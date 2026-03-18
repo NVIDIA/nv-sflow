@@ -27,7 +27,7 @@ class _LauncherByTaskName:
         self._codes = dict(codes)
 
     async def run_async(self, command, output_logger=None, env=None, **kwargs) -> int:  # noqa: ARG002
-        # `output_logger` is task.logger, so we can use its name to determine which task.
+        await asyncio.sleep(0)
         if output_logger is None:
             return 0
         name = output_logger.name.split(".")[-1]
