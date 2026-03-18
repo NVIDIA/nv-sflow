@@ -209,7 +209,7 @@ stateDiagram-v2
 | **`sflow compose`** | Merge multiple YAMLs into one | `--resolve`, `--validate`, `--bulk-input`, `--missable-tasks/-M`, `-o/--output` |
 | **`sflow visualize`** | Render DAG as image/mermaid | `--format` (png/svg/pdf/mermaid/dot), `--show-variables`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M` |
 | **`sflow sample`** | List/copy example workflows | `--list`, `--force`, `-o/--output` |
-| **`sflow skill`** | Copy agent skills into project | `--list`, `--force`, `-o/--output` |
+| **`sflow skill`** | Copy agent skills into project (merges into existing directory) | `--list`, `--force` (overwrite existing files), `-o/--output` |
 
 ### Multi-file Input
 

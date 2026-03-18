@@ -2168,3 +2168,137 @@ def test_bulk_input_sbatch_script_includes_per_row_missable(mock_sflow_app, tmp_
     assert "--missable-tasks" in agg_script
     assert "prefill_server" in agg_script
     assert "decode_server" in agg_script
+
+
+# ---------------------------------------------------------------------------
+# CLI vs CSV precedence tests
+# ---------------------------------------------------------------------------
+
+
+def test_batch_bulk_input_variable_csv_wins_over_cli(mock_sflow_app, tmp_path):
+    """For --set variables, CSV value should take precedence over CLI."""
+    wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
+    out_dir = tmp_path / "sflow_output"
+    csv_file = _write_csv(
+        tmp_path / "jobs.csv",
+        f"sflow_config_file,TP_SIZE\n{wf},8\n",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "batch", "--bulk-input", str(csv_file),
+            "-p", "batch", "-A", "acct", "--nodes", "1",
+            "--output-dir", str(out_dir),
+            "--set", "TP_SIZE=2",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert "CSV value will take precedence" in (result.output + (result.stderr or ""))
+    scripts = sorted(list(out_dir.glob("bulk_*"))[0].glob("*.sh"))
+    script = scripts[0].read_text()
+    assert "--set TP_SIZE=8" in script
+    assert "--set TP_SIZE=2" not in script
+
+
+def test_batch_bulk_input_artifact_cli_wins_over_csv(mock_sflow_app, tmp_path):
+    """For --artifact, CLI value should take precedence over CSV."""
+    wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    csv_model_dir = tmp_path / "csv_models"
+    csv_model_dir.mkdir()
+    out_dir = tmp_path / "sflow_output"
+    csv_file = _write_csv(
+        tmp_path / "jobs.csv",
+        f"sflow_config_file,MODEL_PATH\n{wf},fs://{csv_model_dir}\n",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "batch", "--bulk-input", str(csv_file),
+            "-p", "batch", "-A", "acct", "--nodes", "1",
+            "--output-dir", str(out_dir),
+            "--artifact", f"MODEL_PATH=fs://{model_dir}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert "CLI --artifact value will take precedence" in (result.output + (result.stderr or ""))
+    scripts = sorted(list(out_dir.glob("bulk_*"))[0].glob("*.sh"))
+    script = scripts[0].read_text()
+    assert f"--artifact MODEL_PATH=fs://{model_dir}" in script
+    assert f"--artifact MODEL_PATH=fs://{csv_model_dir}" not in script
+
+
+def test_compose_bulk_input_variable_csv_wins_over_cli(tmp_path):
+    """For --set variables in compose, CSV value should take precedence over CLI."""
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: TP_SIZE\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: run\n"
+        "      script:\n"
+        "        - echo ${{ variables.TP_SIZE }}\n"
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file,TP_SIZE\n{wf},8\n")
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "compose", "--bulk-input", str(csv_file),
+            "-o", str(out_dir),
+            "--set", "TP_SIZE=2",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert "CSV value will take precedence" in (result.output + (result.stderr or ""))
+    yaml_files = list(out_dir.glob("*/*.yaml"))
+    assert len(yaml_files) == 1
+    content = yaml_files[0].read_text()
+    assert "value: '8'" in content or "value: 8" in content
+
+
+def test_compose_bulk_input_artifact_cli_wins_over_csv(tmp_path):
+    """For --artifact in compose, CLI value should take precedence over CSV."""
+    cli_path = tmp_path / "cli_model"
+    cli_path.mkdir()
+    csv_path = tmp_path / "csv_model"
+    csv_path.mkdir()
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "artifacts:\n"
+        "  - name: MY_MODEL\n"
+        f"    uri: fs://{csv_path}\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: run\n"
+        "      script:\n"
+        "        - echo done\n"
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file,MY_MODEL\n{wf},fs://{csv_path}\n")
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "compose", "--bulk-input", str(csv_file),
+            "-o", str(out_dir),
+            "--artifact", f"MY_MODEL=fs://{cli_path}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert "CLI --artifact value will take precedence" in (result.output + (result.stderr or ""))
+    yaml_files = list(out_dir.glob("*/*.yaml"))
+    assert len(yaml_files) == 1
+    content = yaml_files[0].read_text()
+    assert str(cli_path) in content
+    assert str(csv_path) not in content

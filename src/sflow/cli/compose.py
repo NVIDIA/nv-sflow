@@ -462,6 +462,7 @@ def _compose_files(
 def _run_bulk_compose(
     *,
     csv_path: Path,
+    cli_files: list[Path] | None = None,
     cli_set_var: list[str] | None,
     cli_artifact: list[str] | None,
     output_dir: Path,
@@ -471,7 +472,13 @@ def _run_bulk_compose(
     row_filter: list[int] | None = None,
     missable_tasks: list[str] | None = None,
 ) -> None:
-    """Compose one YAML file per CSV row."""
+    """Compose one YAML file per CSV row.
+
+    When *cli_files* are provided alongside the CSV, they are prepended to
+    each row's ``sflow_config_file`` list (common base configs first, then
+    row-specific variant configs).  Duplicates are removed by resolved path,
+    keeping the first occurrence.
+    """
     import csv
     from datetime import datetime
 
@@ -510,6 +517,7 @@ def _run_bulk_compose(
         raise ValueError(f"CSV file has no data rows: {csv_path}")
 
     csv_dir = csv_path.parent
+    resolved_cli_files = [p.resolve() for p in (cli_files or [])]
 
     def _resolve_config_paths(raw: str) -> list[Path]:
         paths = []
@@ -520,15 +528,30 @@ def _run_bulk_compose(
             paths.append(fp.resolve())
         return paths
 
+    def _merge_and_dedup(base: list[Path], extra: list[Path]) -> list[Path]:
+        """Merge two path lists, deduplicating by resolved path (first wins)."""
+        seen: set[Path] = set()
+        merged: list[Path] = []
+        for p in base + extra:
+            if p not in seen:
+                seen.add(p)
+                merged.append(p)
+        return merged
+
     row_configs: list[tuple[list[Path], list[str] | None]] = []
     for r in rows:
-        cfg_files = _resolve_config_paths(r["sflow_config_file"])
+        csv_files = _resolve_config_paths(r["sflow_config_file"])
+        cfg_files = _merge_and_dedup(resolved_cli_files, csv_files)
         row_m = list(missable_tasks) if missable_tasks else []
         csv_m = (r.get("missable_tasks") or "").strip()
         if csv_m:
             row_m.extend(csv_m.split())
         row_configs.append((cfg_files, row_m or None))
     var_cols, art_cols = _classify_csv_columns(columns, row_configs)
+
+    if resolved_cli_files:
+        cli_stems = ", ".join(p.name for p in resolved_cli_files)
+        _logger.info(f"CLI config file(s) prepended to each CSV row: {cli_stems}")
 
     overlap_vars = set(cli_var_map.keys()) & var_cols
     overlap_arts = set(cli_art_map.keys()) & art_cols
@@ -541,7 +564,7 @@ def _run_bulk_compose(
     for name in sorted(overlap_arts):
         typer.echo(
             f"  Warning: artifact '{name}' specified via --artifact and also in CSV; "
-            f"CSV value will take precedence per row.",
+            f"CLI --artifact value will take precedence.",
             err=True,
         )
 
@@ -558,7 +581,8 @@ def _run_bulk_compose(
     for idx, row in enumerate(rows, start=1):
         if row_indices is not None and idx not in row_indices:
             continue
-        config_files = _resolve_config_paths(row["sflow_config_file"])
+        csv_files = _resolve_config_paths(row["sflow_config_file"])
+        config_files = _merge_and_dedup(resolved_cli_files, csv_files)
 
         merged_vars = dict(cli_var_map)
         for col in var_cols:
@@ -566,10 +590,11 @@ def _run_bulk_compose(
                 merged_vars[col] = row[col]
         set_var = [f"{k}={v}" for k, v in merged_vars.items()] or None
 
-        merged_arts = dict(cli_art_map)
+        merged_arts: dict[str, str] = {}
         for col in art_cols:
             if row.get(col):
                 merged_arts[col] = row[col]
+        merged_arts.update(cli_art_map)
         artifacts = [f"{k}={v}" for k, v in merged_arts.items()] or None
 
         overrides_desc = ", ".join(
@@ -787,6 +812,9 @@ def compose(
         # Bulk compose: generate one composed YAML per CSV row
         sflow compose --bulk-input jobs.csv -o output_dir
 
+        # Bulk compose with common base config(s) from CLI + variants from CSV
+        sflow compose backends.yaml common.yaml --bulk-input variants.csv -o output_dir
+
         # Bulk compose with validation (warns about resource issues)
         sflow compose --bulk-input jobs.csv --validate -o output_dir
     """
@@ -803,10 +831,12 @@ def compose(
         if bulk_input is not None:
             from sflow.cli.batch import parse_row_selector
 
+            cli_files = list(src_files or []) + list(file or [])
             parsed_rows = parse_row_selector(row) if row else None
             out_dir = output if output else Path.cwd() / "sflow_output"
             _run_bulk_compose(
                 csv_path=bulk_input,
+                cli_files=cli_files or None,
                 cli_set_var=set_var,
                 cli_artifact=artifact,
                 output_dir=out_dir,

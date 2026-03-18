@@ -36,7 +36,7 @@ def skill(
         typer.Option(
             "--force",
             "-f",
-            help="Overwrite existing skills directory if it exists",
+            help="Overwrite existing files when merging into an existing directory",
         ),
     ] = False,
     list_all: Annotated[
@@ -55,6 +55,10 @@ def skill(
     diagnose sflow errors. After copying, point your IDE's agent skill
     configuration to the output directory.
 
+    Skills are merged into the target directory: existing files and other
+    skills already present are preserved. Use --force to overwrite files
+    that already exist.
+
     Examples:
         # List available skills
         sflow skill --list
@@ -62,10 +66,10 @@ def skill(
         # Copy skills to ./skills (default)
         sflow skill
 
-        # Copy to a custom directory
+        # Copy to a custom directory (merges with existing content)
         sflow skill --output .cursor/skills
 
-        # Overwrite existing skills
+        # Overwrite existing files during merge
         sflow skill --force
     """
     if list_all:
@@ -76,18 +80,16 @@ def skill(
         output = Path.cwd() / "skills"
 
     skills_src = get_skills_dir()
+    available = [s for s in sorted(skills_src.iterdir()) if s.is_dir() and not s.name.startswith("_") and s.name not in {"__pycache__", ".git"}]
 
-    if output.exists() and not force:
-        typer.echo(
-            f"✗ '{output}' already exists. Use --force to overwrite.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    typer.echo(f"Skills will be copied to: {output}/")
+    typer.echo(f"  Skills: {', '.join(s.name for s in available)}")
+    if output.exists():
+        typer.echo(f"  Note: directory already exists — files will be merged{' (existing files will be overwritten)' if force else ' (existing files will be preserved)'}.")
+    if not typer.confirm("Proceed?", default=True):
+        raise typer.Abort()
 
     try:
-        if output.exists() and force:
-            shutil.rmtree(output)
-
         _skip = {"__pycache__", ".git", "__init__.py"}
         output.mkdir(parents=True, exist_ok=True)
 
@@ -97,10 +99,11 @@ def skill(
                 continue
             dest = output / item.name
             if item.is_dir():
-                shutil.copytree(item, dest)
+                _merge_tree(item, dest, force=force)
                 copied.append(f"{item.name}/")
             elif item.is_file():
-                shutil.copy2(item, dest)
+                if not dest.exists() or force:
+                    shutil.copy2(item, dest)
                 copied.append(item.name)
 
         typer.echo(f"✓ Skills copied to: {output}/")
@@ -120,6 +123,21 @@ def skill(
         _logger.exception(f"Failed to copy skills: {e}")
         typer.echo(f"✗ Failed to copy skills: {e}", err=True)
         raise typer.Exit(code=1)
+
+
+def _merge_tree(src: Path, dst: Path, *, force: bool = False) -> None:
+    """Recursively copy *src* into *dst*, merging into existing directories.
+
+    Files are only overwritten when *force* is True.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        dest = dst / item.name
+        if item.is_dir():
+            _merge_tree(item, dest, force=force)
+        elif item.is_file():
+            if not dest.exists() or force:
+                shutil.copy2(item, dest)
 
 
 def _list_skills():

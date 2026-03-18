@@ -861,6 +861,275 @@ def test_compose_missable_tasks_short_flag(tmp_path: Path):
     assert result.exit_code == 0
 
 
+# ---------------------------------------------------------------------------
+# CLI files + --bulk-input merge tests
+# ---------------------------------------------------------------------------
+
+
+def test_compose_bulk_input_merges_cli_files_with_csv(tmp_path: Path):
+    """CLI files are prepended as common base configs to each CSV row's files."""
+    common_backend = _write_yaml(
+        tmp_path / "backends.yaml",
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "slurm_cluster",
+                    "type": "slurm",
+                    "default": True,
+                    "account": "acct",
+                    "partition": "batch",
+                    "time": "00:10:00",
+                    "nodes": 1,
+                    "gpus_per_node": 4,
+                }
+            ],
+        },
+    )
+    variant_a = _write_yaml(
+        tmp_path / "variant_a.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "task_a", "script": ["echo A"]}],
+            },
+        },
+    )
+    variant_b = _write_yaml(
+        tmp_path / "variant_b.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "task_b", "script": ["echo B"]}],
+            },
+        },
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(
+        f"sflow_config_file\n{variant_a}\n{variant_b}\n"
+    )
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "compose",
+            str(common_backend),
+            "--bulk-input",
+            str(csv_file),
+            "-o",
+            str(out_dir),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    composed_files = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed_files) == 2
+
+    for cf in composed_files:
+        merged = yaml.safe_load(cf.read_text())
+        assert any(b["name"] == "slurm_cluster" for b in merged["backends"]), (
+            f"Common backend missing in {cf.name}"
+        )
+        assert len(merged["workflow"]["tasks"]) == 1
+
+
+def test_compose_bulk_input_deduplicates_cli_and_csv_files(tmp_path: Path):
+    """When CLI and CSV both reference the same file, it appears only once."""
+    shared = _write_yaml(
+        tmp_path / "shared.yaml",
+        {
+            "version": "0.1",
+            "variables": [{"name": "TP", "value": 2}],
+        },
+    )
+    workflow = _write_yaml(
+        tmp_path / "workflow.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "t1", "script": ["echo ${{ variables.TP }}"]}],
+            },
+        },
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(
+        f"sflow_config_file\n{shared} {workflow}\n"
+    )
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "compose",
+            str(shared),
+            "--bulk-input",
+            str(csv_file),
+            "-o",
+            str(out_dir),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    composed_files = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed_files) == 1
+    merged = yaml.safe_load(composed_files[0].read_text())
+    assert len(merged["workflow"]["tasks"]) == 1, (
+        "Task should not be duplicated from deduped file"
+    )
+
+
+def test_compose_bulk_input_cli_files_are_base_csv_overlays(tmp_path: Path):
+    """CLI files serve as base (first), CSV files overlay (second — later wins)."""
+    base = _write_yaml(
+        tmp_path / "base.yaml",
+        {
+            "version": "0.1",
+            "variables": [{"name": "TP", "value": 2}],
+        },
+    )
+    overlay = _write_yaml(
+        tmp_path / "overlay.yaml",
+        {
+            "version": "0.1",
+            "variables": [{"name": "TP", "value": 8}],
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "t1", "script": ["echo ${{ variables.TP }}"]}],
+            },
+        },
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file\n{overlay}\n")
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "compose",
+            str(base),
+            "--bulk-input",
+            str(csv_file),
+            "--resolve",
+            "-o",
+            str(out_dir),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    composed_files = sorted(out_dir.rglob("*.yaml"))
+    merged = yaml.safe_load(composed_files[0].read_text())
+    assert merged["workflow"]["tasks"][0]["script"] == ["echo 8"], (
+        "CSV overlay value (8) should win over CLI base value (2)"
+    )
+
+
+def test_compose_bulk_input_no_cli_files_still_works(tmp_path: Path):
+    """When no CLI files are given, bulk-input behaves as before."""
+    f1 = _write_yaml(
+        tmp_path / "vars.yaml",
+        {
+            "version": "0.1",
+            "variables": [{"name": "TP", "value": 2}],
+        },
+    )
+    f2 = _write_yaml(
+        tmp_path / "workflow.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "t1", "script": ["echo ${{ variables.TP }}"]}],
+            },
+        },
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file,TP\n{f1} {f2},4\n")
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed_files = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed_files) == 1
+
+
+def test_compose_bulk_input_cli_files_with_row_filter(tmp_path: Path):
+    """CLI files + --bulk-input + --row filter should compose only selected rows."""
+    common = _write_yaml(
+        tmp_path / "common.yaml",
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "slurm_cluster",
+                    "type": "slurm",
+                    "default": True,
+                    "account": "acct",
+                    "partition": "batch",
+                    "time": "00:10:00",
+                    "nodes": 1,
+                    "gpus_per_node": 4,
+                }
+            ],
+        },
+    )
+    wf1 = _write_yaml(
+        tmp_path / "wf1.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "t1", "script": ["echo 1"]}],
+            },
+        },
+    )
+    wf2 = _write_yaml(
+        tmp_path / "wf2.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "t2", "script": ["echo 2"]}],
+            },
+        },
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file\n{wf1}\n{wf2}\n")
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "compose",
+            str(common),
+            "--bulk-input",
+            str(csv_file),
+            "--row",
+            "2",
+            "-o",
+            str(out_dir),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    composed_files = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed_files) == 1
+    merged = yaml.safe_load(composed_files[0].read_text())
+    assert merged["workflow"]["tasks"][0]["name"] == "t2"
+    assert any(b["name"] == "slurm_cluster" for b in merged["backends"])
+
+
 def test_compose_bulk_input_missable_csv_column(tmp_path: Path):
     """missable_tasks CSV column should work in compose --bulk-input."""
     f_base = _write_yaml(
