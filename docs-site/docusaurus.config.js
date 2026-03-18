@@ -16,8 +16,8 @@ const baseUrl = process.env.DOCS_BASE_URL || "/";
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: "sflow",
-  tagline: "Workflow Orchestrator with Pluggable Backends",
+  title: "NV-sflow",
+  tagline: "Declarative Workflow Descriptor with Swappable Backends",
   url: "https://nvidia.github.io",
   baseUrl,
   trailingSlash: false,
