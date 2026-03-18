@@ -1,0 +1,465 @@
+version: '0.1'
+
+variables:
+
+- name: NUM_FRONTENDS
+  description: Number of frontend instances (1 = direct on node 0, >1 = nginx load-balanced)
+  type: integer
+  value: 2
+
+- name: NUM_CTX_SERVERS
+  description: Number of context/prefill servers
+  type: integer
+  value: 2
+
+- name: NUM_GEN_SERVERS
+  description: Number of generation/decode servers
+  type: integer
+  value: 1
+
+- name: CONCURRENCY
+  description: Concurrency
+  value: 2
+  domain:
+  - 2
+  - 4
+  - 6
+
+backends:
+
+- name: slurm_cluster
+  type: slurm
+  default: true
+  time: 120
+  nodes: 2
+  partition: your_slurm_partition
+  account: your_slurm_account
+  gpus_per_node: 4
+
+artifacts:
+
+- name: LOCAL_MODEL_PATH
+  uri: fs:///your/path/to/model
+
+operators:
+
+- name: dynamo
+  type: srun
+  container_name: dynamo_image
+  container_writable: true
+  mpi: pmix
+  extra_args:
+  - --container-image=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0
+
+- name: nginx
+  type: srun
+  container_image: nginx:latest
+  container_writable: true
+
+workflow:
+  name: dynamo_benchmark
+  timeout: 115m
+  variables:
+  - name: HEAD_NODE_IP
+    description: Head node IP (resolved after allocation)
+    value: ${{ backends.slurm_cluster.nodes[0].ip_address }}
+  - name: ETCD_ENDPOINTS
+    description: ETCD endpoints
+    value: ${{ backends.slurm_cluster.nodes[0].ip_address }}:2379
+  - name: NATS_SERVER
+    description: NATS server URL
+    value: nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222
+  - name: ALL_NODE_IPS
+    description: Comma-separated IPs of all allocated nodes (for nginx config generation)
+    value: ${{ backends.slurm_cluster.nodes | map(attribute='ip_address') | join(',')
+      }}
+  tasks:
+
+  - name: load_image
+    operator:
+      name: dynamo
+      ntasks: 2
+      ntasks_per_node: 1
+    script:
+    - echo "Image Loaded"
+    - sleep 3600
+    probes:
+      readiness:
+        log_watch:
+          match_pattern: Image Loaded
+          match_count: 2
+        timeout: 1200
+        interval: 2
+
+  - name: install_dependency
+    operator:
+      name: dynamo
+      ntasks: 2
+      ntasks_per_node: 1
+    script:
+    - set -x
+    - |-
+      echo "Checking for dynamo, nats-server, and etcd..."
+
+      # Install dynamo if missing (check for the base dynamo.frontend module which all backends use)
+      if ! python3 -c "import dynamo" >/dev/null 2>&1; then
+        echo "dynamo not found, installing ai-dynamo packages (0.8.0)..."
+        pip install --break-system-packages --quiet ai-dynamo-runtime==0.8.0 ai-dynamo==0.8.0
+      else
+        echo "dynamo already installed."
+      fi
+
+      # Install nats-server if missing
+      if ! command -v nats-server >/dev/null 2>&1; then
+        mkdir -p configs
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64)  ARCH_SHORT="amd64" ;;
+          aarch64) ARCH_SHORT="arm64" ;;
+          *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+        esac
+        echo "Downloading NATS (v2.10.28) for $ARCH_SHORT..."
+        NATS_DEB="nats-server-v2.10.28-$ARCH_SHORT.deb"
+        NATS_URL="https://github.com/nats-io/nats-server/releases/download/v2.10.28/${NATS_DEB}"
+        wget -q --tries=3 --waitretry=5 "$NATS_URL" -O "configs/${NATS_DEB}"
+        TMP_DIR=$(mktemp -d)
+        dpkg-deb -x "configs/${NATS_DEB}" "$TMP_DIR"
+        if [ -f "$TMP_DIR/usr/local/bin/nats-server" ]; then
+          cp "$TMP_DIR/usr/local/bin/nats-server" configs/
+        elif [ -f "$TMP_DIR/usr/bin/nats-server" ]; then
+          cp "$TMP_DIR/usr/bin/nats-server" configs/
+        else
+          echo "Could not find nats-server binary in .deb package"; exit 1
+        fi
+        chmod +x configs/nats-server
+        rm -rf "$TMP_DIR" "configs/${NATS_DEB}"
+        export PATH="$PWD/configs:$PATH"
+        echo "nats-server installed."
+      else
+        echo "nats-server already installed."
+      fi
+
+      # Install etcd if missing
+      if ! command -v etcd >/dev/null 2>&1; then
+        mkdir -p configs
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64)  ARCH_SHORT="amd64" ;;
+          aarch64) ARCH_SHORT="arm64" ;;
+          *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+        esac
+        echo "Downloading ETCD (v3.5.21) for $ARCH_SHORT..."
+        ETCD_TAR="etcd-v3.5.21-linux-$ARCH_SHORT.tar.gz"
+        ETCD_URL="https://github.com/etcd-io/etcd/releases/download/v3.5.21/${ETCD_TAR}"
+        wget -q --tries=3 --waitretry=5 "$ETCD_URL" -O "configs/${ETCD_TAR}"
+        tar -xzf "configs/${ETCD_TAR}" --strip-components=1 -C configs \
+          etcd-v3.5.21-linux-$ARCH_SHORT/etcd \
+          etcd-v3.5.21-linux-$ARCH_SHORT/etcdctl
+        chmod +x configs/etcd configs/etcdctl
+        rm "configs/${ETCD_TAR}"
+        export PATH="$PWD/configs:$PATH"
+        echo "etcd installed."
+      else
+        echo "etcd already installed."
+      fi
+
+      echo "All dependencies checked."
+      sleep 3600
+    probes:
+      readiness:
+        log_watch:
+          match_pattern: All dependencies checked.
+          match_count: 2
+        timeout: 1200
+        interval: 2
+    depends_on:
+    - load_image
+
+  - name: gpu_monitor
+    operator:
+      name: dynamo
+      ntasks_per_node: 1
+    resources:
+      nodes:
+        count: 2
+    script:
+    - echo "Starting gpu monitor"
+    - nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used
+      --format=csv,noheader,nounits -lms 2000 | while IFS= read -r input || [ -n "$input"
+      ] ; do timestamp=$(date +%s%3N); printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}"
+      "${input}"; done >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
+    probes:
+      readiness:
+        log_watch:
+          match_pattern: Starting gpu monitor
+        timeout: 60
+        interval: 2
+    depends_on:
+    - load_image
+
+  - name: nats_server
+    operator: dynamo
+    script:
+    - export PATH="$PWD/configs:$PATH"
+    - nats-server -js
+    resources:
+      nodes:
+        indices:
+        - 0
+    probes:
+      readiness:
+        tcp_port:
+          port: 4222
+        timeout: 60
+        interval: 2
+    depends_on:
+    - load_image
+    - install_dependency
+
+  - name: etcd_server
+    operator: dynamo
+    script:
+    - export PATH="$PWD/configs:$PATH"
+    - etcd --listen-client-urls "http://0.0.0.0:2379" --advertise-client-urls "http://0.0.0.0:2379"
+      --listen-peer-urls "http://0.0.0.0:2380" --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+      --initial-cluster "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd
+    resources:
+      nodes:
+        indices:
+        - 0
+    probes:
+      readiness:
+        tcp_port:
+          port: 2379
+        timeout: 60
+        interval: 2
+    depends_on:
+    - load_image
+    - install_dependency
+
+  - name: frontend_server
+    operator: dynamo
+    replicas:
+      count: ${{ variables.NUM_FRONTENDS }}
+      policy: parallel
+    script:
+    - python3 -m dynamo.frontend --http-port 8180
+    resources:
+      nodes:
+        count: 1
+    probes:
+      readiness:
+        tcp_port:
+          port: 8180
+        timeout: 120
+        interval: 5
+    depends_on:
+    - nats_server
+    - etcd_server
+
+  - name: nginx_server
+    operator: nginx
+    script:
+    - |-
+      if [ "${NUM_FRONTENDS}" -le 1 ]; then
+        echo "Single frontend mode (NUM_FRONTENDS=${NUM_FRONTENDS}), nginx not needed."
+        echo "Frontend is directly serving on port 8000 on this node."
+        exit 0
+      fi
+
+      NGINX_CONF=${SFLOW_TASK_OUTPUT_DIR}/nginx.conf
+      cat > $NGINX_CONF << 'CONF_HEADER'
+      worker_processes auto;
+      events {
+          worker_connections 65535;
+          multi_accept on;
+          use epoll;
+      }
+      http {
+          access_log off;
+          upstream backend_servers {
+      CONF_HEADER
+
+      # Build upstream entries from frontend node IPs.
+      # Frontend replicas are assigned to nodes 0..NUM_FRONTENDS-1 via count=1.
+      IFS=',' read -ra NODE_ARRAY <<< "${ALL_NODE_IPS}"
+      for i in $(seq 0 $((NUM_FRONTENDS - 1))); do
+          echo "        server ${NODE_ARRAY[$i]}:8180;" >> $NGINX_CONF
+      done
+
+      cat >> $NGINX_CONF << 'CONF_FOOTER'
+          }
+          server {
+              listen 8000;
+              location / {
+                  proxy_pass http://backend_servers;
+                  proxy_buffering off;
+                  proxy_read_timeout 24h;
+                  proxy_send_timeout 24h;
+              }
+          }
+      }
+      CONF_FOOTER
+
+      echo "Generated nginx.conf:"
+      cat $NGINX_CONF
+      /usr/sbin/nginx -c $NGINX_CONF -g 'daemon off;'
+    resources:
+      nodes:
+        indices:
+        - 0
+    probes:
+      readiness:
+        tcp_port:
+          port: 8000
+        timeout: 120
+        interval: 5
+    depends_on:
+    - frontend_server
+
+  - name: prefill_server
+    operator:
+      name: dynamo
+      ntasks_per_node: 1
+    replicas:
+      count: ${{ variables.NUM_CTX_SERVERS }}
+      policy: parallel
+    script:
+    - set -x
+    - echo ${CUDA_VISIBLE_DEVICES}
+    - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+    - export NODE_RANK=${SLURM_NODEID}
+    - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+    - |-
+      if [ "1" -gt 1 ]; then
+        export MULTI_NODE_EXTRA_ARGS="--dist-init-addr ${FIRST_NODE_IP}:29500 --nnodes 1 --node-rank ${NODE_RANK}"
+      else
+        export MULTI_NODE_EXTRA_ARGS=""
+      fi
+    - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
+    - export DYN_SYSTEM_PORT=$((8082 + ${FIRST_CUDA_DEVICE}))
+    - python3 -m dynamo.sglang --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+      --served-model-name Qwen3-8B-FP8 --tensor-parallel-size  2 --pipeline-parallel-size
+      1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests
+      128 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port
+      $((8998 + ${FIRST_CUDA_DEVICE})) --disaggregation-transfer-backend nixl --load-balance-method
+      round_robin --trust-remote-code --skip-tokenizer-init --cuda-graph-max-bs 128
+      ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0
+    resources:
+      gpus:
+        count: 2
+    depends_on:
+    - frontend_server
+    probes:
+      readiness:
+        http_post:
+          url: http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions
+          headers:
+            Content-Type: application/json
+          body: '{"model": "Qwen3-8B-FP8", "messages": [{"role": "user", "content":
+            "hi"}], "max_tokens": 1}'
+        timeout: 600
+        interval: 20
+      failure:
+        log_watch:
+          match_pattern: Traceback (most recent call last)
+          match_count: 5
+        interval: 30
+
+  - name: decode_server
+    operator:
+      name: dynamo
+      ntasks_per_node: 1
+    replicas:
+      count: ${{ variables.NUM_GEN_SERVERS }}
+      policy: parallel
+    script:
+    - set -x
+    - echo ${CUDA_VISIBLE_DEVICES}
+    - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+    - export NODE_RANK=${SLURM_NODEID}
+    - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+    - |-
+      if [ "1" -gt 1 ]; then
+        export MULTI_NODE_EXTRA_ARGS="--dist-init-addr ${FIRST_NODE_IP}:29500 --nnodes 1 --node-rank ${NODE_RANK}"
+      else
+        export MULTI_NODE_EXTRA_ARGS=""
+      fi
+    - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
+    - export DYN_SYSTEM_PORT=$((8082 + ${FIRST_CUDA_DEVICE}))
+    - python3 -m dynamo.sglang --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+      --served-model-name Qwen3-8B-FP8 --tensor-parallel-size  4 --pipeline-parallel-size
+      1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests
+      128 --max-prefill-tokens 4096  --disaggregation-mode decode --disaggregation-bootstrap-port
+      $((8998 + ${FIRST_CUDA_DEVICE})) --disaggregation-transfer-backend nixl --prefill-round-robin-balance
+      --trust-remote-code --skip-tokenizer-init --cuda-graph-max-bs 128 ${MULTI_NODE_EXTRA_ARGS}
+      --host 0.0.0.0
+    resources:
+      gpus:
+        count: 4
+    depends_on:
+    - frontend_server
+    probes:
+      readiness:
+        http_post:
+          url: http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions
+          headers:
+            Content-Type: application/json
+          body: '{"model": "Qwen3-8B-FP8", "messages": [{"role": "user", "content":
+            "hi"}], "max_tokens": 1}'
+        timeout: 600
+        interval: 20
+      failure:
+        log_watch:
+          match_pattern: Traceback (most recent call last)
+          match_count: 5
+        interval: 30
+
+  - name: benchmark_infmax
+    operator:
+      name: dynamo
+      ntasks: 1
+      extra_args:
+      - --container-remap-root
+    script:
+    - set -x
+    - apt-get update
+    - apt-get install -y curl
+    - curl -L -o InferenceX.tar.gz https://github.com/SemiAnalysisAI/InferenceX/archive/89ce6098ef2bc4576a735c43f39c7d972b091cfc.tar.gz
+    - tar xf InferenceX.tar.gz
+    - mv InferenceX-89ce6098ef2bc4576a735c43f39c7d972b091cfc InferenceX
+    - |-
+      python3 InferenceX/utils/bench_serving/benchmark_serving.py \
+        --model Qwen3-8B-FP8 \
+        --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }} \
+        --backend openai-chat \
+        --base-url http://${{ variables.HEAD_NODE_IP }}:8000 \
+        --endpoint /v1/chat/completions \
+        --dataset-name random \
+        --seed 100 \
+        --random-input-len 1024 \
+        --random-output-len 1024 \
+        --random-range-ratio 1.0 \
+        --num-prompts $((8*${CONCURRENCY})) \
+        --max-concurrency ${CONCURRENCY} \
+        --request-rate inf \
+        --ignore-eos \
+        --save-result \
+        --num-warmups "$((2 * ${CONCURRENCY}))" \
+        --percentile-metrics 'ttft,tpot,itl,e2el'  \
+        --result-dir ${SFLOW_TASK_OUTPUT_DIR} \
+        --result-filename benchmark_serving_isl_1024_osl_1024_concurrency_${CONCURRENCY}.json
+    - echo "Benchmarking finished"
+    resources:
+      nodes:
+        indices:
+        - 0
+    replicas:
+      variables:
+      - CONCURRENCY
+      policy: sequential
+    depends_on:
+    - prefill_server
+    - decode_server
+    - frontend_server
+    - load_image
