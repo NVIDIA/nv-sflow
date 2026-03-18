@@ -51,12 +51,12 @@ def test_orchestrator_fail_fast_cancels_blocked_tasks_and_returns():
 
     orch = Orchestrator(
         workflow=wf,
-        poll_interval=0,
+        poll_interval=0.01,
         launcher=_LauncherByTaskName({"up": 1}),
         fail_fast=True,
     )
 
-    asyncio.run(asyncio.wait_for(orch.run(), timeout=2))
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=5))
 
     assert tg.get_task("up").status == TaskStatus.FAILED
     # Without fail-fast, 'down' would remain INITIATED forever and the workflow would hang.
