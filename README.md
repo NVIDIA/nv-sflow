@@ -4,30 +4,71 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml/badge.svg)](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml)
 
-A Python CLI workflow orchestrator with **pluggable backends** (e.g. local, Slurm) for running declarative YAML DAGs, collecting logs, and organizing outputs consistently.
+A **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_.
+
+Describe your workflow once in a portable YAML -- tasks, dependencies, resources, and launch methods -- and `sflow` executes the DAG through swappable backends, leveraging each platform's native ecosystem. Write one `sflow.yaml` and run it across environments with minimal changes.
+
+The current focus is **Slurm**, which lacks a built-in workflow orchestration layer. Docker and Kubernetes backends are planned.
 
 ![sflow TUI](docs-site/static/img/sflow_tui.gif)
 
-Define _what to run_ in a `sflow.yaml` — tasks, dependencies, how to launch each task, and required resources. `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure. Example of a dynamo PD disaggregation LLM inference service workflow:
+## Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Modular Composition** | Split workflows into reusable YAML fragments, merge at runtime with `sflow compose` or multi-file `sflow run -f` |
+| **Topology-aware GPU Allocation** | Automatic node/GPU placement with `CUDA_VISIBLE_DEVICES` slicing across tasks and replicas |
+| **Probes** | Readiness and failure gates -- TCP port, HTTP, log watch with pattern matching |
+| **Replicas & Sweeps** | Parallel/sequential replicas with Cartesian product variable sweeps |
+| **Batch Mode** | Generate sbatch scripts, CSV-driven bulk sweeps, parallel preflight validation |
+| **Expressions** | Jinja2 `${{ }}` syntax for variables, backend info, and task metadata |
+| **Artifacts** | Named URIs (`fs://`, `file://`, `http://`) with inline content generation |
+| **Live TUI** | Rich terminal interface with task status, log tailing, and allocation maps |
+| **AI Agent Skills** | Built-in skills that teach coding assistants (Cursor, Copilot) to write and debug sflow YAML |
+| **Preflight Validation** | Container image checks, GPU oversubscription detection, dependency cycle analysis |
+
+## Production-Ready Samples
+
+Modular workflow samples for LLM inference serving with [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo):
+
+| Framework | Aggregated | Disaggregated (P/D) | Multi-Node |
+|-----------|:----------:|:-------------------:|:----------:|
+| SGLang    | Yes        | Yes                 | Yes        |
+| vLLM      | Yes        | Yes                 | Yes        |
+| TRT-LLM   | Yes        | Yes                 | Yes        |
+
+All frameworks share a common infrastructure layer (etcd, NATS, frontend, nginx) -- only the server task files differ.
 
 <p align="center">
   <img src="docs-site/static/img/workflow-dag.png" alt="Workflow DAG Example" width="700">
 </p>
 
+## CLI at a Glance
+
+| Command | Purpose | Key Flags |
+|---------|---------|-----------|
+| `sflow run` | Execute a workflow | `--dry-run` `--tui` `--set` `-f` (multi-file) |
+| `sflow batch` | Generate sbatch scripts | `--submit` `--bulk-input` `--row` |
+| `sflow compose` | Merge multiple YAMLs | `--resolve` `--missable-tasks` `-o` |
+| `sflow visualize` | Render DAG graph | `--format png/svg/mermaid` |
+| `sflow sample` | List / copy examples | `--list` `-o` |
+| `sflow skill` | Export AI agent skills | `--list` `-o` |
+
 ## Documentation
 
-Full user documentation is available at: **https://nvidia.github.io/nv-sflow/**
+Full user documentation: **https://nvidia.github.io/nv-sflow/**
 
-Start here:
+- [Introduction](https://nvidia.github.io/nv-sflow/docs/user/intro) -- concepts and architecture
+- [Quickstart](https://nvidia.github.io/nv-sflow/docs/user/quickstart) -- local and Slurm setup
+- [Configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration) -- full YAML schema
+- [Modular Workflows](https://nvidia.github.io/nv-sflow/docs/user/modular-workflows) -- multi-file composition
+- [Quick Reference](https://nvidia.github.io/nv-sflow/docs/user/quick-reference) -- all fields at a glance
+- [CLI Reference](https://nvidia.github.io/nv-sflow/docs/user/cli) -- commands and flags
+- [Sample Workflows](https://nvidia.github.io/nv-sflow/docs/user/samples) -- production examples
 
-- [Introduction](https://nvidia.github.io/nv-sflow/docs/user/intro)
-- [Quickstart](https://nvidia.github.io/nv-sflow/docs/user/quickstart)
-- [Configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration)
-- [CLI Reference](https://nvidia.github.io/nv-sflow/docs/user/cli)
-- [Sample Workflows](https://nvidia.github.io/nv-sflow/docs/user/samples)
 ## Quickstart
 
-If you just want to validate the workflow engine locally (no Slurm required):
+Validate the workflow engine locally (no Slurm required):
 
 ```bash
 uv venv
@@ -37,7 +78,7 @@ uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
 sflow run --file examples/local_hello_world.yaml --tui
 ```
 
-The `local_hello_world.yaml` file looks like this:
+Minimal workflow:
 
 ```yaml
 version: "0.1"
@@ -55,70 +96,42 @@ workflow:
         - echo "Hello ${WHO}"
 ```
 
-## Development Setup
+Run a modular multi-file workflow on Slurm:
 
-This guide will help you set up the development environment for contributing to `sflow`.
+```bash
+sflow run \
+  -f slurm_config.yaml -f common_workflow.yaml \
+  -f sglang/prefill.yaml -f sglang/decode.yaml -f benchmark_aiperf.yaml \
+  --missable-tasks agg_server --tui
+```
+
+Export AI agent skills for your IDE:
+
+```bash
+sflow skill -o .cursor/skills/
+```
+
+## Development Setup
 
 ### Prerequisites
 
 - **Python 3.10 or higher**
-
-  ```bash
-  python --version  # Check your Python version
-  ```
-
 - **uv** (Python package installer and resolver)
-
-  If you don't have `uv` installed, you can install it using:
 
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
 
-  Or via pip:
+### Install in Development Mode
 
-  ```bash
-  pip install uv
-  ```
-
-### Cloning the Repository and Installing in Development Mode
-
-1. **Clone the repository**
-
-   ```bash
-   git clone https://github.com/NVIDIA/nv-sflow.git
-   cd nv-sflow
-   ```
-
-2. **Create a virtual environment**
-
-   ```bash
-   uv venv
-   ```
-
-3. **Activate the virtual environment**
-
-   ```bash
-   source .venv/bin/activate
-   ```
-
-4. **Install the project with development dependencies**
-
-   ```bash
-   uv pip install -e ".[dev]"
-   ```
-
-   This will install:
-
-   - The `sflow` package in editable mode
-   - All runtime dependencies (typer, pydantic, pyyaml, etc.)
-   - Development tools (pytest, pytest-cov, ipython, etc.)
-
-5. **Run unit tests to validate your setup**
-
-   ```bash
-   pytest
-   ```
+```bash
+git clone https://github.com/NVIDIA/nv-sflow.git
+cd nv-sflow
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+pytest
+```
 
 ## Contributing
 
