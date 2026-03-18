@@ -2,6 +2,18 @@
 
 Complete field-by-field reference for sflow v0.1 YAML configuration.
 
+> For narrative docs with examples:
+> [configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration),
+> [variables](https://nvidia.github.io/nv-sflow/docs/user/variables),
+> [artifacts](https://nvidia.github.io/nv-sflow/docs/user/artifacts),
+> [backends](https://nvidia.github.io/nv-sflow/docs/user/backends),
+> [operators](https://nvidia.github.io/nv-sflow/docs/user/operators),
+> [probes](https://nvidia.github.io/nv-sflow/docs/user/probes),
+> [replicas](https://nvidia.github.io/nv-sflow/docs/user/replicas),
+> [resources](https://nvidia.github.io/nv-sflow/docs/user/resources),
+> [modular-workflows](https://nvidia.github.io/nv-sflow/docs/user/modular-workflows),
+> [outputs](https://nvidia.github.io/nv-sflow/docs/user/outputs).
+
 ## Top-Level Fields
 
 ```yaml
@@ -416,3 +428,10 @@ This removes `prefill_server` and `decode_server` from all `depends_on` lists an
 sflow run -f config.yaml --set TP_SIZE=8 --set CONCURRENCY=[16,32,64]
 sflow run -f config.yaml --artifact LOCAL_MODEL_PATH=fs:///new/path
 ```
+
+---
+
+> For detailed explanations and more examples, see:
+> - [modular-workflows](https://nvidia.github.io/nv-sflow/docs/user/modular-workflows) -- merge rules, missable tasks, bulk input
+> - [cli](https://nvidia.github.io/nv-sflow/docs/user/cli) -- all CLI commands and flags
+> - [quick-reference](https://nvidia.github.io/nv-sflow/docs/user/quick-reference) -- all fields at a glance

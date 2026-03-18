@@ -4,14 +4,16 @@
 Usage:
     python parse_sflow_errors.py <log_file>
     python parse_sflow_errors.py -                    # read from stdin
+    python parse_sflow_errors.py --json <log_file>    # JSON output
     sflow run -f config.yaml --dry-run 2>&1 | python parse_sflow_errors.py -
 
 Output:
-    Structured error summary with categories and suggested fixes.
+    Structured error summary with categories, suggested fixes, and statistics.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -155,6 +157,12 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="sbatch submission failed",
         fix="Check SLURM directives in the generated .sh script. Verify partition, account, time, nodes.",
     ),
+    ErrorPattern(
+        category="slurm",
+        pattern=re.compile(r"srun: error:\s*(.+)"),
+        description="srun execution error",
+        fix="Check srun arguments, node availability, and that the SLURM allocation is still active.",
+    ),
 
     # Runtime / task
     ErrorPattern(
@@ -192,6 +200,24 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         pattern=re.compile(r"pyxis:|nvidia-container-cli"),
         description="Container/Pyxis error",
         fix="Verify container image URI and registry access. Try: enroot import docker://<image>",
+    ),
+    ErrorPattern(
+        category="runtime",
+        pattern=re.compile(r"ModuleNotFoundError:\s*No module named '(.+?)'"),
+        description="Missing Python module",
+        fix="Install the missing package in the container or add a pip install step to the task script.",
+    ),
+    ErrorPattern(
+        category="runtime",
+        pattern=re.compile(r"ConnectionRefusedError"),
+        description="Connection refused",
+        fix="Upstream service not ready. Check depends_on ordering and readiness probes.",
+    ),
+    ErrorPattern(
+        category="runtime",
+        pattern=re.compile(r"FileNotFoundError:\s*(.+)"),
+        description="File not found at runtime",
+        fix="Check file paths. Ensure model/data paths are accessible inside the container.",
     ),
 
     # Batch/CSV
@@ -275,6 +301,37 @@ class ParseResult:
     def has_errors(self) -> bool:
         return bool(self.matched_errors) or bool(self.unmatched_error_lines)
 
+    def to_dict(self) -> dict:
+        by_category: dict[str, list[dict]] = {}
+        for me in self.matched_errors:
+            cat = me.pattern.category
+            by_category.setdefault(cat, []).append({
+                "line": me.line_num,
+                "description": me.pattern.description,
+                "text": me.line[:200],
+                "fix": me.pattern.fix,
+            })
+        return {
+            "source": self.source,
+            "total_lines": self.total_lines,
+            "has_errors": self.has_errors,
+            "matched_errors": len(self.matched_errors),
+            "unmatched_error_lines": len(self.unmatched_error_lines),
+            "root_cause": {
+                "line": self.matched_errors[0].line_num,
+                "description": self.matched_errors[0].pattern.description,
+                "fix": self.matched_errors[0].pattern.fix,
+            } if self.matched_errors else None,
+            "categories": {
+                CATEGORY_LABELS.get(cat, cat): errors
+                for cat, errors in by_category.items()
+            },
+            "summary": {
+                CATEGORY_LABELS.get(cat, cat): len(errors)
+                for cat, errors in by_category.items()
+            },
+        }
+
 
 def parse_log(lines: list[str], source: str = "<stdin>") -> ParseResult:
     result = ParseResult(source=source, total_lines=len(lines))
@@ -330,6 +387,14 @@ def print_report(result: ParseResult) -> None:
 
     print(f"  Matched errors: {len(result.matched_errors)}")
     print(f"  Unmatched error-like lines: {len(result.unmatched_error_lines)}")
+
+    if by_category:
+        print(f"\n  Summary by category:")
+        for cat in CATEGORY_PRIORITY:
+            errors = by_category.get(cat, [])
+            if errors:
+                label = CATEGORY_LABELS.get(cat, cat)
+                print(f"    {label}: {len(errors)}")
     print()
 
     for cat in CATEGORY_PRIORITY:
@@ -356,12 +421,15 @@ def print_report(result: ParseResult) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <log_file>", file=sys.stderr)
-        print(f"       {sys.argv[0]} -          (read from stdin)", file=sys.stderr)
+    json_mode = "--json" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--json"]
+
+    if len(args) < 1:
+        print(f"Usage: {sys.argv[0]} [--json] <log_file>", file=sys.stderr)
+        print(f"       {sys.argv[0]} [--json] -          (read from stdin)", file=sys.stderr)
         return 2
 
-    filepath = sys.argv[1]
+    filepath = args[0]
 
     if filepath == "-":
         lines = sys.stdin.readlines()
@@ -375,7 +443,11 @@ def main() -> int:
         source = filepath
 
     result = parse_log(lines, source)
-    print_report(result)
+
+    if json_mode:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print_report(result)
 
     return 1 if result.has_errors else 0
 

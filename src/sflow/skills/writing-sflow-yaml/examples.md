@@ -2,6 +2,9 @@
 
 Annotated examples covering common workflow patterns.
 
+> For runnable sample workflows: `sflow sample --list` and [samples](https://nvidia.github.io/nv-sflow/docs/user/samples).
+> For quickstart tutorial: [quickstart](https://nvidia.github.io/nv-sflow/docs/user/quickstart).
+
 ---
 
 ## Example 1: Local Hello World

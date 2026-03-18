@@ -9,6 +9,9 @@ Checks performed:
     - Top-level keys are from the allowed set
     - Variable references (${{ }}) have valid syntax
     - depends_on references exist as task names
+    - Operator references exist as declared operators
+    - Backend references exist as declared backends
+    - Artifact expression references match declared artifacts
     - GPU resource math consistency (TP * DP * PP vs declared gpus)
     - Common mistake warnings (missing probes, missing depends_on, etc.)
 """
@@ -90,6 +93,39 @@ def _extract_task_names(config: dict) -> list[str]:
     return [t["name"] for t in tasks if isinstance(t, dict) and "name" in t]
 
 
+def _extract_operator_names(config: dict) -> set[str]:
+    """Extract declared operator names."""
+    operators = config.get("operators", [])
+    if not isinstance(operators, list):
+        return set()
+    return {
+        o["name"] for o in operators
+        if isinstance(o, dict) and "name" in o
+    }
+
+
+def _extract_backend_names(config: dict) -> set[str]:
+    """Extract declared backend names."""
+    backends = config.get("backends", [])
+    if not isinstance(backends, list):
+        return set()
+    return {
+        b["name"] for b in backends
+        if isinstance(b, dict) and "name" in b
+    }
+
+
+def _extract_artifact_names(config: dict) -> set[str]:
+    """Extract declared artifact names."""
+    artifacts = config.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        return set()
+    return {
+        a["name"] for a in artifacts
+        if isinstance(a, dict) and "name" in a
+    }
+
+
 def _find_expressions(obj, path: str = "") -> list[tuple[str, str]]:
     """Recursively find all ${{ }} expressions and their YAML paths."""
     results: list[tuple[str, str]] = []
@@ -154,7 +190,13 @@ def check_workflow(config: dict, result: ValidationResult) -> None:
 
 
 def check_expressions(config: dict, result: ValidationResult) -> None:
+    variable_names = _extract_variable_names(config)
+    artifact_names = _extract_artifact_names(config)
     expressions = _find_expressions(config)
+
+    var_ref_pattern = re.compile(r"variables\.(\w+)")
+    art_ref_pattern = re.compile(r"artifacts\.(\w+)")
+
     for path, expr in expressions:
         if "[UNCLOSED]" in expr:
             result.error(f"Unclosed expression at {path}: {expr}")
@@ -162,6 +204,23 @@ def check_expressions(config: dict, result: ValidationResult) -> None:
         inner = expr[3:-2].strip()
         if not inner:
             result.error(f"Empty expression at {path}: {expr}")
+            continue
+
+        for m in var_ref_pattern.finditer(inner):
+            var_name = m.group(1)
+            if variable_names and var_name not in variable_names:
+                result.warn(
+                    f"Expression at {path} references variable '{var_name}' "
+                    f"which is not declared in this file"
+                )
+
+        for m in art_ref_pattern.finditer(inner):
+            art_name = m.group(1)
+            if artifact_names and art_name not in artifact_names:
+                result.warn(
+                    f"Expression at {path} references artifact '{art_name}' "
+                    f"which is not declared in this file"
+                )
 
 
 def check_depends_on(config: dict, result: ValidationResult) -> None:
@@ -195,6 +254,50 @@ def check_task_names_unique(config: dict, result: ValidationResult) -> None:
         if n in seen:
             result.error(f"Duplicate task name: '{n}'")
         seen.add(n)
+
+
+def check_operator_references(config: dict, result: ValidationResult) -> None:
+    """Check that tasks reference declared operators."""
+    operator_names = _extract_operator_names(config)
+    if not operator_names:
+        return
+    wf = config.get("workflow", {})
+    tasks = wf.get("tasks", []) if isinstance(wf, dict) else []
+    if not isinstance(tasks, list):
+        return
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        name = task.get("name", "<unnamed>")
+        op = task.get("operator")
+        if op is None:
+            continue
+        op_name = op if isinstance(op, str) else op.get("name") if isinstance(op, dict) else None
+        if op_name and "${{" not in str(op_name) and op_name not in operator_names:
+            result.warn(
+                f"Task '{name}': references operator '{op_name}' "
+                f"which is not declared in this file (OK if using modular composition)"
+            )
+
+
+def check_artifact_fs_paths(config: dict, result: ValidationResult) -> None:
+    """Warn about fs:// artifact paths that don't exist."""
+    artifacts = config.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        return
+    for art in artifacts:
+        if not isinstance(art, dict):
+            continue
+        uri = art.get("uri", "")
+        name = art.get("name", "<unnamed>")
+        if not isinstance(uri, str) or "${{" in uri:
+            continue
+        if uri.startswith("fs://"):
+            fs_path = uri[5:]
+            if fs_path and not Path(fs_path).exists():
+                result.warn(
+                    f"Artifact '{name}': fs:// path does not exist: {fs_path}"
+                )
 
 
 def check_gpu_consistency(config: dict, result: ValidationResult) -> None:
@@ -262,6 +365,14 @@ def check_common_mistakes(config: dict, result: ValidationResult) -> None:
                 f"Consider adding probes.readiness (log_watch or tcp_port)."
             )
 
+        if has_server_keyword and probes and isinstance(probes, dict):
+            failure = probes.get("failure")
+            if failure is None:
+                result.warn(
+                    f"Task '{name}': server task has readiness probe but no failure probe. "
+                    f"Consider adding probes.failure.log_watch for 'Traceback'."
+                )
+
         if probes and isinstance(probes, dict):
             readiness = probes.get("readiness", {})
             if isinstance(readiness, dict):
@@ -271,6 +382,20 @@ def check_common_mistakes(config: dict, result: ValidationResult) -> None:
                         f"Task '{name}': readiness probe timeout is very short ({timeout}s). "
                         f"Consider at least 60s for container-based tasks."
                     )
+
+        replicas = task.get("replicas")
+        if replicas and isinstance(replicas, dict):
+            sweep_vars = replicas.get("variables", [])
+            if isinstance(sweep_vars, list):
+                variables = config.get("variables", {})
+                if isinstance(variables, dict):
+                    for sv in sweep_vars:
+                        var_def = variables.get(sv)
+                        if isinstance(var_def, dict) and "domain" not in var_def:
+                            result.warn(
+                                f"Task '{name}': sweep variable '{sv}' has no 'domain' "
+                                f"defined. Add domain to enable sweep."
+                            )
 
     backends = config.get("backends", [])
     if isinstance(backends, list):
@@ -316,6 +441,8 @@ def validate_file(filepath: str) -> ValidationResult:
     check_expressions(config, result)
     check_depends_on(config, result)
     check_task_names_unique(config, result)
+    check_operator_references(config, result)
+    check_artifact_fs_paths(config, result)
     check_gpu_consistency(config, result)
     check_common_mistakes(config, result)
 

@@ -382,7 +382,7 @@ workflow:
           log_watch:
             match_pattern: "Application startup complete"
           timeout: 600
-          interval: 10
+          interval: 20
         failure:
           log_watch:
             match_pattern: "Traceback (most recent call last)"
@@ -428,7 +428,7 @@ workflow:
           log_watch:
             match_pattern: "Application startup complete"
           timeout: 600
-          interval: 10
+          interval: 20
         failure:
           log_watch:
             match_pattern: "Traceback (most recent call last)"

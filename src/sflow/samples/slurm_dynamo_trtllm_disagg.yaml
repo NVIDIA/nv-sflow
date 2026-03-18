@@ -390,9 +390,9 @@ workflow:
             url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
             headers:
               Content-Type: "application/json"
-            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
           timeout: 600
-          interval: 10
+          interval: 20
         failure:
           log_watch:
             match_pattern: "Traceback (most recent call last)"
@@ -437,9 +437,9 @@ workflow:
             url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
             headers:
               Content-Type: "application/json"
-            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
           timeout: 600
-          interval: 10
+          interval: 20
         failure:
           log_watch:
             match_pattern: "Traceback (most recent call last)"

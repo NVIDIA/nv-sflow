@@ -1,6 +1,9 @@
 # sflow Error Catalog
 
-Comprehensive catalog of sflow error patterns organized by category. Each entry includes the error text pattern, cause, fix, and an example where helpful.
+Comprehensive catalog of sflow error patterns organized by category. Each entry includes
+the error text pattern, cause, fix, and an example where helpful.
+
+> See also: [faq](https://nvidia.github.io/nv-sflow/docs/user/faq) for common questions and [cli](https://nvidia.github.io/nv-sflow/docs/user/cli) for CLI errors.
 
 ---
 
