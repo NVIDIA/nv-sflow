@@ -134,7 +134,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="gbg"></div>
 <div class="orb oc" style="width:450px;height:450px;top:-120px;left:-120px"></div>
 <div class="orb og" style="width:320px;height:320px;bottom:-80px;right:-80px"></div>
-<span class="sn">01 / 11</span>
+<span class="sn">01 / 12</span>
 <div class="inner" style="align-items:center;text-align:center">
 <img class="logo r as d0" src="img/sflow-logo.jpg" alt="sflow logo">
 <h1 class="r as d1" style="font-family:'Archivo Black',sans-serif;font-size:clamp(2.5rem,7vw,5.5rem);text-transform:uppercase;letter-spacing:.02em">NV-sflow</h1>
@@ -151,7 +151,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s2">
 <div class="gbg"></div>
 <div class="orb oc" style="width:280px;height:280px;top:60%;right:-60px"></div>
-<span class="sn">02 / 11</span>
+<span class="sn">02 / 12</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">The Problem</span>
 <h2 class="r al d1 mb">Same workflow. Different infra. Rewrite everything.</h2>
@@ -164,7 +164,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s3">
 <div class="gbg"></div>
 <div class="orb og" style="width:350px;height:350px;top:15%;right:-100px"></div>
-<span class="sn">03 / 11</span>
+<span class="sn">03 / 12</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">The Solution</span>
 <h2 class="r al d1 mb">Separate <span class="accent">what</span> to deploy from <span class="green">where</span></h2>
@@ -173,6 +173,56 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="fc r au d3"><span class="ic">&#8644;</span><h3>Swappable Backends</h3><p>Slurm now. Docker &amp; K8S planned.</p></div>
 <div class="fc r au d4"><span class="ic">&#9881;</span><h3>Pluggable Plugins</h3><p>Probes, artifacts, replicas &mdash; no platform coupling.</p></div>
 </div>
+<div class="r as d5" style="width:100%;max-width:700px;margin:0 auto">
+<svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
+<defs>
+<linearGradient id="wg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#00d4ff"/></linearGradient>
+<filter id="gl"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+</defs>
+<!-- Left column: K8S, Docker, Slurm -->
+<rect x="20" y="15" width="110" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="75" y="40" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="13" font-weight="600">K8S</text>
+<rect x="20" y="85" width="110" height="40" rx="6" fill="#0d1420" stroke="#6b7d95" stroke-width="1" opacity="0.6"/>
+<text x="75" y="110" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="13">Docker</text>
+<rect x="20" y="158" width="110" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="75" y="183" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="13" font-weight="600">Slurm</text>
+<!-- Right column: Docker, K8S, Slurm -->
+<rect x="570" y="15" width="110" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="625" y="40" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="13" font-weight="600">Docker</text>
+<rect x="570" y="85" width="110" height="40" rx="6" fill="#0d1420" stroke="#6b7d95" stroke-width="1" opacity="0.6"/>
+<text x="625" y="110" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="13">K8S</text>
+<rect x="570" y="158" width="110" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="625" y="183" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="13" font-weight="600">Slurm</text>
+<!-- Dashed wires: all left boxes -> sflow center (behind) -->
+<path d="M130,35 C220,35 280,105 310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M130,105 L310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M130,178 C220,178 280,115 310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<!-- Dashed wires: sflow center -> all right boxes (behind) -->
+<path d="M390,110 C420,105 480,35 570,35" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M390,110 L570,105" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<path d="M390,110 C420,115 480,178 570,178" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
+<!-- Arrow heads on dashed wires (into sflow) -->
+<polygon points="315,105 305,110 315,115" fill="#6b7d95" opacity="0.4"/>
+<!-- Arrow heads on dashed wires (out of sflow) -->
+<polygon points="565,30 575,35 565,40" fill="#6b7d95" opacity="0.4"/>
+<polygon points="565,100 575,105 565,110" fill="#6b7d95" opacity="0.4"/>
+<polygon points="565,173 575,178 565,183" fill="#6b7d95" opacity="0.4"/>
+<!-- Solid green wire 1: K8S(left) -> sflow -> Slurm(right) -->
+<path id="w1" d="M130,35 C230,35 280,108 350,110 C420,112 470,178 570,178" fill="none" stroke="#76ff03" stroke-width="3" opacity="0.8"/>
+<circle r="5" fill="#76ff03" filter="url(#gl)"><animateMotion dur="2.5s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
+<circle r="4" fill="#00d4ff" filter="url(#gl)"><animateMotion dur="2.5s" begin="1.25s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
+<!-- Solid green wire 2: Slurm(left) -> sflow -> Docker(right) — reverse direction drawn right-to-left -->
+<path id="w2" d="M570,35 C470,35 420,108 350,110 C280,112 230,178 130,178" fill="none" stroke="#76ff03" stroke-width="3" opacity="0.7"/>
+<circle r="5" fill="#76ff03" filter="url(#gl)"><animateMotion dur="2.5s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
+<circle r="4" fill="#00d4ff" filter="url(#gl)"><animateMotion dur="2.5s" begin="1.25s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
+<!-- Arrow heads on green wires -->
+<polygon points="565,173 575,178 565,183" fill="#76ff03" opacity="0.9"/>
+<polygon points="135,173 125,178 135,183" fill="#76ff03" opacity="0.8"/>
+<!-- Center: sflow circle (on top) -->
+<circle cx="350" cy="110" r="42" fill="#060a10" stroke="url(#wg)" stroke-width="2.5" filter="url(#gl)"/>
+<text x="350" y="116" text-anchor="middle" fill="#76ff03" font-family="'Archivo Black',sans-serif" font-size="16" font-weight="800">sflow</text>
+</svg>
+</div>
 </div>
 </section>
 
@@ -180,7 +230,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s4">
 <div class="gbg"></div>
 <div class="orb oc" style="width:240px;height:240px;top:8%;left:-70px"></div>
-<span class="sn">04 / 11</span>
+<span class="sn">04 / 12</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">DAG Orchestration</span>
 <h2 class="r al d1 ms">Workflow DAG</h2>
@@ -204,7 +254,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s5">
 <div class="gbg"></div>
 <div class="orb og" style="width:300px;height:300px;bottom:-90px;right:8%"></div>
-<span class="sn">05 / 11</span>
+<span class="sn">05 / 12</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">Resource Planning</span>
 <h2 class="r al d1 ms">Topology-aware GPU Allocation</h2>
@@ -229,7 +279,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s6">
 <div class="gbg"></div>
 <div class="orb oc" style="width:200px;height:200px;top:-40px;right:28%"></div>
-<span class="sn">06 / 11</span>
+<span class="sn">06 / 12</span>
 <div class="inner">
 <h2 class="r au d0 mb">Core Features</h2>
 <div class="fg">
@@ -247,7 +297,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s7">
 <div class="gbg"></div>
 <div class="orb og" style="width:260px;height:260px;top:-60px;left:20%"></div>
-<span class="sn">07 / 11</span>
+<span class="sn">07 / 12</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">Modular Composition</span>
 <h2 class="r al d1 ms">Split. Reuse. Swap.</h2>
@@ -292,7 +342,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s8">
 <div class="gbg"></div>
 <div class="orb oc" style="width:220px;height:220px;bottom:-50px;left:15%"></div>
-<span class="sn">08 / 11</span>
+<span class="sn">08 / 12</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">Real-world Debugging</span>
 <h2 class="r al d1 ms">Structured Error Analysis</h2>
@@ -353,7 +403,7 @@ networking config match SGLang disagg routing.</div>
 <!-- 9: CLI -->
 <section class="sec" id="s9">
 <div class="gbg"></div>
-<span class="sn">09 / 11</span>
+<span class="sn">09 / 12</span>
 <div class="inner">
 <h2 class="r au d0 mb">CLI at a Glance</h2>
 <table class="mtbl r au d1" style="max-width:800px">
@@ -375,7 +425,7 @@ networking config match SGLang disagg routing.</div>
 <div class="gbg"></div>
 <div class="orb og" style="width:280px;height:280px;top:-50px;left:-60px"></div>
 <div class="pt" style="width:4px;height:4px;background:var(--cy);top:30%;left:85%;opacity:.3;animation-duration:16s;animation-delay:3s"></div>
-<span class="sn">10 / 11</span>
+<span class="sn">10 / 12</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">AI-Native</span>
 <h2 class="r al d1 ms">Built-in Agent Skills</h2>
@@ -420,12 +470,59 @@ networking config match SGLang disagg routing.</div>
 </div>
 </section>
 
-<!-- 11: Closing -->
+<!-- 11: Heterogeneous Computing Vision -->
 <section class="sec" id="s11">
+<div class="gbg"></div>
+<div class="orb oc" style="width:300px;height:300px;top:-60px;left:-80px"></div>
+<div class="orb og" style="width:250px;height:250px;bottom:-70px;right:-50px"></div>
+<span class="sn">11 / 12</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">Vision</span>
+<h2 class="r al d1 ms">Heterogeneous Computing</h2>
+<p class="r au d2" style="max-width:720px">As a top-level orchestration abstraction, sflow is uniquely positioned to unify heterogeneous compute &mdash; allocating the right accelerator from the right resource pool for each stage of a disaggregated pipeline.</p>
+<div class="r as d3" style="width:100%;max-width:650px;margin:0 auto">
+<svg viewBox="0 0 650 140" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
+<defs><linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#e3b341"/></linearGradient></defs>
+<!-- Resource pools (left) -->
+<rect x="10" y="10" width="120" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="70" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="10" font-weight="600">Vera Rubin</text>
+<text x="70" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">GPU pool &bull; Prefill</text>
+<rect x="10" y="80" width="120" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="70" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="10" font-weight="600">LPU Cluster</text>
+<text x="70" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">Accelerator &bull; Decode</text>
+<!-- sflow center -->
+<circle cx="325" cy="70" r="35" fill="#060a10" stroke="url(#hg)" stroke-width="2.5"/>
+<text x="325" y="76" text-anchor="middle" fill="#76ff03" font-family="'Archivo Black',sans-serif" font-size="13" font-weight="800">sflow</text>
+<!-- Disaggregated output (right) -->
+<rect x="500" y="10" width="140" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="570" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="10" font-weight="600">prefill_server</text>
+<text x="570" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">Vera Rubin GPUs</text>
+<rect x="500" y="80" width="140" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="570" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="10" font-weight="600">decode_server</text>
+<text x="570" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">LPU accelerators</text>
+<!-- Wires: pools -> sflow -->
+<path d="M130,35 C210,35 250,65 290,70" fill="none" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
+<path d="M130,105 C210,105 250,75 290,70" fill="none" stroke="#e3b341" stroke-width="2" opacity="0.6"/>
+<!-- Wires: sflow -> tasks (animated) -->
+<path id="hw1" d="M360,62 C400,50 440,35 500,35" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
+<path id="hw2" d="M360,78 C400,90 440,105 500,105" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
+<circle r="3.5" fill="#00d4ff"><animateMotion dur="2s" repeatCount="indefinite"><mpath href="#hw1"/></animateMotion></circle>
+<circle r="3.5" fill="#e3b341"><animateMotion dur="2s" repeatCount="indefinite"><mpath href="#hw2"/></animateMotion></circle>
+<!-- Arrows -->
+<polygon points="495,30 505,35 495,40" fill="#00d4ff" opacity="0.6"/>
+<polygon points="495,100 505,105 495,110" fill="#e3b341" opacity="0.6"/>
+</svg>
+</div>
+<p class="r au d4" style="max-width:720px;font-size:var(--s)">Example: PD disaggregation &mdash; one <code>sflow.yaml</code> routes prefill to <span class="accent">Vera Rubin GPU pools</span> for maximum throughput, and decode to <span style="color:#e3b341">LPU accelerators</span> for low-latency token generation. Each task lands on the optimal hardware automatically.</p>
+</div>
+</section>
+
+<!-- 12: Closing -->
+<section class="sec" id="s12">
 <div class="gbg"></div>
 <div class="orb oc" style="width:420px;height:420px;bottom:-160px;left:28%"></div>
 <div class="orb og" style="width:280px;height:280px;top:-90px;right:18%"></div>
-<span class="sn">11 / 11</span>
+<span class="sn">12 / 12</span>
 <div class="inner" style="align-items:center;text-align:center">
 <span class="pill pc r ap d0 ms">What&rsquo;s Next</span>
 <h2 class="r au d1 mb">Slurm today. Docker &amp; Kubernetes tomorrow.</h2>
