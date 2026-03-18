@@ -153,7 +153,7 @@ def _list_skills():
 
     agents_md = skills_dir / "AGENTS.md"
     if agents_md.exists():
-        typer.echo(f"\n  + AGENTS.md (agent workflow guidelines)")
+        typer.echo("\n  + AGENTS.md (agent workflow guidelines)")
 
     typer.echo()
     typer.echo("Usage:")

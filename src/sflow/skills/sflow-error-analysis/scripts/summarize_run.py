@@ -94,7 +94,7 @@ def summarize_run(run_dir: Path) -> int:
         errors = _count_pattern(sflow_log, ERROR_PATTERN)
         print(f"\n  Orchestrator log: {size}, {errors} error line(s)")
     else:
-        print(f"\n  Orchestrator log: not found")
+        print("\n  Orchestrator log: not found")
 
     task_dirs = sorted(
         d for d in run_dir.iterdir()
@@ -153,7 +153,7 @@ def summarize_run(run_dir: Path) -> int:
 
     if failed_details:
         print(f"\n  {'=' * 60}")
-        print(f"  Failed Task Details:")
+        print("  Failed Task Details:")
         print(f"  {'=' * 60}")
         for task_name, tb in failed_details:
             print(f"\n  [{task_name}]")
@@ -163,7 +163,7 @@ def summarize_run(run_dir: Path) -> int:
     outputs_files = list(run_dir.rglob("outputs.json"))
     if outputs_files:
         print(f"\n  {'=' * 60}")
-        print(f"  Task Outputs:")
+        print("  Task Outputs:")
         print(f"  {'=' * 60}")
         for of in outputs_files:
             rel = of.relative_to(run_dir)

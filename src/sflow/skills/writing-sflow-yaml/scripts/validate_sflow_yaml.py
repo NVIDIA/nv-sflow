@@ -411,7 +411,7 @@ def validate_file(filepath: str) -> ValidationResult:
     if not path.exists():
         result.error(f"File not found: {filepath}")
         return result
-    if not path.suffix.lower() in (".yaml", ".yml"):
+    if path.suffix.lower() not in (".yaml", ".yml"):
         result.warn(f"File does not have .yaml/.yml extension: {filepath}")
 
     try:

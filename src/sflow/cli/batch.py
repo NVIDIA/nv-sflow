@@ -220,7 +220,7 @@ def _generate_sbatch_script(
         [
             f"SFLOW_ACTIVATE={activate_path_str}",
             "",
-            f'if [ -f "$SFLOW_ACTIVATE" ]; then',
+            'if [ -f "$SFLOW_ACTIVATE" ]; then',
             "    # Activate existing Python virtual environment for sflow",
             "    # Make sure this venv is compatible with your compute node arch (x86 / arm64)",
             '    source "$SFLOW_ACTIVATE"',

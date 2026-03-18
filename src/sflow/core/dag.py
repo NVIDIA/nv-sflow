@@ -133,7 +133,7 @@ class DAG:
         box_inner = max(max_name_len, 4)
         box_w = box_inner + 4  # "│ " + name + " │"
         h_gap = 3
-        max_per_layer = max(len(layer_nodes[l]) for l in range(num_layers))
+        max_per_layer = max(len(layer_nodes[layer]) for layer in range(num_layers))
         canvas_w = max(max_per_layer * box_w + (max_per_layer - 1) * h_gap, box_w)
 
         if canvas_w > max_width:

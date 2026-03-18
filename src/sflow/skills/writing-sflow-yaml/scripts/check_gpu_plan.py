@@ -234,12 +234,12 @@ def print_plan(filepaths: list[str]) -> int:
     tasks = _get_task_gpu_plan(config, variables)
 
     print(f"\n{'=' * 70}")
-    print(f"  GPU Allocation Plan")
+    print("  GPU Allocation Plan")
     print(f"  Files: {', '.join(filepaths)}")
     print(f"{'=' * 70}")
 
     if backends:
-        print(f"\n  Backends:")
+        print("\n  Backends:")
         print(f"  {'Name':<20} {'Type':<8} {'Nodes':<7} {'GPUs/Node':<10} {'Total GPUs':<10} {'Default'}")
         print(f"  {'-'*20} {'-'*8} {'-'*7} {'-'*10} {'-'*10} {'-'*7}")
         for b in backends:
@@ -250,7 +250,7 @@ def print_plan(filepaths: list[str]) -> int:
             print(f"  {b['name']:<20} {b['type']:<8} {nodes_str:<7} {gpn_str:<10} {total_str:<10} {default_str}")
 
     if tasks:
-        print(f"\n  Tasks:")
+        print("\n  Tasks:")
         print(f"  {'Name':<30} {'GPUs':<6} {'Replicas':<10} {'Total GPUs':<11} {'Policy':<12} {'Pinned'}")
         print(f"  {'-'*30} {'-'*6} {'-'*10} {'-'*11} {'-'*12} {'-'*10}")
 
@@ -289,8 +289,8 @@ def print_plan(filepaths: list[str]) -> int:
         demand_str = f"{total_gpu_demand}+" if has_unresolved else str(total_gpu_demand)
         print(f"\n  Peak concurrent GPU demand: {demand_str}")
         if has_unresolved:
-            print(f"  Note: some GPU counts contain unresolved expressions (shown as '?')")
-            print(f"        Use sflow compose --resolve to get exact values")
+            print("  Note: some GPU counts contain unresolved expressions (shown as '?')")
+            print("        Use sflow compose --resolve to get exact values")
 
         default_backend = next((b for b in backends if b["default"]), backends[0] if backends else None)
         if default_backend and default_backend["total_gpus"] is not None:
@@ -298,9 +298,9 @@ def print_plan(filepaths: list[str]) -> int:
             print(f"  Backend capacity:           {capacity} ({default_backend['name']})")
             if total_gpu_demand > capacity:
                 print(f"\n  *** WARNING: GPU demand ({total_gpu_demand}) exceeds capacity ({capacity})! ***")
-                print(f"  *** Increase nodes or reduce GPU counts / replicas. ***")
+                print("  *** Increase nodes or reduce GPU counts / replicas. ***")
             elif total_gpu_demand == capacity:
-                print(f"  Status: Fully utilized (demand == capacity)")
+                print("  Status: Fully utilized (demand == capacity)")
             else:
                 headroom = capacity - total_gpu_demand
                 print(f"  Status: OK ({headroom} GPU(s) headroom)")

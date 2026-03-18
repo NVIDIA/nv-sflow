@@ -129,17 +129,17 @@ def sample(
             typer.echo("  Option A: Bulk batch (CSV-driven, all-in-one)")
             typer.echo("=" * 65)
             if csv_files:
-                typer.echo(f"\n  Preview scripts (no submission):")
+                typer.echo("\n  Preview scripts (no submission):")
                 typer.echo(
                     f"    sflow batch --bulk-input {output.name}/{csv_files[0]} "
                     f"-A ACCOUNT -p PARTITION"
                 )
-                typer.echo(f"\n  Generate and submit to Slurm:")
+                typer.echo("\n  Generate and submit to Slurm:")
                 typer.echo(
                     f"    sflow batch --bulk-input {output.name}/{csv_files[0]} "
                     f"-A ACCOUNT -p PARTITION --submit"
                 )
-                typer.echo(f"\n  Add --resolve to inline all variables into the generated configs:")
+                typer.echo("\n  Add --resolve to inline all variables into the generated configs:")
                 typer.echo(
                     f"    sflow batch --bulk-input {output.name}/{csv_files[0]} "
                     f"-A ACCOUNT -p PARTITION --resolve"
@@ -150,7 +150,7 @@ def sample(
                 typer.echo(f"\n{'=' * 65}")
                 typer.echo("  Option B: Compose + Submit (step-by-step)")
                 typer.echo("=" * 65)
-                typer.echo(f"\n  Step 1 - Compose modular files into a complete workflow:")
+                typer.echo("\n  Step 1 - Compose modular files into a complete workflow:")
                 typer.echo(
                     f"    sflow compose {output.name}/slurm_config.yaml "
                     f"{output.name}/common_workflow.yaml \\"
@@ -163,18 +163,18 @@ def sample(
                     f"                  {output.name}/benchmark_aiperf.yaml "
                     f"-o composed.yaml"
                 )
-                typer.echo(f"\n  Step 2 - Validate, run, or submit:")
+                typer.echo("\n  Step 2 - Validate, run, or submit:")
                 typer.echo(
-                    f"    sflow run -f composed.yaml --dry-run                        # validate"
+                    "    sflow run -f composed.yaml --dry-run                        # validate"
                 )
                 typer.echo(
-                    f"    sflow run -f composed.yaml --tui                             # run interactively"
+                    "    sflow run -f composed.yaml --tui                             # run interactively"
                 )
                 typer.echo(
-                    f"    sflow batch -f composed.yaml -N 1 -p PARTITION -A ACCOUNT \\"
+                    "    sflow batch -f composed.yaml -N 1 -p PARTITION -A ACCOUNT \\"
                 )
                 typer.echo(
-                    f"                -o run.sh --submit                               # submit to Slurm"
+                    "                -o run.sh --submit                               # submit to Slurm"
                 )
 
             typer.echo(f"\n{'=' * 65}")

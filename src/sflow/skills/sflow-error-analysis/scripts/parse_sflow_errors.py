@@ -380,7 +380,7 @@ def print_report(result: ParseResult) -> None:
     root_cause = result.matched_errors[0] if result.matched_errors else None
 
     if root_cause:
-        print(f"\n  ** Most likely root cause (first error found):")
+        print("\n  ** Most likely root cause (first error found):")
         print(f"     Line {root_cause.line_num}: {root_cause.pattern.description}")
         print(f"     Fix: {root_cause.pattern.fix}")
         print()
@@ -389,7 +389,7 @@ def print_report(result: ParseResult) -> None:
     print(f"  Unmatched error-like lines: {len(result.unmatched_error_lines)}")
 
     if by_category:
-        print(f"\n  Summary by category:")
+        print("\n  Summary by category:")
         for cat in CATEGORY_PRIORITY:
             errors = by_category.get(cat, [])
             if errors:
