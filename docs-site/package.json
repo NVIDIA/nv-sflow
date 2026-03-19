@@ -9,6 +9,7 @@
     "clear": "docusaurus clear"
   },
   "dependencies": {
+    "@cmfcmf/docusaurus-search-local": "^2.0.0",
     "@docusaurus/core": "^3.7.0",
     "@docusaurus/plugin-client-redirects": "^3.7.0",
     "@docusaurus/preset-classic": "^3.7.0",

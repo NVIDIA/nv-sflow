@@ -66,6 +66,12 @@ const config = {
 
   plugins: [
     [
+      require.resolve("@cmfcmf/docusaurus-search-local"),
+      {
+        indexBlog: false,
+      },
+    ],
+    [
       "@docusaurus/plugin-client-redirects",
       {
         // Add a stable alias path for "dev" so /docs/dev/... redirects to /docs/...
@@ -102,6 +108,7 @@ const config = {
         },
         items: [
           { type: "doc", docId: "user/intro", label: "Docs", position: "left" },
+          { type: "search", position: "left" },
           { type: "docsVersionDropdown", position: "right" },
           {
             href: "https://github.com/NVIDIA/nv-sflow",
