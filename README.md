@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml/badge.svg)](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml)
 
-A **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_.
+A **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_, see our [project page](https://nvidia.github.io/nv-sflow/).
 
 Describe your workflow once in a portable YAML -- tasks, dependencies, resources, and launch methods -- and `sflow` executes the DAG through swappable backends, leveraging each platform's native ecosystem. Write one `sflow.yaml` and run it across environments with minimal changes.
 
