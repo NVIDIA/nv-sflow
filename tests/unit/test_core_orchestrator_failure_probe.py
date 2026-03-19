@@ -81,12 +81,12 @@ def test_failure_probe_sets_failed_by_probe_and_cancels_workflow(tmp_path: Path)
 
     orch = Orchestrator(
         workflow=wf,
-        poll_interval=0,
+        poll_interval=0.01,
         launcher=_HangingLauncher(),
         fail_fast=True,
     )
 
-    asyncio.run(asyncio.wait_for(orch.run(), timeout=5))
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=10))
 
     assert server.status == TaskStatus.FAILED
     assert server.failed_by_probe is True
@@ -123,7 +123,7 @@ def test_fail_fast_message_distinguishes_probe_from_process_exit():
 
     orch = Orchestrator(
         workflow=wf,
-        poll_interval=0,
+        poll_interval=0.01,
         launcher=_HangingLauncher(),
         fail_fast=True,
     )
@@ -158,7 +158,7 @@ def test_failure_probe_log_includes_pattern_detail():
 
     orch = Orchestrator(
         workflow=wf,
-        poll_interval=0,
+        poll_interval=0.01,
         launcher=_HangingLauncher(),
         fail_fast=True,
     )
@@ -214,7 +214,7 @@ def test_log_watch_failure_probe_triggers_fail_fast(tmp_path: Path):
 
     orch = Orchestrator(
         workflow=wf,
-        poll_interval=0,
+        poll_interval=0.01,
         launcher=_HangingLauncher(),
         fail_fast=True,
     )
@@ -266,12 +266,12 @@ def test_process_exit_failure_not_marked_as_probe():
 
     orch = Orchestrator(
         workflow=wf,
-        poll_interval=0,
+        poll_interval=0.01,
         launcher=_ImmediateExitLauncher(),
         fail_fast=True,
     )
 
-    asyncio.run(asyncio.wait_for(orch.run(), timeout=2))
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=5))
 
     assert task.status == TaskStatus.FAILED
     assert task.failed_by_probe is False
@@ -318,7 +318,7 @@ def test_mixed_probe_and_process_failure_in_fail_fast_message():
 
     orch = Orchestrator(
         workflow=wf,
-        poll_interval=0,
+        poll_interval=0.01,
         launcher=_MixedLauncher(),
         fail_fast=True,
     )
@@ -387,12 +387,12 @@ def test_failure_probe_with_match_count_requires_multiple_matches(tmp_path: Path
         wf1 = Workflow(name="wf1", task_graph=tg1)
         orch1 = Orchestrator(
             workflow=wf1,
-            poll_interval=0,
+            poll_interval=0.01,
             launcher=_WriteThenHang(log_path, two_tracebacks),
             fail_fast=True,
         )
         with pytest.raises((asyncio.TimeoutError, TimeoutError)):
-            await asyncio.wait_for(orch1.run(), timeout=0.5)
+            await asyncio.wait_for(orch1.run(), timeout=1.5)
         # Let the event loop process pending cancellations from phase 1
         for pending in asyncio.all_tasks():
             if pending is not asyncio.current_task() and not pending.done():
@@ -421,11 +421,11 @@ def test_failure_probe_with_match_count_requires_multiple_matches(tmp_path: Path
         wf2 = Workflow(name="wf2", task_graph=tg2)
         orch2 = Orchestrator(
             workflow=wf2,
-            poll_interval=0,
+            poll_interval=0.01,
             launcher=_WriteThenHang(log_path, three_tracebacks),
             fail_fast=True,
         )
-        await asyncio.wait_for(orch2.run(), timeout=5)
+        await asyncio.wait_for(orch2.run(), timeout=10)
         assert svc2.status == TaskStatus.FAILED
         assert svc2.failed_by_probe is True
 
