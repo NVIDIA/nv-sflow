@@ -896,15 +896,16 @@ def _run_bulk_submit(
             err_short = str(e).split("\n")[0]
             summary.append(f"  [{idx}] {yaml_file.name}: SKIPPED (dry-run failed)")
             failures.append(f"  [{idx}] {yaml_file.name}: {err_short}")
-            result_rows.append(
-                {
-                    "sflow_config_file": str(yaml_file),
-                    "job_name": job_name,
-                    "slurm_job_id": "FAILED",
-                    "sflow_output_dir": "",
-                    "status": "dry-run failed",
-                }
-            )
+            fail_row: dict[str, str] = {
+                "sflow_config_file": str(yaml_file),
+                "job_name": job_name,
+                "slurm_job_id": "FAILED",
+                "sflow_output_dir": "",
+                "status": "dry-run failed",
+            }
+            if resolve:
+                fail_row["composed_sflow_config"] = ""
+            result_rows.append(fail_row)
             continue
 
         # Determine node count from config if not given via CLI
@@ -957,6 +958,7 @@ def _run_bulk_submit(
         script_path.chmod(0o755)
 
         # Generate composed/resolved YAML alongside the sbatch script
+        composed_yaml_path: str = ""
         try:
             from sflow.cli.compose import _compose_files
 
@@ -971,6 +973,7 @@ def _run_bulk_submit(
             )
             yaml_path = bulk_dir / f"{job_name}.yaml"
             yaml_path.write_text(yaml_output)
+            composed_yaml_path = str(yaml_path)
         except Exception as e:
             typer.echo(
                 f"  Warning: could not generate composed config for {yaml_file.name}: {e}",
@@ -991,19 +994,20 @@ def _run_bulk_submit(
 
         sflow_output_dir = f"{effective_output}/{job_id}-*" if job_id else ""
         summary.append(f"  [{idx}] {script_path.name}: {yaml_file.name} -> {status}")
-        result_rows.append(
-            {
-                "sflow_config_file": str(yaml_file),
-                "job_name": job_name,
-                "slurm_job_id": job_id
-                if job_id
-                else ("not submitted" if not submit else "FAILED"),
-                "sflow_output_dir": sflow_output_dir
-                if sflow_output_dir
-                else ("not submitted" if not submit else ""),
-                "status": status,
-            }
-        )
+        success_row: dict[str, str] = {
+            "sflow_config_file": str(yaml_file),
+            "job_name": job_name,
+            "slurm_job_id": job_id
+            if job_id
+            else ("not submitted" if not submit else "FAILED"),
+            "sflow_output_dir": sflow_output_dir
+            if sflow_output_dir
+            else ("not submitted" if not submit else ""),
+            "status": status,
+        }
+        if resolve:
+            success_row["composed_sflow_config"] = composed_yaml_path
+        result_rows.append(success_row)
 
     generated = len(yaml_files) - failed_count
     typer.echo(
@@ -1031,6 +1035,8 @@ def _run_bulk_submit(
             "sflow_output_dir",
             "status",
         ]
+        if resolve:
+            fieldnames.append("composed_sflow_config")
         with open(results_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -1229,6 +1235,8 @@ def _run_bulk_edit(
             dry_run_failures.append(f"  [{idx}] {err_short}")
             result_row["slurm_job_id"] = "FAILED"
             result_row["sflow_output_dir"] = ""
+            if resolve:
+                result_row["composed_sflow_config"] = ""
             result_rows.append(result_row)
             continue
 
@@ -1265,9 +1273,11 @@ def _run_bulk_edit(
 
         row_name = _derive_row_name(row, idx, naming_ctx)
 
+        composed_config_path = ""
         if yaml_output:
             merged_yaml_path = bulk_dir / f"{row_name}.yaml"
             merged_yaml_path.write_text(yaml_output)
+            composed_config_path = str(merged_yaml_path)
 
         script_path = bulk_dir / f"{row_name}.sh"
         script = _generate_sbatch_script(
@@ -1309,6 +1319,8 @@ def _run_bulk_edit(
         result_row["sflow_output_dir"] = (
             f"{effective_output_dir}/{job_id}-*" if job_id else ""
         )
+        if resolve:
+            result_row["composed_sflow_config"] = composed_config_path
         result_rows.append(result_row)
         summary.append(f"  [{idx}] {script_path.name}: ({overrides_desc}) -> {status}")
 
@@ -1337,6 +1349,8 @@ def _run_bulk_edit(
     if result_rows:
         results_csv = bulk_dir / "results.csv"
         result_columns = columns + ["slurm_job_id", "sflow_output_dir"]
+        if resolve:
+            result_columns.append("composed_sflow_config")
         for rr in result_rows:
             if not rr.get("slurm_job_id"):
                 rr["slurm_job_id"] = "not submitted" if not submit else ""
