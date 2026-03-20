@@ -216,33 +216,44 @@ def _generate_sbatch_script(
     venv_parent = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))
     git_ref = sflow_version if sflow_version else "main"
 
+    lock_file = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent / ".sflow_venv.lock"))
+
+    sflow_install_cmd = f"'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{git_ref}' --prerelease=allow"
+
     script_lines.extend(
         [
             f"SFLOW_ACTIVATE={activate_path_str}",
+            f"SFLOW_LOCK={lock_file}",
+            "",
+            "# Use flock to prevent concurrent venv creation/install across Slurm jobs",
+            f"mkdir -p {venv_parent}",
+            '(flock -w 600 9 || { echo "ERROR: timed out waiting for sflow venv lock"; exit 1; }',
             "",
             'if [ -f "$SFLOW_ACTIVATE" ]; then',
             "    # Activate existing Python virtual environment for sflow",
-            "    # Make sure this venv is compatible with your compute node arch (x86 / arm64)",
             '    source "$SFLOW_ACTIVATE"',
         ]
     )
     if sflow_version:
         script_lines.append(
-            f'    "$VIRTUAL_ENV/bin/uv" pip install \'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version}\' --prerelease=allow'
+            f'    "$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}'
         )
     script_lines.extend(
         [
             "else",
             "    # Venv not found; create from scratch and install sflow",
-            "    # Using compute node python to avoid login-node vs compute-node arch mismatch (x86 vs arm64)",
-            f"    mkdir -p {venv_parent}",
             f"    cd {venv_parent}",
             "    python3 -m venv .sflow_venv",
             "    source .sflow_venv/bin/activate",
             '    "$VIRTUAL_ENV/bin/pip" install uv',
-            f'    "$VIRTUAL_ENV/bin/uv" pip install \'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{git_ref}\' --prerelease=allow',
+            f'    "$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}',
             '    "$VIRTUAL_ENV/bin/sflow" --help',
             "fi",
+            "",
+            ') 9>"$SFLOW_LOCK"',
+            "",
+            "# Activate venv outside the lock (lock is only for creation/install)",
+            'source "$SFLOW_ACTIVATE"',
             "",
         ]
     )
