@@ -228,7 +228,7 @@ def _generate_sbatch_script(
     )
     if sflow_version:
         script_lines.append(
-            f"    uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version}' --prerelease=allow"
+            f'    "$VIRTUAL_ENV/bin/uv" pip install \'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version}\' --prerelease=allow'
         )
     script_lines.extend(
         [
@@ -237,11 +237,11 @@ def _generate_sbatch_script(
             "    # Using compute node python to avoid login-node vs compute-node arch mismatch (x86 vs arm64)",
             f"    mkdir -p {venv_parent}",
             f"    cd {venv_parent}",
-            "    /usr/bin/python3 -m venv .sflow_venv",
+            "    python3 -m venv .sflow_venv",
             "    source .sflow_venv/bin/activate",
-            "    pip install uv",
-            f"    uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{git_ref}' --prerelease=allow",
-            "    sflow --help",
+            '    "$VIRTUAL_ENV/bin/pip" install uv',
+            f'    "$VIRTUAL_ENV/bin/uv" pip install \'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{git_ref}\' --prerelease=allow',
+            '    "$VIRTUAL_ENV/bin/sflow" --help',
             "fi",
             "",
         ]

@@ -727,9 +727,8 @@ def compose(
         typer.Option(
             "-o",
             "--output",
-            help="Output file path. If not specified, writes to stdout.",
-            file_okay=True,
-            dir_okay=False,
+            help="Output file path (single compose) or directory (bulk compose). "
+            "If not specified, writes to stdout (single) or ./sflow_output/ (bulk).",
             resolve_path=True,
         ),
     ] = None,
@@ -901,6 +900,14 @@ def compose(
                 typer.echo(f"WARNING: dry-run validation failed: {err_short}", err=True)
 
         if output is not None:
+            if output.is_dir():
+                typer.echo(
+                    f"Error: output path '{output}' is a directory. "
+                    f"For single compose, -o must be a file path (e.g. -o merged.yaml). "
+                    f"For bulk compose, use --bulk-input.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(yaml_output)
             _logger.info(f"Composed config written to {output}")
