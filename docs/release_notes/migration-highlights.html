@@ -756,7 +756,7 @@
                 <div class="flow-arrow">→</div>
                 <div class="flow-node">283 distinct configs</div>
                 <div class="flow-arrow">→</div>
-                <div class="flow-node accent-node">477 CSV rows</div>
+                <div class="flow-node accent-node">477 CSV rows<br><span style="font-size: 0.8em; color: var(--text-secondary);">split by model/prec/gpu/fw</span></div>
             </div>
             <div class="feature-grid reveal" style="margin-top: clamp(0.5rem, 1vw, 1rem);">
                 <div class="feature-card">
@@ -785,7 +785,34 @@
     </section>
 
     <!-- ======================================
-         SLIDE 8: BENEFITS OVERVIEW
+         SLIDE 7b: CSV OWNERSHIP
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Ownership</div>
+            <h2 class="reveal">Each PIC Owns Their <span class="accent">CSV</span></h2>
+            <p class="reveal dim" style="max-width: 700px; text-align: center;">477 rows are not one giant file. CSVs are separated by <strong style="color: var(--text-primary);">model &times; precision &times; GPU &times; framework</strong> so each PIC can monitor, edit, and submit their scope independently.</p>
+            <div class="code-block reveal-scale" style="line-height: 1.6; max-width: min(90vw, 750px);">
+                <span class="file">nvidia_submission/</span><br>
+                └── <span class="kw">dsr1</span>/<span class="str">fp4</span>/<span class="file">b200</span>/<span class="accent">sglang</span>/<span class="kw">jobs.csv</span> <span class="comment"># ← PIC: Alice</span><br>
+                └── <span class="kw">dsr1</span>/<span class="str">fp4</span>/<span class="file">b200</span>/<span class="accent">trtllm</span>/<span class="kw">jobs.csv</span> <span class="comment"># ← PIC: Bob</span><br>
+                └── <span class="kw">dsr1</span>/<span class="str">fp8</span>/<span class="file">gb300</span>/<span class="accent">sglang</span>/<span class="kw">jobs.csv</span> <span class="comment"># ← PIC: Carol</span><br>
+                └── <span class="kw">dsr1</span>/<span class="str">fp8</span>/<span class="file">h200</span>/<span class="accent">trtllm</span>/<span class="kw">jobs.csv</span> <span class="comment"># ← PIC: Dave</span><br>
+                <span class="comment"># No cross-contamination: your CSV, your runs</span>
+            </div>
+            <div class="flow reveal" style="margin-top: clamp(0.3rem, 0.8vw, 0.75rem);">
+                <div class="flow-node">Edit your CSV</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node">Validate locally</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node accent-node">Submit your scope only</div>
+            </div>
+        </div>
+        <span class="slide-num">08</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 9: BENEFITS OVERVIEW
          ====================================== -->
     <section class="slide grid-bg">
         <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
@@ -824,11 +851,11 @@
                 </div>
             </div>
         </div>
-        <span class="slide-num">08</span>
+        <span class="slide-num">09</span>
     </section>
 
     <!-- ======================================
-         SLIDE 9: NEW DIRECTORY STRUCTURE
+         SLIDE 10: NEW DIRECTORY STRUCTURE
          ====================================== -->
     <section class="slide grid-bg">
         <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
@@ -846,11 +873,11 @@
                 &nbsp;&nbsp;&nbsp;&nbsp;└── 8k1k_decode_tep8_low_latency_stp.yaml
             </div>
         </div>
-        <span class="slide-num">09</span>
+        <span class="slide-num">10</span>
     </section>
 
     <!-- ======================================
-         SLIDE 10: HOW TO ADD A BENCHMARK
+         SLIDE 11: HOW TO ADD A BENCHMARK
          ====================================== -->
     <section class="slide grid-bg">
         <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
@@ -881,11 +908,11 @@
                 </div>
             </div>
         </div>
-        <span class="slide-num">10</span>
+        <span class="slide-num">11</span>
     </section>
 
     <!-- ======================================
-         SLIDE 11: NEW VARIANT WORKFLOW
+         SLIDE 12: NEW VARIANT WORKFLOW
          ====================================== -->
     <section class="slide grid-bg">
         <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
@@ -904,11 +931,11 @@
                 <span class="kw">python</span> <span class="file">generate_or_validate_sflow_csv.py</span> <span class="op">--sflow-validate</span>
             </div>
         </div>
-        <span class="slide-num">11</span>
+        <span class="slide-num">12</span>
     </section>
 
     <!-- ======================================
-         SLIDE 12: CI PIPELINE
+         SLIDE 13: CI PIPELINE
          ====================================== -->
     <section class="slide grid-bg">
         <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
@@ -935,11 +962,11 @@
                 </div>
             </div>
         </div>
-        <span class="slide-num">12</span>
+        <span class="slide-num">13</span>
     </section>
 
     <!-- ======================================
-         SLIDE 13: ROLE-BASED GUIDANCE
+         SLIDE 14: ROLE-BASED GUIDANCE
          ====================================== -->
     <section class="slide grid-bg">
         <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
@@ -978,11 +1005,11 @@
                 </div>
             </div>
         </div>
-        <span class="slide-num">13</span>
+        <span class="slide-num">14</span>
     </section>
 
     <!-- ======================================
-         SLIDE 14: CLOSING
+         SLIDE 15: CLOSING
          ====================================== -->
     <section class="slide title-slide grid-bg">
         <div class="slide-content">
@@ -993,7 +1020,7 @@
                 <div class="flow-node accent-node glow-border">sflow batch --bulk-input jobs.csv --submit</div>
             </div>
         </div>
-        <span class="slide-num">14</span>
+        <span class="slide-num">15</span>
     </section>
 
 
