@@ -966,7 +966,84 @@
     </section>
 
     <!-- ======================================
-         SLIDE 14: ROLE-BASED GUIDANCE
+         SLIDE 14: RESULT COLLECTION (CSV IN → CSV OUT)
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Results</div>
+            <h2 class="reveal">CSV In → <span class="accent">Enriched CSV</span> Out</h2>
+            <p class="reveal dim" style="max-width: 750px; text-align: center;">No custom parsers, no artifact hunting. sflow writes results back into the <strong style="color: var(--text-primary);">same CSV</strong> you submitted — every row gains benchmark metrics automatically.</p>
+            <div class="code-block reveal-scale" style="line-height: 1.6; max-width: min(90vw, 850px);">
+                <span class="comment"># INPUT: what you submit</span><br>
+                <span class="kw">name</span>, <span class="file">prefill_config</span>, <span class="file">decode_config</span>, <span class="str">conc</span>, <span class="str">nodes</span><br><br>
+                <span class="comment"># OUTPUT: same CSV, enriched with results</span><br>
+                <span class="kw">name</span>, <span class="file">prefill_config</span>, <span class="file">decode_config</span>, <span class="str">conc</span>, <span class="str">nodes</span>,<br>
+                &nbsp;&nbsp;<span class="accent">tput</span>, <span class="accent">ttft_p99</span>, <span class="accent">e2e_mean</span>, <span class="accent">slurm_job_id</span>, <span class="accent">status</span>
+            </div>
+            <div class="stats-grid reveal" style="margin-top: clamp(0.3rem, 0.8vw, 0.75rem);">
+                <div class="stat-card">
+                    <div class="stat-number" style="font-size: clamp(1.2rem, 3vw, 2rem);">git diff</div>
+                    <div class="stat-label">Results are diffable line-by-line</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" style="font-size: clamp(1.2rem, 3vw, 2rem);">1 file</div>
+                    <div class="stat-label">Input + output in one artifact</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" style="font-size: clamp(1.2rem, 3vw, 2rem);">auto</div>
+                    <div class="stat-label">Collected &amp; merged back into CSV</div>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">14</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 15: RULE-BASED EXPANSION (sflow 0.3.0)
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal" style="color: var(--text-secondary); border: 1px solid var(--border); padding: clamp(0.2rem, 0.5vw, 0.4rem) clamp(0.6rem, 1.5vw, 1rem); border-radius: 100px; display: inline-flex; align-items: center; gap: 0.5em;">COMING SOON · SFLOW 0.3.0</div>
+            <h2 class="reveal">Rule-Based Expansion: <span class="accent">Zero Manual Rows</span></h2>
+            <div class="compare-grid reveal-scale">
+                <div class="compare-card old">
+                    <div class="compare-label">Before: Manual CSV</div>
+                    <div class="code-block" style="border: none; padding: clamp(0.5rem, 1vw, 0.75rem); line-height: 1.5;">
+                        <span class="comment"># Manually write every row</span><br>
+                        <span class="str">dsr1-1k8k-dep4</span>,prefill_dep4,decode_dep8,…<br>
+                        <span class="str">dsr1-1k1k-dep4</span>,prefill_dep4,decode_dep4,…<br>
+                        <span class="str">dsr1-8k1k-tep8</span>,prefill_tep8,decode_tep8,…<br>
+                        <span class="str">gptoss-1k8k-dep4</span>,prefill_dep4,decode_dep8,…<br>
+                        <span class="comment"># 477 rows × human error 😰</span>
+                    </div>
+                </div>
+                <div class="compare-card new">
+                    <div class="compare-label">After: Expansion Rules</div>
+                    <div class="code-block" style="border: none; padding: clamp(0.5rem, 1vw, 0.75rem); line-height: 1.5;">
+                        <span class="comment"># Define rules, CSV auto-generates</span><br>
+                        <span class="kw">rules</span>:<br>
+                        &nbsp;&nbsp;- <span class="kw">when</span>:<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="str">model</span>: dsr1<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="str">isl,osl</span>: 1k,8k<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;<span class="kw">set</span>:<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="file">prefill_server</span>: <span class="accent">prefill_dep_4</span><br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="file">decode_server</span>: <span class="accent">decode_dep_8</span>
+                    </div>
+                </div>
+            </div>
+            <div class="flow reveal" style="margin-top: clamp(0.3rem, 0.8vw, 0.75rem);">
+                <div class="flow-node">Axes: model, precision, isl/osl</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node accent-node">Rules match conditions</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node">Full CSV materialized</div>
+            </div>
+        </div>
+        <span class="slide-num">15</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 16: ROLE-BASED GUIDANCE
          ====================================== -->
     <section class="slide grid-bg">
         <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
@@ -1005,11 +1082,11 @@
                 </div>
             </div>
         </div>
-        <span class="slide-num">14</span>
+        <span class="slide-num">16</span>
     </section>
 
     <!-- ======================================
-         SLIDE 15: CLOSING
+         SLIDE 17: CLOSING
          ====================================== -->
     <section class="slide title-slide grid-bg">
         <div class="slide-content">
@@ -1020,7 +1097,7 @@
                 <div class="flow-node accent-node glow-border">sflow batch --bulk-input jobs.csv --submit</div>
             </div>
         </div>
-        <span class="slide-num">15</span>
+        <span class="slide-num">17</span>
     </section>
 
 
