@@ -25,7 +25,7 @@ from sflow.core.variable import Variable, VariableType
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
-from sflow.plugins.probes import TcpPortProbe
+from sflow.plugins.probes import HttpPostProbe, TcpPortProbe
 
 
 class _FakeBackend(Backend):
@@ -1624,3 +1624,331 @@ def test_build_task_graph_resources_nodes_exclude_all_raises():
 
     with pytest.raises(ValueError, match="removed all nodes"):
         build_task_graph(config, state)
+
+
+# ---------------------------------------------------------------------------
+# HTTP probe replica deduplication
+# ---------------------------------------------------------------------------
+
+
+def _state_with_slurm_backend() -> SflowState:
+    """Convenience: SflowState with a single slurm-like backend and one node."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="probe-dedup",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+    return state
+
+
+def test_http_probe_skipped_on_non_first_replica_when_no_sweep_var_referenced():
+    """HTTP readiness probe that doesn't reference sweep vars should only appear on
+    the first replica — non-first replicas should have no probes but the first
+    replica should list them as readiness_followers."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="sequential"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/v1/chat/completions",
+                                "body": '{"model": "m", "messages": []}',
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+
+    assert len(first.probes) == 1
+    assert isinstance(first.probes[0], HttpPostProbe)
+    assert len(second.probes) == 0
+    assert first.readiness_followers == ["bench_8"]
+
+
+def test_http_probe_kept_on_all_replicas_when_sweep_var_referenced():
+    """HTTP readiness probe that references a sweep variable should be present on
+    every replica."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "PORT": Variable(
+            name="PORT", value=8000, type=VariableType.INTEGER, domain=[8000, 9000]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["PORT"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:${{ variables.PORT }}/health",
+                                "body": '{"check": true}',
+                            },
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("svc_8000")
+    second = tg.get_task("svc_9000")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 1
+    assert isinstance(first.probes[0], HttpPostProbe)
+    assert isinstance(second.probes[0], HttpPostProbe)
+
+
+def test_tcp_probe_always_per_replica():
+    """TCP probes should never be deduplicated — they inherently differ per replica
+    (different assigned hosts)."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "tcp_port": {"port": 8888},
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("svc_4")
+    second = tg.get_task("svc_8")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 1
+    assert isinstance(first.probes[0], TcpPortProbe)
+    assert isinstance(second.probes[0], TcpPortProbe)
+
+
+def test_http_probe_followers_multiple_replicas():
+    """When 3+ replicas share a deduplicated HTTP probe, all non-first replicas
+    should appear in the first replica's readiness_followers."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=4,
+            type=VariableType.INTEGER,
+            domain=[4, 8, 16],
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="sequential"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/health",
+                                "body": "{}",
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+    third = tg.get_task("bench_16")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 0
+    assert len(third.probes) == 0
+    assert first.readiness_followers == ["bench_8", "bench_16"]
+    assert second.readiness_followers == []
+    assert third.readiness_followers == []
+
+
+def test_failure_http_probe_followers():
+    """Deduplicated failure HTTP probes should populate failure_followers."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="sequential"
+                    ),
+                    probes={
+                        "failure": {
+                            "http_get": {
+                                "url": "http://10.0.0.1:8888/health",
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 0
+    assert first.failure_followers == ["bench_8"]
+    assert first.readiness_followers == []
+
+
+def test_http_probe_kept_when_referencing_sflow_replica_index():
+    """HTTP probe referencing SFLOW_REPLICA_INDEX should NOT be skipped on any
+    replica, since each replica has a different index value."""
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(count=3, policy="parallel"),
+                    probes={
+                        "readiness": {
+                            "http_get": {
+                                "url": "http://10.0.0.1:${SFLOW_REPLICA_INDEX}/health",
+                            },
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    for i in range(3):
+        task = tg.get_task(f"svc_{i}")
+        assert len(task.probes) == 1, (
+            f"svc_{i} should have its own probe since URL references SFLOW_REPLICA_INDEX"
+        )
+        assert task.readiness_followers == []
+
+
+def test_http_probe_skipped_when_no_replica_var_referenced():
+    """HTTP probe that doesn't reference any per-replica variable (neither sweep
+    vars nor SFLOW_REPLICA_INDEX) should be skipped on non-first replicas."""
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(count=2, policy="parallel"),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/health",
+                                "body": "{}",
+                            },
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("svc_0")
+    second = tg.get_task("svc_1")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 0
+    assert first.readiness_followers == ["svc_1"]

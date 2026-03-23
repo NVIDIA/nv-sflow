@@ -1067,6 +1067,34 @@ def build_task_graph(
             f"Task '{task_name}' {field} must resolve to int, got {type(resolved).__name__}"
         )
 
+    def _is_http_probe_config(p_conf: Any) -> bool:
+        """Return True if the probe config uses http_get or http_post."""
+        return (
+            getattr(p_conf, "http_get", None) is not None
+            or getattr(p_conf, "http_post", None) is not None
+        )
+
+    def _http_probe_references_vars(p_conf: Any, var_names: list[str]) -> bool:
+        """Check if an HTTP probe config's URL or body references any of the given variable names.
+
+        Inspects the raw (pre-resolved) strings so per-replica variable references like
+        ``${{ variables.CONCURRENCY }}``, ``${CONCURRENCY}``, or ``${SFLOW_REPLICA_INDEX}``
+        are detected.  ``var_names`` should include both user-declared sweep variables and
+        reserved replica variables (e.g. ``SFLOW_REPLICA_INDEX``).
+        """
+        if not var_names:
+            return False
+        texts: list[str] = []
+        http = getattr(p_conf, "http_get", None) or getattr(p_conf, "http_post", None)
+        if http is None:
+            return False
+        texts.append(str(http.url))
+        body = getattr(http, "body", None)
+        if body is not None:
+            texts.append(str(body))
+        combined = " ".join(texts)
+        return any(var_name in combined for var_name in var_names)
+
     def _build_probe(
         task_name: str,
         *,
@@ -1934,24 +1962,69 @@ def build_task_graph(
                 except Exception:
                     default_probe_host = None
 
+                # For replicated tasks, skip HTTP probes on non-first replicas when
+                # the probe URL/body don't reference any per-replica variables — the
+                # probes would send identical requests, creating unnecessary duplicate
+                # load.  Per-replica variables include user-declared sweep variables
+                # and reserved variables like SFLOW_REPLICA_INDEX.
+                replica_var_names: list[str] = []
+                if t_conf.replicas and len(concrete_nodes) > 1:
+                    per_replica_env = replica_envs.get(node_name, {})
+                    replica_var_names = list(per_replica_env.keys())
+                is_non_first_replica = idx > 0 and len(concrete_nodes) > 1
+
                 if t_conf.probes.readiness is not None:
-                    task.probes.append(
-                        _build_probe(
-                            node_name,
-                            p_conf=t_conf.probes.readiness,
-                            p_type=ProbeType.READINESS,
-                            default_host=default_probe_host,
+                    skip = (
+                        is_non_first_replica
+                        and _is_http_probe_config(t_conf.probes.readiness)
+                        and not _http_probe_references_vars(
+                            t_conf.probes.readiness, replica_var_names
                         )
                     )
+                    if skip:
+                        _logger.debug(
+                            "Skipping readiness HTTP probe on replica '%s' "
+                            "(identical to first replica)",
+                            node_name,
+                        )
+                        first_task = task_graph.get_task(concrete_nodes[0])
+                        if first_task is not None:
+                            first_task.readiness_followers.append(node_name)
+                    else:
+                        task.probes.append(
+                            _build_probe(
+                                node_name,
+                                p_conf=t_conf.probes.readiness,
+                                p_type=ProbeType.READINESS,
+                                default_host=default_probe_host,
+                            )
+                        )
                 if t_conf.probes.failure is not None:
-                    task.probes.append(
-                        _build_probe(
-                            node_name,
-                            p_conf=t_conf.probes.failure,
-                            p_type=ProbeType.FAILURE,
-                            default_host=default_probe_host,
+                    skip = (
+                        is_non_first_replica
+                        and _is_http_probe_config(t_conf.probes.failure)
+                        and not _http_probe_references_vars(
+                            t_conf.probes.failure, replica_var_names
                         )
                     )
+                    if skip:
+                        _logger.debug(
+                            "Skipping failure HTTP probe on replica '%s' "
+                            "(identical to first replica)",
+                            node_name,
+                        )
+                        first_task = task_graph.get_task(concrete_nodes[0])
+                        if first_task is not None:
+                            first_task.failure_followers.append(node_name)
+                    else:
+                        task.probes.append(
+                            _build_probe(
+                                node_name,
+                                p_conf=t_conf.probes.failure,
+                                p_type=ProbeType.FAILURE,
+                                default_host=default_probe_host,
+                            )
+                        )
             task.backend_name = backend.name
             # Optional retry policy (REQ-3.6).
             if t_conf.retries:
