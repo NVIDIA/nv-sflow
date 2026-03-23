@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InferenceX Migration: srt-slurm → sflow</title>
+
+    <!-- Fonts: JetBrains Mono for tech feel, General Sans for headings -->
+    <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=general-sans@500,600,700&f[]=cabinet-grotesk@700,800&display=swap">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+    <style>
+        /* ===========================================
+           CSS CUSTOM PROPERTIES (NVIDIA DARK THEME)
+           =========================================== */
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #111111;
+            --bg-card: #161616;
+            --bg-card-hover: #1a1a1a;
+            --text-primary: #e8e8e8;
+            --text-secondary: #888888;
+            --text-dim: #555555;
+            --accent: #76b900;
+            --accent-bright: #8ed100;
+            --accent-glow: rgba(118, 185, 0, 0.25);
+            --accent-subtle: rgba(118, 185, 0, 0.08);
+            --danger: #ff4444;
+            --danger-glow: rgba(255, 68, 68, 0.15);
+            --success: #76b900;
+            --border: rgba(255, 255, 255, 0.06);
+            --border-accent: rgba(118, 185, 0, 0.3);
+
+            --font-display: 'Cabinet Grotesk', 'General Sans', sans-serif;
+            --font-body: 'General Sans', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+
+            --title-size: clamp(2rem, 6vw, 4.5rem);
+            --h2-size: clamp(1.4rem, 3.5vw, 2.8rem);
+            --h3-size: clamp(1rem, 2.5vw, 1.5rem);
+            --body-size: clamp(0.75rem, 1.4vw, 1.1rem);
+            --small-size: clamp(0.65rem, 1vw, 0.85rem);
+            --mono-size: clamp(0.6rem, 1vw, 0.8rem);
+
+            --slide-padding: clamp(1.5rem, 4vw, 5rem);
+            --content-gap: clamp(0.75rem, 2vw, 2rem);
+            --element-gap: clamp(0.25rem, 1vw, 1rem);
+
+            --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+            --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+            --duration-normal: 0.7s;
+            --duration-slow: 1.2s;
+        }
+
+        /* ===========================================
+           RESET & BASE
+           =========================================== */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        /* === VIEWPORT FITTING: MANDATORY BASE STYLES === */
+        html, body { height: 100%; overflow-x: hidden; }
+        html { scroll-snap-type: y mandatory; scroll-behavior: smooth; }
+
+        .slide {
+            width: 100vw; height: 100vh; height: 100dvh;
+            overflow: hidden; scroll-snap-align: start;
+            display: flex; flex-direction: column;
+            position: relative;
+        }
+
+        .slide-content {
+            flex: 1; display: flex; flex-direction: column;
+            justify-content: center; max-height: 100%;
+            overflow: hidden; padding: var(--slide-padding);
+        }
+
+        .card, .container, .content-box {
+            max-width: min(90vw, 1100px);
+            max-height: min(80vh, 700px);
+        }
+
+        .feature-list, .bullet-list { gap: clamp(0.4rem, 1vh, 1rem); }
+        .feature-list li, .bullet-list li { font-size: var(--body-size); line-height: 1.4; }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr));
+            gap: clamp(0.5rem, 1.5vw, 1rem);
+        }
+
+        img, .image-container {
+            max-width: 100%; max-height: min(50vh, 400px); object-fit: contain;
+        }
+
+        @media (max-height: 700px) {
+            :root {
+                --slide-padding: clamp(0.75rem, 3vw, 2rem);
+                --content-gap: clamp(0.4rem, 1.5vw, 1rem);
+                --title-size: clamp(1.25rem, 4.5vw, 2.5rem);
+                --h2-size: clamp(1rem, 3vw, 1.75rem);
+            }
+        }
+        @media (max-height: 600px) {
+            :root {
+                --slide-padding: clamp(0.5rem, 2.5vw, 1.5rem);
+                --content-gap: clamp(0.3rem, 1vw, 0.75rem);
+                --title-size: clamp(1.1rem, 4vw, 2rem);
+                --body-size: clamp(0.7rem, 1.2vw, 0.95rem);
+            }
+            .nav-dots, .keyboard-hint, .decorative { display: none; }
+        }
+        @media (max-height: 500px) {
+            :root {
+                --slide-padding: clamp(0.4rem, 2vw, 1rem);
+                --title-size: clamp(1rem, 3.5vw, 1.5rem);
+                --h2-size: clamp(0.9rem, 2.5vw, 1.25rem);
+                --body-size: clamp(0.65rem, 1vw, 0.85rem);
+            }
+        }
+        @media (max-width: 600px) {
+            :root { --title-size: clamp(1.25rem, 7vw, 2.5rem); }
+            .grid { grid-template-columns: 1fr; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                transition-duration: 0.2s !important;
+            }
+            html { scroll-behavior: auto; }
+        }
+
+        /* ===========================================
+           BODY & TYPOGRAPHY
+           =========================================== */
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            font-size: var(--body-size);
+            -webkit-font-smoothing: antialiased;
+        }
+
+        h1, h2, h3 { font-family: var(--font-display); font-weight: 700; line-height: 1.1; }
+        h1 { font-size: var(--title-size); letter-spacing: -0.03em; }
+        h2 { font-size: var(--h2-size); letter-spacing: -0.02em; }
+        h3 { font-size: var(--h3-size); }
+
+        .accent { color: var(--accent); }
+        .accent-bright { color: var(--accent-bright); }
+        .dim { color: var(--text-secondary); }
+        .danger { color: var(--danger); }
+        .mono { font-family: var(--font-mono); font-size: var(--mono-size); }
+
+        /* ===========================================
+           SLIDE BACKGROUNDS
+           =========================================== */
+        .slide {
+            background: var(--bg-primary);
+        }
+
+        .slide::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(135deg, rgba(118, 185, 0, 0.03) 0%, transparent 50%),
+                linear-gradient(225deg, rgba(118, 185, 0, 0.02) 0%, transparent 40%);
+            pointer-events: none;
+        }
+
+        .grid-bg::after {
+            content: '';
+            position: absolute; inset: 0;
+            background-image:
+                linear-gradient(rgba(118, 185, 0, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(118, 185, 0, 0.03) 1px, transparent 1px);
+            background-size: clamp(30px, 5vw, 60px) clamp(30px, 5vw, 60px);
+            pointer-events: none;
+        }
+
+        /* ===========================================
+           PROGRESS BAR
+           =========================================== */
+        .progress-bar {
+            position: fixed; top: 0; left: 0;
+            height: 3px; background: var(--accent);
+            z-index: 9999; transition: width 0.3s ease;
+            box-shadow: 0 0 12px var(--accent-glow);
+        }
+
+        /* ===========================================
+           NAVIGATION DOTS
+           =========================================== */
+        .nav-dots {
+            position: fixed; right: clamp(0.75rem, 2vw, 1.5rem);
+            top: 50%; transform: translateY(-50%);
+            display: flex; flex-direction: column;
+            gap: clamp(6px, 1vh, 12px); z-index: 9998;
+        }
+        .nav-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--text-dim); cursor: pointer;
+            transition: all 0.3s ease; border: none;
+        }
+        .nav-dot.active {
+            background: var(--accent);
+            box-shadow: 0 0 8px var(--accent-glow);
+            transform: scale(1.3);
+        }
+        .nav-dot:hover { background: var(--text-secondary); }
+
+        /* ===========================================
+           REVEAL ANIMATIONS
+           =========================================== */
+        .reveal {
+            opacity: 0; transform: translateY(25px);
+            transition: opacity var(--duration-normal) var(--ease-out-expo),
+                        transform var(--duration-normal) var(--ease-out-expo);
+        }
+        .slide.visible .reveal { opacity: 1; transform: translateY(0); }
+        .reveal:nth-child(1) { transition-delay: 0.05s; }
+        .reveal:nth-child(2) { transition-delay: 0.15s; }
+        .reveal:nth-child(3) { transition-delay: 0.25s; }
+        .reveal:nth-child(4) { transition-delay: 0.35s; }
+        .reveal:nth-child(5) { transition-delay: 0.45s; }
+        .reveal:nth-child(6) { transition-delay: 0.55s; }
+
+        .reveal-scale {
+            opacity: 0; transform: scale(0.92);
+            transition: opacity 0.8s var(--ease-out-expo), transform 0.8s var(--ease-out-expo);
+        }
+        .slide.visible .reveal-scale { opacity: 1; transform: scale(1); }
+
+        .reveal-left {
+            opacity: 0; transform: translateX(-40px);
+            transition: opacity 0.7s var(--ease-out-expo), transform 0.7s var(--ease-out-expo);
+        }
+        .slide.visible .reveal-left { opacity: 1; transform: translateX(0); }
+
+        /* ===========================================
+           TITLE SLIDE
+           =========================================== */
+        .title-slide {
+            align-items: center; justify-content: center;
+            text-align: center;
+        }
+        .title-slide .slide-content {
+            align-items: center;
+            gap: var(--content-gap);
+        }
+        .title-slide h1 {
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--text-primary) 40%, var(--accent) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .title-badge {
+            display: inline-flex; align-items: center; gap: 0.5em;
+            padding: clamp(0.3rem, 0.8vw, 0.5rem) clamp(0.8rem, 2vw, 1.5rem);
+            border: 1px solid var(--border-accent);
+            border-radius: 100px;
+            font-family: var(--font-mono);
+            font-size: var(--small-size);
+            color: var(--accent);
+            background: var(--accent-subtle);
+            letter-spacing: 0.05em;
+        }
+        .subtitle {
+            font-size: clamp(0.85rem, 1.8vw, 1.3rem);
+            color: var(--text-secondary);
+            max-width: 700px;
+        }
+
+        /* ===========================================
+           COMPARISON CARDS (BEFORE/AFTER)
+           =========================================== */
+        .compare-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: clamp(0.75rem, 2vw, 1.5rem);
+            width: 100%;
+            max-width: min(90vw, 1000px);
+        }
+        @media (max-width: 700px) { .compare-grid { grid-template-columns: 1fr; } }
+
+        .compare-card {
+            padding: clamp(1rem, 2vw, 1.5rem);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+        .compare-card.old {
+            background: linear-gradient(135deg, rgba(255, 68, 68, 0.05), var(--bg-card));
+            border-color: rgba(255, 68, 68, 0.15);
+        }
+        .compare-card.new {
+            background: linear-gradient(135deg, rgba(118, 185, 0, 0.05), var(--bg-card));
+            border-color: rgba(118, 185, 0, 0.2);
+        }
+        .compare-label {
+            font-family: var(--font-mono);
+            font-size: var(--small-size);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: clamp(0.4rem, 1vw, 0.75rem);
+        }
+        .compare-card.old .compare-label { color: var(--danger); }
+        .compare-card.new .compare-label { color: var(--accent); }
+
+        .compare-card ul {
+            list-style: none; padding: 0;
+            display: flex; flex-direction: column;
+            gap: clamp(0.3rem, 0.8vw, 0.5rem);
+        }
+        .compare-card li {
+            font-size: var(--body-size);
+            color: var(--text-secondary);
+            padding-left: 1.2em;
+            position: relative;
+        }
+        .compare-card.old li::before { content: '✗'; position: absolute; left: 0; color: var(--danger); }
+        .compare-card.new li::before { content: '✓'; position: absolute; left: 0; color: var(--accent); }
+
+        /* ===========================================
+           STAT CARDS
+           =========================================== */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: clamp(0.5rem, 1.5vw, 1.25rem);
+            width: 100%;
+            max-width: min(90vw, 900px);
+        }
+        @media (max-width: 600px) { .stats-grid { grid-template-columns: 1fr; } }
+
+        .stat-card {
+            padding: clamp(0.75rem, 2vw, 1.5rem);
+            border-radius: 12px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            text-align: center;
+            transition: border-color 0.3s, box-shadow 0.3s;
+        }
+        .stat-card:hover {
+            border-color: var(--border-accent);
+            box-shadow: 0 0 30px var(--accent-glow);
+        }
+        .stat-number {
+            font-family: var(--font-display);
+            font-size: clamp(1.5rem, 4vw, 3rem);
+            font-weight: 800;
+            color: var(--accent);
+            line-height: 1;
+        }
+        .stat-label {
+            font-size: var(--small-size);
+            color: var(--text-secondary);
+            margin-top: clamp(0.2rem, 0.5vw, 0.5rem);
+        }
+
+        /* ===========================================
+           FEATURE CARDS
+           =========================================== */
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: clamp(0.5rem, 1.5vw, 1rem);
+            width: 100%;
+            max-width: min(90vw, 1000px);
+        }
+        @media (max-width: 700px) { .feature-grid { grid-template-columns: 1fr; } }
+
+        .feature-card {
+            padding: clamp(0.75rem, 1.5vw, 1.25rem);
+            border-radius: 10px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            transition: border-color 0.3s, transform 0.3s;
+        }
+        .feature-card:hover {
+            border-color: var(--border-accent);
+            transform: translateY(-2px);
+        }
+        .feature-icon {
+            font-size: clamp(1rem, 2vw, 1.5rem);
+            margin-bottom: clamp(0.2rem, 0.5vw, 0.4rem);
+        }
+        .feature-card h3 {
+            font-size: clamp(0.85rem, 1.5vw, 1.1rem);
+            margin-bottom: clamp(0.15rem, 0.4vw, 0.3rem);
+        }
+        .feature-card p {
+            font-size: var(--small-size);
+            color: var(--text-secondary);
+            line-height: 1.4;
+        }
+
+        /* ===========================================
+           CODE BLOCK
+           =========================================== */
+        .code-block {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: clamp(0.75rem, 2vw, 1.25rem);
+            font-family: var(--font-mono);
+            font-size: var(--mono-size);
+            line-height: 1.6;
+            color: var(--text-secondary);
+            overflow: hidden;
+            max-width: min(90vw, 900px);
+            width: 100%;
+        }
+        .code-block .kw { color: var(--accent); }
+        .code-block .str { color: #e8a838; }
+        .code-block .comment { color: var(--text-dim); font-style: italic; }
+        .code-block .file { color: #6cb6ff; }
+        .code-block .op { color: var(--text-secondary); }
+
+        /* ===========================================
+           FLOW / PIPELINE DIAGRAM (CSS)
+           =========================================== */
+        .flow {
+            display: flex; align-items: center;
+            gap: clamp(0.4rem, 1vw, 0.75rem);
+            flex-wrap: wrap; justify-content: center;
+            max-width: min(90vw, 900px);
+        }
+        .flow-node {
+            padding: clamp(0.5rem, 1vw, 0.75rem) clamp(0.75rem, 1.5vw, 1.25rem);
+            border-radius: 8px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            font-family: var(--font-mono);
+            font-size: var(--small-size);
+            text-align: center;
+            white-space: nowrap;
+        }
+        .flow-node.accent-node {
+            border-color: var(--border-accent);
+            background: var(--accent-subtle);
+            color: var(--accent);
+        }
+        .flow-arrow {
+            color: var(--text-dim);
+            font-size: clamp(0.8rem, 1.5vw, 1.2rem);
+        }
+
+        /* ===========================================
+           SECTION LABEL
+           =========================================== */
+        .section-label {
+            font-family: var(--font-mono);
+            font-size: var(--small-size);
+            text-transform: uppercase;
+            letter-spacing: 0.15em;
+            color: var(--accent);
+            margin-bottom: clamp(0.3rem, 1vw, 0.75rem);
+        }
+
+        /* ===========================================
+           ROLE CARDS
+           =========================================== */
+        .role-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: clamp(0.5rem, 1.5vw, 1rem);
+            width: 100%;
+            max-width: min(90vw, 1000px);
+        }
+        @media (max-width: 700px) { .role-grid { grid-template-columns: 1fr; } }
+
+        .role-card {
+            padding: clamp(0.75rem, 1.5vw, 1.25rem);
+            border-radius: 10px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+        }
+        .role-card h3 {
+            font-size: clamp(0.85rem, 1.5vw, 1.1rem);
+            margin-bottom: clamp(0.3rem, 0.5vw, 0.5rem);
+            color: var(--accent);
+        }
+        .role-card ul {
+            list-style: none; padding: 0;
+            display: flex; flex-direction: column;
+            gap: clamp(0.2rem, 0.4vw, 0.35rem);
+        }
+        .role-card li {
+            font-size: var(--small-size);
+            color: var(--text-secondary);
+            padding-left: 1em;
+            position: relative;
+        }
+        .role-card li::before {
+            content: '→'; position: absolute; left: 0;
+            color: var(--text-dim);
+        }
+
+        /* ===========================================
+           SLIDE NUMBER
+           =========================================== */
+        .slide-num {
+            position: absolute;
+            bottom: clamp(0.5rem, 1.5vw, 1rem);
+            right: clamp(0.75rem, 2vw, 1.5rem);
+            font-family: var(--font-mono);
+            font-size: var(--small-size);
+            color: var(--text-dim);
+        }
+
+        /* ===========================================
+           GLOW PULSE KEYFRAME
+           =========================================== */
+        @keyframes glowPulse {
+            0%, 100% { box-shadow: 0 0 20px var(--accent-glow); }
+            50% { box-shadow: 0 0 40px var(--accent-glow), 0 0 60px rgba(118, 185, 0, 0.1); }
+        }
+
+        @keyframes scanline {
+            0% { transform: translateY(-100%); }
+            100% { transform: translateY(100vh); }
+        }
+
+        .glow-border {
+            animation: glowPulse 3s ease-in-out infinite;
+        }
+
+        /* ===========================================
+           INLINE EDITING
+           =========================================== */
+        .edit-hotzone {
+            position: fixed; top: 0; left: 0;
+            width: 80px; height: 80px;
+            z-index: 10000; cursor: pointer;
+        }
+        .edit-toggle {
+            position: fixed; top: 12px; left: 12px;
+            background: var(--bg-card); border: 1px solid var(--border);
+            color: var(--text-primary); padding: 6px 12px;
+            border-radius: 6px; cursor: pointer;
+            font-family: var(--font-mono); font-size: var(--small-size);
+            opacity: 0; pointer-events: none;
+            transition: opacity 0.3s ease;
+            z-index: 10001;
+        }
+        .edit-toggle.show, .edit-toggle.active {
+            opacity: 1; pointer-events: auto;
+        }
+        .edit-toggle.active {
+            background: var(--accent); color: var(--bg-primary);
+            border-color: var(--accent);
+        }
+        [contenteditable="true"] {
+            outline: 1px dashed var(--accent);
+            outline-offset: 2px;
+            border-radius: 4px;
+            cursor: text;
+        }
+    </style>
+</head>
+<body>
+    <!-- Progress bar -->
+    <div class="progress-bar" id="progressBar"></div>
+
+    <!-- Navigation dots -->
+    <nav class="nav-dots" id="navDots"></nav>
+
+    <!-- Inline editing UI -->
+    <div class="edit-hotzone" id="editHotzone"></div>
+    <button class="edit-toggle" id="editToggle">✏️ Edit</button>
+
+    <!-- ======================================
+         SLIDE 1: TITLE
+         ====================================== -->
+    <section class="slide title-slide grid-bg">
+        <div class="slide-content">
+            <div class="title-badge reveal">INFERENCEX · INFRASTRUCTURE MIGRATION</div>
+            <h1 class="reveal">srt-slurm → sflow</h1>
+            <p class="subtitle reveal">From 470 monolithic recipes across two repos to modular, CSV-driven benchmarking in one repo</p>
+        </div>
+        <span class="slide-num">01</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 2: THE PROBLEM
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">The Challenge</div>
+            <h2 class="reveal">Two Repos, Two Systems, <span class="danger">Hidden Logic</span></h2>
+            <div class="compare-grid reveal-scale">
+                <div class="compare-card old">
+                    <div class="compare-label">Multi-Node (srt-slurm)</div>
+                    <ul>
+                        <li>External repo, pinned branch</li>
+                        <li>470 monolithic YAML files</li>
+                        <li>Orchestration hidden in Python source</li>
+                        <li>Engineers must branch the codebase</li>
+                    </ul>
+                </div>
+                <div class="compare-card old">
+                    <div class="compare-label">Single-Node (bash)</div>
+                    <ul>
+                        <li>47 standalone bash scripts</li>
+                        <li>Separate execution path in CI</li>
+                        <li>Different tooling than multi-node</li>
+                        <li>Hardcoded server launch commands</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">02</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 3: KEY NUMBERS
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Migration Impact</div>
+            <h2 class="reveal">By the Numbers</h2>
+            <div class="stats-grid">
+                <div class="stat-card reveal" style="transition-delay: 0.1s;">
+                    <div class="stat-number" data-count="484">484</div>
+                    <div class="stat-label">recipe variants → 283 config files</div>
+                </div>
+                <div class="stat-card reveal" style="transition-delay: 0.2s;">
+                    <div class="stat-number">1</div>
+                    <div class="stat-label">CSV row = 1 benchmark run</div>
+                </div>
+                <div class="stat-card reveal" style="transition-delay: 0.3s;">
+                    <div class="stat-number">0</div>
+                    <div class="stat-label">external repo dependencies</div>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">03</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 4: BEFORE/AFTER ARCHITECTURE
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Architecture</div>
+            <h2 class="reveal">Old vs New Pipeline</h2>
+            <div class="compare-grid reveal-scale">
+                <div class="compare-card old">
+                    <div class="compare-label">Before</div>
+                    <ul>
+                        <li>Clone srt-slurm repo in CI</li>
+                        <li>Checkout sa-submission-q1-2026</li>
+                        <li>pip install srtctl</li>
+                        <li>srtctl apply -f recipe.yaml</li>
+                        <li>Separate bash path for single-node</li>
+                    </ul>
+                </div>
+                <div class="compare-card new">
+                    <div class="compare-label">After</div>
+                    <ul>
+                        <li>All configs in-repo</li>
+                        <li>sflow batch --bulk-input jobs.csv</li>
+                        <li>Unified single + multi-node</li>
+                        <li>Compose → Submit → Collect</li>
+                        <li>No external dependencies</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">04</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 5: COMPOSITION MODEL
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Core Concept</div>
+            <h2 class="reveal">Modular Composition via <span class="accent">CSV</span></h2>
+            <div class="flow reveal-scale">
+                <div class="flow-node accent-node">jobs.csv row</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node">slurm_config</div>
+                <div class="flow-arrow">+</div>
+                <div class="flow-node">dynamo_common</div>
+                <div class="flow-arrow">+</div>
+                <div class="flow-node accent-node">prefill.yaml</div>
+                <div class="flow-arrow">+</div>
+                <div class="flow-node accent-node">decode.yaml</div>
+                <div class="flow-arrow">+</div>
+                <div class="flow-node">benchmark</div>
+            </div>
+            <div class="code-block reveal" style="margin-top: clamp(0.5rem, 1vw, 1rem);">
+                <span class="comment"># Only prefill + decode are unique per config</span><br>
+                <span class="comment"># Everything else is shared across all benchmarks</span><br><br>
+                <span class="kw">sflow batch</span> <span class="op">--bulk-input</span> <span class="file">jobs.csv</span> <span class="op">--submit</span><br>
+                <span class="comment"># Each row → compose → SLURM job → results back in CSV</span>
+            </div>
+        </div>
+        <span class="slide-num">05</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 6: OPAQUE vs TRANSPARENT
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Transparency</div>
+            <h2 class="reveal">Config You Can <span class="accent">Actually Read</span></h2>
+            <div class="compare-grid reveal-scale">
+                <div class="compare-card old">
+                    <div class="compare-label">srt-slurm recipe</div>
+                    <div class="code-block" style="border: none; padding: clamp(0.5rem, 1vw, 0.75rem);">
+                        <span class="comment"># What runs? Ask srtctl source code</span><br>
+                        <span class="kw">backend</span>:<br>
+                        &nbsp;&nbsp;<span class="kw">sglang_config</span>:<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;<span class="str">tensor-parallel-size</span>: 4<br>
+                        <span class="kw">health_check</span>:<br>
+                        &nbsp;&nbsp;<span class="str">max_attempts</span>: 360<br>
+                        <span class="comment"># HOW? Hidden in Python 🤷</span>
+                    </div>
+                </div>
+                <div class="compare-card new">
+                    <div class="compare-label">sflow YAML</div>
+                    <div class="code-block" style="border: none; padding: clamp(0.5rem, 1vw, 0.75rem);">
+                        <span class="comment"># Actual command, right here</span><br>
+                        <span class="kw">script</span>:<br>
+                        &nbsp;&nbsp;- <span class="str">python3 -m dynamo.sglang \</span><br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;<span class="str">--tensor-parallel-size 8 \</span><br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;<span class="str">--disaggregation-mode decode</span><br>
+                        <span class="kw">probes</span>: <span class="str">http_post: /v1/...</span><br>
+                        <span class="comment"># What you see = what runs ✓</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">06</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 7: DEDUPLICATION
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Migration Logic</div>
+            <h2 class="reveal">Fingerprint → Deduplicate → <span class="accent">Compose</span></h2>
+            <div class="flow reveal-scale">
+                <div class="flow-node">470 recipes</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node">Extract prefill/decode</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node accent-node">MD5 fingerprint</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node">283 distinct configs</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node accent-node">477 CSV rows</div>
+            </div>
+            <div class="feature-grid reveal" style="margin-top: clamp(0.5rem, 1vw, 1rem);">
+                <div class="feature-card">
+                    <div class="feature-icon">🔀</div>
+                    <h3>STP/MTP Merge</h3>
+                    <p>Pairs differing only in MTP_SIZE → single file, CSV column override</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📏</div>
+                    <h3>Seq-Len Merge</h3>
+                    <p>Identical configs across 1k1k/8k1k → single file, no prefix</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔑</div>
+                    <h3>YAML Key Sorting</h3>
+                    <p>Consistent fingerprinting regardless of key order</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Jinja2 Batch Sizes</h3>
+                    <p>Static lists → dynamic expressions for further dedup</p>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">07</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 8: BENEFITS OVERVIEW
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Benefits</div>
+            <h2 class="reveal">What You Get</h2>
+            <div class="feature-grid reveal">
+                <div class="feature-card">
+                    <div class="feature-icon">📦</div>
+                    <h3>Self-Contained</h3>
+                    <p>No external repos. All configs version-controlled alongside CI.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🧪</div>
+                    <h3>Smoke Tests</h3>
+                    <p>Built-in smoke_test_jobs.csv for quick validation before full sweeps.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔍</div>
+                    <h3>Bug Reproducer</h3>
+                    <p>Composed YAML uploaded as CI artifact. Download → run locally.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">✅</div>
+                    <h3>Auto Validation</h3>
+                    <p>CSV validator checks file existence, variable matching, and compose errors.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📝</div>
+                    <h3>Source Tracking</h3>
+                    <p>Every YAML has a # Source: comment linking to original srt-slurm recipe.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔄</div>
+                    <h3>Unified Path</h3>
+                    <p>Single-node and multi-node share the same sflow batch workflow.</p>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">08</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 9: NEW DIRECTORY STRUCTURE
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Structure</div>
+            <h2 class="reveal">Organized by <span class="accent">Model → GPU → Framework</span></h2>
+            <div class="code-block reveal-scale" style="line-height: 1.5;">
+                <span class="file">nvidia_submission/</span><br>
+                ├── <span class="file">general_template/</span> <span class="comment"># Shared (slurm, dynamo, benchmark)</span><br>
+                ├── <span class="file">benchmark/</span> <span class="comment"># benchmark_infmax.yaml</span><br>
+                └── <span class="kw">dsr1</span>/<span class="str">fp4</span>/<span class="file">b200</span>/multi_node/<span class="accent">sglang</span>/<br>
+                &nbsp;&nbsp;&nbsp;&nbsp;├── <span class="kw">jobs.csv</span> <span class="comment"># 1 row = 1 benchmark</span><br>
+                &nbsp;&nbsp;&nbsp;&nbsp;├── smoke_test_jobs.csv<br>
+                &nbsp;&nbsp;&nbsp;&nbsp;├── 1k1k_prefill_dep4_stp.yaml<br>
+                &nbsp;&nbsp;&nbsp;&nbsp;├── 1k1k_decode_dep8_stp.yaml<br>
+                &nbsp;&nbsp;&nbsp;&nbsp;└── 8k1k_decode_tep8_low_latency_stp.yaml
+            </div>
+        </div>
+        <span class="slide-num">09</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 10: HOW TO ADD A BENCHMARK
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">How-To</div>
+            <h2 class="reveal">Adding a Benchmark Point</h2>
+            <div class="compare-grid reveal-scale">
+                <div class="compare-card old">
+                    <div class="compare-label">Old Way</div>
+                    <ul>
+                        <li>Copy 143-line YAML file</li>
+                        <li>Edit 5+ fields</li>
+                        <li>Push to srt-slurm branch</li>
+                        <li>Update nvidia-master.yaml</li>
+                        <li>Update perf-changelog.yaml</li>
+                    </ul>
+                </div>
+                <div class="compare-card new">
+                    <div class="compare-label">New Way</div>
+                    <div class="code-block" style="border: none; padding: clamp(0.5rem, 1vw, 0.75rem);">
+                        <span class="comment"># Add 1 row to jobs.csv:</span><br>
+                        <span class="str">dsr1-fp4-b200-new</span>,<br>
+                        &nbsp;&nbsp;<span class="file">slurm_config + dynamo +</span><br>
+                        &nbsp;&nbsp;<span class="file">prefill + decode + bench</span>,<br>
+                        &nbsp;&nbsp;<span class="kw">NODES=3,CONC=[512]</span><br><br>
+                        <span class="comment"># Validate:</span><br>
+                        <span class="kw">python</span> <span class="file">nvidia_submission/generate_or_validate_sflow_csv.py</span> <span class="file">nvidia_submission/dsr1/fp8/b200/multi_node/sglang/</span> <span class="op">-v</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">10</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 11: NEW VARIANT WORKFLOW
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">How-To</div>
+            <h2 class="reveal">New Engine Variant? <span class="accent">Copy → Rename → Edit</span></h2>
+            <div class="code-block reveal-scale">
+                <span class="comment"># 1. Copy closest existing config with descriptive new name</span><br>
+                <span class="kw">cp</span> <span class="file">decode_tep8_stp.yaml</span> <span class="file">decode_tep4_stp.yaml</span><br>
+                <span class="comment">#&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;^^^^                  ^^^^  changed</span><br><br>
+                <span class="comment"># 2. Edit the parts that distinguish this variant</span><br>
+                <span class="kw">vi</span> <span class="file">decode_tep4_stp.yaml</span><br>
+                <span class="comment">#    e.g. add export NCCL_P2P_LEVEL="SYS"</span><br>
+                <span class="comment">#    or add --enable-torch-compile flag</span><br><br>
+                <span class="comment"># 3. Add CSV row(s) referencing the new file</span><br>
+                <span class="comment"># 4. Validate</span><br>
+                <span class="kw">python</span> <span class="file">generate_or_validate_sflow_csv.py</span> <span class="op">--sflow-validate</span>
+            </div>
+        </div>
+        <span class="slide-num">11</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 12: CI PIPELINE
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">CI/CD</div>
+            <h2 class="reveal">Parallel Per-Cluster Execution</h2>
+            <div class="flow reveal-scale" style="flex-direction: column; gap: clamp(0.5rem, 1vw, 0.75rem);">
+                <div class="flow-node accent-node" style="width: fit-content;">workflow_dispatch → sflow-setup</div>
+                <div class="flow-arrow" style="transform: rotate(90deg);">→</div>
+                <div style="display: flex; gap: clamp(0.3rem, 0.8vw, 0.5rem); flex-wrap: wrap; justify-content: center;">
+                    <div class="flow-node">B200</div>
+                    <div class="flow-node">B300</div>
+                    <div class="flow-node">GB200</div>
+                    <div class="flow-node">GB300</div>
+                    <div class="flow-node">H200</div>
+                    <div class="flow-node">H100</div>
+                </div>
+                <div class="flow-arrow" style="transform: rotate(90deg);">→</div>
+                <div style="display: flex; gap: clamp(0.3rem, 0.8vw, 0.5rem); flex-wrap: wrap; justify-content: center;">
+                    <div class="flow-node">sflow batch</div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-node">verify</div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-node accent-node">collect results</div>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">12</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 13: ROLE-BASED GUIDANCE
+         ====================================== -->
+    <section class="slide grid-bg">
+        <div class="slide-content" style="align-items: center; gap: var(--content-gap);">
+            <div class="section-label reveal">Who Does What</div>
+            <h2 class="reveal">Usage by Role</h2>
+            <div class="role-grid reveal-scale">
+                <div class="role-card">
+                    <h3>Engineer</h3>
+                    <ul>
+                        <li>Edit jobs.csv to add points</li>
+                        <li>Copy + rename YAML for variants</li>
+                        <li>Run validate script locally</li>
+                        <li>Submit via smoke_test_jobs.csv</li>
+                        <li>Push to sflow/ci-migration</li>
+                    </ul>
+                </div>
+                <div class="role-card">
+                    <h3>Reviewer</h3>
+                    <ul>
+                        <li>Check CSV paths + values</li>
+                        <li>Verify new YAML is needed</li>
+                        <li>Check naming conventions</li>
+                        <li>Confirm smoke test passed</li>
+                        <li>Watch for template regressions</li>
+                    </ul>
+                </div>
+                <div class="role-card">
+                    <h3>Stakeholder</h3>
+                    <ul>
+                        <li>Count jobs.csv rows = runs</li>
+                        <li>Trigger via workflow_dispatch</li>
+                        <li>Use smoke tests for cost control</li>
+                        <li>Filter by cluster_filter input</li>
+                        <li>Results in CI artifacts</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <span class="slide-num">13</span>
+    </section>
+
+    <!-- ======================================
+         SLIDE 14: CLOSING
+         ====================================== -->
+    <section class="slide title-slide grid-bg">
+        <div class="slide-content">
+            <div class="title-badge reveal">MIGRATION COMPLETE</div>
+            <h1 class="reveal" style="font-size: clamp(1.5rem, 4.5vw, 3.5rem);">One Repo. One CSV.<br><span class="accent">Every Benchmark.</span></h1>
+            <p class="subtitle reveal">484 variants → 283 configs · Transparent orchestration · One-line additions</p>
+            <div class="flow reveal" style="margin-top: clamp(0.5rem, 1vw, 1rem);">
+                <div class="flow-node accent-node glow-border">sflow batch --bulk-input jobs.csv --submit</div>
+            </div>
+        </div>
+        <span class="slide-num">14</span>
+    </section>
+
+
+    <!-- ===========================================
+         JAVASCRIPT: PRESENTATION CONTROLLER
+         =========================================== -->
+    <script>
+        class SlidePresentation {
+            constructor() {
+                this.slides = document.querySelectorAll('.slide');
+                this.currentSlide = 0;
+                this.setupIntersectionObserver();
+                this.setupKeyboardNav();
+                this.setupTouchNav();
+                this.setupProgressBar();
+                this.setupNavDots();
+            }
+
+            setupIntersectionObserver() {
+                const observer = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('visible');
+                            const idx = Array.from(this.slides).indexOf(entry.target);
+                            this.currentSlide = idx;
+                            this.updateNavDots();
+                            this.updateProgressBar();
+                        }
+                    });
+                }, { threshold: 0.4 });
+                this.slides.forEach(slide => observer.observe(slide));
+            }
+
+            setupKeyboardNav() {
+                document.addEventListener('keydown', (e) => {
+                    if (e.target.getAttribute('contenteditable')) return;
+                    if (e.key === 'ArrowDown' || e.key === ' ' || e.key === 'PageDown') {
+                        e.preventDefault();
+                        this.goToSlide(this.currentSlide + 1);
+                    } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+                        e.preventDefault();
+                        this.goToSlide(this.currentSlide - 1);
+                    } else if (e.key === 'ArrowRight') {
+                        this.goToSlide(this.currentSlide + 1);
+                    } else if (e.key === 'ArrowLeft') {
+                        this.goToSlide(this.currentSlide - 1);
+                    }
+                });
+            }
+
+            setupTouchNav() {
+                let startY = 0;
+                document.addEventListener('touchstart', (e) => { startY = e.touches[0].clientY; });
+                document.addEventListener('touchend', (e) => {
+                    const diff = startY - e.changedTouches[0].clientY;
+                    if (Math.abs(diff) > 50) {
+                        this.goToSlide(this.currentSlide + (diff > 0 ? 1 : -1));
+                    }
+                });
+            }
+
+            setupProgressBar() {
+                this.progressBar = document.getElementById('progressBar');
+                this.updateProgressBar();
+            }
+
+            updateProgressBar() {
+                const pct = ((this.currentSlide + 1) / this.slides.length) * 100;
+                this.progressBar.style.width = pct + '%';
+            }
+
+            setupNavDots() {
+                const nav = document.getElementById('navDots');
+                this.slides.forEach((_, i) => {
+                    const dot = document.createElement('button');
+                    dot.className = 'nav-dot' + (i === 0 ? ' active' : '');
+                    dot.setAttribute('aria-label', `Slide ${i + 1}`);
+                    dot.addEventListener('click', () => this.goToSlide(i));
+                    nav.appendChild(dot);
+                });
+                this.dots = nav.querySelectorAll('.nav-dot');
+            }
+
+            updateNavDots() {
+                this.dots.forEach((d, i) => d.classList.toggle('active', i === this.currentSlide));
+            }
+
+            goToSlide(idx) {
+                if (idx >= 0 && idx < this.slides.length) {
+                    this.slides[idx].scrollIntoView({ behavior: 'smooth' });
+                }
+            }
+        }
+
+        /* ===========================================
+           INLINE EDITING
+           =========================================== */
+        class InlineEditor {
+            constructor() {
+                this.isActive = false;
+                this.editables = 'h1, h2, h3, p, li, .stat-number, .stat-label, .compare-label, .section-label, .title-badge, .subtitle';
+            }
+
+            toggleEditMode() {
+                this.isActive = !this.isActive;
+                const toggle = document.getElementById('editToggle');
+                toggle.classList.toggle('active', this.isActive);
+                toggle.textContent = this.isActive ? '💾 Save' : '✏️ Edit';
+
+                document.querySelectorAll(this.editables).forEach(el => {
+                    el.contentEditable = this.isActive ? 'true' : 'false';
+                });
+
+                if (!this.isActive) {
+                    localStorage.setItem('slides_content', document.body.innerHTML);
+                }
+            }
+        }
+
+        const presentation = new SlidePresentation();
+        const editor = new InlineEditor();
+
+        // Hotzone hover with 400ms grace period
+        const hotzone = document.getElementById('editHotzone');
+        const editToggle = document.getElementById('editToggle');
+        let hideTimeout = null;
+
+        hotzone.addEventListener('mouseenter', () => {
+            clearTimeout(hideTimeout);
+            editToggle.classList.add('show');
+        });
+        hotzone.addEventListener('mouseleave', () => {
+            hideTimeout = setTimeout(() => {
+                if (!editor.isActive) editToggle.classList.remove('show');
+            }, 400);
+        });
+        editToggle.addEventListener('mouseenter', () => { clearTimeout(hideTimeout); });
+        editToggle.addEventListener('mouseleave', () => {
+            hideTimeout = setTimeout(() => {
+                if (!editor.isActive) editToggle.classList.remove('show');
+            }, 400);
+        });
+        editToggle.addEventListener('click', () => editor.toggleEditMode());
+        hotzone.addEventListener('click', () => editor.toggleEditMode());
+        document.addEventListener('keydown', (e) => {
+            if ((e.key === 'e' || e.key === 'E') && !e.target.getAttribute('contenteditable')) {
+                editor.toggleEditMode();
+            }
+        });
+
+        // Restore saved edits
+        const saved = localStorage.getItem('slides_content');
+        if (saved) {
+            const restore = confirm('Restore previously saved edits?');
+            if (restore) document.body.innerHTML = saved;
+        }
+    </script>
+</body>
+</html>
