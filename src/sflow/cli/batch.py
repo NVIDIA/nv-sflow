@@ -1765,6 +1765,19 @@ def batch(
             all_paths.extend(src_files)
         if file:
             all_paths.extend(file)
+
+        csv_in_bulk_submit = [p for p in all_paths if p.is_file() and p.suffix.lower() == ".csv"]
+        if csv_in_bulk_submit:
+            names = ", ".join(str(f) for f in csv_in_bulk_submit)
+            typer.echo(
+                f"Error: CSV file(s) detected in --bulk-submit input: {names}\n"
+                f"  --bulk-submit expects sflow YAML files or directories, not CSV.\n"
+                f"  Did you mean to use --bulk-input (-b)?\n"
+                f"  Example: sflow batch --bulk-input {csv_in_bulk_submit[0]}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
         yaml_files = _scan_sflow_yamls(all_paths)
         if not yaml_files:
             typer.echo(
@@ -1809,6 +1822,19 @@ def batch(
     files = list(src_files or []) + list(file or [])
     if not files:
         files = [Path("sflow.yaml").resolve()]
+
+    csv_files = [f for f in files if f.suffix.lower() == ".csv"]
+    if csv_files:
+        names = ", ".join(str(f) for f in csv_files)
+        typer.echo(
+            f"Error: CSV file(s) detected in input: {names}\n"
+            f"  CSV files cannot be used as workflow YAML inputs directly.\n"
+            f"  Did you mean to use --bulk-input (-b)?\n"
+            f"  Example: sflow batch --bulk-input {csv_files[0]}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     if missable_tasks and len(files) < 2:
         typer.echo(
             "Error: --missable-tasks is only valid with multiple input files (modular configs).",

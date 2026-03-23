@@ -104,7 +104,7 @@ class _LogCapture(logging.Handler):
         self.records.append(record)
 
     def messages(self, *, containing: str) -> list[str]:
-        return [r.message for r in self.records if containing in r.message]
+        return [r.getMessage() for r in self.records if containing in r.getMessage()]
 
 
 def test_fail_fast_message_distinguishes_probe_from_process_exit():

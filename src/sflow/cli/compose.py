@@ -866,6 +866,19 @@ def compose(
         if not files:
             typer.echo("Error: no input files provided.", err=True)
             raise typer.Exit(code=1)
+
+        csv_files = [f for f in files if f.suffix.lower() == ".csv"]
+        if csv_files:
+            names = ", ".join(str(f) for f in csv_files)
+            typer.echo(
+                f"Error: CSV file(s) detected in input: {names}\n"
+                f"  CSV files cannot be used as workflow YAML inputs directly.\n"
+                f"  Did you mean to use --bulk-input (-b)?\n"
+                f"  Example: sflow compose --bulk-input {csv_files[0]}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
         if missable_tasks and len(files) < 2:
             typer.echo(
                 "Error: --missable-tasks is only valid with multiple input files (modular configs).",

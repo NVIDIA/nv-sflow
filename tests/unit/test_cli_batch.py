@@ -2302,3 +2302,65 @@ def test_compose_bulk_input_artifact_cli_wins_over_csv(tmp_path):
     content = yaml_files[0].read_text()
     assert str(cli_path) in content
     assert str(csv_path) not in content
+
+
+# --- CSV-without-bulk-input hint tests ---
+
+
+def test_batch_csv_input_without_bulk_input_flag(tmp_path):
+    """sflow batch with a .csv file but no --bulk-input exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            str(csv_file),
+            "--partition", "gpu",
+            "--account", "test",
+            "--nodes", "1",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
+
+
+def test_batch_csv_via_file_flag_without_bulk_input(tmp_path):
+    """sflow batch -f jobs.csv (no --bulk-input) exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "-f", str(csv_file),
+            "--partition", "gpu",
+            "--account", "test",
+            "--nodes", "1",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
+
+
+def test_bulk_submit_csv_file_rejected(tmp_path):
+    """sflow batch --bulk-submit with a CSV file exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-submit", str(csv_file),
+            "--partition", "gpu",
+            "--account", "test",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output

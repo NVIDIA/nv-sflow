@@ -1170,3 +1170,34 @@ def test_compose_bulk_input_missable_csv_column(tmp_path: Path):
         ["compose", "--bulk-input", str(csv_file), "-o", str(out_dir)],
     )
     assert result.exit_code == 0
+
+
+# --- CSV-without-bulk-input hint tests ---
+
+
+def test_compose_csv_input_without_bulk_input_flag(tmp_path: Path):
+    """sflow compose with a .csv file but no --bulk-input exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        ["compose", str(csv_file)],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
+
+
+def test_compose_csv_via_file_flag_without_bulk_input(tmp_path: Path):
+    """sflow compose -f jobs.csv (no --bulk-input) exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        ["compose", "-f", str(csv_file)],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
