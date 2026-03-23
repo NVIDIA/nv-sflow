@@ -222,6 +222,16 @@ class Orchestrator:
             probe.status = ProbeStatus.TRIGGERED
             if probe.type == ProbeType.READINESS:
                 task.status = TaskStatus.READY
+                for fname in getattr(task, "readiness_followers", []):
+                    try:
+                        ftask = self.workflow.get_task(fname)
+                    except KeyError:
+                        continue
+                    if ftask.status == TaskStatus.RUNNING:
+                        ftask.status = TaskStatus.READY
+                        _logger.info(
+                            f"Task '{fname}' set to READY (follows probe from '{task.name}')"
+                        )
             elif probe.type == ProbeType.FAILURE:
                 task.status = TaskStatus.FAILED
                 task.failed_by_probe = True
@@ -234,6 +244,17 @@ class Orchestrator:
                     f"The workflow will be terminated because of this probe — "
                     f"the task process was still running when the failure was detected."
                 )
+                for fname in getattr(task, "failure_followers", []):
+                    try:
+                        ftask = self.workflow.get_task(fname)
+                    except KeyError:
+                        continue
+                    if ftask.status == TaskStatus.RUNNING:
+                        ftask.status = TaskStatus.FAILED
+                        ftask.failed_by_probe = True
+                        _logger.error(
+                            f"Task '{fname}' set to FAILED (follows probe from '{task.name}')"
+                        )
 
     async def _launch_task_with_timeout(self, task: Task, timeout: int | None = None):
         if timeout:

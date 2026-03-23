@@ -7,7 +7,9 @@ SUBMIT=""
 PREFLIGHT_ONLY=""
 MAX_JOBS=16
 CLI_MODEL_PATH=""
-while getopts "asmSPj:M:" opt; do
+CLI_PARTITION=""
+CLI_ACCOUNT=""
+while getopts "asmSPj:M:p:A:" opt; do
     case "$opt" in
         a) TEST_TYPE="a" ;;
         s) TEST_TYPE="s" ;;
@@ -16,7 +18,9 @@ while getopts "asmSPj:M:" opt; do
         P) PREFLIGHT_ONLY="1" ;;
         j) MAX_JOBS="$OPTARG" ;;
         M) CLI_MODEL_PATH="$OPTARG" ;;
-        *) echo "Usage: $0 [-a|-s|-m] [-S] [-P] [-j N] [-M model_path]"
+        p) CLI_PARTITION="$OPTARG" ;;
+        A) CLI_ACCOUNT="$OPTARG" ;;
+        *) echo "Usage: $0 [-a|-s|-m] [-S] [-P] [-j N] [-M model_path] [-p partition] [-A account]"
            echo "  -a  all tests (default)"
            echo "  -s  self-contained examples only"
            echo "  -m  modular examples only"
@@ -24,6 +28,8 @@ while getopts "asmSPj:M:" opt; do
            echo "  -P  preflight checks only (skip job submission even if -S is set)"
            echo "  -j  max parallel jobs (default: 16, 0 for unlimited)"
            echo "  -M  model path (default: \$MODEL_PATH or /home/)"
+           echo "  -p  Slurm partition (default: dummy_part for preflight, my_partition for e2e)"
+           echo "  -A  Slurm account (default: dummy_acct for preflight, user for e2e)"
            exit 1 ;;
     esac
 done
@@ -33,6 +39,8 @@ REPO_DIR="$SCRIPT_DIR/.."
 EXAMPLES_DIR="$REPO_DIR/examples"
 CSV_FILE="$EXAMPLES_DIR/inference_x_v2/bulk_input.csv"
 MODEL_PATH="${CLI_MODEL_PATH:-${MODEL_PATH:-/home/}}"
+PARTITION="${CLI_PARTITION:-dummy_part}"
+ACCOUNT="${CLI_ACCOUNT:-dummy_acct}"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 PREFLIGHT_DIR="$REPO_DIR/sflow_output/preflight_$STAMP"
@@ -165,7 +173,7 @@ if true; then
         run_check "batch single $name" \
             sflow batch -f "$f" \
                 -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
-                -p dummy_part -A dummy_acct --log-level warn \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
                 -o "$BATCH_SINGLE_DIR/$name.sh"
     done
 
@@ -180,7 +188,7 @@ if true; then
                 -f "$EXAMPLES_DIR/inference_x_v2/$framework/decode.yaml" \
                 -f "$BENCH_INFMAX" -r \
                 "${MODULAR_MISSABLE[@]}" "${MODULAR_OVERRIDES[@]}" \
-                -p dummy_part -A dummy_acct --log-level warn \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
                 -o "$BATCH_MODULAR_DIR/${framework}_disagg.sh"
         run_check "batch modular $framework/agg" \
             sflow batch \
@@ -188,7 +196,7 @@ if true; then
                 -f "$EXAMPLES_DIR/inference_x_v2/$framework/agg.yaml" \
                 -f "$BENCH_AIPERF" \
                 "${MODULAR_MISSABLE[@]}" "${MODULAR_OVERRIDES[@]}" \
-                -p dummy_part -A dummy_acct --log-level warn \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
                 -o "$BATCH_MODULAR_DIR/${framework}_agg.sh"
     done
 
@@ -196,7 +204,7 @@ if true; then
     run_check "batch bulk-submit (no submit)" \
         sflow batch --bulk-submit "$EXAMPLES_DIR" \
             -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
-            -p dummy_part -A dummy_acct --log-level warn \
+            -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
             --output-dir "$PREFLIGHT_DIR/batch_bulk_submit"
 
     # -- sflow batch --bulk-input (no --submit): CSV --
@@ -204,7 +212,7 @@ if true; then
         run_check "batch bulk-input (no submit)" \
             sflow batch --bulk-input "$CSV_FILE" \
                 -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
-                -p dummy_part -A dummy_acct --log-level warn -r \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn -r \
                 --output-dir "$PREFLIGHT_DIR/batch_bulk_input"
     else
         echo "  SKIP: CSV not found at $CSV_FILE"
@@ -296,7 +304,9 @@ if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
     echo ""
     set -x
     cd "$SCRIPT_DIR/../tests/e2e_tests"
-    ./sample_test.sh -p my_partition -A user -m "$MODEL_PATH" -t "$TEST_TYPE" --submit -- "-e --exclude=gb-nvl-137-compute09,gb-nvl-137-compute16" # 09 has some GPU issues
+    E2E_PARTITION="${CLI_PARTITION:-my_partition}"
+    E2E_ACCOUNT="${CLI_ACCOUNT:-user}"
+    ./sample_test.sh -p "$E2E_PARTITION" -A "$E2E_ACCOUNT" -m "$MODEL_PATH" -t "$TEST_TYPE" --submit -- "-e --exclude=gb-nvl-137-compute09,gb-nvl-137-compute16" # 09 has some GPU issues
 elif [ -z "$SUBMIT" ]; then
     echo "Preflight only (no -S flag). To submit jobs, re-run with -S."
 else

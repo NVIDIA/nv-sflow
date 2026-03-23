@@ -430,3 +430,144 @@ def test_failure_probe_with_match_count_requires_multiple_matches(tmp_path: Path
         assert svc2.failed_by_probe is True
 
     asyncio.run(_run_both_phases())
+
+
+def test_readiness_probe_propagates_to_followers():
+    """When a readiness probe fires, all readiness_followers in RUNNING state
+    should also transition to READY."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    leader = Task(
+        name="server_0",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server_0"),
+        probes=[_AlwaysTriggeredProbe(type=ProbeType.READINESS)],
+        readiness_followers=["server_1", "server_2"],
+    )
+    follower1 = Task(
+        name="server_1",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server_1"),
+    )
+    follower2 = Task(
+        name="server_2",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server_2"),
+    )
+    bench = Task(
+        name="bench",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.bench"),
+    )
+
+    tg.dag.add_node("server_0", leader)
+    tg.dag.add_node("server_1", follower1)
+    tg.dag.add_node("server_2", follower2)
+    tg.dag.add_node("bench", bench)
+    tg.dag.add_edge("server_0", "bench")
+    tg.dag.add_edge("server_1", "bench")
+    tg.dag.add_edge("server_2", "bench")
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+    )
+
+    # Run until all three servers are READY and bench is submitted.
+    # Bench will hang, so we use a timeout and inspect status.
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        asyncio.run(asyncio.wait_for(orch.run(), timeout=3))
+
+    assert leader.status == TaskStatus.READY
+    assert follower1.status == TaskStatus.READY
+    assert follower2.status == TaskStatus.READY
+
+
+def test_failure_probe_propagates_to_followers():
+    """When a failure probe fires, all failure_followers in RUNNING state
+    should also transition to FAILED with failed_by_probe=True."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    leader = Task(
+        name="server_0",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server_0"),
+        probes=[_AlwaysTriggeredProbe(type=ProbeType.FAILURE)],
+        failure_followers=["server_1"],
+    )
+    follower = Task(
+        name="server_1",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server_1"),
+    )
+    bench = Task(
+        name="bench",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.bench"),
+    )
+
+    tg.dag.add_node("server_0", leader)
+    tg.dag.add_node("server_1", follower)
+    tg.dag.add_node("bench", bench)
+    tg.dag.add_edge("server_0", "bench")
+    tg.dag.add_edge("server_1", "bench")
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+    )
+
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=5))
+
+    assert leader.status == TaskStatus.FAILED
+    assert leader.failed_by_probe is True
+    assert follower.status == TaskStatus.FAILED
+    assert follower.failed_by_probe is True
+    assert bench.status == TaskStatus.CANCELLED
+
+
+def test_follower_not_promoted_if_not_running():
+    """A readiness follower that hasn't started (INITIATED) should not be
+    promoted to READY — only RUNNING followers should be affected."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    leader = Task(
+        name="server_0",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server_0"),
+        probes=[_AlwaysTriggeredProbe(type=ProbeType.READINESS)],
+        readiness_followers=["server_1"],
+    )
+    # server_1 depends on server_0 so it won't be RUNNING when the probe fires
+    follower = Task(
+        name="server_1",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server_1"),
+    )
+
+    tg.dag.add_node("server_0", leader)
+    tg.dag.add_node("server_1", follower)
+    tg.dag.add_edge("server_0", "server_1")
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+    )
+
+    # server_1 depends on server_0 so it is INITIATED (not RUNNING) when the probe
+    # fires — follower promotion should be skipped.  After the timeout everything
+    # gets cancelled, but the key property is that server_1 was never set to READY.
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        asyncio.run(asyncio.wait_for(orch.run(), timeout=3))
+
+    assert leader.status == TaskStatus.READY
+    assert follower.status != TaskStatus.READY
