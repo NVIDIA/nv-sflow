@@ -710,6 +710,8 @@ def _classify_csv_columns(
     var_names: set[str] = set()
     art_names: set[str] = set()
     seen: set[tuple[str, ...]] = set()
+    load_errors: list[tuple[tuple[str, ...], Exception]] = []
+    loaded_count = 0
 
     for config_files, row_missable in row_configs:
         key = tuple(str(f) for f in config_files)
@@ -720,8 +722,10 @@ def _classify_csv_columns(
             config = ConfigLoader().load_configs(
                 config_files, missable_tasks=row_missable
             )
-        except Exception:
+        except Exception as exc:
+            load_errors.append((key, exc))
             continue
+        loaded_count += 1
         for v in config.variables or []:
             var_names.add(v.name)
         wf = config.workflow
@@ -730,6 +734,21 @@ def _classify_csv_columns(
                 var_names.add(v.name)
         for a in config.artifacts or []:
             art_names.add(a.name)
+
+    if load_errors:
+        _logger.warning(
+            f"{len(load_errors)} config file set(s) failed to load "
+            f"({loaded_count} succeeded):"
+        )
+        for files, exc in load_errors:
+            file_list = " + ".join(files)
+            _logger.warning(f"  ⚠ [{file_list}]: {exc}")
+        if loaded_count == 0:
+            _logger.warning(
+                "  No config sets loaded successfully. If tasks from one file "
+                "reference tasks in another, consider adding --missable-tasks / -M "
+                "or a 'missable_tasks' CSV column."
+            )
 
     var_cols: set[str] = set()
     art_cols: set[str] = set()
@@ -741,9 +760,19 @@ def _classify_csv_columns(
         elif col in art_names:
             art_cols.add(col)
         else:
-            raise ValueError(
-                f"CSV column '{col}' is not a variable or artifact defined in any of the config file sets"
+            msg = (
+                f"CSV column '{col}' is not a variable or artifact "
+                f"defined in any of the config file sets"
             )
+            if load_errors and loaded_count == 0:
+                msg += (
+                    f". Note: all {len(load_errors)} config set(s) failed to load"
+                    f" — the root cause is likely a config loading error above, "
+                    f"not a missing variable. Common fix: add --missable-tasks / -M "
+                    f"for tasks referenced in depends_on that don't exist in "
+                    f"all files, or add a 'missable_tasks' column to the CSV."
+                )
+            raise ValueError(msg)
     return var_cols, art_cols
 
 

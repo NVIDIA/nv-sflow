@@ -3,6 +3,8 @@
 
 """Unit tests for sflow batch CLI command."""
 
+import logging
+import logging.handlers
 import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,6 +15,7 @@ from typer.testing import CliRunner
 from sflow.cli import app
 from sflow.cli.batch import (
     _build_var_map,
+    _classify_csv_columns,
     _dedup_words,
     _derive_nodes,
     _derive_row_name,
@@ -521,6 +524,149 @@ def test_bulk_edit_rejects_unknown_column(mock_sflow_app, tmp_path):
     )
     assert result.exit_code == 1
     assert "NONEXISTENT_VAR" in result.output
+
+
+# --- _classify_csv_columns chained error info tests ---
+
+
+def test_classify_csv_columns_all_configs_fail_enriches_unknown_column_error(tmp_path):
+    """When all config sets fail to load, the unknown-column ValueError includes
+    chained error context pointing to config loading as the root cause."""
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [missing_task]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([base], None)]
+    with pytest.raises(ValueError, match="all 1 config set.*failed to load"):
+        _classify_csv_columns(["SOME_VAR"], row_configs)
+
+
+def test_classify_csv_columns_partial_failure_no_chained_hint(tmp_path):
+    """When some configs load successfully, the unknown-column error does NOT
+    include the 'all configs failed' hint — the variable is genuinely missing."""
+    good = tmp_path / "good.yaml"
+    good.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: TP\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [nonexistent]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([good], None), ([bad], None)]
+    with pytest.raises(ValueError, match="not a variable or artifact") as exc_info:
+        _classify_csv_columns(["MISSING_VAR"], row_configs)
+    assert "all" not in str(exc_info.value).lower() or "failed to load" not in str(exc_info.value)
+
+
+def test_classify_csv_columns_all_configs_fail_logs_warnings(tmp_path):
+    """When all config sets fail, warnings are logged listing each failure
+    and a hint about --missable-tasks."""
+    f1 = tmp_path / "a.yaml"
+    f1.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [ghost]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([f1], None)]
+
+    log_handler = logging.handlers.MemoryHandler(capacity=100)
+    logger = logging.getLogger("sflow.cli.batch")
+    logger.addHandler(log_handler)
+    old_level = logger.level
+    logger.setLevel(logging.WARNING)
+    try:
+        with pytest.raises(ValueError):
+            _classify_csv_columns(["X"], row_configs)
+        log_handler.flush()
+        messages = [r.getMessage() for r in log_handler.buffer]
+        combined = "\n".join(messages)
+        assert "1 config file set(s) failed to load" in combined
+        assert "No config sets loaded successfully" in combined
+        assert "missable" in combined.lower()
+    finally:
+        logger.removeHandler(log_handler)
+        logger.setLevel(old_level)
+
+
+def test_classify_csv_columns_succeeds_when_column_valid_despite_partial_failure(tmp_path):
+    """A valid column is still recognized even when some config sets fail."""
+    good = tmp_path / "good.yaml"
+    good.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: TP_SIZE\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [nonexistent]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([good], None), ([bad], None)]
+    var_cols, art_cols = _classify_csv_columns(["TP_SIZE"], row_configs)
+    assert var_cols == {"TP_SIZE"}
+    assert art_cols == set()
+
+
+def test_classify_csv_columns_missable_tasks_prevents_load_failure(tmp_path):
+    """Passing missable_tasks for the row avoids the config load failure."""
+    f = tmp_path / "wf.yaml"
+    f.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: MY_VAR\n"
+        "    value: x\n"
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [missing_task]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([f], ["missing_task"])]
+    var_cols, art_cols = _classify_csv_columns(["MY_VAR"], row_configs)
+    assert var_cols == {"MY_VAR"}
 
 
 def test_bulk_edit_with_multiple_config_files(mock_sflow_app, tmp_path):
