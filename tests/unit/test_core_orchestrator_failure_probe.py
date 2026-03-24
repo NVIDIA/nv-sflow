@@ -20,7 +20,7 @@ import pytest
 from sflow.core.command import Command
 from sflow.core.orchestrator import Orchestrator
 from sflow.core.operator import Operator, OperatorConfig
-from sflow.core.probe import Probe, ProbeStatus, ProbeType
+from sflow.core.probe import Probe, ProbeStatus, ProbeTimeoutError, ProbeType
 from sflow.core.task import Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
 from sflow.core.workflow import Workflow
@@ -571,3 +571,139 @@ def test_follower_not_promoted_if_not_running():
 
     assert leader.status == TaskStatus.READY
     assert follower.status != TaskStatus.READY
+
+
+# --- Readiness probe timeout tests ---
+
+
+class _NeverReadyProbe(Probe):
+    """Probe that never becomes ready and has a very short overall timeout."""
+
+    def __init__(self, timeout: int = 1, **kwargs):
+        super().__init__(type=ProbeType.READINESS, interval=0, timeout=timeout, **kwargs)
+
+    async def check(self, task) -> bool:
+        return False
+
+
+def test_readiness_probe_timeout_fails_task_and_cancels_workflow():
+    """When a readiness probe exceeds its overall timeout, the task is marked FAILED
+    and fail-fast cancels remaining tasks."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    server = Task(
+        name="server",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server"),
+        probes=[_NeverReadyProbe(timeout=1)],
+    )
+    bench = Task(
+        name="bench",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.bench"),
+    )
+
+    tg.dag.add_node("server", server)
+    tg.dag.add_node("bench", bench)
+    tg.dag.add_edge("server", "bench")
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+    )
+
+    # Backdate the probe start time to trigger timeout immediately
+    server.probes[0]._started_at -= 2
+
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=10))
+
+    assert server.status == TaskStatus.FAILED
+    assert server.failed_by_probe is True
+    assert server.probes[0].timed_out is True
+    assert bench.status == TaskStatus.CANCELLED
+
+
+def test_readiness_probe_timeout_propagates_to_followers():
+    """When a readiness probe times out on the leader replica, follower replicas
+    are also set to FAILED."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    leader = Task(
+        name="prefill_server_0",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.prefill_server_0"),
+        probes=[_NeverReadyProbe(timeout=1)],
+        readiness_followers=["prefill_server_1", "prefill_server_2"],
+    )
+    follower_1 = Task(
+        name="prefill_server_1",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.prefill_server_1"),
+    )
+    follower_2 = Task(
+        name="prefill_server_2",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.prefill_server_2"),
+    )
+
+    tg.dag.add_node("prefill_server_0", leader)
+    tg.dag.add_node("prefill_server_1", follower_1)
+    tg.dag.add_node("prefill_server_2", follower_2)
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+    )
+
+    # Backdate to trigger timeout immediately
+    leader.probes[0]._started_at -= 2
+
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=10))
+
+    assert leader.status == TaskStatus.FAILED
+    assert leader.failed_by_probe is True
+    assert follower_1.status == TaskStatus.FAILED
+    assert follower_1.failed_by_probe is True
+    assert follower_2.status == TaskStatus.FAILED
+    assert follower_2.failed_by_probe is True
+
+
+def test_readiness_probe_timeout_logs_error():
+    """Readiness probe timeout produces a clear error log with the deadline info."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    server = Task(
+        name="my_server",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.my_server"),
+        probes=[_NeverReadyProbe(timeout=1)],
+    )
+
+    tg.dag.add_node("my_server", server)
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+    )
+
+    server.probes[0]._started_at -= 2
+
+    capture = _LogCapture()
+    sflow_logger = logging.getLogger("sflow")
+    sflow_logger.addHandler(capture)
+    try:
+        asyncio.run(asyncio.wait_for(orch.run(), timeout=10))
+    finally:
+        sflow_logger.removeHandler(capture)
+
+    timeout_msgs = capture.messages(containing="timed out")
+    assert any("my_server" in m for m in timeout_msgs)

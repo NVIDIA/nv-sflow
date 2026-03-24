@@ -220,7 +220,8 @@ class ProbeConfig(StrictBaseModel):
 
     # Common settings (can be expressions)
     delay: Resolvable[int] = 0
-    timeout: Resolvable[int] = 60
+    timeout: Resolvable[int] = 1200
+    each_check_timeout: Resolvable[int] = 30
     interval: Resolvable[int] = 5
     success_threshold: Resolvable[int] = 1
     failure_threshold: Resolvable[int] = 3

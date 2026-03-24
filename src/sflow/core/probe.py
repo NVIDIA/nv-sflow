@@ -29,6 +29,10 @@ class ProbeStatus(str, Enum):
         return self.value
 
 
+class ProbeTimeoutError(Exception):
+    """Raised when a readiness probe exceeds its overall timeout deadline."""
+
+
 class Probe(ABC):
     """
     Abstract base class for probe checks.
@@ -39,24 +43,28 @@ class Probe(ABC):
         *,
         type: ProbeType,
         delay: int = 0,
-        timeout: int = 60,
+        timeout: int = 1200,
+        each_check_timeout: int = 30,
         interval: int = 5,
         success_threshold: int = 1,
         failure_threshold: int = 3,
     ):
-        # Mirror common K8s-style probe knobs.
         # - delay: seconds before first check
-        # - timeout: per-check timeout (seconds)
+        # - timeout: overall deadline (seconds) — for readiness probes, the task
+        #   is marked FAILED if not ready within this window
+        # - each_check_timeout: per-attempt timeout (seconds) for each individual check
         # - interval: seconds between checks
         # - success_threshold: consecutive successes to trigger readiness
         # - failure_threshold: consecutive failures (for failure probes)
         self.delay = int(delay)
         self.timeout = int(timeout)
+        self.each_check_timeout = int(each_check_timeout)
         self.interval = int(interval)
         self.success_threshold = int(success_threshold)
         self.failure_threshold = int(failure_threshold)
         self.type = type
         self.status = ProbeStatus.INITIATED
+        self.timed_out = False
 
         # Internal state for scheduling / thresholds.
         self._started_at = time.time()
@@ -66,6 +74,7 @@ class Probe(ABC):
 
     def reset(self) -> None:
         self.status = ProbeStatus.INITIATED
+        self.timed_out = False
         self._started_at = time.time()
         self._next_check_at = self._started_at + max(self.delay, 0)
         self._success_streak = 0
@@ -88,18 +97,32 @@ class Probe(ABC):
 
         Called repeatedly by the orchestrator; it enforces delay/interval and uses
         thresholds to determine when to trigger.
+
+        Raises ProbeTimeoutError for readiness probes that exceed their overall
+        timeout deadline.
         """
         if self.status != ProbeStatus.INITIATED:
             return False
 
         now = time.time()
+        elapsed = now - self._started_at
+
+        if self.type == ProbeType.READINESS and self.timeout > 0 and elapsed > self.timeout:
+            self.timed_out = True
+            raise ProbeTimeoutError(
+                f"Readiness probe timed out after {int(elapsed)}s "
+                f"(deadline: {self.timeout}s)"
+            )
+
         if now < self._next_check_at:
             return False
 
         self._next_check_at = now + max(self.interval, 0)
 
         try:
-            ok = await asyncio.wait_for(self.check(task), timeout=max(self.timeout, 0))
+            ok = await asyncio.wait_for(
+                self.check(task), timeout=max(self.each_check_timeout, 1)
+            )
         except asyncio.TimeoutError:
             ok = False
 

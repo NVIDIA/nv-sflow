@@ -9,7 +9,7 @@ from sflow.logging import get_logger
 
 from .launcher import SubprocessLauncher
 from .outputs import collect_task_outputs
-from .probe import Probe, ProbeStatus, ProbeType
+from .probe import Probe, ProbeStatus, ProbeTimeoutError, ProbeType
 from .task import Task, TaskStatus
 from .workflow import Workflow
 
@@ -84,6 +84,8 @@ class Orchestrator:
                     _logger.info(f"Submitting task: {task.name}")
                     task.status = TaskStatus.RUNNING
                     task.attempts = int(getattr(task, "attempts", 0)) + 1
+                    for p in getattr(task, "probes", []) or []:
+                        p.reset()
                     self._subprocess_tasks[task.name] = asyncio.create_task(
                         self._launch_task_with_timeout(task)
                     )
@@ -125,12 +127,10 @@ class Orchestrator:
                                 )
 
                                 t.next_retry_at = time.time() + delay
-                                # Reset for re-submission.
+                                # Reset for re-submission. Probe reset (deadlines,
+                                # streaks) happens in the submit loop when the task
+                                # transitions back to RUNNING.
                                 t.status = TaskStatus.INITIATED
-                                # Keep the last exit code visible for observability while we retry.
-                                for p in getattr(t, "probes", []) or []:
-                                    # Reset probe streaks/scheduling too.
-                                    p.status = ProbeStatus.INITIATED
                                 _logger.warning(
                                     f"Task '{t.name}' failed (exit={exit_code}, exception={task_exception}); "
                                     f"retrying in {delay:.2f}s (attempt {attempts}/{1 + int(retries.count)})"
@@ -218,43 +218,66 @@ class Orchestrator:
             _logger.info(f"Workflow execution finished in {duration}")
 
     async def _run_probe(self, probe: Probe, task: Task):
-        if probe.status == ProbeStatus.INITIATED and await probe.probe(task):
-            probe.status = ProbeStatus.TRIGGERED
-            if probe.type == ProbeType.READINESS:
-                task.status = TaskStatus.READY
-                for fname in getattr(task, "readiness_followers", []):
-                    try:
-                        ftask = self.workflow.get_task(fname)
-                    except KeyError:
-                        continue
-                    if ftask.status == TaskStatus.RUNNING:
-                        ftask.status = TaskStatus.READY
-                        _logger.info(
-                            f"Task '{fname}' set to READY (follows probe from '{task.name}')"
-                        )
-            elif probe.type == ProbeType.FAILURE:
-                task.status = TaskStatus.FAILED
-                task.failed_by_probe = True
-                probe_detail = (
-                    getattr(probe, "_pattern_display", None) or type(probe).__name__
-                )
-                _logger.error(
-                    f"Failure probe triggered for task '{task.name}': "
-                    f"pattern matched: '{probe_detail}'. "
-                    f"The workflow will be terminated because of this probe — "
-                    f"the task process was still running when the failure was detected."
-                )
-                for fname in getattr(task, "failure_followers", []):
-                    try:
-                        ftask = self.workflow.get_task(fname)
-                    except KeyError:
-                        continue
-                    if ftask.status == TaskStatus.RUNNING:
-                        ftask.status = TaskStatus.FAILED
-                        ftask.failed_by_probe = True
-                        _logger.error(
-                            f"Task '{fname}' set to FAILED (follows probe from '{task.name}')"
-                        )
+        try:
+            triggered = probe.status == ProbeStatus.INITIATED and await probe.probe(task)
+        except ProbeTimeoutError as exc:
+            _logger.error(
+                f"Task '{task.name}' readiness probe timed out: {exc}"
+            )
+            task.status = TaskStatus.FAILED
+            task.failed_by_probe = True
+            for fname in getattr(task, "readiness_followers", []):
+                try:
+                    ftask = self.workflow.get_task(fname)
+                except KeyError:
+                    continue
+                if ftask.status == TaskStatus.RUNNING:
+                    ftask.status = TaskStatus.FAILED
+                    ftask.failed_by_probe = True
+                    _logger.error(
+                        f"Task '{fname}' set to FAILED (follows timed-out probe from '{task.name}')"
+                    )
+            return
+
+        if not triggered:
+            return
+
+        probe.status = ProbeStatus.TRIGGERED
+        if probe.type == ProbeType.READINESS:
+            task.status = TaskStatus.READY
+            for fname in getattr(task, "readiness_followers", []):
+                try:
+                    ftask = self.workflow.get_task(fname)
+                except KeyError:
+                    continue
+                if ftask.status == TaskStatus.RUNNING:
+                    ftask.status = TaskStatus.READY
+                    _logger.info(
+                        f"Task '{fname}' set to READY (follows probe from '{task.name}')"
+                    )
+        elif probe.type == ProbeType.FAILURE:
+            task.status = TaskStatus.FAILED
+            task.failed_by_probe = True
+            probe_detail = (
+                getattr(probe, "_pattern_display", None) or type(probe).__name__
+            )
+            _logger.error(
+                f"Failure probe triggered for task '{task.name}': "
+                f"pattern matched: '{probe_detail}'. "
+                f"The workflow will be terminated because of this probe — "
+                f"the task process was still running when the failure was detected."
+            )
+            for fname in getattr(task, "failure_followers", []):
+                try:
+                    ftask = self.workflow.get_task(fname)
+                except KeyError:
+                    continue
+                if ftask.status == TaskStatus.RUNNING:
+                    ftask.status = TaskStatus.FAILED
+                    ftask.failed_by_probe = True
+                    _logger.error(
+                        f"Task '{fname}' set to FAILED (follows probe from '{task.name}')"
+                    )
 
     async def _launch_task_with_timeout(self, task: Task, timeout: int | None = None):
         if timeout:
