@@ -1647,10 +1647,55 @@ def _state_with_slurm_backend() -> SflowState:
     return state
 
 
-def test_http_probe_skipped_on_non_first_replica_when_no_sweep_var_referenced():
-    """HTTP readiness probe that doesn't reference sweep vars should only appear on
-    the first replica — non-first replicas should have no probes but the first
-    replica should list them as readiness_followers."""
+def test_http_probe_skipped_on_non_first_parallel_replica_when_no_sweep_var_referenced():
+    """For parallel replicas: HTTP readiness probe that doesn't reference sweep vars
+    should only appear on the first replica — non-first replicas follow the first."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/v1/chat/completions",
+                                "body": '{"model": "m", "messages": []}',
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+
+    assert len(first.probes) == 1
+    assert isinstance(first.probes[0], HttpPostProbe)
+    assert len(second.probes) == 0
+    assert first.readiness_followers == ["bench_8"]
+
+
+def test_sequential_replicas_each_get_own_probe():
+    """For sequential replicas: each replica gets its own probe instance so they
+    have independent timeout deadlines."""
     state = _state_with_slurm_backend()
     state.variables = {
         "CONCURRENCY": Variable(
@@ -1690,8 +1735,9 @@ def test_http_probe_skipped_on_non_first_replica_when_no_sweep_var_referenced():
 
     assert len(first.probes) == 1
     assert isinstance(first.probes[0], HttpPostProbe)
-    assert len(second.probes) == 0
-    assert first.readiness_followers == ["bench_8"]
+    assert len(second.probes) == 1
+    assert isinstance(second.probes[0], HttpPostProbe)
+    assert first.readiness_followers == []
 
 
 def test_http_probe_kept_on_all_replicas_when_sweep_var_referenced():
@@ -1783,9 +1829,61 @@ def test_tcp_probe_always_per_replica():
     assert isinstance(second.probes[0], TcpPortProbe)
 
 
-def test_http_probe_followers_multiple_replicas():
-    """When 3+ replicas share a deduplicated HTTP probe, all non-first replicas
-    should appear in the first replica's readiness_followers."""
+def test_http_probe_followers_multiple_parallel_replicas():
+    """When 3+ parallel replicas share a deduplicated HTTP probe, all non-first
+    replicas should appear in the first replica's readiness_followers."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=4,
+            type=VariableType.INTEGER,
+            domain=[4, 8, 16],
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/health",
+                                "body": "{}",
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+    third = tg.get_task("bench_16")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 0
+    assert len(third.probes) == 0
+    assert first.readiness_followers == ["bench_8", "bench_16"]
+    assert second.readiness_followers == []
+    assert third.readiness_followers == []
+
+
+def test_sequential_replicas_each_get_own_probe_multiple():
+    """When 3+ sequential replicas have HTTP probes, each gets its own independent
+    probe instance (no follower dedup)."""
     state = _state_with_slurm_backend()
     state.variables = {
         "CONCURRENCY": Variable(
@@ -1828,15 +1926,16 @@ def test_http_probe_followers_multiple_replicas():
     third = tg.get_task("bench_16")
 
     assert len(first.probes) == 1
-    assert len(second.probes) == 0
-    assert len(third.probes) == 0
-    assert first.readiness_followers == ["bench_8", "bench_16"]
+    assert len(second.probes) == 1
+    assert len(third.probes) == 1
+    assert first.readiness_followers == []
     assert second.readiness_followers == []
     assert third.readiness_followers == []
 
 
 def test_failure_http_probe_followers():
-    """Deduplicated failure HTTP probes should populate failure_followers."""
+    """Deduplicated failure HTTP probes should populate failure_followers
+    for parallel replicas."""
     state = _state_with_slurm_backend()
     state.variables = {
         "CONCURRENCY": Variable(
@@ -1853,7 +1952,7 @@ def test_failure_http_probe_followers():
                     name="bench",
                     script=["echo run"],
                     replicas=ReplicaConfig(
-                        variables=["CONCURRENCY"], policy="sequential"
+                        variables=["CONCURRENCY"], policy="parallel"
                     ),
                     probes={
                         "failure": {

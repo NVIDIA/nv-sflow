@@ -223,7 +223,7 @@ workflow:
         readiness:
           log_watch:
             match_pattern: "Starting gpu monitor"
-          timeout: 60
+          timeout: 300
           interval: 2
       depends_on:
         - load_image
@@ -239,7 +239,7 @@ workflow:
         readiness:
           tcp_port:
             port: 4222
-          timeout: 60
+          timeout: 300
           interval: 2
       depends_on:
         - load_image
@@ -261,7 +261,7 @@ workflow:
         readiness:
           tcp_port:
             port: 2379
-          timeout: 60
+          timeout: 300
           interval: 2
       depends_on:
         - load_image
@@ -277,7 +277,7 @@ workflow:
         readiness:
           tcp_port:
             port: 8000
-          timeout: 120
+          timeout: 300
           interval: 5
       depends_on:
         - nats_server
@@ -317,7 +317,7 @@ workflow:
             headers:
               Content-Type: "application/json"
             body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
-          timeout: 600
+          timeout: 1200
           interval: 20
         failure:
           log_watch:

@@ -219,7 +219,7 @@ workflow:
         readiness:
           log_watch:
             match_pattern: "Starting gpu monitor"
-          timeout: 60
+          timeout: 300
           interval: 2
       depends_on:
         - load_image
@@ -236,7 +236,7 @@ workflow:
         readiness:
           tcp_port:
             port: 4222
-          timeout: 60
+          timeout: 300
           interval: 2
       depends_on:
         - load_image
@@ -260,7 +260,7 @@ workflow:
         readiness:
           tcp_port:
             port: 2379
-          timeout: 60
+          timeout: 300
           interval: 2
       depends_on:
         - load_image
@@ -283,7 +283,7 @@ workflow:
         readiness:
           tcp_port:
             port: ${{ variables.FRONTEND_PORT }}
-          timeout: 120
+          timeout: 300
           interval: 5
       depends_on:
         - nats_server
@@ -347,7 +347,7 @@ workflow:
         readiness:
           tcp_port:
             port: 8000
-          timeout: 120
+          timeout: 300
           interval: 5
       depends_on:
         - frontend_server

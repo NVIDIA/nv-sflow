@@ -1109,6 +1109,9 @@ def build_task_graph(
         timeout = _resolve_int(
             task_name, field=f"probes.{p_type}.timeout", value=p_conf.timeout
         )
+        each_check_timeout = _resolve_int(
+            task_name, field=f"probes.{p_type}.each_check_timeout", value=p_conf.each_check_timeout
+        )
         interval = _resolve_int(
             task_name, field=f"probes.{p_type}.interval", value=p_conf.interval
         )
@@ -1127,6 +1130,8 @@ def build_task_graph(
             raise ValueError(f"Task '{task_name}' probes.{p_type}.delay must be >= 0")
         if timeout < 0:
             raise ValueError(f"Task '{task_name}' probes.{p_type}.timeout must be >= 0")
+        if each_check_timeout < 0:
+            raise ValueError(f"Task '{task_name}' probes.{p_type}.each_check_timeout must be >= 0")
         if interval < 0:
             raise ValueError(
                 f"Task '{task_name}' probes.{p_type}.interval must be >= 0"
@@ -1144,6 +1149,7 @@ def build_task_graph(
             type=p_type,
             delay=delay,
             timeout=timeout,
+            each_check_timeout=each_check_timeout,
             interval=interval,
             success_threshold=success_threshold,
             failure_threshold=failure_threshold,
@@ -1962,20 +1968,28 @@ def build_task_graph(
                 except Exception:
                     default_probe_host = None
 
-                # For replicated tasks, skip HTTP probes on non-first replicas when
-                # the probe URL/body don't reference any per-replica variables — the
-                # probes would send identical requests, creating unnecessary duplicate
-                # load.  Per-replica variables include user-declared sweep variables
-                # and reserved variables like SFLOW_REPLICA_INDEX.
+                # For parallel replicated tasks, skip HTTP probes on non-first
+                # replicas when the probe URL/body don't reference any per-replica
+                # variables — the probes would send identical requests, creating
+                # unnecessary duplicate load.  Per-replica variables include
+                # user-declared sweep variables and reserved variables like
+                # SFLOW_REPLICA_INDEX.
+                #
+                # Sequential replicas always get their own probe because each
+                # replica runs at a different time and needs an independent
+                # timeout deadline.
                 replica_var_names: list[str] = []
                 if t_conf.replicas and len(concrete_nodes) > 1:
                     per_replica_env = replica_envs.get(node_name, {})
                     replica_var_names = list(per_replica_env.keys())
                 is_non_first_replica = idx > 0 and len(concrete_nodes) > 1
+                can_share_probe = (
+                    is_non_first_replica and replica_policy == "parallel"
+                )
 
                 if t_conf.probes.readiness is not None:
                     skip = (
-                        is_non_first_replica
+                        can_share_probe
                         and _is_http_probe_config(t_conf.probes.readiness)
                         and not _http_probe_references_vars(
                             t_conf.probes.readiness, replica_var_names
@@ -1983,7 +1997,7 @@ def build_task_graph(
                     )
                     if skip:
                         _logger.debug(
-                            "Skipping readiness HTTP probe on replica '%s' "
+                            "Skipping readiness HTTP probe on parallel replica '%s' "
                             "(identical to first replica)",
                             node_name,
                         )
@@ -2001,7 +2015,7 @@ def build_task_graph(
                         )
                 if t_conf.probes.failure is not None:
                     skip = (
-                        is_non_first_replica
+                        can_share_probe
                         and _is_http_probe_config(t_conf.probes.failure)
                         and not _http_probe_references_vars(
                             t_conf.probes.failure, replica_var_names
@@ -2009,7 +2023,7 @@ def build_task_graph(
                     )
                     if skip:
                         _logger.debug(
-                            "Skipping failure HTTP probe on replica '%s' "
+                            "Skipping failure HTTP probe on parallel replica '%s' "
                             "(identical to first replica)",
                             node_name,
                         )

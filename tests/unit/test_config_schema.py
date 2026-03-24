@@ -186,7 +186,8 @@ class TestSflowConfigSchema:
             LogWatchProbeConfig()
 
         # Defaults
-        assert p.timeout == 60
+        assert p.timeout == 1200
+        assert p.each_check_timeout == 30
         assert p.interval == 5
 
     def test_task_config_required_fields(self):

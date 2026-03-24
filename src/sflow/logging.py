@@ -37,7 +37,7 @@ def configure_logging(
         else:
             rich_console = Console(width=_DEFAULT_NON_TTY_WIDTH, force_terminal=False)
         console_handler = RichHandler(console=rich_console, rich_tracebacks=True)
-        # RichHandler handles formatting internally
+        console_handler.setLevel(numeric_level)
         handlers.append(console_handler)
 
     # File handler (if requested)
@@ -66,6 +66,9 @@ def add_log_file(log_file: str) -> None:
     """
     Add a file handler to the `sflow` logger without resetting existing handlers.
     Useful once output directories are known (after config load).
+
+    The file handler always logs at INFO level so the sflow.log captures
+    the full orchestration timeline regardless of the console --log-level.
     """
     logger = logging.getLogger("sflow")
     for h in logger.handlers:
@@ -75,10 +78,16 @@ def add_log_file(log_file: str) -> None:
             return
 
     fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.INFO)
     fh.setFormatter(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
     logger.addHandler(fh)
+
+    # Ensure the logger itself accepts INFO messages even if the console
+    # handler was configured at a higher level (e.g. WARNING).
+    if logger.level > logging.INFO:
+        logger.setLevel(logging.INFO)
 
 
 def get_logger(name: str) -> logging.Logger:
