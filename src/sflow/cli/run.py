@@ -21,6 +21,42 @@ _logger = get_logger(__name__)
 _sflow_app = SflowApp()
 
 
+def _resolve_bulk_input_row(
+    *,
+    bulk_input: Path,
+    row_selectors: list[str],
+    cli_files: list[Path],
+    cli_set_var: list[str] | None,
+    cli_artifact: list[str] | None,
+    cli_missable: list[str] | None,
+) -> tuple[list[Path], list[str] | None, list[str] | None, list[str] | None]:
+    """Resolve a single CSV row into (files, set_var, artifact, missable_tasks).
+
+    Delegates to :func:`sflow.cli.batch.resolve_csv_row` for all CSV parsing,
+    column classification, and override merging.
+    """
+    from sflow.cli.batch import parse_row_selector, resolve_csv_row
+
+    parsed_rows = parse_row_selector(row_selectors)
+    if len(parsed_rows) != 1:
+        raise typer.BadParameter(
+            f"--bulk-input with sflow run requires exactly one row, "
+            f"got {len(parsed_rows)}: {parsed_rows}"
+        )
+
+    try:
+        return resolve_csv_row(
+            csv_path=bulk_input,
+            row_idx=parsed_rows[0],
+            cli_files=cli_files or None,
+            cli_set_var=cli_set_var,
+            cli_artifact=cli_artifact,
+            cli_missable=cli_missable,
+        )
+    except IndexError as e:
+        raise typer.BadParameter(str(e)) from e
+
+
 @app.command(epilog=f"Documentation: {DOCS_URL}")
 def run(
     src_files: Annotated[
@@ -110,6 +146,29 @@ def run(
             help="Extra args to pass to slurm backend (e.g. --gpus-per-node=4). Merged with config extra_args and deduplicated.",
         ),
     ] = None,
+    bulk_input: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--bulk-input",
+            "-b",
+            help="CSV file to resolve config files and variable overrides from a single row. "
+            "Requires --row with a single row index (1-based). "
+            "The 'sflow_config_file' column provides YAML paths; other non-reserved columns "
+            "are treated as variable or artifact overrides.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+    row: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--row",
+            help="1-based row index in the CSV (requires --bulk-input). Only a single row is supported.",
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -185,9 +244,33 @@ def run(
 
         # Run with artifact override
         sflow run workflow.yaml --artifact MODEL=fs:///path/to/model
+
+        # Run a single row from a CSV (bulk-input mode)
+        sflow run --bulk-input jobs.csv --row 3
+
+        # Run a CSV row with additional CLI config files prepended
+        sflow run -f common.yaml --bulk-input jobs.csv --row 1
     """
     try:
-        files = list(src_files or []) + list(file or [])
+        if row and bulk_input is None:
+            typer.echo("Error: --row requires --bulk-input.", err=True)
+            raise typer.Exit(code=1)
+        if bulk_input is not None and not row:
+            typer.echo("Error: --bulk-input requires --row with a single row index.", err=True)
+            raise typer.Exit(code=1)
+
+        if bulk_input is not None:
+            files, set_var, artifact, missable_tasks = _resolve_bulk_input_row(
+                bulk_input=bulk_input,
+                row_selectors=row,
+                cli_files=list(src_files or []) + list(file or []),
+                cli_set_var=set_var,
+                cli_artifact=artifact,
+                cli_missable=missable_tasks,
+            )
+        else:
+            files = list(src_files or []) + list(file or [])
+
         if not files:
             files = [Path("sflow.yaml").resolve()]
         if missable_tasks and len(files) < 2:

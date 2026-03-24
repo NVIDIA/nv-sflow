@@ -142,18 +142,19 @@ if true; then
     # -- sflow compose: modular (multi-file) --
     COMPOSE_MODULAR_DIR="$PREFLIGHT_DIR/compose_modular"
     mkdir -p "$COMPOSE_MODULAR_DIR"
-    COMPOSE_MISSABLE=(-M agg_server -M prefill_server -M decode_server)
     for framework in trtllm sglang vllm; do
         run_check "compose modular $framework/disagg" \
             sflow compose "$SLURM_CFG" "$COMMON" \
                 "$EXAMPLES_DIR/inference_x_v2/$framework/prefill.yaml" \
                 "$EXAMPLES_DIR/inference_x_v2/$framework/decode.yaml" \
-                "${COMPOSE_MISSABLE[@]}" -r -vl \
+                "$BENCH_INFMAX" \
+                "${MODULAR_MISSABLE[@]}" -r -vl \
                 -o "$COMPOSE_MODULAR_DIR/${framework}_disagg.yaml"
         run_check "compose modular $framework/agg" \
             sflow compose "$SLURM_CFG" "$COMMON" \
                 "$EXAMPLES_DIR/inference_x_v2/$framework/agg.yaml" \
-                "${COMPOSE_MISSABLE[@]}" -r -vl \
+                "$BENCH_AIPERF" \
+                "${MODULAR_MISSABLE[@]}" -r -vl \
                 -o "$COMPOSE_MODULAR_DIR/${framework}_agg.yaml"
     done
 
@@ -161,6 +162,12 @@ if true; then
     if [ -f "$CSV_FILE" ]; then
         run_check "compose bulk-input all rows" \
             sflow compose -b "$CSV_FILE" -o "$PREFLIGHT_DIR/compose_bulk_input"
+
+        run_check "compose bulk-input single row" \
+            sflow compose -b "$CSV_FILE" --row 1 -o "$PREFLIGHT_DIR/compose_bulk_input_row1"
+
+        run_check "compose bulk-input row range" \
+            sflow compose -b "$CSV_FILE" --row 7:10 -o "$PREFLIGHT_DIR/compose_bulk_input_multi_rows"
     else
         echo "  SKIP: CSV not found at $CSV_FILE"
     fi
@@ -214,6 +221,30 @@ if true; then
                 -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
                 -p "$PARTITION" -A "$ACCOUNT" --log-level warn -r \
                 --output-dir "$PREFLIGHT_DIR/batch_bulk_input"
+    else
+        echo "  SKIP: CSV not found at $CSV_FILE"
+    fi
+
+    # -- sflow run --bulk-input --row (dry-run): CSV row execution --
+    # Missable tasks are defined in the CSV's missable_tasks column, not via CLI -M.
+    if [ -f "$CSV_FILE" ]; then
+        run_check "run bulk-input row 1 (dry-run)" \
+            sflow run --bulk-input "$CSV_FILE" --row 1 --dry-run \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH"
+
+        run_check "run bulk-input row 3 (dry-run)" \
+            sflow run --bulk-input "$CSV_FILE" --row 3 --dry-run \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH"
+
+        run_check "run bulk-input with cli files (dry-run)" \
+            sflow run -f "$SLURM_CFG" --bulk-input "$CSV_FILE" --row 1 --dry-run \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH"
+
+        run_check "run bulk-input missing --row (expect fail)" \
+            bash -c '! sflow run --bulk-input '"$CSV_FILE"' --dry-run 2>&1'
+
+        run_check "run --row without bulk-input (expect fail)" \
+            bash -c '! sflow run --row 1 --dry-run 2>&1'
     else
         echo "  SKIP: CSV not found at $CSV_FILE"
     fi

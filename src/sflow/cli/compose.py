@@ -489,75 +489,30 @@ def _run_bulk_compose(
     row-specific variant configs).  Duplicates are removed by resolved path,
     keeping the first occurrence.
     """
-    import csv
     from datetime import datetime
 
     from sflow.cli.batch import (
         _RESERVED_CSV_COLUMNS,
         _classify_csv_columns,
         _derive_row_name,
+        _parse_kv_list,
+        build_all_row_configs,
         build_row_naming_ctx,
+        merge_row_overrides,
+        read_bulk_csv,
+        resolve_row_files,
+        row_missable,
     )
 
-    cli_var_map: dict[str, str] = {}
-    for entry in cli_set_var or []:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            cli_var_map[k] = v
-
-    cli_art_map: dict[str, str] = {}
-    for entry in cli_artifact or []:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            cli_art_map[k] = v
-
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise ValueError(f"CSV file is empty: {csv_path}")
-        columns = list(reader.fieldnames)
-        if "sflow_config_file" not in columns:
-            raise ValueError(
-                f"CSV file must contain a 'sflow_config_file' column. "
-                f"Found columns: {columns}"
-            )
-        rows: list[dict[str, Any]] = list(reader)
-
-    if not rows:
-        raise ValueError(f"CSV file has no data rows: {csv_path}")
+    columns, rows = read_bulk_csv(csv_path)
 
     csv_dir = csv_path.parent
     resolved_cli_files = [p.resolve() for p in (cli_files or [])]
+    cli_var_map = _parse_kv_list(cli_set_var)
+    cli_art_map = _parse_kv_list(cli_artifact)
 
-    def _resolve_config_paths(raw: str) -> list[Path]:
-        paths = []
-        for p in raw.split():
-            fp = Path(p)
-            if not fp.is_absolute():
-                fp = csv_dir / fp
-            paths.append(fp.resolve())
-        return paths
-
-    def _merge_and_dedup(base: list[Path], extra: list[Path]) -> list[Path]:
-        """Merge two path lists, deduplicating by resolved path (first wins)."""
-        seen: set[Path] = set()
-        merged: list[Path] = []
-        for p in base + extra:
-            if p not in seen:
-                seen.add(p)
-                merged.append(p)
-        return merged
-
-    row_configs: list[tuple[list[Path], list[str] | None]] = []
-    for r in rows:
-        csv_files = _resolve_config_paths(r["sflow_config_file"])
-        cfg_files = _merge_and_dedup(resolved_cli_files, csv_files)
-        row_m = list(missable_tasks) if missable_tasks else []
-        csv_m = (r.get("missable_tasks") or "").strip()
-        if csv_m:
-            row_m.extend(csv_m.split())
-        row_configs.append((cfg_files, row_m or None))
-    var_cols, art_cols = _classify_csv_columns(columns, row_configs)
+    all_row_configs = build_all_row_configs(rows, csv_dir, resolved_cli_files, missable_tasks)
+    var_cols, art_cols = _classify_csv_columns(columns, all_row_configs)
 
     if resolved_cli_files:
         cli_stems = ", ".join(p.name for p in resolved_cli_files)
@@ -591,33 +546,15 @@ def _run_bulk_compose(
     for idx, row in enumerate(rows, start=1):
         if row_indices is not None and idx not in row_indices:
             continue
-        csv_files = _resolve_config_paths(row["sflow_config_file"])
-        config_files = _merge_and_dedup(resolved_cli_files, csv_files)
-
-        merged_vars = dict(cli_var_map)
-        for col in var_cols:
-            if row.get(col):
-                merged_vars[col] = row[col]
-        set_var = [f"{k}={v}" for k, v in merged_vars.items()] or None
-
-        merged_arts: dict[str, str] = {}
-        for col in art_cols:
-            if row.get(col):
-                merged_arts[col] = row[col]
-        merged_arts.update(cli_art_map)
-        artifacts = [f"{k}={v}" for k, v in merged_arts.items()] or None
+        config_files = resolve_row_files(row, csv_dir, resolved_cli_files)
+        set_var, artifacts = merge_row_overrides(row, var_cols, art_cols, cli_var_map, cli_art_map)
+        effective_missable = row_missable(row, missable_tasks)
 
         overrides_desc = ", ".join(
             f"{col}={row[col]}"
             for col in columns
             if col not in _RESERVED_CSV_COLUMNS and row.get(col)
         )
-
-        row_missable = list(missable_tasks) if missable_tasks else []
-        csv_missable = (row.get("missable_tasks") or "").strip()
-        if csv_missable:
-            row_missable.extend(csv_missable.split())
-        effective_missable = row_missable or None
 
         row_name = _derive_row_name(row, idx, naming_ctx)
         out_path = bulk_dir / f"{row_name}.yaml"
