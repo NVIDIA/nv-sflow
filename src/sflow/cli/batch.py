@@ -776,6 +776,142 @@ def _classify_csv_columns(
     return var_cols, art_cols
 
 
+def read_bulk_csv(csv_path: Path) -> tuple[list[str], list[dict]]:
+    """Read and validate a bulk-input CSV file.
+
+    Returns (columns, rows).
+    Raises ValueError if the file is empty or lacks the ``sflow_config_file`` column.
+    """
+    import csv
+
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV file is empty: {csv_path}")
+        columns = list(reader.fieldnames)
+        if "sflow_config_file" not in columns:
+            raise ValueError(
+                f"CSV must contain a 'sflow_config_file' column. Found: {columns}"
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"CSV file has no data rows: {csv_path}")
+    return columns, rows
+
+
+def resolve_row_files(
+    row: dict, csv_dir: Path, resolved_cli_files: list[Path],
+) -> list[Path]:
+    """Resolve and dedup config file paths for a single CSV row.
+
+    CLI files are prepended; CSV paths are resolved relative to *csv_dir*.
+    """
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for p in resolved_cli_files + [(csv_dir / x).resolve() for x in row["sflow_config_file"].split()]:
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+    return paths
+
+
+def row_missable(row: dict, cli_missable: list[str] | None) -> list[str] | None:
+    """Merge CLI and CSV ``missable_tasks`` for a single row."""
+    m = list(cli_missable) if cli_missable else []
+    csv_m = (row.get("missable_tasks") or "").strip()
+    if csv_m:
+        m.extend(csv_m.split())
+    return m or None
+
+
+def build_all_row_configs(
+    rows: list[dict],
+    csv_dir: Path,
+    resolved_cli_files: list[Path],
+    cli_missable: list[str] | None,
+) -> list[tuple[list[Path], list[str] | None]]:
+    """Build (config_files, missable) tuples for all rows, for column classification."""
+    return [
+        (resolve_row_files(r, csv_dir, resolved_cli_files), row_missable(r, cli_missable))
+        for r in rows
+    ]
+
+
+def _parse_kv_list(entries: list[str] | None) -> dict[str, str]:
+    """Parse a list of 'KEY=VALUE' strings into a dict."""
+    result: dict[str, str] = {}
+    for entry in entries or []:
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            result[k] = v
+    return result
+
+
+def merge_row_overrides(
+    row: dict,
+    var_cols: set[str],
+    art_cols: set[str],
+    cli_var_map: dict[str, str],
+    cli_art_map: dict[str, str],
+) -> tuple[list[str] | None, list[str] | None]:
+    """Merge CLI and CSV overrides for a single row.
+
+    For variables, CSV values take precedence over CLI ``--set``.
+    For artifacts, CLI ``--artifact`` takes precedence over CSV values.
+
+    Returns (set_var_list, artifact_list).
+    """
+    merged_vars = dict(cli_var_map)
+    for col in var_cols:
+        if row.get(col):
+            merged_vars[col] = row[col]
+    set_var = [f"{k}={v}" for k, v in merged_vars.items()] or None
+
+    merged_arts: dict[str, str] = {}
+    for col in art_cols:
+        if row.get(col):
+            merged_arts[col] = row[col]
+    merged_arts.update(cli_art_map)
+    artifacts = [f"{k}={v}" for k, v in merged_arts.items()] or None
+
+    return set_var, artifacts
+
+
+def resolve_csv_row(
+    csv_path: Path,
+    row_idx: int,
+    cli_files: list[Path] | None = None,
+    cli_set_var: list[str] | None = None,
+    cli_artifact: list[str] | None = None,
+    cli_missable: list[str] | None = None,
+) -> tuple[list[Path], list[str] | None, list[str] | None, list[str] | None]:
+    """Resolve a single CSV row into (config_files, set_var, artifact, missable_tasks).
+
+    High-level convenience that reads the CSV, classifies columns, and merges
+    overrides for the selected row (1-based index).
+    Used by ``sflow run --bulk-input``.
+    """
+    columns, rows = read_bulk_csv(csv_path)
+    if row_idx < 1 or row_idx > len(rows):
+        raise IndexError(f"Row {row_idx} out of range (CSV has {len(rows)} rows)")
+
+    csv_dir = csv_path.parent
+    resolved_cli = [fp.resolve() for fp in (cli_files or [])]
+
+    all_row_configs = build_all_row_configs(rows, csv_dir, resolved_cli, cli_missable)
+    var_cols, art_cols = _classify_csv_columns(columns, all_row_configs)
+
+    row = rows[row_idx - 1]
+    config_files = resolve_row_files(row, csv_dir, resolved_cli)
+    missable = row_missable(row, cli_missable)
+
+    cli_var_map = _parse_kv_list(cli_set_var)
+    cli_art_map = _parse_kv_list(cli_artifact)
+    set_var, artifacts = merge_row_overrides(row, var_cols, art_cols, cli_var_map, cli_art_map)
+
+    return config_files, set_var, artifacts, missable
+
+
 def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
     """Scan file paths, directories, and glob patterns for valid sflow YAML configs.
 
