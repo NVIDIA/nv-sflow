@@ -1,0 +1,1386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Consolidated Dynamo Auto-Benchmarking</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@500;700;800&display=swap" rel="stylesheet">
+    <style>
+        /* ===========================================
+           CSS CUSTOM PROPERTIES (THEME)
+           Terminal-inspired dark theme with neon accents
+           =========================================== */
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-card: #1c2128;
+            --text-primary: #e6edf3;
+            --text-secondary: #7d8590;
+            --accent-green: #39d353;
+            --accent-cyan: #58a6ff;
+            --accent-orange: #f0883e;
+            --accent-purple: #a371f7;
+            --accent-pink: #f778ba;
+            --glow-green: rgba(57, 211, 83, 0.3);
+            --glow-cyan: rgba(88, 166, 255, 0.3);
+
+            --font-display: 'Syne', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --title-size: clamp(2rem, 6vw, 4.5rem);
+            --h2-size: clamp(1.5rem, 4vw, 3rem);
+            --h3-size: clamp(1rem, 2vw, 1.5rem);
+            --body-size: clamp(0.75rem, 1.5vw, 1.1rem);
+            --small-size: clamp(0.65rem, 1vw, 0.875rem);
+            --slide-padding: clamp(1.5rem, 5vw, 5rem);
+            --content-gap: clamp(1rem, 3vw, 3rem);
+            --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        /* ===========================================
+           VIEWPORT FITTING: MANDATORY BASE STYLES
+           =========================================== */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            height: 100%;
+            overflow-x: hidden;
+        }
+
+        html {
+            scroll-snap-type: y mandatory;
+            scroll-behavior: smooth;
+        }
+
+        .slide {
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            overflow: hidden;
+            scroll-snap-align: start;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            background: var(--bg-primary);
+        }
+
+        .slide-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            max-height: 100%;
+            overflow: hidden;
+            padding: var(--slide-padding);
+        }
+
+        @media (max-height: 700px) {
+            :root {
+                --slide-padding: clamp(0.75rem, 3vw, 2rem);
+                --content-gap: clamp(0.5rem, 1.5vw, 1rem);
+                --title-size: clamp(1.5rem, 5vw, 3rem);
+                --h2-size: clamp(1.2rem, 3vw, 2rem);
+            }
+        }
+
+        @media (max-height: 600px) {
+            :root {
+                --slide-padding: clamp(0.5rem, 2vw, 1.5rem);
+                --title-size: clamp(1.25rem, 4vw, 2.5rem);
+                --body-size: clamp(0.65rem, 1.2vw, 0.9rem);
+            }
+            .nav-dots { display: none; }
+        }
+
+        @media (max-width: 600px) {
+            :root {
+                --title-size: clamp(1.5rem, 8vw, 2.5rem);
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                transition-duration: 0.2s !important;
+            }
+            html { scroll-behavior: auto; }
+        }
+
+        /* ===========================================
+           TYPOGRAPHY
+           =========================================== */
+        h1, h2, h3 {
+            font-family: var(--font-display);
+            color: var(--text-primary);
+            font-weight: 700;
+            line-height: 1.1;
+        }
+
+        h1 { font-size: var(--title-size); }
+        h2 { font-size: var(--h2-size); }
+        h3 { font-size: var(--h3-size); }
+
+        p, li {
+            font-family: var(--font-mono);
+            color: var(--text-secondary);
+            font-size: var(--body-size);
+            line-height: 1.6;
+        }
+
+        .mono {
+            font-family: var(--font-mono);
+        }
+
+        /* ===========================================
+           ANIMATIONS
+           =========================================== */
+        .reveal {
+            opacity: 0;
+            transform: translateY(20px);
+            transition: opacity 0.6s var(--ease-out-expo),
+                        transform 0.6s var(--ease-out-expo);
+        }
+
+        .slide.visible .reveal {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .reveal:nth-child(1) { transition-delay: 0s; }
+        .reveal:nth-child(2) { transition-delay: 0.1s; }
+        .reveal:nth-child(3) { transition-delay: 0.2s; }
+        .reveal:nth-child(4) { transition-delay: 0.3s; }
+        .reveal:nth-child(5) { transition-delay: 0.4s; }
+        .reveal:nth-child(6) { transition-delay: 0.5s; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        @keyframes glow {
+            0%, 100% { box-shadow: 0 0 20px var(--glow-green); }
+            50% { box-shadow: 0 0 40px var(--glow-green), 0 0 60px var(--glow-green); }
+        }
+
+        /* ===========================================
+           SLIDE: TITLE
+           =========================================== */
+        .title-slide {
+            background: 
+                radial-gradient(ellipse at 30% 20%, rgba(57, 211, 83, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 70% 80%, rgba(88, 166, 255, 0.06) 0%, transparent 50%),
+                var(--bg-primary);
+        }
+
+        .title-slide .slide-content {
+            align-items: center;
+            text-align: center;
+            gap: var(--content-gap);
+        }
+
+        .title-slide h1 {
+            background: linear-gradient(135deg, var(--accent-green) 0%, var(--accent-cyan) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .tagline {
+            font-family: var(--font-mono);
+            color: var(--text-secondary);
+            font-size: clamp(0.8rem, 1.5vw, 1.1rem);
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+        }
+
+        .cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1.2em;
+            background: var(--accent-green);
+            margin-left: 4px;
+            animation: pulse 1s infinite;
+        }
+
+        /* ===========================================
+           SLIDE: STRUCTURE DIAGRAM
+           =========================================== */
+        .structure-slide {
+            background: 
+                linear-gradient(90deg, rgba(57, 211, 83, 0.02) 1px, transparent 1px),
+                linear-gradient(rgba(57, 211, 83, 0.02) 1px, transparent 1px),
+                var(--bg-primary);
+            background-size: 40px 40px;
+        }
+
+        .tree-container {
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            gap: clamp(2rem, 6vw, 8rem);
+            margin-top: clamp(1rem, 3vh, 2rem);
+        }
+
+        .tree-branch {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: clamp(0.5rem, 1.5vh, 1rem);
+        }
+
+        .tree-root {
+            font-family: var(--font-mono);
+            font-size: clamp(0.9rem, 1.8vw, 1.3rem);
+            font-weight: 700;
+            padding: clamp(0.5rem, 1.5vw, 1rem) clamp(1rem, 2.5vw, 2rem);
+            border-radius: 8px;
+            position: relative;
+        }
+
+        .tree-root.public {
+            background: var(--bg-card);
+            border: 2px solid var(--accent-green);
+            color: var(--accent-green);
+            box-shadow: 0 0 20px var(--glow-green);
+        }
+
+        .tree-root.internal {
+            background: var(--bg-card);
+            border: 2px solid var(--accent-orange);
+            color: var(--accent-orange);
+            box-shadow: 0 0 20px rgba(240, 136, 62, 0.3);
+        }
+
+        .tree-children {
+            display: flex;
+            gap: clamp(0.5rem, 1.5vw, 1rem);
+            position: relative;
+        }
+
+        .tree-children::before {
+            content: '';
+            position: absolute;
+            top: calc(-1 * clamp(0.5rem, 1.5vh, 1rem));
+            left: 50%;
+            width: 2px;
+            height: clamp(0.5rem, 1.5vh, 1rem);
+            background: var(--text-secondary);
+        }
+
+        .tree-child {
+            font-family: var(--font-mono);
+            font-size: clamp(0.7rem, 1.2vw, 0.95rem);
+            padding: clamp(0.4rem, 1vw, 0.75rem) clamp(0.8rem, 1.5vw, 1.25rem);
+            background: var(--bg-card);
+            border-radius: 6px;
+            color: var(--text-primary);
+            border: 1px solid var(--bg-secondary);
+            position: relative;
+            white-space: nowrap;
+        }
+
+        .tree-child::before {
+            content: '';
+            position: absolute;
+            top: calc(-1 * clamp(0.5rem, 1.5vh, 1rem));
+            left: 50%;
+            width: 2px;
+            height: clamp(0.5rem, 1.5vh, 1rem);
+            background: var(--text-secondary);
+        }
+
+        .tree-child.highlight {
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 15px var(--glow-cyan);
+        }
+
+        .tree-child .badge {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            font-size: 0.6rem;
+            padding: 2px 6px;
+            border-radius: 10px;
+            background: var(--accent-purple);
+            color: white;
+        }
+
+        /* ===========================================
+           TERMINAL TREE VIEW
+           =========================================== */
+        .terminal-tree {
+            background: var(--bg-card);
+            border: 1px solid var(--bg-secondary);
+            border-radius: 12px;
+            padding: clamp(1rem, 2.5vw, 2rem);
+            font-family: var(--font-mono);
+            font-size: clamp(0.7rem, 1.3vw, 1rem);
+            line-height: 1.6;
+            max-width: min(90vw, 700px);
+            margin: clamp(1rem, 2vh, 2rem) auto 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .terminal-tree::before {
+            content: '$ tree recipes/';
+            display: block;
+            color: var(--accent-green);
+            margin-bottom: clamp(0.5rem, 1vh, 1rem);
+            padding-bottom: clamp(0.5rem, 1vh, 0.75rem);
+            border-bottom: 1px solid var(--bg-secondary);
+        }
+
+        .tree-line {
+            color: var(--text-secondary);
+            white-space: pre;
+        }
+
+        .tree-line .folder {
+            color: var(--accent-cyan);
+            font-weight: 500;
+        }
+
+        .tree-line .folder.public-root {
+            color: var(--accent-green);
+        }
+
+        .tree-line .folder.internal-root {
+            color: var(--accent-orange);
+        }
+
+        .tree-line .comment {
+            color: var(--text-secondary);
+            opacity: 0.6;
+            font-size: 0.85em;
+        }
+
+        .tree-line .tag {
+            display: inline-block;
+            background: var(--accent-purple);
+            color: white;
+            font-size: 0.7em;
+            padding: 1px 6px;
+            border-radius: 8px;
+            margin-left: 8px;
+            vertical-align: middle;
+        }
+
+        .tree-line .tag.live {
+            background: var(--accent-green);
+        }
+
+        /* ===========================================
+           SLIDE: FEATURES
+           =========================================== */
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: clamp(0.75rem, 1.5vw, 1.5rem);
+            margin-top: clamp(1rem, 3vh, 2rem);
+        }
+
+        @media (max-width: 800px) {
+            .features-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 500px) {
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .feature-card {
+            background: var(--bg-card);
+            border: 1px solid var(--bg-secondary);
+            border-radius: 12px;
+            padding: clamp(1rem, 2vw, 1.5rem);
+            transition: all 0.3s ease;
+        }
+
+        .feature-card:hover {
+            border-color: var(--accent-green);
+            transform: translateY(-4px);
+        }
+
+        .feature-icon {
+            font-size: clamp(1.5rem, 3vw, 2rem);
+            margin-bottom: clamp(0.5rem, 1vh, 0.75rem);
+        }
+
+        .feature-card h3 {
+            margin-bottom: clamp(0.3rem, 0.8vh, 0.5rem);
+        }
+
+        .feature-card p {
+            font-size: var(--small-size);
+        }
+
+        /* ===========================================
+           SLIDE: WORKFLOW
+           =========================================== */
+        .workflow-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: clamp(0.5rem, 2vw, 2rem);
+            flex-wrap: wrap;
+            margin-top: clamp(1.5rem, 4vh, 3rem);
+        }
+
+        .workflow-step {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: clamp(0.3rem, 1vh, 0.75rem);
+        }
+
+        .workflow-box {
+            background: var(--bg-card);
+            border: 2px solid var(--bg-secondary);
+            border-radius: 12px;
+            padding: clamp(0.75rem, 2vw, 1.5rem) clamp(1rem, 2.5vw, 2rem);
+            text-align: center;
+            min-width: clamp(100px, 15vw, 140px);
+        }
+
+        .workflow-box.highlight {
+            border-color: var(--accent-green);
+            box-shadow: 0 0 25px var(--glow-green);
+        }
+
+        .workflow-box.auto {
+            border-color: var(--accent-cyan);
+            background: linear-gradient(135deg, var(--bg-card) 0%, rgba(88, 166, 255, 0.1) 100%);
+        }
+
+        .workflow-box.soda {
+            border-color: var(--accent-purple);
+            background: linear-gradient(135deg, var(--bg-card) 0%, rgba(163, 113, 247, 0.15) 100%);
+            box-shadow: 0 0 20px rgba(163, 113, 247, 0.3);
+        }
+
+        .workflow-box h3 {
+            font-size: clamp(0.8rem, 1.5vw, 1.1rem);
+            margin-bottom: 0.25rem;
+        }
+
+        .workflow-box p {
+            font-size: clamp(0.6rem, 1vw, 0.8rem);
+        }
+
+        .workflow-arrow {
+            font-size: clamp(1rem, 2vw, 1.5rem);
+            color: var(--text-secondary);
+        }
+
+        .automation-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: linear-gradient(135deg, rgba(57, 211, 83, 0.2) 0%, rgba(88, 166, 255, 0.2) 100%);
+            border: 1px solid var(--accent-green);
+            border-radius: 20px;
+            padding: clamp(0.3rem, 0.8vw, 0.5rem) clamp(0.8rem, 1.5vw, 1.25rem);
+            font-family: var(--font-mono);
+            font-size: clamp(0.65rem, 1.1vw, 0.9rem);
+            color: var(--accent-green);
+            margin-top: clamp(1rem, 3vh, 2rem);
+        }
+
+        .automation-badge .dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        /* ===========================================
+           SLIDE: PROMOTION FLOW
+           =========================================== */
+        .promotion-flow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: clamp(1rem, 3vw, 3rem);
+            margin-top: clamp(1.5rem, 4vh, 3rem);
+        }
+
+        .promo-box {
+            background: var(--bg-card);
+            border: 2px solid var(--bg-secondary);
+            border-radius: 16px;
+            padding: clamp(1rem, 2.5vw, 2rem);
+            text-align: center;
+            min-width: clamp(120px, 18vw, 180px);
+        }
+
+        .promo-box.internal {
+            border-color: var(--accent-orange);
+        }
+
+        .promo-box.public {
+            border-color: var(--accent-green);
+            animation: glow 3s infinite;
+        }
+
+        .promo-box h3 {
+            margin-bottom: 0.5rem;
+        }
+
+        .promo-box .label {
+            font-family: var(--font-mono);
+            font-size: clamp(0.6rem, 1vw, 0.75rem);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .promo-box.internal .label { color: var(--accent-orange); }
+        .promo-box.public .label { color: var(--accent-green); }
+
+        /* ===========================================
+           SLIDE: SODA DASHBOARDS
+           =========================================== */
+        .soda-slide {
+            background: 
+                radial-gradient(ellipse at 20% 30%, rgba(163, 113, 247, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 70%, rgba(247, 120, 186, 0.06) 0%, transparent 50%),
+                var(--bg-primary);
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: clamp(0.75rem, 1.5vw, 1.25rem);
+            margin-top: clamp(1rem, 2.5vh, 2rem);
+            max-width: min(95vw, 900px);
+        }
+
+        @media (max-width: 700px) {
+            .dashboard-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        .dashboard-card {
+            background: var(--bg-card);
+            border: 1px solid var(--bg-secondary);
+            border-radius: 10px;
+            padding: clamp(0.75rem, 1.5vw, 1.25rem);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .dashboard-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+        }
+
+        .dashboard-card.nightly::before { background: var(--accent-cyan); }
+        .dashboard-card.aic::before { background: var(--accent-orange); }
+        .dashboard-card.release::before { background: var(--accent-pink); }
+        .dashboard-card.infmax::before { background: var(--accent-green); }
+        .dashboard-card.custom::before { background: var(--accent-purple); }
+
+        .dashboard-card:hover {
+            transform: translateY(-3px);
+            border-color: var(--accent-purple);
+        }
+
+        .dashboard-card h3 {
+            font-size: clamp(0.8rem, 1.3vw, 1rem);
+            margin-bottom: clamp(0.25rem, 0.5vh, 0.4rem);
+        }
+
+        .dashboard-card p {
+            font-size: clamp(0.6rem, 0.9vw, 0.75rem);
+            line-height: 1.4;
+        }
+
+        .dashboard-card .team-tag {
+            font-family: var(--font-mono);
+            font-size: clamp(0.5rem, 0.7vw, 0.65rem);
+            color: var(--text-secondary);
+            opacity: 0.7;
+            margin-top: clamp(0.3rem, 0.6vh, 0.5rem);
+        }
+
+        /* ===========================================
+           SLIDE: MODULAR TEMPLATES
+           =========================================== */
+        .modular-slide {
+            background: 
+                linear-gradient(90deg, rgba(88, 166, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(rgba(88, 166, 255, 0.02) 1px, transparent 1px),
+                var(--bg-primary);
+            background-size: 30px 30px;
+        }
+
+        .modular-container {
+            display: flex;
+            gap: clamp(1.5rem, 4vw, 4rem);
+            align-items: flex-start;
+            justify-content: center;
+            margin-top: clamp(1rem, 2.5vh, 2rem);
+        }
+
+        @media (max-width: 800px) {
+            .modular-container {
+                flex-direction: column;
+                align-items: center;
+            }
+        }
+
+        .modular-section {
+            display: flex;
+            flex-direction: column;
+            gap: clamp(0.5rem, 1vh, 0.75rem);
+        }
+
+        .modular-label {
+            font-family: var(--font-mono);
+            font-size: clamp(0.7rem, 1vw, 0.85rem);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: clamp(0.25rem, 0.5vh, 0.5rem);
+        }
+
+        .modular-label.common { color: var(--accent-cyan); }
+        .modular-label.unique { color: var(--accent-green); }
+
+        .modular-block {
+            background: var(--bg-card);
+            border: 1px solid var(--bg-secondary);
+            border-radius: 8px;
+            padding: clamp(0.5rem, 1vw, 0.75rem) clamp(0.75rem, 1.5vw, 1.25rem);
+            font-family: var(--font-mono);
+            font-size: clamp(0.65rem, 1vw, 0.85rem);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.3s ease;
+        }
+
+        .modular-block.common {
+            border-color: var(--accent-cyan);
+            border-left-width: 3px;
+        }
+
+        .modular-block.unique {
+            border-color: var(--accent-green);
+            border-left-width: 3px;
+        }
+
+        .modular-block .icon {
+            opacity: 0.6;
+        }
+
+        .modular-block .lock {
+            color: var(--accent-cyan);
+            font-size: 0.9em;
+        }
+
+        .modular-block .edit {
+            color: var(--accent-green);
+            font-size: 0.9em;
+        }
+
+        .modular-plus {
+            font-size: clamp(1.5rem, 3vw, 2.5rem);
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            padding-top: clamp(1rem, 2vh, 1.5rem);
+        }
+
+        .modular-equals {
+            font-size: clamp(1.5rem, 3vw, 2.5rem);
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            padding-top: clamp(1rem, 2vh, 1.5rem);
+        }
+
+        .modular-result {
+            background: linear-gradient(135deg, var(--bg-card) 0%, rgba(57, 211, 83, 0.1) 100%);
+            border: 2px solid var(--accent-green);
+            border-radius: 12px;
+            padding: clamp(0.75rem, 1.5vw, 1.25rem);
+            text-align: center;
+            box-shadow: 0 0 20px var(--glow-green);
+        }
+
+        .modular-result h3 {
+            font-size: clamp(0.9rem, 1.3vw, 1.1rem);
+            margin-bottom: 0.25rem;
+        }
+
+        .modular-result p {
+            font-size: clamp(0.6rem, 0.9vw, 0.75rem);
+        }
+
+        .soda-logo {
+            font-family: var(--font-display);
+            font-size: clamp(1.25rem, 2.5vw, 2rem);
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--accent-purple) 0%, var(--accent-pink) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            display: inline-block;
+            margin-right: 0.5rem;
+        }
+
+        /* ===========================================
+           SLIDE: COMBINED STRENGTHS
+           =========================================== */
+        .strengths-slide {
+            background: 
+                radial-gradient(ellipse at 20% 80%, rgba(57, 211, 83, 0.06) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 20%, rgba(240, 136, 62, 0.06) 0%, transparent 50%),
+                radial-gradient(ellipse at 50% 50%, rgba(163, 113, 247, 0.04) 0%, transparent 50%),
+                var(--bg-primary);
+        }
+
+        .strengths-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: clamp(1rem, 2vw, 1.5rem);
+            margin-top: clamp(1rem, 2.5vh, 2rem);
+        }
+
+        @media (max-width: 800px) {
+            .strengths-grid {
+                grid-template-columns: 1fr;
+                gap: clamp(0.75rem, 1.5vw, 1rem);
+            }
+        }
+
+        .strength-card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: clamp(1rem, 2vw, 1.5rem);
+            border: 2px solid var(--bg-secondary);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .strength-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+        }
+
+        .strength-card.dynamo::before { background: var(--accent-cyan); }
+        .strength-card.perflab::before { background: var(--accent-green); }
+        .strength-card.aic::before { background: var(--accent-orange); }
+
+        .strength-card .team-name {
+            font-family: var(--font-mono);
+            font-size: clamp(0.65rem, 1vw, 0.8rem);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: clamp(0.3rem, 0.8vh, 0.5rem);
+        }
+
+        .strength-card.dynamo .team-name { color: var(--accent-cyan); }
+        .strength-card.perflab .team-name { color: var(--accent-green); }
+        .strength-card.aic .team-name { color: var(--accent-orange); }
+
+        .strength-card h3 {
+            font-size: clamp(0.9rem, 1.4vw, 1.15rem);
+            margin-bottom: clamp(0.4rem, 1vh, 0.75rem);
+        }
+
+        .strength-card ul {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: clamp(0.2rem, 0.5vh, 0.4rem);
+        }
+
+        .strength-card li {
+            font-size: clamp(0.6rem, 1vw, 0.8rem);
+            color: var(--text-secondary);
+            padding-left: 1em;
+            position: relative;
+        }
+
+        .strength-card li::before {
+            content: '→';
+            position: absolute;
+            left: 0;
+            opacity: 0.5;
+        }
+
+        .synergy-badge {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+            margin-top: clamp(1rem, 2.5vh, 2rem);
+            font-family: var(--font-mono);
+            font-size: clamp(0.7rem, 1.1vw, 0.9rem);
+            color: var(--text-secondary);
+        }
+
+        .synergy-badge .arrow {
+            color: var(--accent-green);
+        }
+
+        .promo-arrow {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--text-secondary);
+        }
+
+        .promo-arrow span {
+            font-size: clamp(1.5rem, 3vw, 2.5rem);
+        }
+
+        .promo-arrow p {
+            font-size: clamp(0.55rem, 0.9vw, 0.7rem);
+            text-align: center;
+            max-width: 100px;
+        }
+
+        /* ===========================================
+           SLIDE: SUMMARY
+           =========================================== */
+        .summary-slide {
+            background: 
+                radial-gradient(ellipse at 50% 50%, rgba(57, 211, 83, 0.1) 0%, transparent 60%),
+                var(--bg-primary);
+        }
+
+        .summary-slide .slide-content {
+            align-items: center;
+            text-align: center;
+        }
+
+        .summary-points {
+            display: flex;
+            gap: clamp(1rem, 3vw, 3rem);
+            margin-top: clamp(1.5rem, 4vh, 3rem);
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .summary-point {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .summary-icon {
+            font-size: clamp(2rem, 4vw, 3rem);
+        }
+
+        .summary-point p {
+            font-family: var(--font-display);
+            font-size: clamp(0.9rem, 1.5vw, 1.2rem);
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        /* ===========================================
+           NAVIGATION
+           =========================================== */
+        .nav-dots {
+            position: fixed;
+            right: clamp(1rem, 2vw, 2rem);
+            top: 50%;
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 100;
+        }
+
+        .nav-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--bg-secondary);
+            border: 1px solid var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .nav-dot:hover {
+            background: var(--accent-green);
+            border-color: var(--accent-green);
+        }
+
+        .nav-dot.active {
+            background: var(--accent-green);
+            border-color: var(--accent-green);
+            box-shadow: 0 0 10px var(--glow-green);
+        }
+
+        .progress-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--accent-green), var(--accent-cyan));
+            width: 0%;
+            z-index: 1000;
+            transition: width 0.3s ease;
+        }
+
+        /* ===========================================
+           UTILITIES
+           =========================================== */
+        .text-green { color: var(--accent-green); }
+        .text-cyan { color: var(--accent-cyan); }
+        .text-orange { color: var(--accent-orange); }
+        .text-purple { color: var(--accent-purple); }
+        .text-pink { color: var(--accent-pink); }
+
+        .slide h2 {
+            margin-bottom: clamp(0.5rem, 1.5vh, 1rem);
+        }
+
+        .subtitle {
+            font-family: var(--font-mono);
+            color: var(--text-secondary);
+            font-size: clamp(0.7rem, 1.2vw, 1rem);
+            margin-bottom: clamp(0.5rem, 1.5vh, 1rem);
+        }
+    </style>
+</head>
+<body>
+    <div class="progress-bar"></div>
+    <nav class="nav-dots"></nav>
+
+    <!-- Slide 1: Title -->
+    <section class="slide title-slide">
+        <div class="slide-content">
+            <p class="tagline reveal">Dynamo + AIC + sflow + perflab infra</p>
+            <h1 class="reveal">Consolidated Dynamo Auto-Benchmarking<span class="cursor"></span></h1>
+            <p class="reveal" style="max-width: 600px;">A unified structure for multi-team benchmark recipes with automated execution and result collection</p>
+        </div>
+    </section>
+
+    <!-- Slide 2: Combined Strengths -->
+    <section class="slide strengths-slide">
+        <div class="slide-content">
+            <h2 class="reveal">Combined Strengths</h2>
+            <p class="subtitle reveal">Each team brings unique capabilities to the table</p>
+            
+            <div class="strengths-grid">
+                <div class="strength-card dynamo reveal">
+                    <div class="team-name">Dynamo CI / Nightly</div>
+                    <h3>Build & Validate</h3>
+                    <ul>
+                        <li>Full auto container builds</li>
+                        <li>Fine-grained validation configs</li>
+                        <li>Daily regression detection</li>
+                    </ul>
+                </div>
+                
+                <div class="strength-card perflab reveal">
+                    <div class="team-name">Perflab Infra</div>
+                    <h3>Execute & Collect</h3>
+                    <ul>
+                        <li>Full cluster infrastructure</li>
+                        <li>Auto CI/CD launch pipeline</li>
+                        <li>Automated data collection</li>
+                    </ul>
+                </div>
+                
+                <div class="strength-card aic reveal">
+                    <div class="team-name">AI Configurator</div>
+                    <h3>Predict & Tune</h3>
+                    <ul>
+                        <li>Prediction algorithms</li>
+                        <li>Best recipes for scenarios</li>
+                        <li>Needs on-silicon data to calibrate</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="synergy-badge reveal">
+                <span style="color: var(--accent-cyan);">Regression Detection</span>
+                <span class="arrow">|</span>
+                <span style="color: var(--accent-green);">Public Data Selection</span>
+                <span class="arrow">|</span>
+                <span style="color: var(--accent-orange);">Algo Calibration</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Slide 3: Folder Structure -->
+    <section class="slide structure-slide">
+        <div class="slide-content">
+            <h2 class="reveal">The Structure</h2>
+            
+            <div class="terminal-tree reveal">
+                <div class="tree-line"><span class="folder">recipes/</span></div>
+                <div class="tree-line">├── <span class="folder" style="color: var(--accent-cyan);">general_template/</span> <span class="comment"># shared infra (slurm, dynamo_common)</span></div>
+                <div class="tree-line">│</div>
+                <div class="tree-line">├── <span class="folder public-root">public/</span> <span class="comment"># reviewed & published</span></div>
+                <div class="tree-line">│   └── <span class="folder">infmax/</span><span class="tag live">LIVE</span></div>
+                <div class="tree-line">│</div>
+                <div class="tree-line">└── <span class="folder internal-root">internal/</span> <span class="comment"># team experiments</span></div>
+                <div class="tree-line">    ├── <span class="folder">nightly/</span> <span class="comment"># automated daily runs</span></div>
+                <div class="tree-line">    ├── <span class="folder">aic/</span> <span class="comment"># AI Configurator team</span></div>
+                <div class="tree-line">    ├── <span class="folder">release_baseline/</span> <span class="comment"># perf validation per release</span></div>
+                <div class="tree-line">    └── <span class="folder" style="color: var(--accent-pink);">feature_highlights/</span> <span class="comment"># KV router, KV offload, ...</span></div>
+            </div>
+            
+            <p class="reveal" style="text-align: center; margin-top: clamp(1rem, 2vh, 1.5rem);">
+                <span class="text-green">public/</span> = marketing-ready &nbsp;|&nbsp; 
+                <span class="text-orange">internal/</span> = iterate freely
+            </p>
+        </div>
+    </section>
+
+    <!-- Slide 4: Team Ownership -->
+    <section class="slide">
+        <div class="slide-content">
+            <h2 class="reveal">Team Ownership</h2>
+            <p class="subtitle reveal">Each team owns their recipes. Share what works.</p>
+            
+            <div class="features-grid">
+                <div class="feature-card reveal">
+                    <div class="feature-icon">🔧</div>
+                    <h3>Own Your Space</h3>
+                    <p>Own folder + CSV to track your scope and overall picture</p>
+                </div>
+                <div class="feature-card reveal">
+                    <div class="feature-icon">🔗</div>
+                    <h3>Reference & Dedup</h3>
+                    <p>See what's run before, reuse existing data, skip duplicates</p>
+                </div>
+                <div class="feature-card reveal">
+                    <div class="feature-icon">🚀</div>
+                    <h3>Independent CI/CD</h3>
+                    <p>Trigger runs anytime. No waiting on other teams</p>
+                </div>
+                <div class="feature-card reveal">
+                    <div class="feature-icon">📦</div>
+                    <h3>Own SLURM Quota</h3>
+                    <p>Dedicated perflab cluster infra, use quota from who triggers</p>
+                </div>
+                <div class="feature-card reveal">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Zero Dependencies</h3>
+                    <p>Work in parallel. No cross-team blockers</p>
+                </div>
+                <div class="feature-card reveal">
+                    <div class="feature-icon">📊</div>
+                    <h3>Same Infrastructure</h3>
+                    <p>Compose, execute, collect — all automated</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Slide 5: Modular Templates -->
+    <section class="slide modular-slide">
+        <div class="slide-content">
+            <h2 class="reveal">Modular Templates</h2>
+            <p class="subtitle reveal">general_template/ — common infra stays common, teams pick recipe parts</p>
+            
+            <div class="modular-container">
+                <div class="modular-section reveal">
+                    <div class="modular-label common">Shared (edit once, benefits all)</div>
+                    <div class="modular-block common">
+                        <span class="lock">🔗</span>
+                        slurm_config.yaml
+                    </div>
+                    <div class="modular-block common">
+                        <span class="lock">🔗</span>
+                        dynamo_common.yaml
+                    </div>
+                </div>
+                
+                <div class="modular-plus reveal">+</div>
+                
+                <div class="modular-section reveal">
+                    <div class="modular-label unique">Your recipes (pick & customize)</div>
+                    <div class="modular-block unique">
+                        <span class="edit">✏️</span>
+                        prefill.yaml
+                    </div>
+                    <div class="modular-block unique">
+                        <span class="edit">✏️</span>
+                        decode.yaml
+                    </div>
+                    <div class="modular-block unique">
+                        <span class="edit">✏️</span>
+                        agg.yaml
+                    </div>
+                </div>
+                
+                <div class="modular-equals reveal">=</div>
+                
+                <div class="modular-section reveal">
+                    <div class="modular-label" style="color: var(--text-secondary);">Result</div>
+                    <div class="modular-result">
+                        <h3>Full Recipe</h3>
+                        <p>Ready to run via sflow</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Slide 6: The Automation -->
+    <section class="slide">
+        <div class="slide-content">
+            <h2 class="reveal">The Automation</h2>
+            <p class="subtitle reveal">You define recipes. We handle the rest.</p>
+            
+            <div class="workflow-container">
+                <div class="workflow-step reveal">
+                    <div class="workflow-box highlight">
+                        <h3>Recipes</h3>
+                        <p class="text-green">Team-owned</p>
+                    </div>
+                </div>
+                
+                <div class="workflow-arrow reveal">→</div>
+                
+                <div class="workflow-step reveal">
+                    <div class="workflow-box auto">
+                        <h3>Compose</h3>
+                        <p class="text-cyan">sflow</p>
+                    </div>
+                </div>
+                
+                <div class="workflow-arrow reveal">→</div>
+                
+                <div class="workflow-step reveal">
+                    <div class="workflow-box auto">
+                        <h3>Execute</h3>
+                        <p class="text-cyan">SLURM</p>
+                    </div>
+                </div>
+                
+                <div class="workflow-arrow reveal">→</div>
+                
+                <div class="workflow-step reveal">
+                    <div class="workflow-box auto">
+                        <h3>Collect</h3>
+                        <p class="text-cyan">perflab</p>
+                    </div>
+                </div>
+                
+                <div class="workflow-arrow reveal">→</div>
+                
+                <div class="workflow-step reveal">
+                    <div class="workflow-box soda">
+                        <h3>Analyze</h3>
+                        <p class="text-purple">SODA</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="automation-badge reveal">
+                <span class="dot"></span>
+                Fully automated with sflow + perflab + SODA
+            </div>
+        </div>
+    </section>
+
+    <!-- Slide 7: SODA Dashboards -->
+    <section class="slide soda-slide">
+        <div class="slide-content">
+            <h2 class="reveal"><span class="soda-logo">SODA</span> Dashboards</h2>
+            <p class="subtitle reveal">Each team builds their own views. Your data, your way.</p>
+            
+            <div class="dashboard-grid">
+                <div class="dashboard-card nightly reveal">
+                    <h3>Nightly Regressions</h3>
+                    <p>Track daily perf changes, auto-flag regressions</p>
+                    <div class="team-tag">nightly/</div>
+                </div>
+                <div class="dashboard-card aic reveal">
+                    <h3>Config Sweeps</h3>
+                    <p>Parameter search results, best configs</p>
+                    <div class="team-tag">aic/</div>
+                </div>
+                <div class="dashboard-card release reveal">
+                    <h3>Release Validation</h3>
+                    <p>Per-release perf data, cherry-pick to public</p>
+                    <div class="team-tag">release_baseline/</div>
+                </div>
+                <div class="dashboard-card infmax reveal">
+                    <h3>Public Benchmarks</h3>
+                    <p>Customer-facing results, leaderboards</p>
+                    <div class="team-tag">infmax/</div>
+                </div>
+                <div class="dashboard-card custom reveal">
+                    <h3>Cross-Team Views</h3>
+                    <p>Reference data from any recipe folder</p>
+                    <div class="team-tag">shared</div>
+                </div>
+                <div class="dashboard-card custom reveal">
+                    <h3>Custom Reports</h3>
+                    <p>Build your own filters, charts, alerts</p>
+                    <div class="team-tag">your-team/</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Slide 8: Promotion Flow -->
+    <section class="slide">
+        <div class="slide-content">
+            <h2 class="reveal">Promote to Public</h2>
+            <p class="subtitle reveal">Validated internally → Published for all teams</p>
+            
+            <div class="promotion-flow">
+                <div class="promo-box internal reveal">
+                    <span class="label">internal</span>
+                    <h3>Experiment</h3>
+                    <p style="font-size: var(--small-size);">nightly/, aic/, release_baseline/</p>
+                </div>
+                
+                <div class="promo-arrow reveal">
+                    <span>→</span>
+                    <p>Reviewed & approved</p>
+                </div>
+                
+                <div class="promo-box public reveal">
+                    <span class="label">public</span>
+                    <h3>Production</h3>
+                    <p style="font-size: var(--small-size);">infmax/ — ready for marketing</p>
+                </div>
+            </div>
+            
+            <p class="reveal" style="text-align: center; margin-top: clamp(1.5rem, 4vh, 3rem); font-size: var(--body-size);">
+                Marketing & external teams know: <span class="text-green">public/</span> = verified benchmark data
+            </p>
+        </div>
+    </section>
+
+    <!-- Slide 9: Summary -->
+    <section class="slide summary-slide">
+        <div class="slide-content">
+            <h2 class="reveal">One System, Many Teams</h2>
+            
+            <div class="summary-points">
+                <div class="summary-point reveal">
+                    <div class="summary-icon">📁</div>
+                    <p>One structure</p>
+                </div>
+                <div class="summary-point reveal">
+                    <div class="summary-icon">🤝</div>
+                    <p>Team autonomy</p>
+                </div>
+                <div class="summary-point reveal">
+                    <div class="summary-icon">⚡</div>
+                    <p>Full automation</p>
+                </div>
+                <div class="summary-point reveal">
+                    <div class="summary-icon">📊</div>
+                    <p>Custom insights</p>
+                </div>
+            </div>
+            
+            <p class="reveal" style="margin-top: clamp(1.5rem, 4vh, 3rem); font-size: var(--body-size);">
+                <span class="text-green">recipes/</span> → 
+                <span class="text-cyan">sflow</span> → 
+                <span class="text-cyan">SLURM</span> → 
+                <span class="text-cyan">perflab</span> → 
+                <span class="text-purple">SODA</span>
+            </p>
+        </div>
+    </section>
+
+    <script>
+        /* ===========================================
+           SLIDE PRESENTATION CONTROLLER
+           =========================================== */
+        class SlidePresentation {
+            constructor() {
+                this.slides = document.querySelectorAll('.slide');
+                this.currentSlide = 0;
+                this.setupIntersectionObserver();
+                this.setupKeyboardNav();
+                this.setupProgressBar();
+                this.setupNavDots();
+            }
+
+            setupIntersectionObserver() {
+                const observer = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('visible');
+                            this.currentSlide = Array.from(this.slides).indexOf(entry.target);
+                            this.updateNavDots();
+                            this.updateProgressBar();
+                        }
+                    });
+                }, { threshold: 0.5 });
+
+                this.slides.forEach(slide => observer.observe(slide));
+            }
+
+            setupKeyboardNav() {
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === ' ') {
+                        e.preventDefault();
+                        this.goToSlide(Math.min(this.currentSlide + 1, this.slides.length - 1));
+                    } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+                        e.preventDefault();
+                        this.goToSlide(Math.max(this.currentSlide - 1, 0));
+                    }
+                });
+            }
+
+            setupProgressBar() {
+                this.progressBar = document.querySelector('.progress-bar');
+                this.updateProgressBar();
+            }
+
+            updateProgressBar() {
+                const progress = ((this.currentSlide + 1) / this.slides.length) * 100;
+                this.progressBar.style.width = `${progress}%`;
+            }
+
+            setupNavDots() {
+                const nav = document.querySelector('.nav-dots');
+                this.slides.forEach((_, i) => {
+                    const dot = document.createElement('div');
+                    dot.className = 'nav-dot' + (i === 0 ? ' active' : '');
+                    dot.addEventListener('click', () => this.goToSlide(i));
+                    nav.appendChild(dot);
+                });
+            }
+
+            updateNavDots() {
+                const dots = document.querySelectorAll('.nav-dot');
+                dots.forEach((dot, i) => {
+                    dot.classList.toggle('active', i === this.currentSlide);
+                });
+            }
+
+            goToSlide(index) {
+                this.slides[index].scrollIntoView({ behavior: 'smooth' });
+            }
+        }
+
+        new SlidePresentation();
+    </script>
+</body>
+</html>
