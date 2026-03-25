@@ -647,85 +647,95 @@
         }
 
         .modular-label {
-            font-family: var(--font-mono);
-            font-size: clamp(0.7rem, 1vw, 0.85rem);
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            margin-bottom: clamp(0.25rem, 0.5vh, 0.5rem);
+            font-family: var(--font-display);
+            font-size: clamp(0.8rem, 1.2vw, 1rem);
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            margin-bottom: clamp(0.4rem, 0.8vh, 0.6rem);
         }
 
         .modular-label.common { color: var(--accent-cyan); }
         .modular-label.unique { color: var(--accent-green); }
 
         .modular-block {
-            background: var(--bg-card);
+            background: rgba(28, 33, 40, 0.9);
             border: 1px solid var(--bg-secondary);
-            border-radius: 8px;
-            padding: clamp(0.5rem, 1vw, 0.75rem) clamp(0.75rem, 1.5vw, 1.25rem);
+            border-radius: 10px;
+            padding: clamp(0.6rem, 1.2vw, 1rem) clamp(1rem, 2vw, 1.5rem);
             font-family: var(--font-mono);
-            font-size: clamp(0.65rem, 1vw, 0.85rem);
+            font-size: clamp(0.8rem, 1.2vw, 1rem);
+            font-weight: 500;
+            color: var(--text-primary);
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 0.75rem;
             transition: all 0.3s ease;
         }
 
         .modular-block.common {
             border-color: var(--accent-cyan);
-            border-left-width: 3px;
+            border-left-width: 4px;
+            background: linear-gradient(90deg, rgba(88, 166, 255, 0.08) 0%, rgba(28, 33, 40, 0.9) 100%);
         }
 
         .modular-block.unique {
             border-color: var(--accent-green);
-            border-left-width: 3px;
+            border-left-width: 4px;
+            background: linear-gradient(90deg, rgba(57, 211, 83, 0.08) 0%, rgba(28, 33, 40, 0.9) 100%);
         }
 
         .modular-block .icon {
-            opacity: 0.6;
+            opacity: 0.8;
         }
 
         .modular-block .lock {
             color: var(--accent-cyan);
-            font-size: 0.9em;
+            font-size: 1.1em;
         }
 
         .modular-block .edit {
             color: var(--accent-green);
-            font-size: 0.9em;
+            font-size: 1.1em;
         }
 
         .modular-plus {
-            font-size: clamp(1.5rem, 3vw, 2.5rem);
-            color: var(--text-secondary);
+            font-size: clamp(2rem, 4vw, 3rem);
+            font-weight: 300;
+            color: var(--accent-cyan);
             display: flex;
             align-items: center;
             padding-top: clamp(1rem, 2vh, 1.5rem);
+            opacity: 0.8;
         }
 
         .modular-equals {
-            font-size: clamp(1.5rem, 3vw, 2.5rem);
-            color: var(--text-secondary);
+            font-size: clamp(2rem, 4vw, 3rem);
+            font-weight: 300;
+            color: var(--accent-green);
             display: flex;
             align-items: center;
             padding-top: clamp(1rem, 2vh, 1.5rem);
+            opacity: 0.8;
         }
 
         .modular-result {
-            background: linear-gradient(135deg, var(--bg-card) 0%, rgba(57, 211, 83, 0.1) 100%);
+            background: linear-gradient(135deg, rgba(28, 33, 40, 0.95) 0%, rgba(57, 211, 83, 0.15) 100%);
             border: 2px solid var(--accent-green);
-            border-radius: 12px;
-            padding: clamp(0.75rem, 1.5vw, 1.25rem);
+            border-radius: 14px;
+            padding: clamp(1rem, 2vw, 1.5rem);
             text-align: center;
-            box-shadow: 0 0 20px var(--glow-green);
+            box-shadow: 0 0 30px var(--glow-green);
         }
 
         .modular-result h3 {
-            font-size: clamp(0.9rem, 1.3vw, 1.1rem);
-            margin-bottom: 0.25rem;
+            font-size: clamp(1rem, 1.5vw, 1.25rem);
+            margin-bottom: 0.3rem;
+            color: var(--accent-green);
         }
 
         .modular-result p {
-            font-size: clamp(0.6rem, 0.9vw, 0.75rem);
+            font-size: clamp(0.75rem, 1.1vw, 0.9rem);
+            color: var(--text-primary);
         }
 
         .soda-logo {
