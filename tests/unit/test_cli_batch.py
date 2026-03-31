@@ -21,6 +21,7 @@ from sflow.cli.batch import (
     _derive_row_name,
     _normalize_col_value,
     _resolve_backend_int_field,
+    _resolve_sbatch_extra_args,
     _sanitize_name,
     _scan_sflow_yamls,
     build_row_naming_ctx,
@@ -2510,3 +2511,304 @@ def test_bulk_submit_csv_file_rejected(tmp_path):
     assert result.exit_code == 1
     assert "CSV file(s) detected" in result.output
     assert "--bulk-input" in result.output
+
+
+# --- _resolve_sbatch_extra_args tests ---
+
+
+def test_resolve_sbatch_extra_args_no_expressions():
+    """Args without expressions are returned unchanged."""
+    args = ["--exclusive", "--segment=4"]
+    result = _resolve_sbatch_extra_args(args, [], None)
+    assert result == ["--exclusive", "--segment=4"]
+
+
+def test_resolve_sbatch_extra_args_with_variable_from_set_var():
+    """Expression resolved from --set overrides."""
+    args = ["--segment=${{ variables.SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(
+        args, [], ["SLURM_NODES=6"]
+    )
+    assert result == ["--segment=6"]
+
+
+def test_resolve_sbatch_extra_args_from_config_file(tmp_path):
+    """Expression resolved from config YAML variable defaults."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 3\n"
+    )
+    args = ["--segment=${{ variables.SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--segment=3"]
+
+
+def test_resolve_sbatch_extra_args_set_var_overrides_config(tmp_path):
+    """--set overrides take priority over config defaults."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 3\n"
+    )
+    args = ["--segment=${{ variables.SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], ["SLURM_NODES=8"])
+    assert result == ["--segment=8"]
+
+
+def test_resolve_sbatch_extra_args_mixed():
+    """Mix of expression and non-expression args."""
+    args = [
+        "--exclusive",
+        "--segment=${{ variables.SLURM_NODES }}",
+        "--gres=gpu:8",
+    ]
+    result = _resolve_sbatch_extra_args(args, [], ["SLURM_NODES=4"])
+    assert result == ["--exclusive", "--segment=4", "--gres=gpu:8"]
+
+
+def test_resolve_sbatch_extra_args_undefined_variable_passthrough():
+    """Undefined variables are passed through unchanged."""
+    args = ["--segment=${{ variables.UNDEFINED_VAR }}"]
+    result = _resolve_sbatch_extra_args(args, [], None)
+    assert result == ["--segment=${{ variables.UNDEFINED_VAR }}"]
+
+
+def test_resolve_sbatch_extra_args_shorthand_without_variables_prefix():
+    """${{ SLURM_NODES }} shorthand (no 'variables.' prefix) resolves."""
+    args = ["--segment=${{ SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(args, [], ["SLURM_NODES=4"])
+    assert result == ["--segment=4"]
+
+
+def test_resolve_sbatch_extra_args_shorthand_from_config(tmp_path):
+    """Shorthand resolves from config file defaults."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  GPUS_PER_NODE:\n"
+        "    value: 8\n"
+    )
+    args = ["--gres=gpu:${{ GPUS_PER_NODE }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--gres=gpu:8"]
+
+
+def test_resolve_sbatch_extra_args_both_syntaxes_in_same_call():
+    """Both ${{ variables.X }} and ${{ X }} work in the same invocation."""
+    args = [
+        "--segment=${{ variables.SLURM_NODES }}",
+        "--gres=gpu:${{ GPUS_PER_NODE }}",
+    ]
+    result = _resolve_sbatch_extra_args(
+        args, [], ["SLURM_NODES=3", "GPUS_PER_NODE=8"]
+    )
+    assert result == ["--segment=3", "--gres=gpu:8"]
+
+
+# --- CLI integration tests: -e expression in generated sbatch scripts ---
+
+
+def test_batch_sbatch_extra_args_expression_resolved_in_script(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: -e with ${{ variables.X }} produces resolved #SBATCH directive."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 4\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "4",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --segment=4" in script
+    assert "${{" not in script.split("#SBATCH --segment")[1].split("\n")[0]
+
+
+def test_batch_sbatch_extra_args_expression_with_set_override(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: --set overrides variable before -e expression resolution."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 2\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "8",
+            "--sbatch-path", str(sbatch_path),
+            "--set", "SLURM_NODES=8",
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --segment=8" in script
+
+
+def test_batch_sbatch_extra_args_expression_mixed_with_plain(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: mix of plain and expression -e args in generated script."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 3\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "3",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--exclusive",
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+            "-e", "--gres=gpu:8",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --exclusive" in script
+    assert "#SBATCH --segment=3" in script
+    assert "#SBATCH --gres=gpu:8" in script
+
+
+def test_batch_sbatch_extra_args_expression_jinja2_arithmetic(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: Jinja2 arithmetic in -e expression."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    type: integer\n"
+        "    value: 4\n"
+        "  GPUS_PER_NODE:\n"
+        "    type: integer\n"
+        "    value: 8\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "4",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--gres=gpu:${{ variables.GPUS_PER_NODE }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --gres=gpu:8" in script
+
+
+def test_bulk_input_sbatch_extra_args_expression_per_row(mock_sflow_app, tmp_path):
+    """Bulk-input: -e expression resolved independently per CSV row."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    type: integer\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(
+        "sflow_config_file,SLURM_NODES\n"
+        f"{workflow_file.name},2\n"
+        f"{workflow_file.name},5\n"
+    )
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-input", str(csv_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+            "--output-dir", str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+
+    scripts = sorted(out_dir.rglob("*.sh"))
+    assert len(scripts) == 2
+
+    script_1 = scripts[0].read_text()
+    script_2 = scripts[1].read_text()
+    assert "#SBATCH --segment=2" in script_1
+    assert "#SBATCH --segment=5" in script_2
