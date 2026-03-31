@@ -128,6 +128,57 @@ def _resolve_slurm_defaults(
     return partition, account
 
 
+def _resolve_sbatch_extra_args(
+    extra_args: list[str],
+    config_files: list[Path],
+    set_var: list[str] | None,
+) -> list[str]:
+    """Resolve ``${{ }}`` expressions in sbatch extra args.
+
+    Supports both ``${{ variables.SLURM_NODES }}`` (full path) and
+    ``${{ SLURM_NODES }}`` (shorthand).  Builds a variable context from the
+    config YAML files (defaults) with ``set_var`` overrides applied on top,
+    then resolves any Jinja2 expressions found in the extra args.
+    """
+    if not any("${{" in arg for arg in extra_args):
+        return list(extra_args)
+
+    from sflow.config.resolver import ExpressionResolver
+
+    var_map: dict[str, Any] = {}
+    for cfg_path in config_files:
+        try:
+            import yaml as _yaml
+
+            with open(cfg_path) as fh:
+                data = _yaml.safe_load(fh)
+            if data:
+                var_map.update(_build_var_map(data))
+        except Exception:
+            pass
+
+    if set_var:
+        for override in set_var:
+            if "=" in override:
+                k, v = override.split("=", 1)
+                var_map[k] = v
+
+    ctx: dict[str, Any] = {"variables": var_map}
+    ctx.update(var_map)
+    resolver = ExpressionResolver()
+
+    resolved: list[str] = []
+    for arg in extra_args:
+        if "${{" in arg:
+            try:
+                resolved.append(str(resolver.resolve(arg, ctx)))
+            except Exception:
+                resolved.append(arg)
+        else:
+            resolved.append(arg)
+    return resolved
+
+
 def _generate_sbatch_script(
     *,
     files: list[Path],
@@ -191,7 +242,10 @@ def _generate_sbatch_script(
         sbatch_directives.append(f"#SBATCH --time={time}")
 
     if sbatch_extra_args:
-        for extra_arg in sbatch_extra_args:
+        resolved_extra_args = _resolve_sbatch_extra_args(
+            sbatch_extra_args, files, set_var
+        )
+        for extra_arg in resolved_extra_args:
             sbatch_directives.append(f"#SBATCH {extra_arg}")
 
     script_lines = [
@@ -1684,7 +1738,12 @@ def batch(
         typer.Option(
             "--sbatch-extra-args",
             "-e",
-            help="Additional sbatch directives to append (e.g., '--exclusive', '--segment=NUM_NODES'). Can be used multiple times, will be in script as '#SBATCH directives'.",
+            help="Additional sbatch directives to append as '#SBATCH' lines. "
+            "Supports ${{ variables.X }} or ${{ X }} expressions resolved from the sflow config "
+            "(e.g., -e '--segment=${{ SLURM_NODES }}'). "
+            "Variable values from --set overrides and CSV bulk-input columns are applied "
+            "before resolution. Use single quotes to prevent shell expansion. "
+            "Can be used multiple times.",
         ),
     ] = None,
     # runtime options
@@ -1865,8 +1924,8 @@ def batch(
         # With custom virtual environment
         sflow batch workflow.yaml --sflow-venv-path /path/to/.venv
 
-        # With extra sbatch directives
-        sflow batch workflow.yaml --sbatch-extra-args "--exclusive" --sbatch-extra-args "--segment=NUM_NODES"
+        # With extra sbatch directives (supports ${{ variables.X }} expressions)
+        sflow batch workflow.yaml -e "--exclusive" -e "--segment=${{ variables.SLURM_NODES }}"
 
         # Bulk input: generate one job per CSV row (--nodes not required)
         sflow batch --bulk-input jobs.csv --partition gpu --account myaccount

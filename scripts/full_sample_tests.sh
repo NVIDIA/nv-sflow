@@ -68,6 +68,17 @@ run_check() {
     local result_file="$RESULTS_DIR/${id}.result"
     local output_file="$RESULTS_DIR/${id}.output"
 
+    # Detect output path from -o / --output-dir / --sbatch-path args
+    local out_path=""
+    local prev=""
+    for arg in "$@"; do
+        if [ "$prev" = "-o" ] || [ "$prev" = "--output-dir" ] || [ "$prev" = "--sbatch-path" ]; then
+            out_path="$arg"
+            break
+        fi
+        prev="$arg"
+    done
+
     throttle
 
     (
@@ -82,6 +93,20 @@ run_check() {
             echo "LABEL=$label"
             echo "CMD=$cmd_str"
         } > "$result_file"
+
+        # Save the raw command to the output directory for reference
+        if [ -n "$out_path" ]; then
+            local cmd_target
+            if [ -d "$out_path" ]; then
+                cmd_target="$out_path"
+            else
+                cmd_target=$(dirname "$out_path")
+            fi
+            if [ -d "$cmd_target" ]; then
+                printf '# Test: %s\n# Status: %s\n$ %s\n' "$label" "$status" "$cmd_str" \
+                    > "$cmd_target/_command.txt"
+            fi
+        fi
     ) &
 }
 
@@ -207,6 +232,28 @@ if true; then
                 -o "$BATCH_MODULAR_DIR/${framework}_agg.sh"
     done
 
+    # -- sflow batch -e with expression resolution --
+    BATCH_EXTRA_ARGS_DIR="$PREFLIGHT_DIR/batch_extra_args_expr"
+    mkdir -p "$BATCH_EXTRA_ARGS_DIR"
+    EXTRA_ARGS_EXAMPLE="$EXAMPLES_DIR/slurm_dynamo_sglang_disagg.yaml"
+    if [ -f "$EXTRA_ARGS_EXAMPLE" ]; then
+        run_check "batch -e expression resolution" \
+            sflow batch -f "$EXTRA_ARGS_EXAMPLE" \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+                -s "SLURM_NODES=3" \
+                -e '--segment=${{ variables.SLURM_NODES }}' \
+                -o "$BATCH_EXTRA_ARGS_DIR/expr_test.sh"
+        if [ -f "$BATCH_EXTRA_ARGS_DIR/expr_test.sh" ]; then
+            if grep -q '#SBATCH --segment=3' "$BATCH_EXTRA_ARGS_DIR/expr_test.sh"; then
+                echo "  PASS: -e expression resolved to '--segment=3'"
+            else
+                echo "  FAIL: -e expression was not resolved (expected '#SBATCH --segment=3')"
+                grep '#SBATCH --segment' "$BATCH_EXTRA_ARGS_DIR/expr_test.sh" || echo "    (no --segment directive found)"
+            fi
+        fi
+    fi
+
     # -- sflow batch --bulk-submit (no --submit): self-contained --
     run_check "batch bulk-submit (no submit)" \
         sflow batch --bulk-submit "$EXAMPLES_DIR" \
@@ -223,6 +270,31 @@ if true; then
                 --output-dir "$PREFLIGHT_DIR/batch_bulk_input"
     else
         echo "  SKIP: CSV not found at $CSV_FILE"
+    fi
+
+    # -- sflow batch --bulk-input with -e expression: verify per-row resolution --
+    if [ -f "$CSV_FILE" ]; then
+        BATCH_BULK_EXPR_DIR="$PREFLIGHT_DIR/batch_bulk_input_expr"
+        run_check "batch bulk-input -e expression" \
+            sflow batch --bulk-input "$CSV_FILE" \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+                -e '--segment=${{ variables.SLURM_NODES }}' \
+                --output-dir "$BATCH_BULK_EXPR_DIR"
+        EXPR_FAIL=0
+        for sh_file in "$BATCH_BULK_EXPR_DIR"/bulk_input_*/*.sh; do
+            [ -f "$sh_file" ] || continue
+            if grep -q '#SBATCH --segment=\${{' "$sh_file"; then
+                echo "  FAIL: unresolved expression in $(basename "$sh_file")"
+                EXPR_FAIL=1
+            elif ! grep -q '#SBATCH --segment=[0-9]' "$sh_file"; then
+                echo "  FAIL: missing --segment directive in $(basename "$sh_file")"
+                EXPR_FAIL=1
+            fi
+        done
+        if [ "$EXPR_FAIL" -eq 0 ]; then
+            echo "  PASS: -e expressions resolved per CSV row in bulk-input"
+        fi
     fi
 
     # -- sflow run --bulk-input --row (dry-run): CSV row execution --
@@ -303,6 +375,30 @@ if true; then
             head -20 "$output_file" 2>/dev/null | sed 's/^/       /'
             FAILED_LABELS="$FAILED_LABELS  - $label\n"
         fi
+    done
+
+    # Save test commands and results to the preflight output directory
+    TEST_LOG="$PREFLIGHT_DIR/preflight_test_log.txt"
+    {
+        echo "# Preflight Test Log"
+        echo "# Generated: $(date)"
+        echo "# Results: $PASS/$TOTAL passed, $FAIL failed"
+        echo ""
+    } > "$TEST_LOG"
+    for result_file in "$RESULTS_DIR"/*.result; do
+        [ -f "$result_file" ] || continue
+        id=$(basename "$result_file" .result)
+        log_status="" log_label="" log_cmd=""
+        while IFS='=' read -r key value; do
+            case "$key" in
+                STATUS) log_status="$value" ;;
+                LABEL)  log_label="$value" ;;
+                CMD)    log_cmd="$value" ;;
+            esac
+        done < "$result_file"
+        echo "[$id] $log_status  $log_label" >> "$TEST_LOG"
+        echo "  \$ $log_cmd" >> "$TEST_LOG"
+        echo "" >> "$TEST_LOG"
     done
 
     echo ""
