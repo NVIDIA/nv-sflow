@@ -193,6 +193,19 @@ if true; then
 
         run_check "compose bulk-input row range" \
             sflow compose -b "$CSV_FILE" --row 7:10 -o "$PREFLIGHT_DIR/compose_bulk_input_multi_rows"
+
+        # -- negative index and open-ended slice tests --
+        run_check "compose bulk-input last row (--row=-1)" \
+            sflow compose -b "$CSV_FILE" --row=-1 -o "$PREFLIGHT_DIR/compose_bulk_input_last_row"
+
+        run_check "compose bulk-input negative range (--row=-3:)" \
+            sflow compose -b "$CSV_FILE" --row=-3: -o "$PREFLIGHT_DIR/compose_bulk_input_last3"
+
+        run_check "compose bulk-input open-end slice (--row 3:)" \
+            sflow compose -b "$CSV_FILE" --row=3: -o "$PREFLIGHT_DIR/compose_bulk_input_3_to_end"
+
+        run_check "compose bulk-input negative slice (--row=-3:-1)" \
+            sflow compose -b "$CSV_FILE" --row=-3:-1 -o "$PREFLIGHT_DIR/compose_bulk_input_neg_slice"
     else
         echo "  SKIP: CSV not found at $CSV_FILE"
     fi
@@ -268,6 +281,25 @@ if true; then
                 -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
                 -p "$PARTITION" -A "$ACCOUNT" --log-level warn -r \
                 --output-dir "$PREFLIGHT_DIR/batch_bulk_input"
+
+        # -- negative index and open-ended slice tests --
+        run_check "batch bulk-input last row (--row=-1)" \
+            sflow batch --bulk-input "$CSV_FILE" --row=-1 \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+                --output-dir "$PREFLIGHT_DIR/batch_bulk_input_last_row"
+
+        run_check "batch bulk-input last 3 rows (--row=-3:)" \
+            sflow batch --bulk-input "$CSV_FILE" --row=-3: \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+                --output-dir "$PREFLIGHT_DIR/batch_bulk_input_last3"
+
+        run_check "batch bulk-input open-end (--row=3:)" \
+            sflow batch --bulk-input "$CSV_FILE" --row=3: \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+                --output-dir "$PREFLIGHT_DIR/batch_bulk_input_3_to_end"
     else
         echo "  SKIP: CSV not found at $CSV_FILE"
     fi
@@ -310,6 +342,15 @@ if true; then
 
         run_check "run bulk-input with cli files (dry-run)" \
             sflow run -f "$SLURM_CFG" --bulk-input "$CSV_FILE" --row 1 --dry-run \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH"
+
+        # -- negative index tests for sflow run --
+        run_check "run bulk-input last row (--row=-1, dry-run)" \
+            sflow run --bulk-input "$CSV_FILE" --row=-1 --dry-run \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH"
+
+        run_check "run bulk-input negative row (--row=-3, dry-run)" \
+            sflow run --bulk-input "$CSV_FILE" --row=-3 --dry-run \
                 -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH"
 
         run_check "run bulk-input missing --row (expect fail)" \

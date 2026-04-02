@@ -166,7 +166,8 @@ def run(
         Optional[List[str]],
         typer.Option(
             "--row",
-            help="1-based row index in the CSV (requires --bulk-input). Only a single row is supported.",
+            help="1-based row index in the CSV (requires --bulk-input). Only a single row is supported. "
+            "Negative indices select from the end (--row=-1 → last row).",
         ),
     ] = None,
     verbose: Annotated[

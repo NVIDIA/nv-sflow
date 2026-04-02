@@ -479,7 +479,7 @@ def _run_bulk_compose(
     log_level: str,
     resolve: bool = False,
     validate: bool = False,
-    row_filter: list[int] | None = None,
+    row_selectors: list[str] | None = None,
     missable_tasks: list[str] | None = None,
 ) -> None:
     """Compose one YAML file per CSV row.
@@ -499,6 +499,7 @@ def _run_bulk_compose(
         build_all_row_configs,
         build_row_naming_ctx,
         merge_row_overrides,
+        parse_row_selector,
         read_bulk_csv,
         resolve_row_files,
         row_missable,
@@ -540,7 +541,9 @@ def _run_bulk_compose(
     summary: list[str] = []
     warnings: list[str] = []
     failed_count = 0
-    row_indices = set(row_filter) if row_filter else None
+    row_indices: set[int] | None = None
+    if row_selectors:
+        row_indices = set(parse_row_selector(row_selectors, n_rows=len(rows)))
     naming_ctx = build_row_naming_ctx(rows)
 
     for idx, row in enumerate(rows, start=1):
@@ -720,9 +723,12 @@ def compose(
         typer.Option(
             "--row",
             help="Only process specific CSV row(s) by 1-based index. "
-            "Supports: single (--row 1), multiple (--row 1 --row 3), "
-            "comma-separated (--row 1,3,5), and Python-style slices with exclusive end "
-            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]). "
+            "Supports: single (--row 1), negative (--row=-1 → last row), "
+            "multiple (--row 1 --row 3), "
+            "comma-separated (--row 1,3,5), Python-style slices with exclusive end "
+            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]), "
+            "and open-ended/negative slices (--row=-3: → last 3 rows; --row 3: → row 3 to end). "
+            "Negative indices use --row=N syntax to avoid flag ambiguity. "
             "Requires --bulk-input.",
         ),
     ] = None,
@@ -779,10 +785,7 @@ def compose(
 
         # --- Bulk-input mode ---
         if bulk_input is not None:
-            from sflow.cli.batch import parse_row_selector
-
             cli_files = list(src_files or []) + list(file or [])
-            parsed_rows = parse_row_selector(row) if row else None
             out_dir = output if output else Path.cwd() / "sflow_output"
             _run_bulk_compose(
                 csv_path=bulk_input,
@@ -793,7 +796,7 @@ def compose(
                 log_level=log_level,
                 resolve=resolve,
                 validate=validate,
-                row_filter=parsed_rows,
+                row_selectors=row,
                 missable_tasks=missable_tasks,
             )
             return

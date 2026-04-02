@@ -26,6 +26,7 @@ from sflow.cli.batch import (
     _scan_sflow_yamls,
     build_row_naming_ctx,
     parse_row_selector,
+    resolve_row_indices,
 )
 
 
@@ -1300,6 +1301,213 @@ class TestParseRowSelector:
 
     def test_mixed_comma_and_slice(self):
         assert parse_row_selector(["1,4:6"]) == [1, 4, 5]
+
+    # -- Negative indices (deferred, no n_rows) --
+
+    def test_negative_single(self):
+        assert parse_row_selector(["-1"]) == [-1]
+
+    def test_negative_multiple(self):
+        assert parse_row_selector(["-1", "-3"]) == [-3, -1]
+
+    def test_negative_comma(self):
+        assert parse_row_selector(["-1,-3"]) == [-3, -1]
+
+    def test_negative_slice_both_bounds(self):
+        assert parse_row_selector(["-3:-1"]) == [-3, -2]
+
+    def test_mixed_positive_negative(self):
+        result = parse_row_selector(["1", "-1"])
+        assert result == [1, -1]
+
+    # -- Negative indices (resolved with n_rows) --
+
+    def test_negative_single_resolved(self):
+        assert parse_row_selector(["-1"], n_rows=10) == [10]
+
+    def test_negative_last_three_resolved(self):
+        assert parse_row_selector(["-3", "-2", "-1"], n_rows=10) == [8, 9, 10]
+
+    def test_negative_slice_resolved(self):
+        assert parse_row_selector(["-3:-1"], n_rows=10) == [8, 9]
+
+    def test_mixed_positive_negative_resolved(self):
+        assert parse_row_selector(["1", "-1"], n_rows=5) == [1, 5]
+
+    # -- Open-ended slices (require n_rows) --
+
+    def test_open_end_slice(self):
+        assert parse_row_selector(["3:"], n_rows=5) == [3, 4, 5]
+
+    def test_open_start_slice(self):
+        assert parse_row_selector([":3"], n_rows=5) == [1, 2]
+
+    def test_negative_open_end_slice(self):
+        assert parse_row_selector(["-3:"], n_rows=10) == [8, 9, 10]
+
+    def test_open_end_slice_without_n_rows_raises(self):
+        with pytest.raises(Exception, match="Open-ended slice"):
+            parse_row_selector(["3:"])
+
+    def test_open_start_slice_without_n_rows_raises(self):
+        with pytest.raises(Exception, match="Open-ended slice"):
+            parse_row_selector([":3"])
+
+    def test_open_end_with_step(self):
+        assert parse_row_selector(["1::2"], n_rows=6) == [1, 3, 5]
+
+    # -- Edge cases --
+
+    def test_negative_out_of_range_warns(self):
+        result = parse_row_selector(["-10"], n_rows=5)
+        assert result == []
+
+    def test_brackets_negative(self):
+        assert parse_row_selector(["[-1]"]) == [-1]
+
+    def test_brackets_negative_resolved(self):
+        assert parse_row_selector(["[-1]"], n_rows=5) == [5]
+
+
+# ---------------------------------------------------------------------------
+# resolve_row_indices tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRowIndices:
+    def test_positive_passthrough(self):
+        assert resolve_row_indices([1, 3, 5], 10) == [1, 3, 5]
+
+    def test_negative_last(self):
+        assert resolve_row_indices([-1], 10) == [10]
+
+    def test_negative_sequence(self):
+        assert resolve_row_indices([-3, -2, -1], 10) == [8, 9, 10]
+
+    def test_mixed(self):
+        assert resolve_row_indices([1, -1], 5) == [1, 5]
+
+    def test_out_of_range_dropped(self):
+        assert resolve_row_indices([0, 11, -11], 10) == []
+
+    def test_deduplicates(self):
+        assert resolve_row_indices([1, 1, -1, -1], 5) == [1, 5]
+
+    def test_empty(self):
+        assert resolve_row_indices([], 10) == []
+
+
+# ---------------------------------------------------------------------------
+# CLI integration: negative indices & open-ended slices via sflow batch --row
+# ---------------------------------------------------------------------------
+
+
+def _make_batch_csv(tmp_path, n_rows=5):
+    """Create a minimal CSV with *n_rows* data rows for batch --row tests."""
+    wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
+    header = "sflow_config_file,TP_SIZE\n"
+    rows = "".join(f"{wf},{2 * (i + 1)}\n" for i in range(n_rows))
+    return _write_csv(tmp_path / "jobs.csv", header + rows)
+
+
+class TestBatchRowNegativeIndex:
+    """Test sflow batch --bulk-input with negative indices and open-ended slices."""
+
+    def test_batch_row_negative_last(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=-1",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 1
+
+    def test_batch_row_negative_last_three(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=-3:",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 3
+
+    def test_batch_row_open_end_from_3(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=3:",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 3
+
+    def test_batch_row_open_start_to_3(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=:3",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 2  # rows 1, 2 (exclusive end)
+
+    def test_batch_row_negative_slice(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=-3:-1",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 2  # rows 3, 4
+
+    def test_batch_row_mixed_positive_and_negative(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row", "1", "--row=-1",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 2  # rows 1 and 5
 
 
 # ---------------------------------------------------------------------------

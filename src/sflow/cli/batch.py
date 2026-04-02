@@ -354,18 +354,26 @@ _RESERVED_CSV_COLUMNS = frozenset({"sflow_config_file", "job_name", "missable_ta
 _NODE_COLUMN_NAMES = frozenset({"SLURM_NODES", "NUM_SLURM_NODES", "NUM_NODES"})
 
 
-def parse_row_selector(values: list[str]) -> list[int]:
+def parse_row_selector(values: list[str], *, n_rows: int | None = None) -> list[int]:
     """Parse ``--row`` values into a flat sorted list of 1-based row indices.
 
     Supported formats (all 1-based; slice end is **exclusive** like Python):
 
     * Single int:        ``--row 1``
+    * Negative int:      ``--row -1``       →  last row
     * Comma-separated:   ``--row 1,3,5``   or   ``--row [1,3,5]``
     * Slice:             ``--row 1:4``      →  rows 1, 2, 3
     * Slice with step:   ``--row 1:6:2``    →  rows 1, 3, 5
+    * Open-ended slice:  ``--row 3:``       →  row 3 to last (needs *n_rows*)
+    * Negative slice:    ``--row -3:``      →  last 3 rows   (needs *n_rows*)
     * Brackets optional: ``--row [1:4]``    same as ``--row 1:4``
 
     Multiple ``--row`` flags are combined:  ``--row 1:3 --row 7``  →  [1, 2, 7]
+
+    Negative indices follow Python semantics: ``-1`` is the last row, ``-2``
+    is second-to-last, etc.  When *n_rows* is ``None``, negative indices and
+    open-ended slices are kept as-is (callers must resolve them later via
+    :func:`resolve_row_indices`).
     """
     indices: set[int] = set()
     for raw in values:
@@ -376,27 +384,78 @@ def parse_row_selector(values: list[str]) -> list[int]:
             for part in token.split(","):
                 part = part.strip()
                 if part:
-                    indices.update(_parse_single_or_slice(part))
+                    indices.update(_parse_single_or_slice(part, n_rows=n_rows))
         else:
-            indices.update(_parse_single_or_slice(token))
-    return sorted(indices)
+            indices.update(_parse_single_or_slice(token, n_rows=n_rows))
+    result = sorted(indices, key=lambda x: (x < 0, x))
+    if n_rows is not None:
+        result = resolve_row_indices(result, n_rows)
+    return result
 
 
-def _parse_single_or_slice(token: str) -> list[int]:
-    """Parse a single int or a start:stop[:step] slice into 1-based indices."""
+def resolve_row_indices(indices: list[int], n_rows: int) -> list[int]:
+    """Resolve negative 1-based row indices to positive ones.
+
+    Negative indices map like Python: ``-1 → n_rows``, ``-2 → n_rows - 1``, etc.
+    After resolution, indices outside ``[1, n_rows]`` are dropped with a warning.
+    """
+    resolved: set[int] = set()
+    for idx in indices:
+        pos = n_rows + 1 + idx if idx < 0 else idx
+        if 1 <= pos <= n_rows:
+            resolved.add(pos)
+        else:
+            typer.echo(
+                f"  Warning: row index {idx} (resolved to {pos}) "
+                f"is out of range [1, {n_rows}]; skipping.",
+                err=True,
+            )
+    return sorted(resolved)
+
+
+def _parse_single_or_slice(token: str, *, n_rows: int | None = None) -> list[int]:
+    """Parse a single int or a start:stop[:step] slice into 1-based indices.
+
+    Open-ended slices (``3:``, ``:-2``) require *n_rows* to resolve the missing
+    bound.  When *n_rows* is ``None`` and the slice is open-ended, a
+    :class:`typer.BadParameter` is raised.
+    """
     if ":" in token:
         parts = token.split(":")
         if len(parts) == 2:
-            start, stop = int(parts[0]), int(parts[1])
+            start_s, stop_s = parts
             step = 1
         elif len(parts) == 3:
-            start, stop, step = int(parts[0]), int(parts[1]), int(parts[2])
+            start_s, stop_s, step_s = parts
+            step = int(step_s) if step_s else 1
         else:
             raise typer.BadParameter(
                 f"Invalid slice: '{token}' (expected start:stop or start:stop:step)"
             )
         if step == 0:
             raise typer.BadParameter("Slice step cannot be zero")
+
+        has_open_end = not start_s or not stop_s
+        if has_open_end and n_rows is None:
+            raise typer.BadParameter(
+                f"Open-ended slice '{token}' requires known row count. "
+                f"This will be resolved automatically when used with --bulk-input."
+            )
+
+        if not start_s:
+            start = 1
+        else:
+            start = int(start_s)
+            if start < 0 and n_rows is not None:
+                start = n_rows + 1 + start
+
+        if not stop_s:
+            stop = n_rows + 1  # type: ignore[operator]
+        else:
+            stop = int(stop_s)
+            if stop < 0 and n_rows is not None:
+                stop = n_rows + 1 + stop
+
         return list(range(start, stop, step))
     return [int(token)]
 
@@ -946,6 +1005,8 @@ def resolve_csv_row(
     Used by ``sflow run --bulk-input``.
     """
     columns, rows = read_bulk_csv(csv_path)
+    if row_idx < 0:
+        row_idx = len(rows) + 1 + row_idx
     if row_idx < 1 or row_idx > len(rows):
         raise IndexError(f"Row {row_idx} out of range (CSV has {len(rows)} rows)")
 
@@ -1299,7 +1360,7 @@ def _run_bulk_edit(
     sflow_venv_path: Path | None,
     sflow_version: str | None,
     submit: bool,
-    row_filter: list[int] | None = None,
+    row_selectors: list[str] | None = None,
     resolve: bool = False,
     missable_tasks: list[str] | None = None,
 ) -> None:
@@ -1395,7 +1456,9 @@ def _run_bulk_edit(
     result_rows: list[dict[str, str]] = []
     effective_output_dir = output_dir or Path.cwd() / "sflow_output"
 
-    row_indices = set(row_filter) if row_filter else None
+    row_indices: set[int] | None = None
+    if row_selectors:
+        row_indices = set(parse_row_selector(row_selectors, n_rows=len(rows)))
     naming_ctx = build_row_naming_ctx(rows, fallback_base=job_name, cli_nodes=nodes)
 
     for idx, row in enumerate(rows, start=1):
@@ -1815,9 +1878,12 @@ def batch(
         typer.Option(
             "--row",
             help="Only process specific CSV row(s) by 1-based index. "
-            "Supports: single (--row 1), multiple (--row 1 --row 3), "
-            "comma-separated (--row 1,3,5), and Python-style slices with exclusive end "
-            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]). "
+            "Supports: single (--row 1), negative (--row=-1 → last row), "
+            "multiple (--row 1 --row 3), "
+            "comma-separated (--row 1,3,5), Python-style slices with exclusive end "
+            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]), "
+            "and open-ended/negative slices (--row=-3: → last 3 rows; --row 3: → row 3 to end). "
+            "Negative indices use --row=N syntax to avoid flag ambiguity. "
             "Requires --bulk-input.",
         ),
     ] = None,
@@ -1949,7 +2015,6 @@ def batch(
 
     # --- Bulk-edit mode ---
     if bulk_input is not None:
-        parsed_rows = parse_row_selector(row) if row else None
         try:
             _run_bulk_edit(
                 csv_path=bulk_input,
@@ -1970,7 +2035,7 @@ def batch(
                 sflow_venv_path=sflow_venv_path,
                 sflow_version=sflow_version,
                 submit=submit,
-                row_filter=parsed_rows,
+                row_selectors=row,
                 resolve=resolve,
                 missable_tasks=missable_tasks,
             )
