@@ -309,6 +309,55 @@ def test_cli_run_bulk_input_out_of_range(mock_sflow_app, csv_file):
     assert "out of range" in result.output.lower() or "Row 99" in result.output
 
 
+def test_cli_run_bulk_input_negative_last(mock_sflow_app, csv_file, workflow_files):
+    """--row=-1 resolves to the last CSV row (row 3 in a 3-row CSV)."""
+    _base, variant = workflow_files
+    files, set_var, _artifact, missable = _resolve_bulk_input_row(
+        bulk_input=csv_file,
+        row_selectors=["-1"],
+        cli_files=[variant],
+        cli_set_var=None,
+        cli_artifact=None,
+        cli_missable=None,
+    )
+    assert any("30" in v for v in set_var)
+    assert missable == ["server"]
+
+
+def test_cli_run_bulk_input_negative_second_to_last(mock_sflow_app, csv_file):
+    """--row=-2 resolves to the second-to-last CSV row (row 2)."""
+    result = runner.invoke(
+        app,
+        ["run", "--bulk-input", str(csv_file), "--row=-2", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    overrides = mock_sflow_app.run.call_args.kwargs.get("variable_overrides") or []
+    override_map = dict(v.split("=", 1) for v in overrides)
+    assert override_map.get("MY_VAR") == "20"
+
+
+def test_cli_run_bulk_input_negative_first(mock_sflow_app, csv_file):
+    """--row=-3 resolves to the first row (row 1 in a 3-row CSV)."""
+    result = runner.invoke(
+        app,
+        ["run", "--bulk-input", str(csv_file), "--row=-3", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    overrides = mock_sflow_app.run.call_args.kwargs.get("variable_overrides") or []
+    override_map = dict(v.split("=", 1) for v in overrides)
+    assert override_map.get("MY_VAR") == "10"
+
+
+def test_cli_run_bulk_input_negative_out_of_range(mock_sflow_app, csv_file):
+    """--row=-99 is out of range for a 3-row CSV."""
+    result = runner.invoke(
+        app,
+        ["run", "--bulk-input", str(csv_file), "--row=-99", "--dry-run"],
+    )
+    assert result.exit_code != 0
+    assert "out of range" in result.output.lower() or "Row" in result.output
+
+
 # -- Shared batch helper unit tests --
 
 

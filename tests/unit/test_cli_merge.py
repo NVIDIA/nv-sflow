@@ -1130,6 +1130,100 @@ def test_compose_bulk_input_cli_files_with_row_filter(tmp_path: Path):
     assert any(b["name"] == "slurm_cluster" for b in merged["backends"])
 
 
+def _make_compose_csv(tmp_path: Path, n_rows: int = 4):
+    """Create a CSV with *n_rows* workflow variants for compose --row tests."""
+    wfs = []
+    for i in range(1, n_rows + 1):
+        wf = _write_yaml(
+            tmp_path / f"wf{i}.yaml",
+            {
+                "version": "0.1",
+                "workflow": {
+                    "name": "wf",
+                    "tasks": [{"name": f"t{i}", "script": [f"echo {i}"]}],
+                },
+            },
+        )
+        wfs.append(wf)
+    csv_path = tmp_path / "jobs.csv"
+    csv_path.write_text(
+        "sflow_config_file\n" + "".join(f"{wf}\n" for wf in wfs)
+    )
+    return csv_path
+
+
+def test_compose_bulk_input_row_negative_last(tmp_path: Path):
+    """--row=-1 composes only the last CSV row."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=-1", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 1
+    merged = yaml.safe_load(composed[0].read_text())
+    assert merged["workflow"]["tasks"][0]["name"] == "t4"
+
+
+def test_compose_bulk_input_row_negative_open_end(tmp_path: Path):
+    """--row=-3: composes the last 3 rows."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=-3:", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 3
+
+
+def test_compose_bulk_input_row_open_end(tmp_path: Path):
+    """--row=3: composes from row 3 to end."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=3:", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 2
+
+
+def test_compose_bulk_input_row_open_start(tmp_path: Path):
+    """--row=:3 composes rows 1 and 2 (exclusive end)."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=:3", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 2
+
+
+def test_compose_bulk_input_row_negative_slice(tmp_path: Path):
+    """--row=-3:-1 composes rows n-2 and n-1 (exclusive end)."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=-3:-1", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 2
+
+
 def test_compose_bulk_input_missable_csv_column(tmp_path: Path):
     """missable_tasks CSV column should work in compose --bulk-input."""
     f_base = _write_yaml(
