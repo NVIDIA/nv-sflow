@@ -240,17 +240,30 @@ class SrunOperator(Operator):
         if c.mpi is not None:
             command.add_opt("--mpi", c.mpi)
 
-        # Pyxis container support
-        if c.container_image is not None:
-            command.add_opt("--container-image", c.container_image)
-        if c.container_mount_home:
-            command.add_opt("--container-mount-home")
-        if not c.container_mount_home:
-            command.add_opt("--no-container-mount-home")
-        if c.container_name is not None:
-            command.add_opt("--container-name", c.container_name)
-        if c.container_writable:
-            command.add_opt("--container-writable")
+        # Pyxis container support — only emit container flags when a container is in use
+        _has_container = (
+            c.container_image is not None
+            or c.container_name is not None
+            or any(
+                a.startswith("--container-image") or a.startswith("--container-name")
+                for a in c.extra_args
+            )
+        )
+        if _has_container:
+            if c.container_image is not None:
+                command.add_opt("--container-image", c.container_image)
+            if c.container_name is not None:
+                command.add_opt("--container-name", c.container_name)
+            if c.container_mount_home:
+                command.add_opt("--container-mount-home")
+            else:
+                command.add_opt("--no-container-mount-home")
+            if c.container_writable:
+                command.add_opt("--container-writable")
+            if c.container_workdir is not None:
+                command.add_opt("--container-workdir", c.container_workdir)
+            if c.container_remap_root:
+                command.add_opt("--container-remap-root")
 
         # Merge container_mounts from config with any --container-mounts in extra_args
         all_mounts: list[str] = list(c.container_mounts) if c.container_mounts else []
@@ -259,12 +272,10 @@ class SrunOperator(Operator):
         while i < len(c.extra_args):
             arg = c.extra_args[i]
             if arg == "--container-mounts" and i + 1 < len(c.extra_args):
-                # Next arg is the mount value
                 extra_mounts = c.extra_args[i + 1].split(",")
                 all_mounts.extend(extra_mounts)
                 i += 2
             elif arg.startswith("--container-mounts="):
-                # Value is part of the arg itself
                 extra_mounts = arg.split("=", 1)[1].split(",")
                 all_mounts.extend(extra_mounts)
                 i += 1
@@ -272,13 +283,8 @@ class SrunOperator(Operator):
                 filtered_extra_args.append(arg)
                 i += 1
 
-        if all_mounts:
+        if _has_container and all_mounts:
             command.add_opt("--container-mounts", ",".join(all_mounts))
-
-        if c.container_workdir is not None:
-            command.add_opt("--container-workdir", c.container_workdir)
-        if c.container_remap_root:
-            command.add_opt("--container-remap-root")
 
         for arg in filtered_extra_args:
             command.add_opt(arg)
