@@ -282,6 +282,7 @@ if true; then
                 -p "$PARTITION" -A "$ACCOUNT" --log-level warn -r \
                 --output-dir "$PREFLIGHT_DIR/batch_bulk_input"
 
+        # -- verify sflow_batch_dir column in results.csv --
         # -- negative index and open-ended slice tests --
         run_check "batch bulk-input last row (--row=-1)" \
             sflow batch --bulk-input "$CSV_FILE" --row=-1 \
@@ -440,6 +441,29 @@ if true; then
         echo "[$id] $log_status  $log_label" >> "$TEST_LOG"
         echo "  \$ $log_cmd" >> "$TEST_LOG"
         echo "" >> "$TEST_LOG"
+    done
+
+    # -- Post-wait: verify sflow_batch_dir column in results.csv --
+    for mode in batch_bulk_submit batch_bulk_input; do
+        csv_file=$(find "$PREFLIGHT_DIR/$mode" -name results.csv -print -quit 2>/dev/null)
+        if [ -f "$csv_file" ]; then
+            if head -1 "$csv_file" | grep -q "sflow_batch_dir"; then
+                bulk_dir=$(basename "$(dirname "$csv_file")")
+                if grep -q "$bulk_dir" "$csv_file"; then
+                    echo "  PASS: sflow_batch_dir column present and correct in $mode/results.csv"
+                else
+                    echo "  FAIL: sflow_batch_dir value mismatch in $mode/results.csv"
+                    FAIL=$((FAIL + 1))
+                    TOTAL=$((TOTAL + 1))
+                    FAILED_LABELS="$FAILED_LABELS  - sflow_batch_dir value mismatch ($mode)\n"
+                fi
+            else
+                echo "  FAIL: sflow_batch_dir column missing from $mode/results.csv"
+                FAIL=$((FAIL + 1))
+                TOTAL=$((TOTAL + 1))
+                FAILED_LABELS="$FAILED_LABELS  - sflow_batch_dir column missing ($mode)\n"
+            fi
+        fi
     done
 
     echo ""
