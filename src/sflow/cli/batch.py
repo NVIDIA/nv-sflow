@@ -1192,6 +1192,7 @@ def _run_bulk_submit(
                 "job_name": job_name,
                 "slurm_job_id": "FAILED",
                 "sflow_output_dir": "",
+                "sflow_batch_dir": bulk_dir.name,
                 "status": "dry-run failed",
             }
             if resolve:
@@ -1294,6 +1295,7 @@ def _run_bulk_submit(
             "sflow_output_dir": sflow_output_dir
             if sflow_output_dir
             else ("not submitted" if not submit else ""),
+            "sflow_batch_dir": bulk_dir.name,
             "status": status,
         }
         if resolve:
@@ -1324,6 +1326,7 @@ def _run_bulk_submit(
             "job_name",
             "slurm_job_id",
             "sflow_output_dir",
+            "sflow_batch_dir",
             "status",
         ]
         if resolve:
@@ -1528,6 +1531,7 @@ def _run_bulk_edit(
             dry_run_failures.append(f"  [{idx}] {err_short}")
             result_row["slurm_job_id"] = "FAILED"
             result_row["sflow_output_dir"] = ""
+            result_row["sflow_batch_dir"] = bulk_dir.name
             if resolve:
                 result_row["composed_sflow_config"] = ""
             result_rows.append(result_row)
@@ -1612,6 +1616,7 @@ def _run_bulk_edit(
         result_row["sflow_output_dir"] = (
             f"{effective_output_dir}/{job_id}-*" if job_id else ""
         )
+        result_row["sflow_batch_dir"] = bulk_dir.name
         if resolve:
             result_row["composed_sflow_config"] = composed_config_path
         result_rows.append(result_row)
@@ -1641,7 +1646,7 @@ def _run_bulk_edit(
 
     if result_rows:
         results_csv = bulk_dir / "results.csv"
-        result_columns = columns + ["slurm_job_id", "sflow_output_dir"]
+        result_columns = columns + ["slurm_job_id", "sflow_output_dir", "sflow_batch_dir"]
         if resolve:
             result_columns.append("composed_sflow_config")
         for rr in result_rows:

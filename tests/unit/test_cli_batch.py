@@ -766,7 +766,9 @@ def test_bulk_input_writes_results_csv_with_submit(mock_sflow_app, tmp_path):
     assert len(rows) == 2
     assert "slurm_job_id" in reader.fieldnames
     assert "sflow_output_dir" in reader.fieldnames
+    assert "sflow_batch_dir" in reader.fieldnames
     assert rows[0]["slurm_job_id"] == "99999"
+    assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
 def test_bulk_input_results_csv_without_submit_has_not_submitted(mock_sflow_app, tmp_path):
@@ -808,6 +810,7 @@ def test_bulk_input_results_csv_without_submit_has_not_submitted(mock_sflow_app,
     assert len(rows) == 1
     assert rows[0]["slurm_job_id"] == "not submitted"
     assert rows[0]["sflow_output_dir"] == "not submitted"
+    assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
 def test_bulk_input_results_csv_marks_failed_rows(tmp_path):
@@ -868,6 +871,8 @@ def test_bulk_input_results_csv_marks_failed_rows(tmp_path):
     assert rows[0]["slurm_job_id"] == "11111"
     assert rows[1]["slurm_job_id"] == "FAILED"
     assert rows[1]["sflow_output_dir"] == ""
+    assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
+    assert rows[1]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
 def test_bulk_input_dry_run_failures_shown_at_end(tmp_path):
@@ -1695,6 +1700,8 @@ def test_bulk_submit_writes_results_csv(mock_sflow_app, tmp_path):
     assert "sflow_config_file" in rows[0]
     assert "job_name" in rows[0]
     assert "status" in rows[0]
+    assert "sflow_batch_dir" in rows[0]
+    assert rows[0]["sflow_batch_dir"].startswith("bulk_submit_")
 
 
 def test_bulk_submit_no_valid_files(mock_sflow_app, tmp_path):
@@ -1784,6 +1791,7 @@ def test_bulk_submit_results_csv_not_submitted_values(mock_sflow_app, tmp_path):
     assert len(rows) == 1
     assert rows[0]["slurm_job_id"] == "not submitted"
     assert rows[0]["sflow_output_dir"] == "not submitted"
+    assert rows[0]["sflow_batch_dir"].startswith("bulk_submit_")
 
 
 def test_bulk_input_generates_merged_yaml(mock_sflow_app, tmp_path):
