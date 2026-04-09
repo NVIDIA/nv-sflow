@@ -29,6 +29,7 @@ class SlurmBackendConfig(BackendConfig):
     # Slurm backend requires GPUs-per-node to be specified so we can correctly
     # populate ComputeNode.num_gpus for scheduling/packing/validation.
     gpus_per_node: Resolvable[int]
+    qos: Resolvable[str] | None = None
     extra_args: list[Resolvable[str]] | None = None
     job_name: str | None = None
 
@@ -46,6 +47,7 @@ class SlurmBackend(Backend):
         self._partition = str(config.partition)
         self._nodes = int(config.nodes)
         self._time = str(config.time)
+        self._qos = str(config.qos) if config.qos else None
         self._job_name = str(config.job_name or config.name)
         self._extra_args = [str(a) for a in (config.extra_args or [])]
         try:
@@ -244,6 +246,8 @@ class SlurmBackend(Backend):
             .add_opt("--job-name", self._job_name)
             .add_opt("--no-shell")
         )
+        if self._qos:
+            command.add_opt("--qos", self._qos)
         for arg in self._extra_args:
             command.add_opt(arg)
 
@@ -335,6 +339,7 @@ class SlurmBackend(Backend):
         partition = resolver.resolve(conf.partition, ctx)
         time = resolver.resolve(conf.time, ctx)
         nodes = resolver.resolve(conf.nodes, ctx)
+        qos = str(resolver.resolve(conf.qos, ctx)) if conf.qos is not None else None
 
         try:
             nodes_i = int(nodes)
@@ -371,6 +376,7 @@ class SlurmBackend(Backend):
             partition=str(partition),
             time=str(time),
             nodes=nodes_i,
+            qos=qos if qos else None,
             extra_args=extra_args,
             job_name=str(workflow_name),
             gpus_per_node=gpus_per_node,
