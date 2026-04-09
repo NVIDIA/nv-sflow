@@ -344,7 +344,7 @@ class SlurmBackend(Backend):
             ) from e
 
         extra_args_raw = conf.extra_args or []
-        extra_args = [str(resolver.resolve(arg, ctx)) for arg in extra_args_raw]
+        extra_args = [s for arg in extra_args_raw if (s := str(resolver.resolve(arg, ctx))).strip()]
 
         if conf.gpus_per_node is None:
             # Defensive (schema should enforce), but keeps the error clear if called directly.
