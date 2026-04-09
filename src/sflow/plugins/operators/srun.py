@@ -240,16 +240,18 @@ class SrunOperator(Operator):
         if c.mpi is not None:
             command.add_opt("--mpi", c.mpi)
 
-        # Pyxis container support
+        # Pyxis container support — only emit container flags when a container is in use
+        _using_container = c.container_image is not None or c.container_name is not None
         if c.container_image is not None:
             command.add_opt("--container-image", c.container_image)
-        if c.container_mount_home:
-            command.add_opt("--container-mount-home")
-        if not c.container_mount_home:
-            command.add_opt("--no-container-mount-home")
+        if _using_container:
+            if c.container_mount_home:
+                command.add_opt("--container-mount-home")
+            else:
+                command.add_opt("--no-container-mount-home")
         if c.container_name is not None:
             command.add_opt("--container-name", c.container_name)
-        if c.container_writable:
+        if _using_container and c.container_writable:
             command.add_opt("--container-writable")
 
         # Merge container_mounts from config with any --container-mounts in extra_args
