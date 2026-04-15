@@ -1272,22 +1272,22 @@ def build_task_graph(
                 if isinstance(nodes_exclude_raw, list)
                 else [nodes_exclude_raw]
             )
-            exclude_indices = set(
-                _resolve_int_list(
-                    task_name, field="resources.nodes.exclude", values=raw
-                )
+            n = len(alloc_nodes)
+            raw_indices = _resolve_int_list(
+                task_name, field="resources.nodes.exclude", values=raw
             )
-            out_of_range = {
-                i for i in exclude_indices if i < 0 or i >= len(alloc_nodes)
-            }
-            if out_of_range:
-                raise ValueError(
-                    f"Task '{task_name}' resources.nodes.exclude contains index(es) "
-                    f"{sorted(out_of_range)} out of range for {len(alloc_nodes)} allocated node(s) "
-                    f"(valid: 0..{len(alloc_nodes) - 1})"
-                )
+            resolved_exclude: set[int] = set()
+            for idx in raw_indices:
+                ri = idx if idx >= 0 else idx + n
+                if ri < 0 or ri >= n:
+                    raise ValueError(
+                        f"Task '{task_name}' resources.nodes.exclude contains index {idx} "
+                        f"out of range for {n} allocated node(s) "
+                        f"(valid: {-n}..{n - 1})"
+                    )
+                resolved_exclude.add(ri)
             alloc_nodes = [
-                n for i, n in enumerate(alloc_nodes) if i not in exclude_indices
+                node for i, node in enumerate(alloc_nodes) if i not in resolved_exclude
             ]
             if not alloc_nodes:
                 raise ValueError(
@@ -1305,14 +1305,16 @@ def build_task_graph(
                 field="resources.nodes.indices",
                 values=list(nodes_indices_raw),
             )
+            n = len(alloc_nodes)
             chosen: list[str] = []
             for idx in indices:
-                if idx < 0 or idx >= len(alloc_nodes):
+                resolved_idx = idx if idx >= 0 else idx + n
+                if resolved_idx < 0 or resolved_idx >= n:
                     raise ValueError(
                         f"Task '{task_name}' resources.nodes.indices contains out-of-range index {idx}; "
-                        f"allocation has {len(alloc_nodes)} nodes"
+                        f"allocation has {n} nodes (valid: {-n}..{n - 1})"
                     )
-                chosen.append(alloc_nodes[idx].name)
+                chosen.append(alloc_nodes[resolved_idx].name)
             return chosen, False
 
         if nodes_count_raw is not None:

@@ -50,11 +50,16 @@ workflow:
         - echo "replica=$SFLOW_REPLICA_INDEX CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 ```
 
-## Nodes: pin tasks to the same node
+## Nodes: pin tasks to specific nodes
 
-This is useful for “server + client” style workflows where `127.0.0.1` must work.
+Use `resources.nodes.indices` to select specific nodes from the allocation. Indices are 0-based
+positions into the node list (after any `exclude` filtering).
 
-Example pattern:
+**Negative indices** work like Python: `-1` is the last node, `-2` is second-to-last, etc.
+
+### Pin server and client to the same node
+
+Useful for "server + client" style workflows where `127.0.0.1` must work:
 
 ```yaml
 workflow:
@@ -71,4 +76,25 @@ workflow:
         nodes:
           indices: [0]
       script: ["curl -sf http://127.0.0.1:8000/ > /dev/null"]
+```
+
+### Run a task on the last allocated node
+
+Useful when the benchmark client should run on a dedicated node separate from the serving nodes:
+
+```yaml
+workflow:
+  name: wf
+  tasks:
+    - name: serving
+      resources:
+        nodes:
+          exclude: [-1]   # all nodes except the last
+      script: ["start_server.sh"]
+    - name: benchmark
+      depends_on: [serving]
+      resources:
+        nodes:
+          indices: [-1]   # last node only
+      script: ["run_benchmark.sh"]
 ```

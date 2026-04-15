@@ -564,6 +564,165 @@ def test_build_task_graph_resources_nodes_indices_selects_subset_of_allocation_n
     assert t1.operator.config.nodes == 2
 
 
+def test_build_task_graph_resources_nodes_negative_indices_select_from_end():
+    """Negative indices wrap around Python-style: -1 is last node, -2 second-to-last."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg1",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(indices=[-1])),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n4"]
+    assert t1.operator.config.nodes == 1
+
+
+def test_build_task_graph_resources_nodes_negative_indices_mixed_with_positive():
+    """Mix of positive and negative indices works correctly."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg2",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0, -1])
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n1", "n4"]
+    assert t1.operator.config.nodes == 2
+
+
+def test_build_task_graph_resources_nodes_negative_index_out_of_range():
+    """Negative index too large (e.g. -5 with 4 nodes) raises ValueError."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg3",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(indices=[-5])),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="out-of-range index -5"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_resources_nodes_negative_indices_after_exclude():
+    """-1 refers to the last node AFTER exclude filtering."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg4",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(exclude=[3], indices=[-1])
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    # After excluding node at position 3 (n4), remaining = [n1, n2, n3]; -1 → n3
+    assert t1.operator.config.nodelist == ["n3"]
+    assert t1.operator.config.nodes == 1
+
+
 def test_build_task_graph_resources_nodes_count_compact_allocation_for_parallel_replicas():
     state = _state()
     state.backends = {

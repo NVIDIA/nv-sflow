@@ -350,9 +350,14 @@ class TestValidateNodeExcludeIndices:
         with pytest.raises(ValueError, match="out of range for 2 allocated"):
             validate_node_exclude_indices(cfg)
 
-    def test_concrete_nodes_negative_exclude(self):
-        """Negative exclude index should raise."""
+    def test_concrete_nodes_negative_exclude_wraps(self):
+        """Negative exclude index wraps Python-style: -1 is last node."""
         cfg = _make_config(nodes_val=3, exclude_val=[-1])
+        validate_node_exclude_indices(cfg)  # -1 → index 2, valid for 3 nodes
+
+    def test_concrete_nodes_negative_exclude_out_of_range(self):
+        """Negative exclude index too large should raise."""
+        cfg = _make_config(nodes_val=3, exclude_val=[-4])
         with pytest.raises(ValueError, match="out of range for 3 allocated"):
             validate_node_exclude_indices(cfg)
 

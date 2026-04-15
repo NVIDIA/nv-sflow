@@ -542,9 +542,10 @@ def validate_node_exclude_indices(config: SflowConfig) -> None:
             idx = _try_resolve_int(idx_val)
             if idx is None:
                 continue
-            if idx < 0 or idx >= total_nodes:
+            resolved_idx = idx if idx >= 0 else idx + total_nodes
+            if resolved_idx < 0 or resolved_idx >= total_nodes:
                 raise ValueError(
                     f"Task '{task.name}' resources.nodes.exclude contains index "
                     f"{idx} out of range for {total_nodes} allocated node(s) "
-                    f"(valid: 0..{total_nodes - 1})"
+                    f"(valid: {-total_nodes}..{total_nodes - 1})"
                 )
