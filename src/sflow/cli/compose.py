@@ -18,6 +18,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from sflow.cli import DOCS_URL, app
 from sflow.config.loader import ConfigLoader, merge_config_dicts
 from sflow.config.resolver import ExpressionResolver
+from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
 from sflow.logging import configure_logging, get_logger
 
 _logger = get_logger(__name__)
@@ -300,6 +301,7 @@ def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
     replica_vars = _collect_replica_variable_names(merged)
 
     variables = _extract_variables(merged)
+    domains = extract_domains_from_raw_config(merged)
     resolved, unresolvable = _classify_resolvable(variables)
 
     # Never resolve replica sweep variables — their value changes per replica.
@@ -315,7 +317,8 @@ def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
         variable_start_string="${{",
         variable_end_string="}}",
     )
-    ctx: dict[str, Any] = {"variables": resolved, **resolved}
+    wrapped = build_variables_ctx_from_raw(resolved, domains)
+    ctx: dict[str, Any] = {"variables": wrapped, **wrapped}
 
     merged = _resolve_expressions(merged, ctx, env)
     merged = _resolve_shell_vars(merged, resolved)

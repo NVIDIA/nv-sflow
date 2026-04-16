@@ -26,7 +26,7 @@ from sflow.core.compute_node import ComputeNode
 from sflow.core.state import SflowState
 from sflow.core.task import OutputSpec, RetryPolicy, Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
-from sflow.core.variable import Variable, VariableType
+from sflow.core.variable import Variable, VariableType, build_variables_ctx
 from sflow.core.workflow import Workflow
 from sflow.logging import get_logger
 
@@ -272,9 +272,7 @@ def preflight_validate_container_images(config: SflowConfig, state: SflowState) 
     """
     from sflow.plugins.operators.srun import _is_valid_container_image
 
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     ctx: dict[str, Any] = {"variables": variables_ctx, **variables_ctx}
 
     def _try_resolve(raw: Any) -> str:
@@ -425,9 +423,7 @@ def resolve_artifacts(
     out_dir = Path(output_dir) if output_dir is not None else ws_dir / "sflow_output"
     cache_dir = ws_dir / ".sflow_cache" / "artifacts"
 
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     backends_ctx: dict[str, Any] = {
         name: b.to_dict() for name, b in (state.backends or {}).items()
     }
@@ -722,11 +718,8 @@ def resolve_backends(config: SflowConfig, state: SflowState) -> SflowState:
 
     ensure_builtin_backends_registered()
 
-    # Build a simple context from resolved variables (values only)
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
-    ctx = {"variables": variables_ctx, **variables_ctx}
+    variables_ctx = build_variables_ctx(state.variables)
+    ctx: dict[str, Any] = {"variables": variables_ctx, **variables_ctx}
 
     backends: dict[str, Backend] = dict(state.backends or {})
 
@@ -847,9 +840,7 @@ def resolve_workflow_variables(
     backends_ctx: dict[str, Any] = {
         name: b.to_dict() for name, b in (state.backends or {}).items()
     }
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     # If caller constructed `state` manually (e.g. unit tests) without resolving artifacts,
     # populate artifacts from config so expressions like `${{ artifacts.NAME.path }}` work.
     if (not state.artifacts) and (config.artifacts):
@@ -913,9 +904,7 @@ def build_task_graph(
     operator_adapter = operator_config_type_adapter()
 
     # Context for resolving expressions (scripts/resources/etc.)
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     if (not state.artifacts) and (config.artifacts):
         state = resolve_artifacts(
             config, state, workspace_dir=workspace_dir, materialize=False

@@ -139,13 +139,18 @@ def _resolve_sbatch_extra_args(
     ``${{ SLURM_NODES }}`` (shorthand).  Builds a variable context from the
     config YAML files (defaults) with ``set_var`` overrides applied on top,
     then resolves any Jinja2 expressions found in the extra args.
+
+    Variable values are wrapped in :class:`VariableValue` so that
+    ``${{ variables.X.domain }}`` is accessible.
     """
     if not any("${{" in arg for arg in extra_args):
         return list(extra_args)
 
     from sflow.config.resolver import ExpressionResolver
+    from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
 
     var_map: dict[str, Any] = {}
+    domain_map: dict[str, list[Any]] = {}
     for cfg_path in config_files:
         try:
             import yaml as _yaml
@@ -154,6 +159,7 @@ def _resolve_sbatch_extra_args(
                 data = _yaml.safe_load(fh)
             if data:
                 var_map.update(_build_var_map(data))
+                domain_map.update(extract_domains_from_raw_config(data))
         except Exception:
             pass
 
@@ -163,8 +169,9 @@ def _resolve_sbatch_extra_args(
                 k, v = override.split("=", 1)
                 var_map[k] = v
 
-    ctx: dict[str, Any] = {"variables": var_map}
-    ctx.update(var_map)
+    wrapped = build_variables_ctx_from_raw(var_map, domain_map)
+    ctx: dict[str, Any] = {"variables": wrapped}
+    ctx.update(wrapped)
     resolver = ExpressionResolver()
 
     resolved: list[str] = []

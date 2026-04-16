@@ -2827,6 +2827,62 @@ def test_resolve_sbatch_extra_args_both_syntaxes_in_same_call():
     assert result == ["--segment=3", "--gres=gpu:8"]
 
 
+def test_resolve_sbatch_extra_args_domain_from_config(tmp_path):
+    """${{ variables.X.domain }} resolves to the domain list from config."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  CONCURRENCY:\n"
+        "    value: 16\n"
+        "    type: integer\n"
+        "    domain: [1, 4, 16, 64]\n"
+    )
+    args = ["--comment=${{ variables.CONCURRENCY.domain }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--comment=[1, 4, 16, 64]"]
+
+
+def test_resolve_sbatch_extra_args_domain_shorthand(tmp_path):
+    """${{ X.domain }} shorthand resolves domain from config."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  MODE:\n"
+        "    value: fast\n"
+        "    domain: [fast, balanced, accurate]\n"
+    )
+    args = ["--comment=${{ MODE.domain }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--comment=['fast', 'balanced', 'accurate']"]
+
+
+def test_resolve_sbatch_extra_args_domain_empty_when_not_set():
+    """${{ variables.X.domain }} returns [] when variable has no domain."""
+    args = ["--comment=${{ variables.X.domain }}"]
+    result = _resolve_sbatch_extra_args(args, [], ["X=42"])
+    assert result == ["--comment=[]"]
+
+
+def test_resolve_sbatch_extra_args_value_and_domain_together(tmp_path):
+    """Value and domain can be accessed in the same arg list."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  NODES:\n"
+        "    value: 4\n"
+        "    domain: [1, 2, 4, 8]\n"
+    )
+    args = [
+        "--segment=${{ variables.NODES }}",
+        "--comment=${{ variables.NODES.domain }}",
+    ]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--segment=4", "--comment=[1, 2, 4, 8]"]
+
+
 # --- CLI integration tests: -e expression in generated sbatch scripts ---
 
 
@@ -2982,6 +3038,44 @@ def test_batch_sbatch_extra_args_expression_jinja2_arithmetic(
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     script = sbatch_path.read_text()
     assert "#SBATCH --gres=gpu:8" in script
+
+
+def test_batch_sbatch_extra_args_domain_in_script(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: -e with ${{ variables.X.domain }} produces resolved #SBATCH directive."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  CONCURRENCY:\n"
+        "    value: 16\n"
+        "    type: integer\n"
+        "    domain: [1, 4, 16, 64]\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "1",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--comment=${{ variables.CONCURRENCY.domain }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --comment=[1, 4, 16, 64]" in script
 
 
 def test_bulk_input_sbatch_extra_args_expression_per_row(mock_sflow_app, tmp_path):

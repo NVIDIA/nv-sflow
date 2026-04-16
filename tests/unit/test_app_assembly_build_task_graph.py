@@ -2210,3 +2210,39 @@ def test_http_probe_skipped_when_no_replica_var_referenced():
     assert len(first.probes) == 1
     assert len(second.probes) == 0
     assert first.readiness_followers == ["svc_1"]
+
+
+def test_build_task_graph_variable_domain_accessible_in_script_expression():
+    """${{ variables.X.domain }} resolves to the domain list in task scripts."""
+    state = _state()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=16,
+            type=VariableType.INTEGER,
+            domain=[1, 4, 16, 64],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=[
+                        "echo value=${{ variables.CONCURRENCY }}",
+                        "echo domain=${{ variables.CONCURRENCY.domain }}",
+                    ],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t = tg.get_task("t1")
+    assert t.script[0] == "echo value=16"
+    assert t.script[1] == "echo domain=[1, 4, 16, 64]"

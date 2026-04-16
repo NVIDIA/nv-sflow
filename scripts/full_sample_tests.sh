@@ -124,6 +124,8 @@ if true; then
         sflow run "$EXAMPLES_DIR/local_hello_world.yaml" --dry-run
     run_check "local_dag" \
         sflow run "$EXAMPLES_DIR/local_dag.yaml" --dry-run
+    run_check "local_variable_domain" \
+        sflow run "$EXAMPLES_DIR/local_variable_domain.yaml" --dry-run
 
     # -- sflow run --dry-run: self-contained slurm examples --
     for f in "$EXAMPLES_DIR"/slurm_*.yaml; do
@@ -154,6 +156,13 @@ if true; then
                 "$BENCH_AIPERF" \
                 --dry-run "${MODULAR_MISSABLE[@]}" "${MODULAR_OVERRIDES[@]}"
     done
+
+    # -- sflow compose: variable domain access --
+    COMPOSE_DOMAIN_DIR="$PREFLIGHT_DIR/compose_domain"
+    mkdir -p "$COMPOSE_DOMAIN_DIR"
+    run_check "compose variable_domain" \
+        sflow compose "$EXAMPLES_DIR/local_variable_domain.yaml" -vl -r \
+            -o "$COMPOSE_DOMAIN_DIR/resolved.yaml"
 
     # -- sflow compose: single-file self-contained examples --
     COMPOSE_SINGLE_DIR="$PREFLIGHT_DIR/compose_single"
@@ -265,6 +274,19 @@ if true; then
                 grep '#SBATCH --segment' "$BATCH_EXTRA_ARGS_DIR/expr_test.sh" || echo "    (no --segment directive found)"
             fi
         fi
+    fi
+
+    # -- sflow batch -e with variables.X.domain expression --
+    BATCH_DOMAIN_DIR="$PREFLIGHT_DIR/batch_domain_expr"
+    mkdir -p "$BATCH_DOMAIN_DIR"
+    DOMAIN_EXAMPLE="$EXAMPLES_DIR/local_variable_domain.yaml"
+    if [ -f "$DOMAIN_EXAMPLE" ]; then
+        run_check "batch -e domain expression" \
+            sflow batch -f "$DOMAIN_EXAMPLE" \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+                --nodes 1 \
+                -e '--comment=${{ variables.CONCURRENCY.domain }}' \
+                -o "$BATCH_DOMAIN_DIR/domain_test.sh"
     fi
 
     # -- sflow batch --bulk-submit (no --submit): self-contained --
@@ -442,6 +464,43 @@ if true; then
         echo "  \$ $log_cmd" >> "$TEST_LOG"
         echo "" >> "$TEST_LOG"
     done
+
+    # -- Post-wait: verify ${{ variables.X.domain }} resolved in batch -e --
+    BATCH_DOMAIN_SCRIPT="$BATCH_DOMAIN_DIR/domain_test.sh"
+    if [ -f "$BATCH_DOMAIN_SCRIPT" ]; then
+        if grep -q '#SBATCH --comment=\[1, 4, 16, 64, 128\]' "$BATCH_DOMAIN_SCRIPT"; then
+            echo "  PASS: batch -e variables.X.domain resolved to [1, 4, 16, 64, 128]"
+        else
+            echo "  FAIL: batch -e variables.X.domain not resolved in sbatch script"
+            grep '#SBATCH --comment' "$BATCH_DOMAIN_SCRIPT" || echo "    (no --comment directive found)"
+            FAIL=$((FAIL + 1))
+            TOTAL=$((TOTAL + 1))
+            FAILED_LABELS="$FAILED_LABELS  - batch -e variables.X.domain resolution\n"
+        fi
+    fi
+
+    # -- Post-wait: verify ${{ variables.X.domain }} resolved correctly --
+    DOMAIN_RESOLVED="$COMPOSE_DOMAIN_DIR/resolved.yaml"
+    if [ -f "$DOMAIN_RESOLVED" ]; then
+        DOMAIN_FAIL=0
+        if grep -q '\[1, 4, 16, 64, 128\]' "$DOMAIN_RESOLVED"; then
+            echo "  PASS: variables.CONCURRENCY.domain resolved to [1, 4, 16, 64, 128]"
+        else
+            echo "  FAIL: variables.CONCURRENCY.domain not resolved in compose output"
+            DOMAIN_FAIL=1
+        fi
+        if grep -q "sglang.*vllm.*trtllm" "$DOMAIN_RESOLVED"; then
+            echo "  PASS: variables.FRAMEWORK.domain resolved to framework list"
+        else
+            echo "  FAIL: variables.FRAMEWORK.domain not resolved in compose output"
+            DOMAIN_FAIL=1
+        fi
+        if [ "$DOMAIN_FAIL" -gt 0 ]; then
+            FAIL=$((FAIL + DOMAIN_FAIL))
+            TOTAL=$((TOTAL + DOMAIN_FAIL))
+            FAILED_LABELS="$FAILED_LABELS  - variables.X.domain resolution\n"
+        fi
+    fi
 
     # -- Post-wait: verify sflow_batch_dir column in results.csv --
     for mode in batch_bulk_submit batch_bulk_input; do
