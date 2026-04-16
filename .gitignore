@@ -236,4 +236,4 @@ tests/e2e_tests/sflow.sh
 tests/e2e_tests/*_config.yaml
 tests/e2e_tests/.sflow_venv.lock
 .gitnexus
-.claude/skills/gitnexus/
+.claude/

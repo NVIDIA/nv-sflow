@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **nv-sflow** (2665 symbols, 7924 relationships, 182 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **nv-sflow** (2748 symbols, 8202 relationships, 186 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -97,5 +97,19 @@ To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.
 | Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
 | Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+| Work in the Unit area (762 symbols) | `.claude/skills/generated/unit/SKILL.md` |
+| Work in the Cli area (48 symbols) | `.claude/skills/generated/cli/SKILL.md` |
+| Work in the Config area (44 symbols) | `.claude/skills/generated/config/SKILL.md` |
+| Work in the App area (44 symbols) | `.claude/skills/generated/app/SKILL.md` |
+| Work in the Scripts area (40 symbols) | `.claude/skills/generated/scripts/SKILL.md` |
+| Work in the Operators area (24 symbols) | `.claude/skills/generated/operators/SKILL.md` |
+| Work in the Backends area (21 symbols) | `.claude/skills/generated/backends/SKILL.md` |
+| Work in the Probes area (17 symbols) | `.claude/skills/generated/probes/SKILL.md` |
+| Work in the Ui area (14 symbols) | `.claude/skills/generated/ui/SKILL.md` |
+| Work in the Cluster_76 area (13 symbols) | `.claude/skills/generated/cluster-76/SKILL.md` |
+| Work in the Cluster_90 area (10 symbols) | `.claude/skills/generated/cluster-90/SKILL.md` |
+| Work in the Samples area (8 symbols) | `.claude/skills/generated/samples/SKILL.md` |
+| Work in the Artifacts area (6 symbols) | `.claude/skills/generated/artifacts/SKILL.md` |
+| Work in the Cluster_89 area (3 symbols) | `.claude/skills/generated/cluster-89/SKILL.md` |
 
 <!-- gitnexus:end -->
