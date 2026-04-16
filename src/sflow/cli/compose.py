@@ -304,11 +304,13 @@ def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
     domains = extract_domains_from_raw_config(merged)
     resolved, unresolvable = _classify_resolvable(variables)
 
-    # Never resolve replica sweep variables — their value changes per replica.
+    # Replica sweep variables must stay as declarations (their value changes
+    # per replica), but they should still be accessible in the Jinja context
+    # so that static metadata like ${{ variables.X.domain }} can resolve.
     for rv in replica_vars:
         resolved.pop(rv, None)
 
-    if not resolved:
+    if not resolved and not replica_vars:
         return merged
 
     env = SandboxedEnvironment(
@@ -318,6 +320,16 @@ def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
         variable_end_string="}}",
     )
     wrapped = build_variables_ctx_from_raw(resolved, domains)
+    # Add replica vars to the "variables" namespace only (not top-level) so
+    # that ${{ variables.X.domain }} resolves, but ${{ variables.X }} and
+    # ${{ X }} stay unresolved (VariableValue.__str__ re-emits the expression).
+    from sflow.core.variable import VariableValue
+
+    for rv in replica_vars:
+        if rv not in wrapped and rv in variables:
+            wrapped[rv] = VariableValue(
+                f"${{{{ variables.{rv} }}}}", domain=domains.get(rv)
+            )
     ctx: dict[str, Any] = {"variables": wrapped, **wrapped}
 
     merged = _resolve_expressions(merged, ctx, env)

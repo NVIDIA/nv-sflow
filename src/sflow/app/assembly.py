@@ -1897,12 +1897,32 @@ def build_task_graph(
             task_logger.propagate = False
 
             # Resolve `${{ ... }}` expressions inside task scripts using the current context.
-            # Note: we intentionally do NOT expand `$FOO` style shell variables here; those are
-            # handled by `task.envs` + the shell at runtime.
-            # Note: `${{ task.* }}` expressions are resolved in a second pass after all tasks are
-            # built (see below).
+            # For replicas with sweep variables, overlay per-replica values so that
+            # ${{ variables.CONCURRENCY }} resolves to the replica-specific value.
+            # Note: `${{ task.* }}` expressions are resolved in a second pass after
+            # all tasks are built (see below).
+            replica_env = replica_envs.get(node_name, {})
+            if replica_env:
+                from sflow.core.variable import VariableValue
+
+                replica_ctx = dict(ctx)
+                replica_variables = dict(ctx.get("variables", {}))
+                for k, v in replica_env.items():
+                    if k == "SFLOW_REPLICA_INDEX":
+                        continue
+                    existing = replica_variables.get(k)
+                    domain = existing.domain if isinstance(existing, VariableValue) else None
+                    typed_v = _maybe_int(v)
+                    wrapped = VariableValue(typed_v, domain=domain)
+                    replica_variables[k] = wrapped
+                    replica_ctx[k] = wrapped
+                replica_ctx["variables"] = replica_variables
+                resolve_ctx = replica_ctx
+            else:
+                resolve_ctx = ctx
+
             script = [
-                str(resolver.resolve(line, ctx))
+                str(resolver.resolve(line, resolve_ctx))
                 if resolver.has_expression(line) and "task." not in line
                 else line
                 for line in list(t_conf.script)

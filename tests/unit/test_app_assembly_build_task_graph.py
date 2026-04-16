@@ -2246,3 +2246,114 @@ def test_build_task_graph_variable_domain_accessible_in_script_expression():
     t = tg.get_task("t1")
     assert t.script[0] == "echo value=16"
     assert t.script[1] == "echo domain=[1, 4, 16, 64]"
+
+
+def test_build_task_graph_replica_sweep_resolves_jinja_expression_per_replica():
+    """${{ variables.X }} in scripts resolves to per-replica value, not default."""
+    state = _state()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=1,
+            type=VariableType.INTEGER,
+            domain=[1, 4, 16],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo conc=${{ variables.CONCURRENCY }}"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="sequential"
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("bench_1").script[0] == "echo conc=1"
+    assert tg.get_task("bench_4").script[0] == "echo conc=4"
+    assert tg.get_task("bench_16").script[0] == "echo conc=16"
+
+
+def test_build_task_graph_replica_sweep_domain_resolves_in_all_replicas():
+    """${{ variables.X.domain }} resolves to the same domain list in every replica."""
+    state = _state()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=1,
+            type=VariableType.INTEGER,
+            domain=[1, 4, 16],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=[
+                        "echo conc=${{ variables.CONCURRENCY }}",
+                        "echo domain=${{ variables.CONCURRENCY.domain }}",
+                    ],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    for name, expected_val in [("bench_1", "1"), ("bench_4", "4"), ("bench_16", "16")]:
+        t = tg.get_task(name)
+        assert t.script[0] == f"echo conc={expected_val}"
+        assert t.script[1] == "echo domain=[1, 4, 16]"
+
+
+def test_build_task_graph_replica_sweep_arithmetic_with_jinja():
+    """Arithmetic on sweep variable resolves per-replica."""
+    state = _state()
+    state.variables = {
+        "CONC": Variable(
+            name="CONC",
+            value=1,
+            type=VariableType.INTEGER,
+            domain=[2, 8],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t",
+                    script=["echo doubled=${{ variables.CONC * 2 }}"],
+                    replicas=ReplicaConfig(
+                        variables=["CONC"], policy="sequential"
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t_2").script[0] == "echo doubled=4"
+    assert tg.get_task("t_8").script[0] == "echo doubled=16"

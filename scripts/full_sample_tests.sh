@@ -127,6 +127,13 @@ if true; then
     run_check "local_variable_domain" \
         sflow run "$EXAMPLES_DIR/local_variable_domain.yaml" --dry-run
 
+    # -- sflow run (live): verify replica sweep + domain resolution --
+    # Note: may fail in sandboxed environments (pty device limits) with many parallel tasks.
+    DOMAIN_RUN_DIR="$PREFLIGHT_DIR/run_variable_domain"
+    run_check "run local_variable_domain (live, optional)" \
+        sflow run "$EXAMPLES_DIR/local_variable_domain.yaml" \
+            --output-dir "$DOMAIN_RUN_DIR"
+
     # -- sflow run --dry-run: self-contained slurm examples --
     for f in "$EXAMPLES_DIR"/slurm_*.yaml; do
         name=$(basename "$f" .yaml)
@@ -465,11 +472,50 @@ if true; then
         echo "" >> "$TEST_LOG"
     done
 
+    # -- Post-wait: verify replica sweep resolves per-replica values + domain --
+    SFLOW_LOG=$(find "$DOMAIN_RUN_DIR" -name "sflow.log" -print -quit 2>/dev/null)
+    if [ -f "$SFLOW_LOG" ]; then
+        REPLICA_FAIL=0
+        # Verify domain resolved in the command log
+        if grep -q 'concurrency_domain=\[1, 4, 16\]' "$SFLOW_LOG"; then
+            :  # pass
+        else
+            echo "  FAIL: sflow.log did not contain resolved concurrency domain list"
+            REPLICA_FAIL=1
+        fi
+        if grep -q 'framework_domain=.*sglang.*vllm.*trtllm' "$SFLOW_LOG"; then
+            :  # pass
+        else
+            echo "  FAIL: sflow.log did not contain resolved framework domain list"
+            REPLICA_FAIL=1
+        fi
+        # Verify per-replica value shift for both sweep variables
+        if grep -q "echo concurrency=1$" "$SFLOW_LOG" && grep -q "echo concurrency=16$" "$SFLOW_LOG"; then
+            :  # pass
+        else
+            echo "  FAIL: concurrency replica value shift not found (expected 1 and 16)"
+            REPLICA_FAIL=1
+        fi
+        if grep -q "echo framework=sglang$" "$SFLOW_LOG" && grep -q "echo framework=trtllm$" "$SFLOW_LOG"; then
+            :  # pass
+        else
+            echo "  FAIL: framework replica value shift not found (expected sglang and trtllm)"
+            REPLICA_FAIL=1
+        fi
+        if [ "$REPLICA_FAIL" -eq 0 ]; then
+            echo "  PASS: replica sweep resolves per-replica values + domain correctly"
+        else
+            FAIL=$((FAIL + REPLICA_FAIL))
+            TOTAL=$((TOTAL + REPLICA_FAIL))
+            FAILED_LABELS="$FAILED_LABELS  - replica sweep value/domain resolution\n"
+        fi
+    fi
+
     # -- Post-wait: verify ${{ variables.X.domain }} resolved in batch -e --
     BATCH_DOMAIN_SCRIPT="$BATCH_DOMAIN_DIR/domain_test.sh"
     if [ -f "$BATCH_DOMAIN_SCRIPT" ]; then
-        if grep -q '#SBATCH --comment=\[1, 4, 16, 64, 128\]' "$BATCH_DOMAIN_SCRIPT"; then
-            echo "  PASS: batch -e variables.X.domain resolved to [1, 4, 16, 64, 128]"
+        if grep -q '#SBATCH --comment=\[1, 4, 16\]' "$BATCH_DOMAIN_SCRIPT"; then
+            echo "  PASS: batch -e variables.X.domain resolved to [1, 4, 16]"
         else
             echo "  FAIL: batch -e variables.X.domain not resolved in sbatch script"
             grep '#SBATCH --comment' "$BATCH_DOMAIN_SCRIPT" || echo "    (no --comment directive found)"
@@ -483,8 +529,8 @@ if true; then
     DOMAIN_RESOLVED="$COMPOSE_DOMAIN_DIR/resolved.yaml"
     if [ -f "$DOMAIN_RESOLVED" ]; then
         DOMAIN_FAIL=0
-        if grep -q '\[1, 4, 16, 64, 128\]' "$DOMAIN_RESOLVED"; then
-            echo "  PASS: variables.CONCURRENCY.domain resolved to [1, 4, 16, 64, 128]"
+        if grep -q '\[1, 4, 16\]' "$DOMAIN_RESOLVED"; then
+            echo "  PASS: variables.CONCURRENCY.domain resolved to [1, 4, 16]"
         else
             echo "  FAIL: variables.CONCURRENCY.domain not resolved in compose output"
             DOMAIN_FAIL=1
