@@ -237,3 +237,5 @@ tests/e2e_tests/*_config.yaml
 tests/e2e_tests/.sflow_venv.lock
 .gitnexus
 .claude/
+AGENTS.md
+CLAUDE.md
