@@ -128,7 +128,7 @@ def test_resolve_bulk_input_row_cli_files_prepended(csv_file, tmp_path):
 
 
 def test_resolve_bulk_input_row_cli_set_var_merged(csv_file):
-    """Test that CLI --set overrides merge with CSV columns (CSV wins)."""
+    """Test that CLI --set overrides merge with CSV columns (CLI wins)."""
     _, set_var, _, _ = _resolve_bulk_input_row(
         bulk_input=csv_file,
         row_selectors=["2"],
@@ -138,7 +138,7 @@ def test_resolve_bulk_input_row_cli_set_var_merged(csv_file):
         cli_missable=None,
     )
     var_map = dict(v.split("=", 1) for v in set_var)
-    assert var_map["MY_VAR"] == "20"
+    assert var_map["MY_VAR"] == "999"
     assert var_map["EXTRA"] == "hello"
 
 
@@ -468,13 +468,14 @@ class TestParseKvList:
 
 
 class TestMergeRowOverrides:
-    def test_csv_vars_win_over_cli(self):
+    def test_cli_vars_win_over_csv(self):
         row = {"VAR1": "csv_val", "VAR2": "csv2"}
         var_cols = {"VAR1", "VAR2"}
         cli_var_map = {"VAR1": "cli_val", "EXTRA": "extra"}
         set_var, _ = merge_row_overrides(row, var_cols, set(), cli_var_map, {})
         var_map = dict(v.split("=", 1) for v in set_var)
-        assert var_map["VAR1"] == "csv_val"
+        assert var_map["VAR1"] == "cli_val"
+        assert var_map["VAR2"] == "csv2"
         assert var_map["EXTRA"] == "extra"
 
     def test_cli_artifacts_win_over_csv(self):

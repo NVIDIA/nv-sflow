@@ -153,7 +153,7 @@ Common options:
 - `--bulk-input, -b <csv>`: CSV file with a required `sflow_config_file` column and optional `job_name` column. All other columns are matched to variable or artifact names.
 - `--row`: process specific rows (e.g. `--row 1:4`, `--row 1,3,5`)
 - `--resolve, -r`: resolve variables in the generated merged YAML configs (same as `sflow compose --resolve`)
-- Override precedence: for variables, CSV values override CLI `--set`. For artifacts, CLI `--artifact` overrides CSV values.
+- Override precedence: CLI `--set` overrides CSV values; CLI `--artifact` overrides CSV values.
 - Generates both `.sh` (sbatch script) and `.yaml` (merged config) files per row.
 - Always writes a `results.csv` with job IDs, output directories, and status.
 - Reserved CSV column `missable_tasks`: space-separated task names or glob patterns per row. Merged with CLI `--missable-tasks`. Allows mixed disagg/agg rows in the same CSV where different rows have different absent tasks. Columns that only exist in some row configs (e.g. `NUM_AGG_SERVERS` for agg rows, `NUM_CTX_SERVERS` for disagg rows) are automatically handled.

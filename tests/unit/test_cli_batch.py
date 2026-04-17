@@ -2538,8 +2538,8 @@ def test_bulk_input_sbatch_script_includes_per_row_missable(mock_sflow_app, tmp_
 # ---------------------------------------------------------------------------
 
 
-def test_batch_bulk_input_variable_csv_wins_over_cli(mock_sflow_app, tmp_path):
-    """For --set variables, CSV value should take precedence over CLI."""
+def test_batch_bulk_input_variable_cli_wins_over_csv(mock_sflow_app, tmp_path):
+    """For --set variables, CLI value should take precedence over CSV."""
     wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
     out_dir = tmp_path / "sflow_output"
     csv_file = _write_csv(
@@ -2556,11 +2556,11 @@ def test_batch_bulk_input_variable_csv_wins_over_cli(mock_sflow_app, tmp_path):
         ],
     )
     assert result.exit_code == 0, f"CLI failed: {result.output}"
-    assert "CSV value will take precedence" in (result.output + (result.stderr or ""))
+    assert "CLI --set value will take precedence" in (result.output + (result.stderr or ""))
     scripts = sorted(list(out_dir.glob("bulk_*"))[0].glob("*.sh"))
     script = scripts[0].read_text()
-    assert "--set TP_SIZE=8" in script
-    assert "--set TP_SIZE=2" not in script
+    assert "--set TP_SIZE=2" in script
+    assert "--set TP_SIZE=8" not in script
 
 
 def test_batch_bulk_input_artifact_cli_wins_over_csv(mock_sflow_app, tmp_path):
@@ -2592,8 +2592,8 @@ def test_batch_bulk_input_artifact_cli_wins_over_csv(mock_sflow_app, tmp_path):
     assert f"--artifact MODEL_PATH=fs://{csv_model_dir}" not in script
 
 
-def test_compose_bulk_input_variable_csv_wins_over_cli(tmp_path):
-    """For --set variables in compose, CSV value should take precedence over CLI."""
+def test_compose_bulk_input_variable_cli_wins_over_csv(tmp_path):
+    """For --set variables in compose, CLI value should take precedence over CSV."""
     wf = tmp_path / "wf.yaml"
     wf.write_text(
         'version: "0.1"\n'
@@ -2620,11 +2620,11 @@ def test_compose_bulk_input_variable_csv_wins_over_cli(tmp_path):
         ],
     )
     assert result.exit_code == 0, f"CLI failed: {result.output}"
-    assert "CSV value will take precedence" in (result.output + (result.stderr or ""))
+    assert "CLI --set value will take precedence" in (result.output + (result.stderr or ""))
     yaml_files = list(out_dir.glob("*/*.yaml"))
     assert len(yaml_files) == 1
     content = yaml_files[0].read_text()
-    assert "value: '8'" in content or "value: 8" in content
+    assert "value: '2'" in content or "value: 2" in content
 
 
 def test_compose_bulk_input_artifact_cli_wins_over_csv(tmp_path):

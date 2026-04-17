@@ -359,6 +359,28 @@ if true; then
         fi
     fi
 
+    # -- sflow batch --bulk-input with -s overlapping CSV column: CLI --set must win --
+    if [ -f "$CSV_FILE" ]; then
+        BATCH_BULK_SET_DIR="$PREFLIGHT_DIR/batch_bulk_input_set_precedence"
+        BATCH_BULK_SET_OUT="$RESULTS_DIR/batch_bulk_input_set_precedence.stderr"
+        run_check "batch bulk-input -s overrides CSV column" \
+            bash -c "sflow batch --bulk-input '$CSV_FILE' \
+                -a 'LOCAL_MODEL_PATH=fs://$MODEL_PATH' \
+                -p '$PARTITION' -A '$ACCOUNT' --log-level warn \
+                -s 'GPUS_PER_NODE=77' \
+                --output-dir '$BATCH_BULK_SET_DIR' 2> '$BATCH_BULK_SET_OUT'"
+    fi
+
+    # -- sflow compose --bulk-input with --set overlapping CSV column: CLI --set must win --
+    if [ -f "$CSV_FILE" ]; then
+        COMPOSE_BULK_SET_DIR="$PREFLIGHT_DIR/compose_bulk_input_set_precedence"
+        COMPOSE_BULK_SET_OUT="$RESULTS_DIR/compose_bulk_input_set_precedence.stderr"
+        run_check "compose bulk-input --set overrides CSV column" \
+            bash -c "sflow compose --bulk-input '$CSV_FILE' \
+                --set 'GPUS_PER_NODE=77' \
+                -o '$COMPOSE_BULK_SET_DIR' 2> '$COMPOSE_BULK_SET_OUT'"
+    fi
+
     # -- sflow run --bulk-input --row (dry-run): CSV row execution --
     # Missable tasks are defined in the CSV's missable_tasks column, not via CLI -M.
     if [ -f "$CSV_FILE" ]; then
@@ -545,6 +567,82 @@ if true; then
             FAIL=$((FAIL + DOMAIN_FAIL))
             TOTAL=$((TOTAL + DOMAIN_FAIL))
             FAILED_LABELS="$FAILED_LABELS  - variables.X.domain resolution\n"
+        fi
+    fi
+
+    # -- Post-wait: verify CLI --set wins over CSV column in bulk-input --
+    # batch: generated sbatch scripts must call `sflow run --set GPUS_PER_NODE=77`
+    # and must NOT pass the CSV value (GPUS_PER_NODE=4) for that variable.
+    if [ -d "$BATCH_BULK_SET_DIR" ]; then
+        SET_FAIL=0
+        scripts_found=0
+        for sh_file in "$BATCH_BULK_SET_DIR"/bulk_input_*/*.sh; do
+            [ -f "$sh_file" ] || continue
+            scripts_found=$((scripts_found + 1))
+            if ! grep -q -- '--set GPUS_PER_NODE=77' "$sh_file"; then
+                echo "  FAIL: CLI --set GPUS_PER_NODE=77 missing in $(basename "$sh_file")"
+                SET_FAIL=1
+            fi
+            if grep -q -- '--set GPUS_PER_NODE=4\b' "$sh_file"; then
+                echo "  FAIL: CSV GPUS_PER_NODE=4 not overridden in $(basename "$sh_file")"
+                SET_FAIL=1
+            fi
+        done
+        if [ "$scripts_found" -eq 0 ]; then
+            echo "  FAIL: no scripts generated in $BATCH_BULK_SET_DIR"
+            SET_FAIL=1
+        fi
+        if [ -f "$BATCH_BULK_SET_OUT" ] && \
+           ! grep -q "CLI --set value will take precedence" "$BATCH_BULK_SET_OUT"; then
+            echo "  FAIL: expected 'CLI --set value will take precedence' warning (batch)"
+            SET_FAIL=1
+        fi
+        if [ "$SET_FAIL" -eq 0 ]; then
+            echo "  PASS: batch bulk-input --set overrides CSV column (CLI wins)"
+        else
+            FAIL=$((FAIL + SET_FAIL))
+            TOTAL=$((TOTAL + SET_FAIL))
+            FAILED_LABELS="$FAILED_LABELS  - batch bulk-input --set precedence\n"
+        fi
+    fi
+
+    # compose: merged YAMLs must carry the CLI value for GPUS_PER_NODE (77), not 4.
+    if [ -d "$COMPOSE_BULK_SET_DIR" ]; then
+        SET_FAIL=0
+        yamls_found=0
+        for yaml_file in "$COMPOSE_BULK_SET_DIR"/compose_*/*.yaml; do
+            [ -f "$yaml_file" ] || continue
+            yamls_found=$((yamls_found + 1))
+            # Extract GPUS_PER_NODE variable block: expect value '77' from CLI, not 4 from CSV.
+            gpn_value=$(awk '
+                /name: GPUS_PER_NODE/ {found=1; next}
+                found && /value:/ {
+                    sub(/.*value:[[:space:]]*/, "")
+                    gsub(/["'\'']/, "")
+                    print
+                    exit
+                }
+            ' "$yaml_file")
+            if [ "$gpn_value" != "77" ]; then
+                echo "  FAIL: GPUS_PER_NODE expected 77 (CLI), got '$gpn_value' in $(basename "$yaml_file")"
+                SET_FAIL=1
+            fi
+        done
+        if [ "$yamls_found" -eq 0 ]; then
+            echo "  FAIL: no yamls generated in $COMPOSE_BULK_SET_DIR"
+            SET_FAIL=1
+        fi
+        if [ -f "$COMPOSE_BULK_SET_OUT" ] && \
+           ! grep -q "CLI --set value will take precedence" "$COMPOSE_BULK_SET_OUT"; then
+            echo "  FAIL: expected 'CLI --set value will take precedence' warning (compose)"
+            SET_FAIL=1
+        fi
+        if [ "$SET_FAIL" -eq 0 ]; then
+            echo "  PASS: compose bulk-input --set overrides CSV column (CLI wins)"
+        else
+            FAIL=$((FAIL + SET_FAIL))
+            TOTAL=$((TOTAL + SET_FAIL))
+            FAILED_LABELS="$FAILED_LABELS  - compose bulk-input --set precedence\n"
         fi
     fi
 

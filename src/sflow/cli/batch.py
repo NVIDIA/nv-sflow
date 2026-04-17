@@ -976,15 +976,16 @@ def merge_row_overrides(
 ) -> tuple[list[str] | None, list[str] | None]:
     """Merge CLI and CSV overrides for a single row.
 
-    For variables, CSV values take precedence over CLI ``--set``.
+    For variables, CLI ``--set`` takes precedence over CSV values.
     For artifacts, CLI ``--artifact`` takes precedence over CSV values.
 
     Returns (set_var_list, artifact_list).
     """
-    merged_vars = dict(cli_var_map)
+    merged_vars: dict[str, str] = {}
     for col in var_cols:
         if row.get(col):
             merged_vars[col] = row[col]
+    merged_vars.update(cli_var_map)
     set_var = [f"{k}={v}" for k, v in merged_vars.items()] or None
 
     merged_arts: dict[str, str] = {}
@@ -1442,7 +1443,7 @@ def _run_bulk_edit(
     for name in sorted(overlap_vars):
         typer.echo(
             f"  Warning: variable '{name}' specified via --set and also in CSV; "
-            f"CSV value will take precedence per row.",
+            f"CLI --set value will take precedence over CSV.",
             err=True,
         )
     for name in sorted(overlap_arts):
@@ -1476,23 +1477,17 @@ def _run_bulk_edit(
             continue
         config_files = _resolve_config_paths(row["sflow_config_file"])
 
-        merged_vars = dict(cli_var_map)
-        for col in csv_var_names:
-            if row.get(col):
-                merged_vars[col] = row[col]
-        set_var = [f"{k}={v}" for k, v in merged_vars.items()]
-
-        merged_arts: dict[str, str] = {}
-        for col in csv_art_names:
-            if row.get(col):
-                merged_arts[col] = row[col]
-        merged_arts.update(cli_art_map)
-        artifacts = [f"{k}={v}" for k, v in merged_arts.items()]
+        set_var_opt, artifacts_opt = merge_row_overrides(
+            row, csv_var_names, csv_art_names, cli_var_map, cli_art_map
+        )
+        set_var = set_var_opt or []
+        artifacts = artifacts_opt or []
 
         all_overrides: dict[str, str] = {}
         for col in columns:
             if col not in _RESERVED_CSV_COLUMNS and row.get(col):
                 all_overrides[col] = row[col]
+        all_overrides.update(cli_var_map)
         all_overrides.update(cli_art_map)
         overrides_desc = ", ".join(f"{k}={v}" for k, v in all_overrides.items())
 

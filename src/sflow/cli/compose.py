@@ -539,7 +539,7 @@ def _run_bulk_compose(
     for name in sorted(overlap_vars):
         typer.echo(
             f"  Warning: variable '{name}' specified via --set and also in CSV; "
-            f"CSV value will take precedence per row.",
+            f"CLI --set value will take precedence over CSV.",
             err=True,
         )
     for name in sorted(overlap_arts):
