@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+import sflow.cli.batch as batch_mod
 from sflow.cli import app
 from sflow.cli.batch import (
     _build_var_map,
@@ -3122,3 +3123,86 @@ def test_bulk_input_sbatch_extra_args_expression_per_row(mock_sflow_app, tmp_pat
     script_2 = scripts[1].read_text()
     assert "#SBATCH --segment=2" in script_1
     assert "#SBATCH --segment=5" in script_2
+
+
+class _FakeSflowDistribution:
+    def __init__(self, *, version: str, direct_url_text: str | None = None):
+        self.version = version
+        self._direct_url_text = direct_url_text
+
+    def read_text(self, name: str) -> str | None:
+        assert name == "direct_url.json"
+        return self._direct_url_text
+
+
+def test_resolve_effective_sflow_version_uses_requested_revision():
+    dist = _FakeSflowDistribution(
+        version="0.2.0",
+        direct_url_text=(
+            '{"url":"https://github.com/NVIDIA/nv-sflow.git",'
+            '"vcs_info":{"vcs":"git","requested_revision":"feature/infmax_v3","commit_id":"abc123"}}'
+        ),
+    )
+
+    with patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist):
+        assert batch_mod._resolve_effective_sflow_version(None) == "feature/infmax_v3"
+
+
+def test_resolve_effective_sflow_version_uses_editable_repo_branch(tmp_path):
+    repo_path = tmp_path / "nv-sflow"
+    repo_path.mkdir()
+    dist = _FakeSflowDistribution(
+        version="0.2.0",
+        direct_url_text=(
+            '{"url":"file://'
+            + str(repo_path)
+            + '","dir_info":{"editable":true}}'
+        ),
+    )
+
+    with (
+        patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist),
+        patch("sflow.cli.batch._git_current_ref", return_value="feature/infmax_v3"),
+    ):
+        assert batch_mod._resolve_effective_sflow_version(None) == "feature/infmax_v3"
+
+
+def test_resolve_effective_sflow_version_falls_back_to_installed_package_version():
+    dist = _FakeSflowDistribution(version="0.2.0", direct_url_text=None)
+
+    with patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist):
+        assert batch_mod._resolve_effective_sflow_version(None) == "0.2.0"
+
+
+def test_batch_defaults_sflow_version_from_execution_env(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    sbatch_path = tmp_path / "test.sh"
+
+    with patch(
+        "sflow.cli.batch._resolve_effective_sflow_version",
+        return_value="feature/infmax_v3",
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "batch",
+                "--file",
+                str(temp_workflow_file),
+                "--partition",
+                "batch",
+                "--account",
+                "testaccount",
+                "--nodes",
+                "1",
+                "--sbatch-path",
+                str(sbatch_path),
+            ],
+        )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert (
+        "git+https://github.com/NVIDIA/nv-sflow.git@feature/infmax_v3"
+        in script_content
+    )

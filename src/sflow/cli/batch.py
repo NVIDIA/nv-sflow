@@ -6,10 +6,14 @@ CLI command for generating sbatch scripts to run sflow in batch mode.
 """
 
 import csv
+import json
 import shlex
 from datetime import datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import typer
 
@@ -126,6 +130,97 @@ def _resolve_slurm_defaults(
             )
 
     return partition, account
+
+
+def _git_current_ref(repo_path: Path) -> str | None:
+    """Return the current git branch, or detached HEAD commit if needed."""
+    import subprocess
+
+    try:
+        branch = subprocess.check_output(
+            ["git", "-C", str(repo_path), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        if branch:
+            return branch
+    except Exception:
+        pass
+
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        if commit:
+            return commit
+    except Exception:
+        pass
+
+    return None
+
+
+def _repo_path_from_direct_url(url: str) -> Path | None:
+    """Resolve a local repo path from a PEP 610 direct_url entry."""
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+
+    raw_path = url2pathname(parsed.path)
+    if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+        raw_path = f"//{parsed.netloc}{raw_path}"
+
+    repo_path = Path(raw_path)
+    if repo_path.exists():
+        return repo_path
+    return None
+
+
+def _resolve_effective_sflow_version(sflow_version: str | None) -> str | None:
+    """Resolve the git ref/version that generated batch scripts should install."""
+    if sflow_version:
+        return sflow_version
+
+    try:
+        dist = importlib_metadata.distribution("sflow")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+    try:
+        direct_url_text = dist.read_text("direct_url.json")
+    except Exception:
+        direct_url_text = None
+
+    if direct_url_text:
+        try:
+            direct_url = json.loads(direct_url_text)
+        except json.JSONDecodeError:
+            direct_url = {}
+
+        vcs_info = direct_url.get("vcs_info") or {}
+        requested_revision = vcs_info.get("requested_revision")
+        if requested_revision:
+            return str(requested_revision)
+
+        repo_url = direct_url.get("url")
+        if isinstance(repo_url, str):
+            repo_path = _repo_path_from_direct_url(repo_url)
+            if repo_path:
+                repo_ref = _git_current_ref(repo_path)
+                if repo_ref:
+                    return repo_ref
+
+    version = getattr(dist, "version", None)
+    if version:
+        return str(version)
+
+    try:
+        return importlib_metadata.version("sflow")
+    except importlib_metadata.PackageNotFoundError:
+        return None
 
 
 def _resolve_sbatch_extra_args(
@@ -275,7 +370,8 @@ def _generate_sbatch_script(
 
     activate_path_str = shlex.quote(str(activate_script))
     venv_parent = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))
-    git_ref = sflow_version if sflow_version else "main"
+    effective_sflow_version = _resolve_effective_sflow_version(sflow_version)
+    git_ref = effective_sflow_version if effective_sflow_version else "main"
 
     lock_file = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent / ".sflow_venv.lock"))
 
@@ -295,7 +391,7 @@ def _generate_sbatch_script(
             '    source "$SFLOW_ACTIVATE"',
         ]
     )
-    if sflow_version:
+    if effective_sflow_version:
         script_lines.append(
             f'    "$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}'
         )
@@ -1833,7 +1929,10 @@ def batch(
         Optional[str],
         typer.Option(
             "--sflow-version",
-            help="Git ref (branch or tag) to install from the GitHub repo (e.g., 'main', 'v0.1.0'). If not specified, reuse the installed version in the existing venv, or create a new venv and install the latest main version.",
+            help="Git ref (branch or tag) to install from the GitHub repo (e.g., 'main', 'v0.1.0'). "
+            "If not specified, generated scripts default to the currently executing sflow environment's "
+            "installed git ref when available, otherwise the installed package version, and only fall back "
+            "to 'main' when neither can be determined.",
         ),
     ] = None,
     missable_tasks: Annotated[

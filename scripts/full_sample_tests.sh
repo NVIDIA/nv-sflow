@@ -49,6 +49,12 @@ mkdir -p "$PREFLIGHT_DIR"
 RESULTS_DIR=$(mktemp -d)
 trap 'rm -rf "$RESULTS_DIR"' EXIT
 TEST_ID=0
+EXPECTED_BATCH_SFLOW_VERSION=$(python - <<'PY'
+from sflow.cli.batch import _resolve_effective_sflow_version
+
+print(_resolve_effective_sflow_version(None) or "main")
+PY
+)
 
 throttle() {
     if [ "$MAX_JOBS" -gt 0 ]; then
@@ -281,6 +287,18 @@ if true; then
                 grep '#SBATCH --segment' "$BATCH_EXTRA_ARGS_DIR/expr_test.sh" || echo "    (no --segment directive found)"
             fi
         fi
+    fi
+
+    # -- sflow batch default --sflow-version: should follow current execution env --
+    BATCH_DEFAULT_VERSION_DIR="$PREFLIGHT_DIR/batch_default_sflow_version"
+    mkdir -p "$BATCH_DEFAULT_VERSION_DIR"
+    if [ -f "$EXTRA_ARGS_EXAMPLE" ]; then
+        run_check "batch default --sflow-version from current env" \
+            sflow batch -f "$EXTRA_ARGS_EXAMPLE" \
+                -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+                -s "SLURM_NODES=3" \
+                -o "$BATCH_DEFAULT_VERSION_DIR/default_version.sh"
     fi
 
     # -- sflow batch -e with variables.X.domain expression --
@@ -544,6 +562,22 @@ if true; then
             FAIL=$((FAIL + 1))
             TOTAL=$((TOTAL + 1))
             FAILED_LABELS="$FAILED_LABELS  - batch -e variables.X.domain resolution\n"
+        fi
+    fi
+
+    # -- Post-wait: verify default batch install version follows current env --
+    BATCH_DEFAULT_SCRIPT="$BATCH_DEFAULT_VERSION_DIR/default_version.sh"
+    if [ -f "$BATCH_DEFAULT_SCRIPT" ]; then
+        expected_ref="git+https://github.com/NVIDIA/nv-sflow.git@$EXPECTED_BATCH_SFLOW_VERSION"
+        if grep -Fq "$expected_ref" "$BATCH_DEFAULT_SCRIPT"; then
+            echo "  PASS: batch default --sflow-version resolved to $EXPECTED_BATCH_SFLOW_VERSION"
+        else
+            echo "  FAIL: batch default --sflow-version did not resolve to $EXPECTED_BATCH_SFLOW_VERSION"
+            grep -F 'git+https://github.com/NVIDIA/nv-sflow.git@' "$BATCH_DEFAULT_SCRIPT" || \
+                echo "    (no nv-sflow install line found)"
+            FAIL=$((FAIL + 1))
+            TOTAL=$((TOTAL + 1))
+            FAILED_LABELS="$FAILED_LABELS  - batch default --sflow-version resolution\n"
         fi
     fi
 
