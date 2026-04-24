@@ -177,6 +177,44 @@ if true; then
         sflow compose "$EXAMPLES_DIR/local_variable_domain.yaml" -vl -r \
             -o "$COMPOSE_DOMAIN_DIR/resolved.yaml"
 
+    # -- sflow compose: deferred Jinja should keep backend refs but inline resolved vars --
+    COMPOSE_DEFERRED_DIR="$PREFLIGHT_DIR/compose_deferred_jinja"
+    COMPOSE_DEFERRED_FIXTURE_DIR="$COMPOSE_DEFERRED_DIR/fixture"
+    mkdir -p "$COMPOSE_DEFERRED_FIXTURE_DIR"
+    cat > "$COMPOSE_DEFERRED_FIXTURE_DIR/vars.yaml" <<'EOF'
+version: "0.1"
+variables:
+  - name: INFRA_NODE_INDEX
+    value: 0
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: acct
+    partition: batch
+    time: "00:10:00"
+    nodes: 2
+    gpus_per_node: 4
+EOF
+    cat > "$COMPOSE_DEFERRED_FIXTURE_DIR/workflow.yaml" <<'EOF'
+version: "0.1"
+workflow:
+  name: wf
+  variables:
+    - name: HEAD_NODE_IP
+      value: ${{ backends.slurm_cluster.nodes[0].ip_address if variables.INFRA_NODE_INDEX == 0 else backends.slurm_cluster.nodes[-1].ip_address }}
+    - name: NATS_SERVER
+      value: nats://${{ backends.slurm_cluster.nodes[0].ip_address if variables.INFRA_NODE_INDEX == 0 else backends.slurm_cluster.nodes[-1].ip_address }}:4222
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+EOF
+    run_check "compose deferred_jinja_literal_rewrite" \
+        sflow compose "$COMPOSE_DEFERRED_FIXTURE_DIR/vars.yaml" \
+            "$COMPOSE_DEFERRED_FIXTURE_DIR/workflow.yaml" -r \
+            -o "$COMPOSE_DEFERRED_DIR/resolved.yaml"
+
     # -- sflow compose: single-file self-contained examples --
     COMPOSE_SINGLE_DIR="$PREFLIGHT_DIR/compose_single"
     mkdir -p "$COMPOSE_SINGLE_DIR"
@@ -444,6 +482,16 @@ if true; then
     # -- sflow sample --
     run_check "sample list" \
         sflow sample --list
+    SAMPLE_SELF_DIR="$PREFLIGHT_DIR/sample_copy_self"
+    mkdir -p "$SAMPLE_SELF_DIR"
+    run_check "sample copy self-contained" \
+        sflow sample local_hello_world \
+            --output "$SAMPLE_SELF_DIR/local_hello_world.yaml"
+    SAMPLE_MODULAR_DIR="$PREFLIGHT_DIR/sample_copy_modular"
+    mkdir -p "$SAMPLE_MODULAR_DIR"
+    run_check "sample copy modular" \
+        sflow sample inference_x_v2 \
+            --output "$SAMPLE_MODULAR_DIR/inference_x_v2"
 
     # =====================================================================
     # Wait for all parallel tests and aggregate results
@@ -602,6 +650,54 @@ if true; then
             TOTAL=$((TOTAL + DOMAIN_FAIL))
             FAILED_LABELS="$FAILED_LABELS  - variables.X.domain resolution\n"
         fi
+    fi
+
+    # -- Post-wait: verify compose -r rewrites resolved vars inside deferred Jinja --
+    COMPOSE_DEFERRED_RESOLVED="$PREFLIGHT_DIR/compose_deferred_jinja/resolved.yaml"
+    COMPOSE_DEFERRED_FAIL=0
+    if [ ! -f "$COMPOSE_DEFERRED_RESOLVED" ]; then
+        echo "  FAIL: compose deferred-Jinja e2e output missing"
+        COMPOSE_DEFERRED_FAIL=1
+    else
+        if grep -q 'variables.INFRA_NODE_INDEX' "$COMPOSE_DEFERRED_RESOLVED"; then
+            echo "  FAIL: compose deferred-Jinja output still references variables.INFRA_NODE_INDEX"
+            COMPOSE_DEFERRED_FAIL=1
+        fi
+        if grep -q 'if 0 == 0' "$COMPOSE_DEFERRED_RESOLVED"; then
+            echo "  PASS: compose -r rewrote resolved vars inside deferred Jinja"
+        else
+            echo "  FAIL: compose deferred-Jinja output did not inline the resolved literal"
+            COMPOSE_DEFERRED_FAIL=1
+        fi
+    fi
+    if [ "$COMPOSE_DEFERRED_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + COMPOSE_DEFERRED_FAIL))
+        TOTAL=$((TOTAL + COMPOSE_DEFERRED_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - compose deferred-Jinja resolution\n"
+    fi
+
+    # -- Post-wait: verify sflow sample copy flows --
+    SAMPLE_SELF_OUT="$PREFLIGHT_DIR/sample_copy_self/local_hello_world.yaml"
+    SAMPLE_MODULAR_OUT="$PREFLIGHT_DIR/sample_copy_modular/inference_x_v2"
+    SAMPLE_COPY_FAIL=0
+    if [ -s "$SAMPLE_SELF_OUT" ]; then
+        echo "  PASS: sample copied self-contained workflow to custom output path"
+    else
+        echo "  FAIL: sample self-contained copy missing or empty"
+        SAMPLE_COPY_FAIL=1
+    fi
+    if [ -d "$SAMPLE_MODULAR_OUT" ] && \
+       [ -f "$SAMPLE_MODULAR_OUT/slurm_config.yaml" ] && \
+       [ -f "$SAMPLE_MODULAR_OUT/bulk_input.csv" ]; then
+        echo "  PASS: sample copied modular workflow folder with key files"
+    else
+        echo "  FAIL: sample modular copy missing expected files"
+        SAMPLE_COPY_FAIL=1
+    fi
+    if [ "$SAMPLE_COPY_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + SAMPLE_COPY_FAIL))
+        TOTAL=$((TOTAL + SAMPLE_COPY_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - sample copy flows\n"
     fi
 
     # -- Post-wait: verify CLI --set wins over CSV column in bulk-input --

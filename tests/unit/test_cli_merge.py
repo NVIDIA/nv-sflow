@@ -382,6 +382,68 @@ def test_compose_keeps_backend_dependent_expressions(tmp_path: Path):
     assert composed["workflow"]["tasks"][0]["script"] == ["echo server at ${HEAD_IP}"]
 
 
+def test_compose_rewrites_resolved_variables_inside_deferred_jinja(tmp_path: Path):
+    """Resolved variables should be inlined even inside still-deferred Jinja."""
+    f1 = _write_yaml(
+        tmp_path / "vars.yaml",
+        {
+            "version": "0.1",
+            "variables": [
+                {"name": "INFRA_NODE_INDEX", "value": 0},
+            ],
+            "backends": [
+                {
+                    "name": "slurm_cluster",
+                    "type": "slurm",
+                    "default": True,
+                    "account": "acct",
+                    "partition": "batch",
+                    "time": "00:10:00",
+                    "nodes": 2,
+                    "gpus_per_node": 4,
+                }
+            ],
+        },
+    )
+    f2 = _write_yaml(
+        tmp_path / "workflow.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "variables": [
+                    {
+                        "name": "HEAD_NODE_IP",
+                        "value": "${{ backends.slurm_cluster.nodes[0].ip_address if variables.INFRA_NODE_INDEX == 0 else backends.slurm_cluster.nodes[-1].ip_address }}",
+                    },
+                    {
+                        "name": "NATS_SERVER",
+                        "value": "nats://${{ backends.slurm_cluster.nodes[0].ip_address if variables.INFRA_NODE_INDEX == 0 else backends.slurm_cluster.nodes[-1].ip_address }}:4222",
+                    },
+                ],
+                "tasks": [{"name": "t1", "script": ["echo hi"]}],
+            },
+        },
+    )
+
+    result = runner.invoke(
+        app, ["compose", str(f1), str(f2), "--resolve"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+
+    composed = yaml.safe_load(result.output)
+    assert "variables" not in composed, "Resolved top-level variables should be removed"
+    wf_vars = {entry["name"]: entry["value"] for entry in composed["workflow"]["variables"]}
+    assert wf_vars["HEAD_NODE_IP"] == (
+        "${{ backends.slurm_cluster.nodes[0].ip_address if 0 == 0 else "
+        "backends.slurm_cluster.nodes[-1].ip_address }}"
+    )
+    assert wf_vars["NATS_SERVER"] == (
+        "nats://${{ backends.slurm_cluster.nodes[0].ip_address if 0 == 0 else "
+        "backends.slurm_cluster.nodes[-1].ip_address }}:4222"
+    )
+
+
 def test_compose_resolves_shell_variable_refs_in_scripts(tmp_path: Path):
     """${NAME} shell references in scripts are inlined for resolved variables."""
     f1 = _write_yaml(

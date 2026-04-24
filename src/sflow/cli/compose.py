@@ -25,6 +25,7 @@ _logger = get_logger(__name__)
 
 _EXPR_RE = re.compile(r"\$\{\{(.+?)\}\}")
 _SHELL_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Env vars that are NOT sflow variables — never resolve these.
 _BUILTIN_ENV_VARS = frozenset(
@@ -170,8 +171,106 @@ def _coerce_type(value: str) -> Any:
     return value
 
 
+def _to_jinja_literal(value: Any) -> str:
+    """Render a Python value as a Jinja-compatible literal."""
+    return repr(value)
+
+
+def _consume_quoted_string(text: str, start: int) -> tuple[str, int]:
+    """Return the quoted substring starting at *start* and the next index."""
+    quote = text[start]
+    end = start + 1
+    while end < len(text):
+        if text[end] == "\\":
+            end += 2
+            continue
+        if text[end] == quote:
+            end += 1
+            break
+        end += 1
+    return text[start:end], end
+
+
+def _inline_resolved_vars_in_expr_body(
+    body: str,
+    resolved: dict[str, Any],
+    domains: dict[str, list[Any]] | None,
+) -> str:
+    """Inline known variable values into a raw Jinja expression body."""
+    if not resolved:
+        return body
+
+    domain_map = domains or {}
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in ("'", '"'):
+            quoted, i = _consume_quoted_string(body, i)
+            out.append(quoted)
+            continue
+
+        if body.startswith("variables.", i):
+            match = _IDENTIFIER_RE.match(body, i + len("variables."))
+            if match:
+                name = match.group(0)
+                end = match.end()
+                if body.startswith(".domain", end) and name in resolved:
+                    out.append(_to_jinja_literal(domain_map.get(name, [])))
+                    i = end + len(".domain")
+                    continue
+                if name in resolved:
+                    out.append(_to_jinja_literal(resolved[name]))
+                    i = end
+                    continue
+
+        match = _IDENTIFIER_RE.match(body, i)
+        if match:
+            name = match.group(0)
+            end = match.end()
+            prev = body[i - 1] if i > 0 else ""
+            if prev != "." and not (prev.isalnum() or prev == "_"):
+                if body.startswith(".domain", end) and name in resolved:
+                    out.append(_to_jinja_literal(domain_map.get(name, [])))
+                    i = end + len(".domain")
+                    continue
+                if name in resolved:
+                    out.append(_to_jinja_literal(resolved[name]))
+                    i = end
+                    continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _inline_resolved_vars_in_jinja(
+    text: str,
+    resolved: dict[str, Any],
+    domains: dict[str, list[Any]] | None = None,
+) -> str:
+    """Rewrite deferred Jinja expressions so removed variables become literals."""
+    if "${{" not in text or not resolved:
+        return text
+
+    def _rewrite(match: re.Match) -> str:
+        expr_text = match.group(0)
+        body = expr_text[3:-2]
+        rewritten = _inline_resolved_vars_in_expr_body(body, resolved, domains)
+        if rewritten == body:
+            return expr_text
+        return "${{" + rewritten + "}}"
+
+    return _EXPR_RE.sub(_rewrite, text)
+
+
 def _resolve_expressions(
-    obj: Any, ctx: dict[str, Any], env: SandboxedEnvironment
+    obj: Any,
+    ctx: dict[str, Any],
+    env: SandboxedEnvironment,
+    resolved: dict[str, Any] | None = None,
+    domains: dict[str, list[Any]] | None = None,
 ) -> Any:
     """Walk a data structure, resolving ${{ }} expressions where all refs are available.
 
@@ -189,20 +288,41 @@ def _resolve_expressions(
                 result = env.from_string(obj).render(**ctx)
                 return _coerce_type(result)
             except (UndefinedError, Exception):
-                return obj
+                rewritten = _inline_resolved_vars_in_jinja(obj, resolved or {}, domains)
+                if rewritten == obj:
+                    return obj
+                try:
+                    result = env.from_string(rewritten).render(**ctx)
+                    return _coerce_type(result)
+                except (UndefinedError, Exception):
+                    return rewritten
 
         def _replace_match(m: re.Match) -> str:
             expr_text = m.group(0)
             try:
                 return env.from_string(expr_text).render(**ctx)
             except (UndefinedError, Exception):
-                return expr_text
+                rewritten = _inline_resolved_vars_in_jinja(
+                    expr_text, resolved or {}, domains
+                )
+                if rewritten == expr_text:
+                    return expr_text
+                try:
+                    return env.from_string(rewritten).render(**ctx)
+                except (UndefinedError, Exception):
+                    return rewritten
 
         return _EXPR_RE.sub(_replace_match, obj)
     if isinstance(obj, list):
-        return [_resolve_expressions(item, ctx, env) for item in obj]
+        return [
+            _resolve_expressions(item, ctx, env, resolved=resolved, domains=domains)
+            for item in obj
+        ]
     if isinstance(obj, dict):
-        return {k: _resolve_expressions(v, ctx, env) for k, v in obj.items()}
+        return {
+            k: _resolve_expressions(v, ctx, env, resolved=resolved, domains=domains)
+            for k, v in obj.items()
+        }
     return obj
 
 
@@ -332,7 +452,7 @@ def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
             )
     ctx: dict[str, Any] = {"variables": wrapped, **wrapped}
 
-    merged = _resolve_expressions(merged, ctx, env)
+    merged = _resolve_expressions(merged, ctx, env, resolved=resolved, domains=domains)
     merged = _resolve_shell_vars(merged, resolved)
     merged = _clean_resolved_strings(merged)
 
