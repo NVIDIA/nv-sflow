@@ -249,9 +249,18 @@ class OutputConfig(StrictBaseModel):
 class NodeResourceConfig(StrictBaseModel):
     """Node resource configuration for a task."""
 
-    indices: Optional[List[Resolvable[int]]] = None  # Can be [0, 1] or ["${{ ... }}"]
+    indices: Optional[Union[List[Resolvable[int]], str]] = None  # Can be [0, 1], ["${{ ... }}"], or "${{ ... }}" resolving to a list
     count: Optional[Resolvable[int]] = None  # Can be int or expression
     exclude: Optional[Union[List[Resolvable[int]], Resolvable[int]]] = None
+
+    @field_validator("indices")
+    @classmethod
+    def indices_must_be_list_or_expression(cls, v: Any) -> Any:
+        if isinstance(v, str) and not is_expression(v):
+            raise ValueError(
+                "resources.nodes.indices must be a list or an expression that resolves to a list"
+            )
+        return v
 
 
 class GpuResourceConfig(StrictBaseModel):

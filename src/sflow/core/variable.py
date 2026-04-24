@@ -68,6 +68,9 @@ class VariableValue:
     def __int__(self) -> int:
         return int(self._value)
 
+    def __index__(self) -> int:
+        return int(self._value)
+
     def __float__(self) -> float:
         return float(self._value)
 

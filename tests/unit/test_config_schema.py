@@ -224,6 +224,16 @@ class TestSflowConfigSchema:
         assert t.resources.nodes.count == 2
         assert t.resources.gpus.count == 4
 
+        expr_resources = ResourcesConfig(
+            nodes=NodeResourceConfig(
+                indices="${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}"
+            )
+        )
+        expr_task = TaskConfig(name="expr_task", script=["run"], resources=expr_resources)
+        assert expr_task.resources.nodes.indices == (
+            "${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}"
+        )
+
     def test_replica_policy(self):
         """
         REQ-3.3: Task Replication policies.

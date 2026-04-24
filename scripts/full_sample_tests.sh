@@ -193,7 +193,7 @@ backends:
     account: acct
     partition: batch
     time: "00:10:00"
-    nodes: 2
+    nodes: 4
     gpus_per_node: 4
 EOF
     cat > "$COMPOSE_DEFERRED_FIXTURE_DIR/workflow.yaml" <<'EOF'
@@ -214,6 +214,65 @@ EOF
         sflow compose "$COMPOSE_DEFERRED_FIXTURE_DIR/vars.yaml" \
             "$COMPOSE_DEFERRED_FIXTURE_DIR/workflow.yaml" -r \
             -o "$COMPOSE_DEFERRED_DIR/resolved.yaml"
+
+    # -- sflow compose: resources.nodes.indices/exclude may be a single expression string resolving to a list --
+    COMPOSE_INDICES_DIR="$PREFLIGHT_DIR/compose_indices_expression"
+    COMPOSE_INDICES_FIXTURE_DIR="$COMPOSE_INDICES_DIR/fixture"
+    COMPOSE_INDICES_DRYRUN_LOG="$COMPOSE_INDICES_DIR/dry_run.log"
+    mkdir -p "$COMPOSE_INDICES_FIXTURE_DIR"
+    cat > "$COMPOSE_INDICES_FIXTURE_DIR/vars.yaml" <<'EOF'
+version: "0.1"
+variables:
+  - name: INFRA_NODE_INDEX
+    value: 0
+    type: integer
+  - name: NUM_FRONTENDS
+    value: 2
+    type: integer
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: acct
+    partition: batch
+    time: "00:10:00"
+    nodes: 4
+    gpus_per_node: 4
+EOF
+    cat > "$COMPOSE_INDICES_FIXTURE_DIR/workflow.yaml" <<'EOF'
+version: "0.1"
+workflow:
+  name: wf
+  tasks:
+    - name: frontend_server
+      script:
+        - echo hi
+      resources:
+        nodes:
+          indices: ${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}
+    - name: worker_server
+      script:
+        - echo worker
+      resources:
+        nodes:
+          exclude: ${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}
+    - name: ordered_pool
+      script:
+        - echo ordered
+      replicas:
+        count: 4
+        policy: parallel
+      resources:
+        nodes:
+          indices: [-1, 0, 1, 2]
+          count: 1
+EOF
+    run_check "compose nodes.indices/exclude expression strings resolve to list" \
+        sflow compose "$COMPOSE_INDICES_FIXTURE_DIR/vars.yaml" \
+            "$COMPOSE_INDICES_FIXTURE_DIR/workflow.yaml" -r \
+            -o "$COMPOSE_INDICES_DIR/resolved.yaml"
+    run_check "run nodes.indices/exclude expression strings and indices+count ordering (dry-run)" \
+        bash -c "sflow run \"$COMPOSE_INDICES_FIXTURE_DIR/vars.yaml\" \"$COMPOSE_INDICES_FIXTURE_DIR/workflow.yaml\" --dry-run > \"$COMPOSE_INDICES_DRYRUN_LOG\" 2>&1"
 
     # -- sflow compose: single-file self-contained examples --
     COMPOSE_SINGLE_DIR="$PREFLIGHT_DIR/compose_single"
@@ -674,6 +733,76 @@ EOF
         FAIL=$((FAIL + COMPOSE_DEFERRED_FAIL))
         TOTAL=$((TOTAL + COMPOSE_DEFERRED_FAIL))
         FAILED_LABELS="$FAILED_LABELS  - compose deferred-Jinja resolution\n"
+    fi
+
+    # -- Post-wait: verify compose -r resolves nodes.indices expression strings to a YAML list value --
+    COMPOSE_INDICES_RESOLVED="$PREFLIGHT_DIR/compose_indices_expression/resolved.yaml"
+    COMPOSE_INDICES_FAIL=0
+    if [ ! -f "$COMPOSE_INDICES_RESOLVED" ]; then
+        echo "  FAIL: compose nodes.indices e2e output missing"
+        COMPOSE_INDICES_FAIL=1
+    else
+        export COMPOSE_INDICES_RESOLVED
+        if python - <<'PY'
+import os
+from pathlib import Path
+import yaml
+
+resolved_path = Path(os.environ["COMPOSE_INDICES_RESOLVED"])
+data = yaml.safe_load(resolved_path.read_text())
+tasks = {task["name"]: task for task in data["workflow"]["tasks"]}
+indices = tasks["frontend_server"]["resources"]["nodes"]["indices"]
+exclude = tasks["worker_server"]["resources"]["nodes"]["exclude"]
+assert indices in ("[0, 1]", [0, 1]), indices
+assert exclude in ("[0, 1]", [0, 1]), exclude
+PY
+        then
+            echo "  PASS: compose -r resolves resources.nodes.indices/exclude expression strings to [0, 1]"
+        else
+            echo "  FAIL: compose nodes.indices/exclude output did not resolve to [0, 1]"
+            COMPOSE_INDICES_FAIL=1
+        fi
+    fi
+    if [ "$COMPOSE_INDICES_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + COMPOSE_INDICES_FAIL))
+        TOTAL=$((TOTAL + COMPOSE_INDICES_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - compose nodes.indices/exclude expression resolution\n"
+    fi
+
+    # -- Post-wait: verify dry-run assigns nodes from indices+count in the configured order --
+    COMPOSE_INDICES_DRYRUN_FAIL=0
+    if [ ! -f "$COMPOSE_INDICES_DRYRUN_LOG" ]; then
+        echo "  FAIL: dry-run nodes.indices/count log missing"
+        COMPOSE_INDICES_DRYRUN_FAIL=1
+    else
+        export COMPOSE_INDICES_DRYRUN_LOG
+        if python - <<'PY'
+import os
+import re
+from pathlib import Path
+
+text = Path(os.environ["COMPOSE_INDICES_DRYRUN_LOG"]).read_text()
+expected = {
+    "ordered_pool_0": "slurm_cluster-node3",
+    "ordered_pool_1": "slurm_cluster-node0",
+    "ordered_pool_2": "slurm_cluster-node1",
+    "ordered_pool_3": "slurm_cluster-node2",
+}
+for task_name, node_name in expected.items():
+    pattern = rf"\[\d+\]\s+{re.escape(task_name)}.*?nodelist:\s+\['{re.escape(node_name)}'\]"
+    assert re.search(pattern, text, re.S), (task_name, node_name)
+PY
+        then
+            echo "  PASS: dry-run assigns indices+count replicas in configured order"
+        else
+            echo "  FAIL: dry-run did not preserve indices+count ordering"
+            COMPOSE_INDICES_DRYRUN_FAIL=1
+        fi
+    fi
+    if [ "$COMPOSE_INDICES_DRYRUN_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + COMPOSE_INDICES_DRYRUN_FAIL))
+        TOTAL=$((TOTAL + COMPOSE_INDICES_DRYRUN_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - dry-run nodes.indices+count ordering\n"
     fi
 
     # -- Post-wait: verify sflow sample copy flows --

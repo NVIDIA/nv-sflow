@@ -15,6 +15,7 @@ from sflow.config.schema import (
     ResourcesConfig,
     SflowConfig,
     TaskConfig,
+    VariableConfig,
     WorkflowConfig,
 )
 from sflow.core.backend import Allocation, Backend
@@ -564,6 +565,48 @@ def test_build_task_graph_resources_nodes_indices_selects_subset_of_allocation_n
     assert t1.operator.config.nodes == 2
 
 
+def test_build_task_graph_resources_nodes_indices_expression_string_selects_subset():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="333e",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            indices="${{ range(1, 3) | list }}"
+                        )
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n2", "n3"]
+    assert t1.operator.config.nodes == 2
+
+
 def test_build_task_graph_resources_nodes_negative_indices_select_from_end():
     """Negative indices wrap around Python-style: -1 is last node, -2 second-to-last."""
     state = _state()
@@ -763,6 +806,51 @@ def test_build_task_graph_resources_nodes_count_compact_allocation_for_parallel_
     assert t11.operator.config.type == "srun"
     assert t10.operator.config.nodelist == ["n1", "n2"]
     assert t11.operator.config.nodelist == ["n3", "n4"]
+
+
+def test_build_task_graph_resources_nodes_indices_and_count_follow_selected_order():
+    """indices defines the pool; count slices that pool in order across replicas."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="444c",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    replicas=ReplicaConfig(count=4, policy="parallel"),
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[-1, 0, 1, 2], count=1)
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t1_0").operator.config.nodelist == ["n4"]
+    assert tg.get_task("t1_1").operator.config.nodelist == ["n1"]
+    assert tg.get_task("t1_2").operator.config.nodelist == ["n2"]
+    assert tg.get_task("t1_3").operator.config.nodelist == ["n3"]
+    assert tg.get_task("t1_0").operator.config.nodes == 1
+    assert tg.get_task("t1_3").operator.config.nodes == 1
 
 
 def test_build_task_graph_resources_gpus_count_sets_cuda_visible_devices_with_offset():
@@ -1664,6 +1752,48 @@ def test_build_task_graph_resources_nodes_exclude_list():
     tg = build_task_graph(config, state)
     t1 = tg.get_task("t1")
     assert t1.operator.config.nodelist == ["n2", "n4"]
+
+
+def test_build_task_graph_resources_nodes_exclude_expression_string_list():
+    """exclude may be a single expression string that resolves to a list of indices."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="exc2e",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            exclude="${{ range(0, 2) | list }}"
+                        )
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n3", "n4"]
 
 
 def test_build_task_graph_resources_nodes_exclude_with_count():

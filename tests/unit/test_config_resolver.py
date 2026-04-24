@@ -135,3 +135,16 @@ class TestVariableValueInExpressions:
         ctx = {"variables": {"HOST": VariableValue("10.0.0.1"), "PORT": VariableValue(8080)}}
         result = resolver.resolve("${{ variables.HOST }}:${{ variables.PORT }}", ctx)
         assert result == "10.0.0.1:8080"
+
+    def test_range_list_expression(self, resolver):
+        ctx = {
+            "variables": {
+                "INFRA_NODE_INDEX": VariableValue(0),
+                "NUM_FRONTENDS": VariableValue(2),
+            }
+        }
+        result = resolver.resolve(
+            "${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}",
+            ctx,
+        )
+        assert result == "[0, 1]"

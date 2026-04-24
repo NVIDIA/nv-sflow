@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import math
 import re
 import shutil
@@ -1218,10 +1219,20 @@ def build_task_graph(
         )
 
     def _resolve_int_list(
-        task_name: str, *, field: str, values: list[Any]
+        task_name: str, *, field: str, values: Any
     ) -> list[int]:
+        resolved_values = (
+            resolver.resolve(values, ctx) if resolver.has_expression(values) else values
+        )
+        if isinstance(resolved_values, str):
+            try:
+                resolved_values = json.loads(resolved_values)
+            except json.JSONDecodeError as e:
+                pass
+        if not isinstance(resolved_values, list):
+            resolved_values = [resolved_values]
         out: list[int] = []
-        for i, v in enumerate(values):
+        for i, v in enumerate(resolved_values):
             out.append(_resolve_int(task_name, field=f"{field}[{i}]", value=v))
         return out
 
@@ -1258,7 +1269,7 @@ def build_task_graph(
         if nodes_exclude_raw is not None:
             raw = (
                 nodes_exclude_raw
-                if isinstance(nodes_exclude_raw, list)
+                if isinstance(nodes_exclude_raw, list) or resolver.has_expression(nodes_exclude_raw)
                 else [nodes_exclude_raw]
             )
             n = len(alloc_nodes)
@@ -1283,19 +1294,15 @@ def build_task_graph(
                     f"Task '{task_name}' resources.nodes.exclude removed all nodes from the pool"
                 )
 
-        if nodes_indices_raw is not None and nodes_count_raw is not None:
-            raise ValueError(
-                f"Task '{task_name}' resources.nodes cannot set both 'indices' and 'count'"
-            )
-
+        selected_nodes = alloc_nodes
         if nodes_indices_raw is not None:
             indices = _resolve_int_list(
                 task_name,
                 field="resources.nodes.indices",
-                values=list(nodes_indices_raw),
+                values=nodes_indices_raw,
             )
             n = len(alloc_nodes)
-            chosen: list[str] = []
+            chosen_nodes: list[ComputeNode] = []
             for idx in indices:
                 resolved_idx = idx if idx >= 0 else idx + n
                 if resolved_idx < 0 or resolved_idx >= n:
@@ -1303,8 +1310,10 @@ def build_task_graph(
                         f"Task '{task_name}' resources.nodes.indices contains out-of-range index {idx}; "
                         f"allocation has {n} nodes (valid: {-n}..{n - 1})"
                     )
-                chosen.append(alloc_nodes[resolved_idx].name)
-            return chosen, False
+                chosen_nodes.append(alloc_nodes[resolved_idx])
+            selected_nodes = chosen_nodes
+            if nodes_count_raw is None:
+                return [node.name for node in selected_nodes], False
 
         if nodes_count_raw is not None:
             count = _resolve_int(
@@ -1316,12 +1325,12 @@ def build_task_graph(
                 )
             start = 0 if replica_policy == "sequential" else replica_index * count
             end = start + count
-            if end > len(alloc_nodes):
+            if end > len(selected_nodes):
                 raise ValueError(
                     f"Task '{task_name}' needs {count} nodes (replica_index={replica_index}, policy={replica_policy}), "
-                    f"but allocation has only {len(alloc_nodes)} nodes"
+                    f"but allocation has only {len(selected_nodes)} nodes"
                 )
-            return [n.name for n in alloc_nodes[start:end]], False
+            return [node.name for node in selected_nodes[start:end]], False
 
         # If nodes are not explicitly requested but GPUs are, first try to "pack" the task onto
         # a single allocation node that still has enough remaining GPUs.
