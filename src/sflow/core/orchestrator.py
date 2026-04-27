@@ -244,6 +244,11 @@ class Orchestrator:
 
         probe.status = ProbeStatus.TRIGGERED
         if probe.type == ProbeType.READINESS:
+            readiness_probes = [
+                p for p in task.probes if p.type == ProbeType.READINESS
+            ]
+            if any(p.status != ProbeStatus.TRIGGERED for p in readiness_probes):
+                return
             task.status = TaskStatus.READY
             for fname in getattr(task, "readiness_followers", []):
                 try:

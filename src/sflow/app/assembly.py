@@ -1085,6 +1085,11 @@ def build_task_graph(
         combined = " ".join(texts)
         return any(var_name in combined for var_name in var_names)
 
+    def _probe_config_list(p_conf: Any) -> list[Any]:
+        if p_conf is None:
+            return []
+        return p_conf if isinstance(p_conf, list) else [p_conf]
+
     def _build_probe(
         task_name: str,
         *,
@@ -2007,12 +2012,16 @@ def build_task_graph(
                     is_non_first_replica and replica_policy == "parallel"
                 )
 
-                if t_conf.probes.readiness is not None:
+                readiness_probe_configs = _probe_config_list(t_conf.probes.readiness)
+                if readiness_probe_configs:
                     skip = (
                         can_share_probe
-                        and _is_http_probe_config(t_conf.probes.readiness)
-                        and not _http_probe_references_vars(
-                            t_conf.probes.readiness, replica_var_names
+                        and all(
+                            _is_http_probe_config(p_conf)
+                            and not _http_probe_references_vars(
+                                p_conf, replica_var_names
+                            )
+                            for p_conf in readiness_probe_configs
                         )
                     )
                     if skip:
@@ -2025,14 +2034,15 @@ def build_task_graph(
                         if first_task is not None:
                             first_task.readiness_followers.append(node_name)
                     else:
-                        task.probes.append(
-                            _build_probe(
-                                node_name,
-                                p_conf=t_conf.probes.readiness,
-                                p_type=ProbeType.READINESS,
-                                default_host=default_probe_host,
+                        for p_conf in readiness_probe_configs:
+                            task.probes.append(
+                                _build_probe(
+                                    node_name,
+                                    p_conf=p_conf,
+                                    p_type=ProbeType.READINESS,
+                                    default_host=default_probe_host,
+                                )
                             )
-                        )
                 if t_conf.probes.failure is not None:
                     skip = (
                         can_share_probe

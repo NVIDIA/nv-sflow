@@ -140,6 +140,62 @@ if true; then
         sflow run "$EXAMPLES_DIR/local_variable_domain.yaml" \
             --output-dir "$DOMAIN_RUN_DIR"
 
+    # -- sflow run --dry-run: readiness accepts a list and builds multiple readiness probes --
+    READINESS_AND_DIR="$PREFLIGHT_DIR/readiness_probe_and"
+    READINESS_AND_FIXTURE="$READINESS_AND_DIR/readiness_probe_and.yaml"
+    READINESS_AND_DRYRUN_LOG="$READINESS_AND_DIR/dry_run.log"
+    READINESS_SINGLE_FIXTURE="$READINESS_AND_DIR/readiness_probe_single.yaml"
+    READINESS_SINGLE_DRYRUN_LOG="$READINESS_AND_DIR/single_dry_run.log"
+    mkdir -p "$READINESS_AND_DIR"
+    cat > "$READINESS_AND_FIXTURE" <<'EOF'
+version: "0.1"
+workflow:
+  name: readiness_probe_and
+  tasks:
+    - name: service
+      script:
+        - echo "readiness one"
+        - sleep 1
+        - echo "readiness two"
+        - touch "${SFLOW_WORKFLOW_OUTPUT_DIR}/all_readiness_probes_passed"
+        - sleep 2
+      probes:
+        readiness:
+          - log_watch:
+              match_pattern: "readiness one"
+            interval: 0
+            timeout: 10
+          - log_watch:
+              match_pattern: "readiness two"
+            interval: 0
+            timeout: 10
+    - name: after_ready
+      depends_on:
+        - service
+      script:
+        - test -f "${SFLOW_WORKFLOW_OUTPUT_DIR}/all_readiness_probes_passed"
+        - echo "after_ready observed all readiness probes"
+EOF
+    run_check "run readiness probe list (dry-run)" \
+        bash -c "sflow run \"$READINESS_AND_FIXTURE\" --dry-run > \"$READINESS_AND_DRYRUN_LOG\" 2>&1"
+    cat > "$READINESS_SINGLE_FIXTURE" <<'EOF'
+version: "0.1"
+workflow:
+  name: readiness_probe_single_compat
+  tasks:
+    - name: service
+      script:
+        - echo "single readiness"
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "single readiness"
+          interval: 0
+          timeout: 10
+EOF
+    run_check "run single readiness probe compatibility (dry-run)" \
+        bash -c "sflow run \"$READINESS_SINGLE_FIXTURE\" --dry-run > \"$READINESS_SINGLE_DRYRUN_LOG\" 2>&1"
+
     # -- sflow run --dry-run: self-contained slurm examples --
     for f in "$EXAMPLES_DIR"/slurm_*.yaml; do
         name=$(basename "$f" .yaml)
@@ -803,6 +859,54 @@ PY
         FAIL=$((FAIL + COMPOSE_INDICES_DRYRUN_FAIL))
         TOTAL=$((TOTAL + COMPOSE_INDICES_DRYRUN_FAIL))
         FAILED_LABELS="$FAILED_LABELS  - dry-run nodes.indices+count ordering\n"
+    fi
+
+    # -- Post-wait: verify readiness probe list appears as two readiness checks in dry-run plan --
+    READINESS_AND_FAIL=0
+    if [ ! -f "$READINESS_AND_DRYRUN_LOG" ]; then
+        echo "  FAIL: readiness probe list dry-run log missing"
+        READINESS_AND_FAIL=1
+    else
+        if ! grep -q 'readiness: log_watch (pattern=readiness one)' "$READINESS_AND_DRYRUN_LOG"; then
+            echo "  FAIL: first readiness probe missing from dry-run plan"
+            READINESS_AND_FAIL=1
+        fi
+        if ! grep -q 'readiness: log_watch (pattern=readiness two)' "$READINESS_AND_DRYRUN_LOG"; then
+            echo "  FAIL: second readiness probe missing from dry-run plan"
+            READINESS_AND_FAIL=1
+        fi
+        if [ "$READINESS_AND_FAIL" -eq 0 ]; then
+            echo "  PASS: readiness probe list expands to multiple readiness checks"
+        fi
+    fi
+    if [ "$READINESS_AND_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + READINESS_AND_FAIL))
+        TOTAL=$((TOTAL + READINESS_AND_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - readiness probe list dry-run expansion\n"
+    fi
+
+    # -- Post-wait: verify old single readiness probe object still works --
+    READINESS_SINGLE_FAIL=0
+    if [ ! -f "$READINESS_SINGLE_DRYRUN_LOG" ]; then
+        echo "  FAIL: single readiness probe dry-run log missing"
+        READINESS_SINGLE_FAIL=1
+    else
+        if ! grep -q 'readiness: log_watch (pattern=single readiness)' "$READINESS_SINGLE_DRYRUN_LOG"; then
+            echo "  FAIL: single readiness probe missing from dry-run plan"
+            READINESS_SINGLE_FAIL=1
+        fi
+        if grep -q 'ValidationError\|Traceback' "$READINESS_SINGLE_DRYRUN_LOG"; then
+            echo "  FAIL: single readiness probe dry-run emitted validation error"
+            READINESS_SINGLE_FAIL=1
+        fi
+        if [ "$READINESS_SINGLE_FAIL" -eq 0 ]; then
+            echo "  PASS: single readiness probe object remains compatible"
+        fi
+    fi
+    if [ "$READINESS_SINGLE_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + READINESS_SINGLE_FAIL))
+        TOTAL=$((TOTAL + READINESS_SINGLE_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - single readiness probe compatibility\n"
     fi
 
     # -- Post-wait: verify sflow sample copy flows --

@@ -57,6 +57,52 @@ class _AlwaysTriggeredProbe(Probe):
         return True
 
 
+class _ControlledReadinessProbe(Probe):
+    """Readiness probe with deterministic check results for AND-semantics tests."""
+
+    def __init__(self, results: list[bool]):
+        super().__init__(type=ProbeType.READINESS, interval=0, timeout=10)
+        self._results = list(results)
+
+    async def check(self, task) -> bool:
+        return self._results.pop(0) if self._results else False
+
+
+def test_multiple_readiness_probes_require_all_to_trigger():
+    """A task is ready only after every readiness probe has triggered."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+    first_probe = _ControlledReadinessProbe([True])
+    second_probe = _ControlledReadinessProbe([False, True])
+    server = Task(
+        name="server",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server"),
+        status=TaskStatus.RUNNING,
+        probes=[first_probe, second_probe],
+    )
+    tg.dag.add_node("server", server)
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+    )
+
+    asyncio.run(orch._run_probe(first_probe, server))
+    assert first_probe.status == ProbeStatus.TRIGGERED
+    assert server.status == TaskStatus.RUNNING
+
+    asyncio.run(orch._run_probe(second_probe, server))
+    assert second_probe.status == ProbeStatus.INITIATED
+    assert server.status == TaskStatus.RUNNING
+
+    asyncio.run(orch._run_probe(second_probe, server))
+    assert second_probe.status == ProbeStatus.TRIGGERED
+    assert server.status == TaskStatus.READY
+
+
 def test_failure_probe_sets_failed_by_probe_and_cancels_workflow(tmp_path: Path):
     """When a failure probe fires, the task is marked FAILED with failed_by_probe=True,
     and fail-fast cancels all other tasks."""

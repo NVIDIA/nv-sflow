@@ -190,6 +190,20 @@ class TestSflowConfigSchema:
         assert p.each_check_timeout == 30
         assert p.interval == 5
 
+        # Backwards compatibility: the old single readiness probe object is still valid.
+        single_probe = ProbeConfig(tcp_port=TcpPortProbeConfig(port=8080))
+        probes = ProbesConfig(readiness=single_probe)
+        assert probes.readiness == single_probe
+
+        # Multiple readiness probes are allowed and evaluated as an AND at runtime.
+        probes = ProbesConfig(
+            readiness=[
+                ProbeConfig(tcp_port=TcpPortProbeConfig(port=8080)),
+                ProbeConfig(http_get=HttpProbeConfig(url="http://localhost/health")),
+            ]
+        )
+        assert len(probes.readiness) == 2
+
     def test_task_config_required_fields(self):
         """
         REQ-3.1: Task Definition. Name and script are minimal requirements effectively?

@@ -230,8 +230,15 @@ class ProbeConfig(StrictBaseModel):
 class ProbesConfig(StrictBaseModel):
     """Configuration for task probes."""
 
-    readiness: Optional[ProbeConfig] = None
+    readiness: Optional[Union[ProbeConfig, List[ProbeConfig]]] = None
     failure: Optional[ProbeConfig] = None
+
+    @field_validator("readiness")
+    @classmethod
+    def readiness_list_must_not_be_empty(cls, v: Any) -> Any:
+        if isinstance(v, list) and not v:
+            raise ValueError("readiness probe list cannot be empty")
+        return v
 
 
 class OutputMetricConfig(StrictBaseModel):
@@ -385,9 +392,16 @@ class WorkflowConfig(StrictBaseModel):
             # Check probe log watchers
             if task.probes:
                 for probe_type in ["readiness", "failure"]:
-                    probe = getattr(task.probes, probe_type)
-                    if probe and probe.log_watch and probe.log_watch.logger:
-                        if probe.log_watch.logger not in task_names:
+                    probes = getattr(task.probes, probe_type)
+                    if probes is None:
+                        continue
+                    probe_list = probes if isinstance(probes, list) else [probes]
+                    for probe in probe_list:
+                        if (
+                            probe.log_watch
+                            and probe.log_watch.logger
+                            and probe.log_watch.logger not in task_names
+                        ):
                             raise ValueError(
                                 f"Task '{task.name}' {probe_type} probe refers to unknown task '{probe.log_watch.logger}'"
                             )

@@ -26,7 +26,7 @@ from sflow.core.variable import Variable, VariableType
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
-from sflow.plugins.probes import HttpPostProbe, TcpPortProbe
+from sflow.plugins.probes import HttpGetProbe, HttpPostProbe, TcpPortProbe
 
 
 class _FakeBackend(Backend):
@@ -478,6 +478,66 @@ def test_build_task_graph_tcp_probe_defaults_to_assigned_node_ip_for_slurm_backe
     p = svc.probes[0]
     assert isinstance(p, TcpPortProbe)
     assert p._host == "10.0.0.1"
+
+
+def test_build_task_graph_attaches_multiple_readiness_probes():
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo hi"],
+                    probes={
+                        "readiness": [
+                            {"tcp_port": {"port": 8000}},
+                            {"http_get": {"url": "http://10.0.0.1:8000/health"}},
+                        ]
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    svc = tg.get_task("svc")
+
+    assert len(svc.probes) == 2
+    assert isinstance(svc.probes[0], TcpPortProbe)
+    assert isinstance(svc.probes[1], HttpGetProbe)
+
+
+def test_build_task_graph_keeps_single_readiness_probe_object_compatibility():
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo hi"],
+                    probes={
+                        "readiness": {
+                            "http_get": {"url": "http://10.0.0.1:8000/health"},
+                            "timeout": 30,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    svc = tg.get_task("svc")
+
+    assert len(svc.probes) == 1
+    assert isinstance(svc.probes[0], HttpGetProbe)
+    assert svc.probes[0].timeout == 30
 
 
 def test_build_task_graph_replica_sweep_uses_variable_domain_and_injects_envs():
