@@ -111,6 +111,30 @@ value: "${{ variables.MY_VAR }}"
 value: "${{ MY_VAR }}"
 ```
 
+### Variable Domains in Expressions
+
+When a variable declares a `domain`, the current value still renders normally, and the domain list is available as metadata:
+
+```yaml
+variables:
+  CONCURRENCY:
+    value: 16
+    type: integer
+    domain: [1, 4, 16, 64]
+
+workflow:
+  tasks:
+    - name: show_domain
+      script:
+        - echo "value=${{ variables.CONCURRENCY }}"
+        - echo "domain=${{ variables.CONCURRENCY.domain }}"
+        - echo "max=${{ variables.CONCURRENCY.domain | max }}"
+```
+
+This also works in places that resolve expressions before execution, including `sflow compose --resolve` and `sflow batch -e/--sbatch-extra-args`.
+
+For replica sweeps, `${{ variables.CONCURRENCY }}` resolves to each replica's row value while `${{ variables.CONCURRENCY.domain }}` stays the full domain list for every replica.
+
 ### Task Node and GPU Access (Scripts Only)
 
 Inside task scripts, you can reference other tasks' assigned nodes and GPUs using the `task` context:
@@ -341,6 +365,7 @@ Notes:
 
 - `--set` can only override variables that already exist in `variables:` (otherwise it errors).
 - Values use simple type inference (int/float/bool/list/string).
+- JSON-style list values update the variable `domain`; the variable `value` becomes the first element of the list.
 
 ### Override Domains for Replica Sweeps
 
