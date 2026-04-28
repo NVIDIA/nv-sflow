@@ -3,6 +3,25 @@ title: Quickstart
 sidebar_position: 2
 ---
 
+## Install sflow
+
+```bash
+mkdir -p sflow_workspace && cd sflow_workspace
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv --python python3
+source .venv/bin/activate
+uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
+sflow --help
+```
+
+If `curl` is unavailable (e.g. on some locked-down clusters), install `uv` via pip instead:
+
+```bash
+pip install uv
+```
+
+---
+
 ## One-Minute Mindset
 
 `sflow` lets you describe a multi-step workflow in a single YAML file and run it on **any compute backend** — your laptop today, a Slurm cluster tomorrow — without rewriting scripts.
@@ -20,25 +39,6 @@ sidebar_position: 2
 
 **Why not just write a bash script?**
 A bash script hard-wires node names, GPU indices, and execution order. With sflow you declare what you want; it handles allocation, node discovery, GPU assignment, dependency ordering, log collection, and retries — the same YAML works locally for debugging and on Slurm for production.
-
----
-
-## Install sflow
-
-```bash
-mkdir -p sflow_workspace && cd sflow_workspace
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv --python python3
-source .venv/bin/activate
-uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
-sflow --help
-```
-
-If `curl` is unavailable (e.g. on some locked-down clusters), install `uv` via pip instead:
-
-```bash
-pip install uv
-```
 
 ---
 
