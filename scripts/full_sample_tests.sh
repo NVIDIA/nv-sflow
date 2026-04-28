@@ -505,6 +505,66 @@ EOF
         echo "  SKIP: CSV not found at $CSV_FILE"
     fi
 
+    # -- sflow batch --bulk-input + CLI -f: CLI config must be prepended to every CSV row --
+    BATCH_BULK_CLI_FILES_DIR="$PREFLIGHT_DIR/batch_bulk_input_cli_files"
+    BATCH_BULK_CLI_FILES_FIXTURE_DIR="$BATCH_BULK_CLI_FILES_DIR/fixture"
+    mkdir -p "$BATCH_BULK_CLI_FILES_FIXTURE_DIR"
+    cat > "$BATCH_BULK_CLI_FILES_FIXTURE_DIR/common.yaml" <<'EOF'
+version: "0.1"
+variables:
+  - name: SHARED_VALUE
+    value: from_common
+EOF
+    cat > "$BATCH_BULK_CLI_FILES_FIXTURE_DIR/task.yaml" <<'EOF'
+version: "0.1"
+workflow:
+  name: batch_bulk_input_cli_files
+  tasks:
+    - name: show_shared
+      script:
+        - echo "${SHARED_VALUE}"
+EOF
+    cat > "$BATCH_BULK_CLI_FILES_FIXTURE_DIR/jobs.csv" <<EOF
+sflow_config_file
+$BATCH_BULK_CLI_FILES_FIXTURE_DIR/task.yaml
+EOF
+    run_check "batch bulk-input with cli -f prepends config" \
+        bash -c "set -euo pipefail
+            sflow batch -f '$BATCH_BULK_CLI_FILES_FIXTURE_DIR/common.yaml' \
+                --bulk-input '$BATCH_BULK_CLI_FILES_FIXTURE_DIR/jobs.csv' \
+                -p '$PARTITION' -A '$ACCOUNT' --nodes 1 --log-level warn \
+                --output-dir '$BATCH_BULK_CLI_FILES_DIR/out'
+            sh_file=\$(find '$BATCH_BULK_CLI_FILES_DIR/out' -name '*.sh' -print -quit)
+            test -n \"\$sh_file\"
+            common_path=\$(python - '$BATCH_BULK_CLI_FILES_FIXTURE_DIR/common.yaml' <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).resolve())
+PY
+)
+            task_path=\$(python - '$BATCH_BULK_CLI_FILES_FIXTURE_DIR/task.yaml' <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).resolve())
+PY
+)
+            common_arg=\"--file \$common_path\"
+            task_arg=\"--file \$task_path\"
+            grep -F -- \"\$common_arg\" \"\$sh_file\"
+            grep -F -- \"\$task_arg\" \"\$sh_file\"
+            python - \"\$sh_file\" \"\$common_arg\" \"\$task_arg\" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+common = sys.argv[2]
+task = sys.argv[3]
+if text.index(common) > text.index(task):
+    raise SystemExit('CLI -f config appears after CSV row config')
+PY"
+
     # -- sflow batch --bulk-input with -e expression: verify per-row resolution --
     if [ -f "$CSV_FILE" ]; then
         BATCH_BULK_EXPR_DIR="$PREFLIGHT_DIR/batch_bulk_input_expr"
