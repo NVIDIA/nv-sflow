@@ -278,8 +278,8 @@ def test_preflight_fs_artifact_with_existing_path_passes(tmp_path: Path):
     assert result is None
 
 
-def test_preflight_fs_artifact_with_missing_path_fails(tmp_path: Path):
-    """fs:// artifact pointing to a non-existent path should fail dry-run."""
+def test_preflight_fs_artifact_with_missing_path_warns_on_dry_run(tmp_path: Path):
+    """fs:// artifact pointing to a non-existent path should warn (not fail) during dry-run."""
     from sflow.app.sflow import SflowApp
 
     wf = tmp_path / "wf.yaml"
@@ -295,8 +295,8 @@ def test_preflight_fs_artifact_with_missing_path_fails(tmp_path: Path):
         "      script:\n"
         "        - echo hi\n"
     )
-    with pytest.raises(ValueError, match="does not exist"):
-        SflowApp().run(file=wf, dry_run=True)
+    result = SflowApp().run(file=wf, dry_run=True)
+    assert result is None
 
 
 def test_preflight_fs_artifact_with_variable_expression_resolved(tmp_path: Path):
@@ -326,8 +326,8 @@ def test_preflight_fs_artifact_with_variable_expression_resolved(tmp_path: Path)
     assert result is None
 
 
-def test_preflight_fs_artifact_with_variable_expression_missing_path_fails(tmp_path: Path):
-    """fs:// artifact URI resolved from variable to a missing path should fail."""
+def test_preflight_fs_artifact_with_variable_expression_missing_path_warns_on_dry_run(tmp_path: Path):
+    """fs:// artifact URI resolved from variable to a missing path should warn during dry-run."""
     from sflow.app.sflow import SflowApp
 
     wf = tmp_path / "wf.yaml"
@@ -346,8 +346,8 @@ def test_preflight_fs_artifact_with_variable_expression_missing_path_fails(tmp_p
         "      script:\n"
         "        - echo hi\n"
     )
-    with pytest.raises(ValueError, match="does not exist"):
-        SflowApp().run(file=wf, dry_run=True)
+    result = SflowApp().run(file=wf, dry_run=True)
+    assert result is None
 
 
 def test_preflight_fs_artifact_with_unresolvable_expression_skipped(tmp_path: Path):

@@ -18,12 +18,14 @@ from jinja2.sandbox import SandboxedEnvironment
 from sflow.cli import DOCS_URL, app
 from sflow.config.loader import ConfigLoader, merge_config_dicts
 from sflow.config.resolver import ExpressionResolver
+from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
 from sflow.logging import configure_logging, get_logger
 
 _logger = get_logger(__name__)
 
 _EXPR_RE = re.compile(r"\$\{\{(.+?)\}\}")
 _SHELL_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Env vars that are NOT sflow variables — never resolve these.
 _BUILTIN_ENV_VARS = frozenset(
@@ -169,8 +171,106 @@ def _coerce_type(value: str) -> Any:
     return value
 
 
+def _to_jinja_literal(value: Any) -> str:
+    """Render a Python value as a Jinja-compatible literal."""
+    return repr(value)
+
+
+def _consume_quoted_string(text: str, start: int) -> tuple[str, int]:
+    """Return the quoted substring starting at *start* and the next index."""
+    quote = text[start]
+    end = start + 1
+    while end < len(text):
+        if text[end] == "\\":
+            end += 2
+            continue
+        if text[end] == quote:
+            end += 1
+            break
+        end += 1
+    return text[start:end], end
+
+
+def _inline_resolved_vars_in_expr_body(
+    body: str,
+    resolved: dict[str, Any],
+    domains: dict[str, list[Any]] | None,
+) -> str:
+    """Inline known variable values into a raw Jinja expression body."""
+    if not resolved:
+        return body
+
+    domain_map = domains or {}
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in ("'", '"'):
+            quoted, i = _consume_quoted_string(body, i)
+            out.append(quoted)
+            continue
+
+        if body.startswith("variables.", i):
+            match = _IDENTIFIER_RE.match(body, i + len("variables."))
+            if match:
+                name = match.group(0)
+                end = match.end()
+                if body.startswith(".domain", end) and name in resolved:
+                    out.append(_to_jinja_literal(domain_map.get(name, [])))
+                    i = end + len(".domain")
+                    continue
+                if name in resolved:
+                    out.append(_to_jinja_literal(resolved[name]))
+                    i = end
+                    continue
+
+        match = _IDENTIFIER_RE.match(body, i)
+        if match:
+            name = match.group(0)
+            end = match.end()
+            prev = body[i - 1] if i > 0 else ""
+            if prev != "." and not (prev.isalnum() or prev == "_"):
+                if body.startswith(".domain", end) and name in resolved:
+                    out.append(_to_jinja_literal(domain_map.get(name, [])))
+                    i = end + len(".domain")
+                    continue
+                if name in resolved:
+                    out.append(_to_jinja_literal(resolved[name]))
+                    i = end
+                    continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _inline_resolved_vars_in_jinja(
+    text: str,
+    resolved: dict[str, Any],
+    domains: dict[str, list[Any]] | None = None,
+) -> str:
+    """Rewrite deferred Jinja expressions so removed variables become literals."""
+    if "${{" not in text or not resolved:
+        return text
+
+    def _rewrite(match: re.Match) -> str:
+        expr_text = match.group(0)
+        body = expr_text[3:-2]
+        rewritten = _inline_resolved_vars_in_expr_body(body, resolved, domains)
+        if rewritten == body:
+            return expr_text
+        return "${{" + rewritten + "}}"
+
+    return _EXPR_RE.sub(_rewrite, text)
+
+
 def _resolve_expressions(
-    obj: Any, ctx: dict[str, Any], env: SandboxedEnvironment
+    obj: Any,
+    ctx: dict[str, Any],
+    env: SandboxedEnvironment,
+    resolved: dict[str, Any] | None = None,
+    domains: dict[str, list[Any]] | None = None,
 ) -> Any:
     """Walk a data structure, resolving ${{ }} expressions where all refs are available.
 
@@ -188,20 +288,41 @@ def _resolve_expressions(
                 result = env.from_string(obj).render(**ctx)
                 return _coerce_type(result)
             except (UndefinedError, Exception):
-                return obj
+                rewritten = _inline_resolved_vars_in_jinja(obj, resolved or {}, domains)
+                if rewritten == obj:
+                    return obj
+                try:
+                    result = env.from_string(rewritten).render(**ctx)
+                    return _coerce_type(result)
+                except (UndefinedError, Exception):
+                    return rewritten
 
         def _replace_match(m: re.Match) -> str:
             expr_text = m.group(0)
             try:
                 return env.from_string(expr_text).render(**ctx)
             except (UndefinedError, Exception):
-                return expr_text
+                rewritten = _inline_resolved_vars_in_jinja(
+                    expr_text, resolved or {}, domains
+                )
+                if rewritten == expr_text:
+                    return expr_text
+                try:
+                    return env.from_string(rewritten).render(**ctx)
+                except (UndefinedError, Exception):
+                    return rewritten
 
         return _EXPR_RE.sub(_replace_match, obj)
     if isinstance(obj, list):
-        return [_resolve_expressions(item, ctx, env) for item in obj]
+        return [
+            _resolve_expressions(item, ctx, env, resolved=resolved, domains=domains)
+            for item in obj
+        ]
     if isinstance(obj, dict):
-        return {k: _resolve_expressions(v, ctx, env) for k, v in obj.items()}
+        return {
+            k: _resolve_expressions(v, ctx, env, resolved=resolved, domains=domains)
+            for k, v in obj.items()
+        }
     return obj
 
 
@@ -300,13 +421,16 @@ def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
     replica_vars = _collect_replica_variable_names(merged)
 
     variables = _extract_variables(merged)
+    domains = extract_domains_from_raw_config(merged)
     resolved, unresolvable = _classify_resolvable(variables)
 
-    # Never resolve replica sweep variables — their value changes per replica.
+    # Replica sweep variables must stay as declarations (their value changes
+    # per replica), but they should still be accessible in the Jinja context
+    # so that static metadata like ${{ variables.X.domain }} can resolve.
     for rv in replica_vars:
         resolved.pop(rv, None)
 
-    if not resolved:
+    if not resolved and not replica_vars:
         return merged
 
     env = SandboxedEnvironment(
@@ -315,9 +439,20 @@ def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
         variable_start_string="${{",
         variable_end_string="}}",
     )
-    ctx: dict[str, Any] = {"variables": resolved, **resolved}
+    wrapped = build_variables_ctx_from_raw(resolved, domains)
+    # Add replica vars to the "variables" namespace only (not top-level) so
+    # that ${{ variables.X.domain }} resolves, but ${{ variables.X }} and
+    # ${{ X }} stay unresolved (VariableValue.__str__ re-emits the expression).
+    from sflow.core.variable import VariableValue
 
-    merged = _resolve_expressions(merged, ctx, env)
+    for rv in replica_vars:
+        if rv not in wrapped and rv in variables:
+            wrapped[rv] = VariableValue(
+                f"${{{{ variables.{rv} }}}}", domain=domains.get(rv)
+            )
+    ctx: dict[str, Any] = {"variables": wrapped, **wrapped}
+
+    merged = _resolve_expressions(merged, ctx, env, resolved=resolved, domains=domains)
     merged = _resolve_shell_vars(merged, resolved)
     merged = _clean_resolved_strings(merged)
 
@@ -479,7 +614,7 @@ def _run_bulk_compose(
     log_level: str,
     resolve: bool = False,
     validate: bool = False,
-    row_filter: list[int] | None = None,
+    row_selectors: list[str] | None = None,
     missable_tasks: list[str] | None = None,
 ) -> None:
     """Compose one YAML file per CSV row.
@@ -489,75 +624,31 @@ def _run_bulk_compose(
     row-specific variant configs).  Duplicates are removed by resolved path,
     keeping the first occurrence.
     """
-    import csv
     from datetime import datetime
 
     from sflow.cli.batch import (
         _RESERVED_CSV_COLUMNS,
         _classify_csv_columns,
         _derive_row_name,
+        _parse_kv_list,
+        build_all_row_configs,
         build_row_naming_ctx,
+        merge_row_overrides,
+        parse_row_selector,
+        read_bulk_csv,
+        resolve_row_files,
+        row_missable,
     )
 
-    cli_var_map: dict[str, str] = {}
-    for entry in cli_set_var or []:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            cli_var_map[k] = v
-
-    cli_art_map: dict[str, str] = {}
-    for entry in cli_artifact or []:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            cli_art_map[k] = v
-
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise ValueError(f"CSV file is empty: {csv_path}")
-        columns = list(reader.fieldnames)
-        if "sflow_config_file" not in columns:
-            raise ValueError(
-                f"CSV file must contain a 'sflow_config_file' column. "
-                f"Found columns: {columns}"
-            )
-        rows: list[dict[str, Any]] = list(reader)
-
-    if not rows:
-        raise ValueError(f"CSV file has no data rows: {csv_path}")
+    columns, rows = read_bulk_csv(csv_path)
 
     csv_dir = csv_path.parent
     resolved_cli_files = [p.resolve() for p in (cli_files or [])]
+    cli_var_map = _parse_kv_list(cli_set_var)
+    cli_art_map = _parse_kv_list(cli_artifact)
 
-    def _resolve_config_paths(raw: str) -> list[Path]:
-        paths = []
-        for p in raw.split():
-            fp = Path(p)
-            if not fp.is_absolute():
-                fp = csv_dir / fp
-            paths.append(fp.resolve())
-        return paths
-
-    def _merge_and_dedup(base: list[Path], extra: list[Path]) -> list[Path]:
-        """Merge two path lists, deduplicating by resolved path (first wins)."""
-        seen: set[Path] = set()
-        merged: list[Path] = []
-        for p in base + extra:
-            if p not in seen:
-                seen.add(p)
-                merged.append(p)
-        return merged
-
-    row_configs: list[tuple[list[Path], list[str] | None]] = []
-    for r in rows:
-        csv_files = _resolve_config_paths(r["sflow_config_file"])
-        cfg_files = _merge_and_dedup(resolved_cli_files, csv_files)
-        row_m = list(missable_tasks) if missable_tasks else []
-        csv_m = (r.get("missable_tasks") or "").strip()
-        if csv_m:
-            row_m.extend(csv_m.split())
-        row_configs.append((cfg_files, row_m or None))
-    var_cols, art_cols = _classify_csv_columns(columns, row_configs)
+    all_row_configs = build_all_row_configs(rows, csv_dir, resolved_cli_files, missable_tasks)
+    var_cols, art_cols = _classify_csv_columns(columns, all_row_configs)
 
     if resolved_cli_files:
         cli_stems = ", ".join(p.name for p in resolved_cli_files)
@@ -568,7 +659,7 @@ def _run_bulk_compose(
     for name in sorted(overlap_vars):
         typer.echo(
             f"  Warning: variable '{name}' specified via --set and also in CSV; "
-            f"CSV value will take precedence per row.",
+            f"CLI --set value will take precedence over CSV.",
             err=True,
         )
     for name in sorted(overlap_arts):
@@ -585,39 +676,23 @@ def _run_bulk_compose(
     summary: list[str] = []
     warnings: list[str] = []
     failed_count = 0
-    row_indices = set(row_filter) if row_filter else None
+    row_indices: set[int] | None = None
+    if row_selectors:
+        row_indices = set(parse_row_selector(row_selectors, n_rows=len(rows)))
     naming_ctx = build_row_naming_ctx(rows)
 
     for idx, row in enumerate(rows, start=1):
         if row_indices is not None and idx not in row_indices:
             continue
-        csv_files = _resolve_config_paths(row["sflow_config_file"])
-        config_files = _merge_and_dedup(resolved_cli_files, csv_files)
-
-        merged_vars = dict(cli_var_map)
-        for col in var_cols:
-            if row.get(col):
-                merged_vars[col] = row[col]
-        set_var = [f"{k}={v}" for k, v in merged_vars.items()] or None
-
-        merged_arts: dict[str, str] = {}
-        for col in art_cols:
-            if row.get(col):
-                merged_arts[col] = row[col]
-        merged_arts.update(cli_art_map)
-        artifacts = [f"{k}={v}" for k, v in merged_arts.items()] or None
+        config_files = resolve_row_files(row, csv_dir, resolved_cli_files)
+        set_var, artifacts = merge_row_overrides(row, var_cols, art_cols, cli_var_map, cli_art_map)
+        effective_missable = row_missable(row, missable_tasks)
 
         overrides_desc = ", ".join(
             f"{col}={row[col]}"
             for col in columns
             if col not in _RESERVED_CSV_COLUMNS and row.get(col)
         )
-
-        row_missable = list(missable_tasks) if missable_tasks else []
-        csv_missable = (row.get("missable_tasks") or "").strip()
-        if csv_missable:
-            row_missable.extend(csv_missable.split())
-        effective_missable = row_missable or None
 
         row_name = _derive_row_name(row, idx, naming_ctx)
         out_path = bulk_dir / f"{row_name}.yaml"
@@ -727,9 +802,8 @@ def compose(
         typer.Option(
             "-o",
             "--output",
-            help="Output file path. If not specified, writes to stdout.",
-            file_okay=True,
-            dir_okay=False,
+            help="Output file path (single compose) or directory (bulk compose). "
+            "If not specified, writes to stdout (single) or ./sflow_output/ (bulk).",
             resolve_path=True,
         ),
     ] = None,
@@ -784,9 +858,12 @@ def compose(
         typer.Option(
             "--row",
             help="Only process specific CSV row(s) by 1-based index. "
-            "Supports: single (--row 1), multiple (--row 1 --row 3), "
-            "comma-separated (--row 1,3,5), and Python-style slices with exclusive end "
-            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]). "
+            "Supports: single (--row 1), negative (--row=-1 → last row), "
+            "multiple (--row 1 --row 3), "
+            "comma-separated (--row 1,3,5), Python-style slices with exclusive end "
+            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]), "
+            "and open-ended/negative slices (--row=-3: → last 3 rows; --row 3: → row 3 to end). "
+            "Negative indices use --row=N syntax to avoid flag ambiguity. "
             "Requires --bulk-input.",
         ),
     ] = None,
@@ -843,10 +920,7 @@ def compose(
 
         # --- Bulk-input mode ---
         if bulk_input is not None:
-            from sflow.cli.batch import parse_row_selector
-
             cli_files = list(src_files or []) + list(file or [])
-            parsed_rows = parse_row_selector(row) if row else None
             out_dir = output if output else Path.cwd() / "sflow_output"
             _run_bulk_compose(
                 csv_path=bulk_input,
@@ -857,7 +931,7 @@ def compose(
                 log_level=log_level,
                 resolve=resolve,
                 validate=validate,
-                row_filter=parsed_rows,
+                row_selectors=row,
                 missable_tasks=missable_tasks,
             )
             return
@@ -867,6 +941,19 @@ def compose(
         if not files:
             typer.echo("Error: no input files provided.", err=True)
             raise typer.Exit(code=1)
+
+        csv_files = [f for f in files if f.suffix.lower() == ".csv"]
+        if csv_files:
+            names = ", ".join(str(f) for f in csv_files)
+            typer.echo(
+                f"Error: CSV file(s) detected in input: {names}\n"
+                f"  CSV files cannot be used as workflow YAML inputs directly.\n"
+                f"  Did you mean to use --bulk-input (-b)?\n"
+                f"  Example: sflow compose --bulk-input {csv_files[0]}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
         if missable_tasks and len(files) < 2:
             typer.echo(
                 "Error: --missable-tasks is only valid with multiple input files (modular configs).",
@@ -901,6 +988,14 @@ def compose(
                 typer.echo(f"WARNING: dry-run validation failed: {err_short}", err=True)
 
         if output is not None:
+            if output.is_dir():
+                typer.echo(
+                    f"Error: output path '{output}' is a directory. "
+                    f"For single compose, -o must be a file path (e.g. -o merged.yaml). "
+                    f"For bulk compose, use --bulk-input.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(yaml_output)
             _logger.info(f"Composed config written to {output}")

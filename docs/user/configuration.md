@@ -64,7 +64,16 @@ sflow run --file sflow.yaml --set SLURM_PARTITION=debug --set NUM_GPUS=4
 Notes:
 
 - `--set` can **only override variables that already exist** in the config; otherwise it errors.
-- Values use simple type inference (int/float/bool/string).
+- Values use simple type inference (int/float/bool/list/string).
+- List values set the variable domain for replica sweeps, and the variable value becomes the first item.
+
+You can also read a variable's domain inside expressions:
+
+```yaml
+script:
+  - echo "all concurrencies=${{ variables.CONCURRENCY.domain }}"
+  - echo "max concurrency=${{ variables.CONCURRENCY.domain | max }}"
+```
 
 ## artifacts
 
@@ -192,6 +201,16 @@ workflow:
     - echo "server on node0, 4 gpus"
 ```
 
+`resources.nodes` supports `indices`, `count`, and `exclude`. `exclude` removes nodes from the allocation before `indices`, `count`, or GPU packing are applied:
+
+```yaml
+- name: workers
+  resources:
+    nodes:
+      exclude: [0]
+      count: 2
+```
+
 ### replicas
 
 Run multiple instances of a task in parallel or sequentially:
@@ -220,3 +239,5 @@ Probes are useful for service-style tasks (e.g. start a server, then run a clien
       tcp_port:
         port: 8000
 ```
+
+`probes.readiness` may also be a list of probes; all must trigger before the task is ready. Probe types include `tcp_port`, `http_get`, `http_post`, and `log_watch`. `probes.failure` marks a running task as failed when its condition is detected, which fail-fast uses to cancel downstream work.

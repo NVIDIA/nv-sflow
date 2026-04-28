@@ -220,7 +220,8 @@ class ProbeConfig(StrictBaseModel):
 
     # Common settings (can be expressions)
     delay: Resolvable[int] = 0
-    timeout: Resolvable[int] = 60
+    timeout: Resolvable[int] = 1200
+    each_check_timeout: Resolvable[int] = 30
     interval: Resolvable[int] = 5
     success_threshold: Resolvable[int] = 1
     failure_threshold: Resolvable[int] = 3
@@ -229,8 +230,15 @@ class ProbeConfig(StrictBaseModel):
 class ProbesConfig(StrictBaseModel):
     """Configuration for task probes."""
 
-    readiness: Optional[ProbeConfig] = None
+    readiness: Optional[Union[ProbeConfig, List[ProbeConfig]]] = None
     failure: Optional[ProbeConfig] = None
+
+    @field_validator("readiness")
+    @classmethod
+    def readiness_list_must_not_be_empty(cls, v: Any) -> Any:
+        if isinstance(v, list) and not v:
+            raise ValueError("readiness probe list cannot be empty")
+        return v
 
 
 class OutputMetricConfig(StrictBaseModel):
@@ -248,9 +256,18 @@ class OutputConfig(StrictBaseModel):
 class NodeResourceConfig(StrictBaseModel):
     """Node resource configuration for a task."""
 
-    indices: Optional[List[Resolvable[int]]] = None  # Can be [0, 1] or ["${{ ... }}"]
+    indices: Optional[Union[List[Resolvable[int]], str]] = None  # Can be [0, 1], ["${{ ... }}"], or "${{ ... }}" resolving to a list
     count: Optional[Resolvable[int]] = None  # Can be int or expression
     exclude: Optional[Union[List[Resolvable[int]], Resolvable[int]]] = None
+
+    @field_validator("indices")
+    @classmethod
+    def indices_must_be_list_or_expression(cls, v: Any) -> Any:
+        if isinstance(v, str) and not is_expression(v):
+            raise ValueError(
+                "resources.nodes.indices must be a list or an expression that resolves to a list"
+            )
+        return v
 
 
 class GpuResourceConfig(StrictBaseModel):
@@ -375,9 +392,16 @@ class WorkflowConfig(StrictBaseModel):
             # Check probe log watchers
             if task.probes:
                 for probe_type in ["readiness", "failure"]:
-                    probe = getattr(task.probes, probe_type)
-                    if probe and probe.log_watch and probe.log_watch.logger:
-                        if probe.log_watch.logger not in task_names:
+                    probes = getattr(task.probes, probe_type)
+                    if probes is None:
+                        continue
+                    probe_list = probes if isinstance(probes, list) else [probes]
+                    for probe in probe_list:
+                        if (
+                            probe.log_watch
+                            and probe.log_watch.logger
+                            and probe.log_watch.logger not in task_names
+                        ):
                             raise ValueError(
                                 f"Task '{task.name}' {probe_type} probe refers to unknown task '{probe.log_watch.logger}'"
                             )
@@ -541,9 +565,10 @@ def validate_node_exclude_indices(config: SflowConfig) -> None:
             idx = _try_resolve_int(idx_val)
             if idx is None:
                 continue
-            if idx < 0 or idx >= total_nodes:
+            resolved_idx = idx if idx >= 0 else idx + total_nodes
+            if resolved_idx < 0 or resolved_idx >= total_nodes:
                 raise ValueError(
                     f"Task '{task.name}' resources.nodes.exclude contains index "
                     f"{idx} out of range for {total_nodes} allocated node(s) "
-                    f"(valid: 0..{total_nodes - 1})"
+                    f"(valid: {-total_nodes}..{total_nodes - 1})"
                 )

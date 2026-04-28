@@ -404,7 +404,9 @@ class SflowApp:
                 def _preflight_validate_artifacts(
                     artifact_configs: list | None,
                     workspace_dir: Path,
-                ) -> None:
+                    *,
+                    dry_run: bool = False,
+                ) -> list[str]:
                     from urllib.parse import urlparse
 
                     from sflow.core.artifact_registry import (
@@ -462,9 +464,14 @@ class SflowApp:
                             continue
                         if not resolved.exists():
                             if scheme == "fs":
-                                errors.append(
-                                    f"Artifact '{a_conf.name}' (fs://) path does not exist: {resolved}"
-                                )
+                                if dry_run:
+                                    warnings.append(
+                                        f"Artifact '{a_conf.name}' (fs://) path does not exist: {resolved}"
+                                    )
+                                else:
+                                    errors.append(
+                                        f"Artifact '{a_conf.name}' (fs://) path does not exist: {resolved}"
+                                    )
                             else:
                                 warnings.append(
                                     f"Artifact '{a_conf.name}' (file://) path does not exist: {resolved}"
@@ -472,14 +479,17 @@ class SflowApp:
                     if errors:
                         for e in errors:
                             _logger.error(f"  ✗ {e}")
-                    if warnings:
+                    if warnings and not dry_run:
                         for w in warnings:
                             _logger.warning(f"  ⚠ {w}")
                     if errors:
                         details = "\n".join(f"  - {e}" for e in errors)
                         raise ValueError(f"Artifact path validation failed:\n{details}")
+                    return warnings
 
-                _preflight_validate_artifacts(config.artifacts, ws_dir)
+                _artifact_warnings = _preflight_validate_artifacts(
+                    config.artifacts, ws_dir, dry_run=dry_run
+                )
 
                 # build the state:
                 # - dry-run: never allocates
@@ -1097,6 +1107,17 @@ class SflowApp:
                     enroot_warning = _check_enroot_credentials(plan_tasks)
                     if enroot_warning:
                         _logger.warning(f"  ⚠ {enroot_warning}")
+
+                    if _artifact_warnings:
+                        _logger.warning("")
+                        _logger.warning(
+                            "Artifact path warnings (non-existent fs:// / file:// paths):"
+                        )
+                        for w in _artifact_warnings:
+                            _logger.warning(f"  ⚠ {w}")
+                        _logger.warning(
+                            "These paths must exist before the workflow is run."
+                        )
 
                     _logger.info("")
                     _logger.info("─" * 60)

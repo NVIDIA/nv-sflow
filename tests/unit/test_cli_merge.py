@@ -382,6 +382,68 @@ def test_compose_keeps_backend_dependent_expressions(tmp_path: Path):
     assert composed["workflow"]["tasks"][0]["script"] == ["echo server at ${HEAD_IP}"]
 
 
+def test_compose_rewrites_resolved_variables_inside_deferred_jinja(tmp_path: Path):
+    """Resolved variables should be inlined even inside still-deferred Jinja."""
+    f1 = _write_yaml(
+        tmp_path / "vars.yaml",
+        {
+            "version": "0.1",
+            "variables": [
+                {"name": "INFRA_NODE_INDEX", "value": 0},
+            ],
+            "backends": [
+                {
+                    "name": "slurm_cluster",
+                    "type": "slurm",
+                    "default": True,
+                    "account": "acct",
+                    "partition": "batch",
+                    "time": "00:10:00",
+                    "nodes": 2,
+                    "gpus_per_node": 4,
+                }
+            ],
+        },
+    )
+    f2 = _write_yaml(
+        tmp_path / "workflow.yaml",
+        {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "variables": [
+                    {
+                        "name": "HEAD_NODE_IP",
+                        "value": "${{ backends.slurm_cluster.nodes[0].ip_address if variables.INFRA_NODE_INDEX == 0 else backends.slurm_cluster.nodes[-1].ip_address }}",
+                    },
+                    {
+                        "name": "NATS_SERVER",
+                        "value": "nats://${{ backends.slurm_cluster.nodes[0].ip_address if variables.INFRA_NODE_INDEX == 0 else backends.slurm_cluster.nodes[-1].ip_address }}:4222",
+                    },
+                ],
+                "tasks": [{"name": "t1", "script": ["echo hi"]}],
+            },
+        },
+    )
+
+    result = runner.invoke(
+        app, ["compose", str(f1), str(f2), "--resolve"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+
+    composed = yaml.safe_load(result.output)
+    assert "variables" not in composed, "Resolved top-level variables should be removed"
+    wf_vars = {entry["name"]: entry["value"] for entry in composed["workflow"]["variables"]}
+    assert wf_vars["HEAD_NODE_IP"] == (
+        "${{ backends.slurm_cluster.nodes[0].ip_address if 0 == 0 else "
+        "backends.slurm_cluster.nodes[-1].ip_address }}"
+    )
+    assert wf_vars["NATS_SERVER"] == (
+        "nats://${{ backends.slurm_cluster.nodes[0].ip_address if 0 == 0 else "
+        "backends.slurm_cluster.nodes[-1].ip_address }}:4222"
+    )
+
+
 def test_compose_resolves_shell_variable_refs_in_scripts(tmp_path: Path):
     """${NAME} shell references in scripts are inlined for resolved variables."""
     f1 = _write_yaml(
@@ -1130,6 +1192,100 @@ def test_compose_bulk_input_cli_files_with_row_filter(tmp_path: Path):
     assert any(b["name"] == "slurm_cluster" for b in merged["backends"])
 
 
+def _make_compose_csv(tmp_path: Path, n_rows: int = 4):
+    """Create a CSV with *n_rows* workflow variants for compose --row tests."""
+    wfs = []
+    for i in range(1, n_rows + 1):
+        wf = _write_yaml(
+            tmp_path / f"wf{i}.yaml",
+            {
+                "version": "0.1",
+                "workflow": {
+                    "name": "wf",
+                    "tasks": [{"name": f"t{i}", "script": [f"echo {i}"]}],
+                },
+            },
+        )
+        wfs.append(wf)
+    csv_path = tmp_path / "jobs.csv"
+    csv_path.write_text(
+        "sflow_config_file\n" + "".join(f"{wf}\n" for wf in wfs)
+    )
+    return csv_path
+
+
+def test_compose_bulk_input_row_negative_last(tmp_path: Path):
+    """--row=-1 composes only the last CSV row."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=-1", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 1
+    merged = yaml.safe_load(composed[0].read_text())
+    assert merged["workflow"]["tasks"][0]["name"] == "t4"
+
+
+def test_compose_bulk_input_row_negative_open_end(tmp_path: Path):
+    """--row=-3: composes the last 3 rows."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=-3:", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 3
+
+
+def test_compose_bulk_input_row_open_end(tmp_path: Path):
+    """--row=3: composes from row 3 to end."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=3:", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 2
+
+
+def test_compose_bulk_input_row_open_start(tmp_path: Path):
+    """--row=:3 composes rows 1 and 2 (exclusive end)."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=:3", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 2
+
+
+def test_compose_bulk_input_row_negative_slice(tmp_path: Path):
+    """--row=-3:-1 composes rows n-2 and n-1 (exclusive end)."""
+    csv_file = _make_compose_csv(tmp_path, n_rows=4)
+    out_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        ["compose", "--bulk-input", str(csv_file), "--row=-3:-1", "-o", str(out_dir)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    composed = sorted(out_dir.rglob("*.yaml"))
+    assert len(composed) == 2
+
+
 def test_compose_bulk_input_missable_csv_column(tmp_path: Path):
     """missable_tasks CSV column should work in compose --bulk-input."""
     f_base = _write_yaml(
@@ -1170,3 +1326,34 @@ def test_compose_bulk_input_missable_csv_column(tmp_path: Path):
         ["compose", "--bulk-input", str(csv_file), "-o", str(out_dir)],
     )
     assert result.exit_code == 0
+
+
+# --- CSV-without-bulk-input hint tests ---
+
+
+def test_compose_csv_input_without_bulk_input_flag(tmp_path: Path):
+    """sflow compose with a .csv file but no --bulk-input exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        ["compose", str(csv_file)],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
+
+
+def test_compose_csv_via_file_flag_without_bulk_input(tmp_path: Path):
+    """sflow compose -f jobs.csv (no --bulk-input) exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        ["compose", "-f", str(csv_file)],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output

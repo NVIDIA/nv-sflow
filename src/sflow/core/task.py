@@ -101,6 +101,11 @@ class Task:
     # Sweep variable names for this replica (empty if not a sweep replica).
     sweep_variables: list[str] = field(default_factory=list)
 
+    # Task names that should mirror this task's readiness/failure probe result.
+    # Populated when HTTP probes are deduplicated across replicas with identical check info.
+    readiness_followers: list[str] = field(default_factory=list)
+    failure_followers: list[str] = field(default_factory=list)
+
     # Optional retry configuration (see SRD REQ-3.6).
     retries: RetryPolicy | None = None
     # Number of launch attempts made so far (includes the initial attempt).

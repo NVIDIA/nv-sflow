@@ -15,6 +15,7 @@ from sflow.config.schema import (
     ResourcesConfig,
     SflowConfig,
     TaskConfig,
+    VariableConfig,
     WorkflowConfig,
 )
 from sflow.core.backend import Allocation, Backend
@@ -25,7 +26,7 @@ from sflow.core.variable import Variable, VariableType
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
-from sflow.plugins.probes import TcpPortProbe
+from sflow.plugins.probes import HttpGetProbe, HttpPostProbe, TcpPortProbe
 
 
 class _FakeBackend(Backend):
@@ -479,6 +480,66 @@ def test_build_task_graph_tcp_probe_defaults_to_assigned_node_ip_for_slurm_backe
     assert p._host == "10.0.0.1"
 
 
+def test_build_task_graph_attaches_multiple_readiness_probes():
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo hi"],
+                    probes={
+                        "readiness": [
+                            {"tcp_port": {"port": 8000}},
+                            {"http_get": {"url": "http://10.0.0.1:8000/health"}},
+                        ]
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    svc = tg.get_task("svc")
+
+    assert len(svc.probes) == 2
+    assert isinstance(svc.probes[0], TcpPortProbe)
+    assert isinstance(svc.probes[1], HttpGetProbe)
+
+
+def test_build_task_graph_keeps_single_readiness_probe_object_compatibility():
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo hi"],
+                    probes={
+                        "readiness": {
+                            "http_get": {"url": "http://10.0.0.1:8000/health"},
+                            "timeout": 30,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    svc = tg.get_task("svc")
+
+    assert len(svc.probes) == 1
+    assert isinstance(svc.probes[0], HttpGetProbe)
+    assert svc.probes[0].timeout == 30
+
+
 def test_build_task_graph_replica_sweep_uses_variable_domain_and_injects_envs():
     state = _state()
     state.variables = {
@@ -564,6 +625,207 @@ def test_build_task_graph_resources_nodes_indices_selects_subset_of_allocation_n
     assert t1.operator.config.nodes == 2
 
 
+def test_build_task_graph_resources_nodes_indices_expression_string_selects_subset():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="333e",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            indices="${{ range(1, 3) | list }}"
+                        )
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n2", "n3"]
+    assert t1.operator.config.nodes == 2
+
+
+def test_build_task_graph_resources_nodes_negative_indices_select_from_end():
+    """Negative indices wrap around Python-style: -1 is last node, -2 second-to-last."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg1",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(indices=[-1])),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n4"]
+    assert t1.operator.config.nodes == 1
+
+
+def test_build_task_graph_resources_nodes_negative_indices_mixed_with_positive():
+    """Mix of positive and negative indices works correctly."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg2",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0, -1])
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n1", "n4"]
+    assert t1.operator.config.nodes == 2
+
+
+def test_build_task_graph_resources_nodes_negative_index_out_of_range():
+    """Negative index too large (e.g. -5 with 4 nodes) raises ValueError."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg3",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(indices=[-5])),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="out-of-range index -5"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_resources_nodes_negative_indices_after_exclude():
+    """-1 refers to the last node AFTER exclude filtering."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="neg4",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(exclude=[3], indices=[-1])
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    # After excluding node at position 3 (n4), remaining = [n1, n2, n3]; -1 → n3
+    assert t1.operator.config.nodelist == ["n3"]
+    assert t1.operator.config.nodes == 1
+
+
 def test_build_task_graph_resources_nodes_count_compact_allocation_for_parallel_replicas():
     state = _state()
     state.backends = {
@@ -604,6 +866,51 @@ def test_build_task_graph_resources_nodes_count_compact_allocation_for_parallel_
     assert t11.operator.config.type == "srun"
     assert t10.operator.config.nodelist == ["n1", "n2"]
     assert t11.operator.config.nodelist == ["n3", "n4"]
+
+
+def test_build_task_graph_resources_nodes_indices_and_count_follow_selected_order():
+    """indices defines the pool; count slices that pool in order across replicas."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="444c",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    replicas=ReplicaConfig(count=4, policy="parallel"),
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[-1, 0, 1, 2], count=1)
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t1_0").operator.config.nodelist == ["n4"]
+    assert tg.get_task("t1_1").operator.config.nodelist == ["n1"]
+    assert tg.get_task("t1_2").operator.config.nodelist == ["n2"]
+    assert tg.get_task("t1_3").operator.config.nodelist == ["n3"]
+    assert tg.get_task("t1_0").operator.config.nodes == 1
+    assert tg.get_task("t1_3").operator.config.nodes == 1
 
 
 def test_build_task_graph_resources_gpus_count_sets_cuda_visible_devices_with_offset():
@@ -1507,6 +1814,48 @@ def test_build_task_graph_resources_nodes_exclude_list():
     assert t1.operator.config.nodelist == ["n2", "n4"]
 
 
+def test_build_task_graph_resources_nodes_exclude_expression_string_list():
+    """exclude may be a single expression string that resolves to a list of indices."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="exc2e",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                    ComputeNode(name="n3", ip_address="10.0.0.3", index=2),
+                    ComputeNode(name="n4", ip_address="10.0.0.4", index=3),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            exclude="${{ range(0, 2) | list }}"
+                        )
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.nodelist == ["n3", "n4"]
+
+
 def test_build_task_graph_resources_nodes_exclude_with_count():
     """exclude + count: count operates on the filtered pool."""
     state = _state()
@@ -1624,3 +1973,577 @@ def test_build_task_graph_resources_nodes_exclude_all_raises():
 
     with pytest.raises(ValueError, match="removed all nodes"):
         build_task_graph(config, state)
+
+
+# ---------------------------------------------------------------------------
+# HTTP probe replica deduplication
+# ---------------------------------------------------------------------------
+
+
+def _state_with_slurm_backend() -> SflowState:
+    """Convenience: SflowState with a single slurm-like backend and one node."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="probe-dedup",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+    return state
+
+
+def test_http_probe_skipped_on_non_first_parallel_replica_when_no_sweep_var_referenced():
+    """For parallel replicas: HTTP readiness probe that doesn't reference sweep vars
+    should only appear on the first replica — non-first replicas follow the first."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/v1/chat/completions",
+                                "body": '{"model": "m", "messages": []}',
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+
+    assert len(first.probes) == 1
+    assert isinstance(first.probes[0], HttpPostProbe)
+    assert len(second.probes) == 0
+    assert first.readiness_followers == ["bench_8"]
+
+
+def test_sequential_replicas_each_get_own_probe():
+    """For sequential replicas: each replica gets its own probe instance so they
+    have independent timeout deadlines."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="sequential"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/v1/chat/completions",
+                                "body": '{"model": "m", "messages": []}',
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+
+    assert len(first.probes) == 1
+    assert isinstance(first.probes[0], HttpPostProbe)
+    assert len(second.probes) == 1
+    assert isinstance(second.probes[0], HttpPostProbe)
+    assert first.readiness_followers == []
+
+
+def test_http_probe_kept_on_all_replicas_when_sweep_var_referenced():
+    """HTTP readiness probe that references a sweep variable should be present on
+    every replica."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "PORT": Variable(
+            name="PORT", value=8000, type=VariableType.INTEGER, domain=[8000, 9000]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["PORT"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:${{ variables.PORT }}/health",
+                                "body": '{"check": true}',
+                            },
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("svc_8000")
+    second = tg.get_task("svc_9000")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 1
+    assert isinstance(first.probes[0], HttpPostProbe)
+    assert isinstance(second.probes[0], HttpPostProbe)
+
+
+def test_tcp_probe_always_per_replica():
+    """TCP probes should never be deduplicated — they inherently differ per replica
+    (different assigned hosts)."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "tcp_port": {"port": 8888},
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("svc_4")
+    second = tg.get_task("svc_8")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 1
+    assert isinstance(first.probes[0], TcpPortProbe)
+    assert isinstance(second.probes[0], TcpPortProbe)
+
+
+def test_http_probe_followers_multiple_parallel_replicas():
+    """When 3+ parallel replicas share a deduplicated HTTP probe, all non-first
+    replicas should appear in the first replica's readiness_followers."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=4,
+            type=VariableType.INTEGER,
+            domain=[4, 8, 16],
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/health",
+                                "body": "{}",
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+    third = tg.get_task("bench_16")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 0
+    assert len(third.probes) == 0
+    assert first.readiness_followers == ["bench_8", "bench_16"]
+    assert second.readiness_followers == []
+    assert third.readiness_followers == []
+
+
+def test_sequential_replicas_each_get_own_probe_multiple():
+    """When 3+ sequential replicas have HTTP probes, each gets its own independent
+    probe instance (no follower dedup)."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=4,
+            type=VariableType.INTEGER,
+            domain=[4, 8, 16],
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="sequential"
+                    ),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/health",
+                                "body": "{}",
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+    third = tg.get_task("bench_16")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 1
+    assert len(third.probes) == 1
+    assert first.readiness_followers == []
+    assert second.readiness_followers == []
+    assert third.readiness_followers == []
+
+
+def test_failure_http_probe_followers():
+    """Deduplicated failure HTTP probes should populate failure_followers
+    for parallel replicas."""
+    state = _state_with_slurm_backend()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY", value=4, type=VariableType.INTEGER, domain=[4, 8]
+        ),
+    }
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                    probes={
+                        "failure": {
+                            "http_get": {
+                                "url": "http://10.0.0.1:8888/health",
+                            },
+                            "timeout": 60,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("bench_4")
+    second = tg.get_task("bench_8")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 0
+    assert first.failure_followers == ["bench_8"]
+    assert first.readiness_followers == []
+
+
+def test_http_probe_kept_when_referencing_sflow_replica_index():
+    """HTTP probe referencing SFLOW_REPLICA_INDEX should NOT be skipped on any
+    replica, since each replica has a different index value."""
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(count=3, policy="parallel"),
+                    probes={
+                        "readiness": {
+                            "http_get": {
+                                "url": "http://10.0.0.1:${SFLOW_REPLICA_INDEX}/health",
+                            },
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    for i in range(3):
+        task = tg.get_task(f"svc_{i}")
+        assert len(task.probes) == 1, (
+            f"svc_{i} should have its own probe since URL references SFLOW_REPLICA_INDEX"
+        )
+        assert task.readiness_followers == []
+
+
+def test_http_probe_skipped_when_no_replica_var_referenced():
+    """HTTP probe that doesn't reference any per-replica variable (neither sweep
+    vars nor SFLOW_REPLICA_INDEX) should be skipped on non-first replicas."""
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo run"],
+                    replicas=ReplicaConfig(count=2, policy="parallel"),
+                    probes={
+                        "readiness": {
+                            "http_post": {
+                                "url": "http://10.0.0.1:8888/health",
+                                "body": "{}",
+                            },
+                            "timeout": 30,
+                            "interval": 5,
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    first = tg.get_task("svc_0")
+    second = tg.get_task("svc_1")
+
+    assert len(first.probes) == 1
+    assert len(second.probes) == 0
+    assert first.readiness_followers == ["svc_1"]
+
+
+def test_build_task_graph_variable_domain_accessible_in_script_expression():
+    """${{ variables.X.domain }} resolves to the domain list in task scripts."""
+    state = _state()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=16,
+            type=VariableType.INTEGER,
+            domain=[1, 4, 16, 64],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=[
+                        "echo value=${{ variables.CONCURRENCY }}",
+                        "echo domain=${{ variables.CONCURRENCY.domain }}",
+                    ],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t = tg.get_task("t1")
+    assert t.script[0] == "echo value=16"
+    assert t.script[1] == "echo domain=[1, 4, 16, 64]"
+
+
+def test_build_task_graph_replica_sweep_resolves_jinja_expression_per_replica():
+    """${{ variables.X }} in scripts resolves to per-replica value, not default."""
+    state = _state()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=1,
+            type=VariableType.INTEGER,
+            domain=[1, 4, 16],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo conc=${{ variables.CONCURRENCY }}"],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="sequential"
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("bench_1").script[0] == "echo conc=1"
+    assert tg.get_task("bench_4").script[0] == "echo conc=4"
+    assert tg.get_task("bench_16").script[0] == "echo conc=16"
+
+
+def test_build_task_graph_replica_sweep_domain_resolves_in_all_replicas():
+    """${{ variables.X.domain }} resolves to the same domain list in every replica."""
+    state = _state()
+    state.variables = {
+        "CONCURRENCY": Variable(
+            name="CONCURRENCY",
+            value=1,
+            type=VariableType.INTEGER,
+            domain=[1, 4, 16],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=[
+                        "echo conc=${{ variables.CONCURRENCY }}",
+                        "echo domain=${{ variables.CONCURRENCY.domain }}",
+                    ],
+                    replicas=ReplicaConfig(
+                        variables=["CONCURRENCY"], policy="parallel"
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    for name, expected_val in [("bench_1", "1"), ("bench_4", "4"), ("bench_16", "16")]:
+        t = tg.get_task(name)
+        assert t.script[0] == f"echo conc={expected_val}"
+        assert t.script[1] == "echo domain=[1, 4, 16]"
+
+
+def test_build_task_graph_replica_sweep_arithmetic_with_jinja():
+    """Arithmetic on sweep variable resolves per-replica."""
+    state = _state()
+    state.variables = {
+        "CONC": Variable(
+            name="CONC",
+            value=1,
+            type=VariableType.INTEGER,
+            domain=[2, 8],
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t",
+                    script=["echo doubled=${{ variables.CONC * 2 }}"],
+                    replicas=ReplicaConfig(
+                        variables=["CONC"], policy="sequential"
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t_2").script[0] == "echo doubled=4"
+    assert tg.get_task("t_8").script[0] == "echo doubled=16"

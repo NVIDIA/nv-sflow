@@ -3,6 +3,8 @@
 
 """Unit tests for sflow batch CLI command."""
 
+import logging
+import logging.handlers
 import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,18 +12,22 @@ from unittest.mock import MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+import sflow.cli.batch as batch_mod
 from sflow.cli import app
 from sflow.cli.batch import (
     _build_var_map,
+    _classify_csv_columns,
     _dedup_words,
     _derive_nodes,
     _derive_row_name,
     _normalize_col_value,
     _resolve_backend_int_field,
+    _resolve_sbatch_extra_args,
     _sanitize_name,
     _scan_sflow_yamls,
     build_row_naming_ctx,
     parse_row_selector,
+    resolve_row_indices,
 )
 
 
@@ -523,6 +529,149 @@ def test_bulk_edit_rejects_unknown_column(mock_sflow_app, tmp_path):
     assert "NONEXISTENT_VAR" in result.output
 
 
+# --- _classify_csv_columns chained error info tests ---
+
+
+def test_classify_csv_columns_all_configs_fail_enriches_unknown_column_error(tmp_path):
+    """When all config sets fail to load, the unknown-column ValueError includes
+    chained error context pointing to config loading as the root cause."""
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [missing_task]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([base], None)]
+    with pytest.raises(ValueError, match="all 1 config set.*failed to load"):
+        _classify_csv_columns(["SOME_VAR"], row_configs)
+
+
+def test_classify_csv_columns_partial_failure_no_chained_hint(tmp_path):
+    """When some configs load successfully, the unknown-column error does NOT
+    include the 'all configs failed' hint — the variable is genuinely missing."""
+    good = tmp_path / "good.yaml"
+    good.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: TP\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [nonexistent]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([good], None), ([bad], None)]
+    with pytest.raises(ValueError, match="not a variable or artifact") as exc_info:
+        _classify_csv_columns(["MISSING_VAR"], row_configs)
+    assert "all" not in str(exc_info.value).lower() or "failed to load" not in str(exc_info.value)
+
+
+def test_classify_csv_columns_all_configs_fail_logs_warnings(tmp_path):
+    """When all config sets fail, warnings are logged listing each failure
+    and a hint about --missable-tasks."""
+    f1 = tmp_path / "a.yaml"
+    f1.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [ghost]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([f1], None)]
+
+    log_handler = logging.handlers.MemoryHandler(capacity=100)
+    logger = logging.getLogger("sflow.cli.batch")
+    logger.addHandler(log_handler)
+    old_level = logger.level
+    logger.setLevel(logging.WARNING)
+    try:
+        with pytest.raises(ValueError):
+            _classify_csv_columns(["X"], row_configs)
+        log_handler.flush()
+        messages = [r.getMessage() for r in log_handler.buffer]
+        combined = "\n".join(messages)
+        assert "1 config file set(s) failed to load" in combined
+        assert "No config sets loaded successfully" in combined
+        assert "missable" in combined.lower()
+    finally:
+        logger.removeHandler(log_handler)
+        logger.setLevel(old_level)
+
+
+def test_classify_csv_columns_succeeds_when_column_valid_despite_partial_failure(tmp_path):
+    """A valid column is still recognized even when some config sets fail."""
+    good = tmp_path / "good.yaml"
+    good.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: TP_SIZE\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [nonexistent]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([good], None), ([bad], None)]
+    var_cols, art_cols = _classify_csv_columns(["TP_SIZE"], row_configs)
+    assert var_cols == {"TP_SIZE"}
+    assert art_cols == set()
+
+
+def test_classify_csv_columns_missable_tasks_prevents_load_failure(tmp_path):
+    """Passing missable_tasks for the row avoids the config load failure."""
+    f = tmp_path / "wf.yaml"
+    f.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: MY_VAR\n"
+        "    value: x\n"
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      depends_on: [missing_task]\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    row_configs = [([f], ["missing_task"])]
+    var_cols, art_cols = _classify_csv_columns(["MY_VAR"], row_configs)
+    assert var_cols == {"MY_VAR"}
+
+
 def test_bulk_edit_with_multiple_config_files(mock_sflow_app, tmp_path):
     f1 = tmp_path / "backends.yaml"
     f1.write_text('version: "0.1"\nvariables:\n  - name: NODES\n    value: 1\n')
@@ -618,7 +767,9 @@ def test_bulk_input_writes_results_csv_with_submit(mock_sflow_app, tmp_path):
     assert len(rows) == 2
     assert "slurm_job_id" in reader.fieldnames
     assert "sflow_output_dir" in reader.fieldnames
+    assert "sflow_batch_dir" in reader.fieldnames
     assert rows[0]["slurm_job_id"] == "99999"
+    assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
 def test_bulk_input_results_csv_without_submit_has_not_submitted(mock_sflow_app, tmp_path):
@@ -660,6 +811,7 @@ def test_bulk_input_results_csv_without_submit_has_not_submitted(mock_sflow_app,
     assert len(rows) == 1
     assert rows[0]["slurm_job_id"] == "not submitted"
     assert rows[0]["sflow_output_dir"] == "not submitted"
+    assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
 def test_bulk_input_results_csv_marks_failed_rows(tmp_path):
@@ -720,6 +872,8 @@ def test_bulk_input_results_csv_marks_failed_rows(tmp_path):
     assert rows[0]["slurm_job_id"] == "11111"
     assert rows[1]["slurm_job_id"] == "FAILED"
     assert rows[1]["sflow_output_dir"] == ""
+    assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
+    assert rows[1]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
 def test_bulk_input_dry_run_failures_shown_at_end(tmp_path):
@@ -1154,6 +1308,213 @@ class TestParseRowSelector:
     def test_mixed_comma_and_slice(self):
         assert parse_row_selector(["1,4:6"]) == [1, 4, 5]
 
+    # -- Negative indices (deferred, no n_rows) --
+
+    def test_negative_single(self):
+        assert parse_row_selector(["-1"]) == [-1]
+
+    def test_negative_multiple(self):
+        assert parse_row_selector(["-1", "-3"]) == [-3, -1]
+
+    def test_negative_comma(self):
+        assert parse_row_selector(["-1,-3"]) == [-3, -1]
+
+    def test_negative_slice_both_bounds(self):
+        assert parse_row_selector(["-3:-1"]) == [-3, -2]
+
+    def test_mixed_positive_negative(self):
+        result = parse_row_selector(["1", "-1"])
+        assert result == [1, -1]
+
+    # -- Negative indices (resolved with n_rows) --
+
+    def test_negative_single_resolved(self):
+        assert parse_row_selector(["-1"], n_rows=10) == [10]
+
+    def test_negative_last_three_resolved(self):
+        assert parse_row_selector(["-3", "-2", "-1"], n_rows=10) == [8, 9, 10]
+
+    def test_negative_slice_resolved(self):
+        assert parse_row_selector(["-3:-1"], n_rows=10) == [8, 9]
+
+    def test_mixed_positive_negative_resolved(self):
+        assert parse_row_selector(["1", "-1"], n_rows=5) == [1, 5]
+
+    # -- Open-ended slices (require n_rows) --
+
+    def test_open_end_slice(self):
+        assert parse_row_selector(["3:"], n_rows=5) == [3, 4, 5]
+
+    def test_open_start_slice(self):
+        assert parse_row_selector([":3"], n_rows=5) == [1, 2]
+
+    def test_negative_open_end_slice(self):
+        assert parse_row_selector(["-3:"], n_rows=10) == [8, 9, 10]
+
+    def test_open_end_slice_without_n_rows_raises(self):
+        with pytest.raises(Exception, match="Open-ended slice"):
+            parse_row_selector(["3:"])
+
+    def test_open_start_slice_without_n_rows_raises(self):
+        with pytest.raises(Exception, match="Open-ended slice"):
+            parse_row_selector([":3"])
+
+    def test_open_end_with_step(self):
+        assert parse_row_selector(["1::2"], n_rows=6) == [1, 3, 5]
+
+    # -- Edge cases --
+
+    def test_negative_out_of_range_warns(self):
+        result = parse_row_selector(["-10"], n_rows=5)
+        assert result == []
+
+    def test_brackets_negative(self):
+        assert parse_row_selector(["[-1]"]) == [-1]
+
+    def test_brackets_negative_resolved(self):
+        assert parse_row_selector(["[-1]"], n_rows=5) == [5]
+
+
+# ---------------------------------------------------------------------------
+# resolve_row_indices tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRowIndices:
+    def test_positive_passthrough(self):
+        assert resolve_row_indices([1, 3, 5], 10) == [1, 3, 5]
+
+    def test_negative_last(self):
+        assert resolve_row_indices([-1], 10) == [10]
+
+    def test_negative_sequence(self):
+        assert resolve_row_indices([-3, -2, -1], 10) == [8, 9, 10]
+
+    def test_mixed(self):
+        assert resolve_row_indices([1, -1], 5) == [1, 5]
+
+    def test_out_of_range_dropped(self):
+        assert resolve_row_indices([0, 11, -11], 10) == []
+
+    def test_deduplicates(self):
+        assert resolve_row_indices([1, 1, -1, -1], 5) == [1, 5]
+
+    def test_empty(self):
+        assert resolve_row_indices([], 10) == []
+
+
+# ---------------------------------------------------------------------------
+# CLI integration: negative indices & open-ended slices via sflow batch --row
+# ---------------------------------------------------------------------------
+
+
+def _make_batch_csv(tmp_path, n_rows=5):
+    """Create a minimal CSV with *n_rows* data rows for batch --row tests."""
+    wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
+    header = "sflow_config_file,TP_SIZE\n"
+    rows = "".join(f"{wf},{2 * (i + 1)}\n" for i in range(n_rows))
+    return _write_csv(tmp_path / "jobs.csv", header + rows)
+
+
+class TestBatchRowNegativeIndex:
+    """Test sflow batch --bulk-input with negative indices and open-ended slices."""
+
+    def test_batch_row_negative_last(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=-1",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 1
+
+    def test_batch_row_negative_last_three(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=-3:",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 3
+
+    def test_batch_row_open_end_from_3(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=3:",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 3
+
+    def test_batch_row_open_start_to_3(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=:3",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 2  # rows 1, 2 (exclusive end)
+
+    def test_batch_row_negative_slice(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row=-3:-1",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 2  # rows 3, 4
+
+    def test_batch_row_mixed_positive_and_negative(self, mock_sflow_app, tmp_path):
+        csv_file = _make_batch_csv(tmp_path, n_rows=5)
+        out_dir = tmp_path / "output"
+        result = runner.invoke(
+            app,
+            [
+                "batch", "--bulk-input", str(csv_file),
+                "--row", "1", "--row=-1",
+                "--partition", "p", "--account", "a", "--nodes", "1",
+                "--output-dir", str(out_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        scripts = list(out_dir.rglob("*.sh"))
+        assert len(scripts) == 2  # rows 1 and 5
+
 
 # ---------------------------------------------------------------------------
 # _scan_sflow_yamls tests
@@ -1340,6 +1701,8 @@ def test_bulk_submit_writes_results_csv(mock_sflow_app, tmp_path):
     assert "sflow_config_file" in rows[0]
     assert "job_name" in rows[0]
     assert "status" in rows[0]
+    assert "sflow_batch_dir" in rows[0]
+    assert rows[0]["sflow_batch_dir"].startswith("bulk_submit_")
 
 
 def test_bulk_submit_no_valid_files(mock_sflow_app, tmp_path):
@@ -1429,6 +1792,7 @@ def test_bulk_submit_results_csv_not_submitted_values(mock_sflow_app, tmp_path):
     assert len(rows) == 1
     assert rows[0]["slurm_job_id"] == "not submitted"
     assert rows[0]["sflow_output_dir"] == "not submitted"
+    assert rows[0]["sflow_batch_dir"].startswith("bulk_submit_")
 
 
 def test_bulk_input_generates_merged_yaml(mock_sflow_app, tmp_path):
@@ -2175,8 +2539,8 @@ def test_bulk_input_sbatch_script_includes_per_row_missable(mock_sflow_app, tmp_
 # ---------------------------------------------------------------------------
 
 
-def test_batch_bulk_input_variable_csv_wins_over_cli(mock_sflow_app, tmp_path):
-    """For --set variables, CSV value should take precedence over CLI."""
+def test_batch_bulk_input_variable_cli_wins_over_csv(mock_sflow_app, tmp_path):
+    """For --set variables, CLI value should take precedence over CSV."""
     wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
     out_dir = tmp_path / "sflow_output"
     csv_file = _write_csv(
@@ -2193,11 +2557,11 @@ def test_batch_bulk_input_variable_csv_wins_over_cli(mock_sflow_app, tmp_path):
         ],
     )
     assert result.exit_code == 0, f"CLI failed: {result.output}"
-    assert "CSV value will take precedence" in (result.output + (result.stderr or ""))
+    assert "CLI --set value will take precedence" in (result.output + (result.stderr or ""))
     scripts = sorted(list(out_dir.glob("bulk_*"))[0].glob("*.sh"))
     script = scripts[0].read_text()
-    assert "--set TP_SIZE=8" in script
-    assert "--set TP_SIZE=2" not in script
+    assert "--set TP_SIZE=2" in script
+    assert "--set TP_SIZE=8" not in script
 
 
 def test_batch_bulk_input_artifact_cli_wins_over_csv(mock_sflow_app, tmp_path):
@@ -2229,8 +2593,8 @@ def test_batch_bulk_input_artifact_cli_wins_over_csv(mock_sflow_app, tmp_path):
     assert f"--artifact MODEL_PATH=fs://{csv_model_dir}" not in script
 
 
-def test_compose_bulk_input_variable_csv_wins_over_cli(tmp_path):
-    """For --set variables in compose, CSV value should take precedence over CLI."""
+def test_compose_bulk_input_variable_cli_wins_over_csv(tmp_path):
+    """For --set variables in compose, CLI value should take precedence over CSV."""
     wf = tmp_path / "wf.yaml"
     wf.write_text(
         'version: "0.1"\n'
@@ -2257,11 +2621,11 @@ def test_compose_bulk_input_variable_csv_wins_over_cli(tmp_path):
         ],
     )
     assert result.exit_code == 0, f"CLI failed: {result.output}"
-    assert "CSV value will take precedence" in (result.output + (result.stderr or ""))
+    assert "CLI --set value will take precedence" in (result.output + (result.stderr or ""))
     yaml_files = list(out_dir.glob("*/*.yaml"))
     assert len(yaml_files) == 1
     content = yaml_files[0].read_text()
-    assert "value: '8'" in content or "value: 8" in content
+    assert "value: '2'" in content or "value: 2" in content
 
 
 def test_compose_bulk_input_artifact_cli_wins_over_csv(tmp_path):
@@ -2302,3 +2666,543 @@ def test_compose_bulk_input_artifact_cli_wins_over_csv(tmp_path):
     content = yaml_files[0].read_text()
     assert str(cli_path) in content
     assert str(csv_path) not in content
+
+
+# --- CSV-without-bulk-input hint tests ---
+
+
+def test_batch_csv_input_without_bulk_input_flag(tmp_path):
+    """sflow batch with a .csv file but no --bulk-input exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            str(csv_file),
+            "--partition", "gpu",
+            "--account", "test",
+            "--nodes", "1",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
+
+
+def test_batch_csv_via_file_flag_without_bulk_input(tmp_path):
+    """sflow batch -f jobs.csv (no --bulk-input) exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "-f", str(csv_file),
+            "--partition", "gpu",
+            "--account", "test",
+            "--nodes", "1",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
+
+
+def test_bulk_submit_csv_file_rejected(tmp_path):
+    """sflow batch --bulk-submit with a CSV file exits with a helpful hint."""
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("sflow_config_file\nworkflow.yaml\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-submit", str(csv_file),
+            "--partition", "gpu",
+            "--account", "test",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "CSV file(s) detected" in result.output
+    assert "--bulk-input" in result.output
+
+
+# --- _resolve_sbatch_extra_args tests ---
+
+
+def test_resolve_sbatch_extra_args_no_expressions():
+    """Args without expressions are returned unchanged."""
+    args = ["--exclusive", "--segment=4"]
+    result = _resolve_sbatch_extra_args(args, [], None)
+    assert result == ["--exclusive", "--segment=4"]
+
+
+def test_resolve_sbatch_extra_args_with_variable_from_set_var():
+    """Expression resolved from --set overrides."""
+    args = ["--segment=${{ variables.SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(
+        args, [], ["SLURM_NODES=6"]
+    )
+    assert result == ["--segment=6"]
+
+
+def test_resolve_sbatch_extra_args_from_config_file(tmp_path):
+    """Expression resolved from config YAML variable defaults."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 3\n"
+    )
+    args = ["--segment=${{ variables.SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--segment=3"]
+
+
+def test_resolve_sbatch_extra_args_set_var_overrides_config(tmp_path):
+    """--set overrides take priority over config defaults."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 3\n"
+    )
+    args = ["--segment=${{ variables.SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], ["SLURM_NODES=8"])
+    assert result == ["--segment=8"]
+
+
+def test_resolve_sbatch_extra_args_mixed():
+    """Mix of expression and non-expression args."""
+    args = [
+        "--exclusive",
+        "--segment=${{ variables.SLURM_NODES }}",
+        "--gres=gpu:8",
+    ]
+    result = _resolve_sbatch_extra_args(args, [], ["SLURM_NODES=4"])
+    assert result == ["--exclusive", "--segment=4", "--gres=gpu:8"]
+
+
+def test_resolve_sbatch_extra_args_undefined_variable_passthrough():
+    """Undefined variables are passed through unchanged."""
+    args = ["--segment=${{ variables.UNDEFINED_VAR }}"]
+    result = _resolve_sbatch_extra_args(args, [], None)
+    assert result == ["--segment=${{ variables.UNDEFINED_VAR }}"]
+
+
+def test_resolve_sbatch_extra_args_shorthand_without_variables_prefix():
+    """${{ SLURM_NODES }} shorthand (no 'variables.' prefix) resolves."""
+    args = ["--segment=${{ SLURM_NODES }}"]
+    result = _resolve_sbatch_extra_args(args, [], ["SLURM_NODES=4"])
+    assert result == ["--segment=4"]
+
+
+def test_resolve_sbatch_extra_args_shorthand_from_config(tmp_path):
+    """Shorthand resolves from config file defaults."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  GPUS_PER_NODE:\n"
+        "    value: 8\n"
+    )
+    args = ["--gres=gpu:${{ GPUS_PER_NODE }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--gres=gpu:8"]
+
+
+def test_resolve_sbatch_extra_args_both_syntaxes_in_same_call():
+    """Both ${{ variables.X }} and ${{ X }} work in the same invocation."""
+    args = [
+        "--segment=${{ variables.SLURM_NODES }}",
+        "--gres=gpu:${{ GPUS_PER_NODE }}",
+    ]
+    result = _resolve_sbatch_extra_args(
+        args, [], ["SLURM_NODES=3", "GPUS_PER_NODE=8"]
+    )
+    assert result == ["--segment=3", "--gres=gpu:8"]
+
+
+def test_resolve_sbatch_extra_args_domain_from_config(tmp_path):
+    """${{ variables.X.domain }} resolves to the domain list from config."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  CONCURRENCY:\n"
+        "    value: 16\n"
+        "    type: integer\n"
+        "    domain: [1, 4, 16, 64]\n"
+    )
+    args = ["--comment=${{ variables.CONCURRENCY.domain }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--comment=[1, 4, 16, 64]"]
+
+
+def test_resolve_sbatch_extra_args_domain_shorthand(tmp_path):
+    """${{ X.domain }} shorthand resolves domain from config."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  MODE:\n"
+        "    value: fast\n"
+        "    domain: [fast, balanced, accurate]\n"
+    )
+    args = ["--comment=${{ MODE.domain }}"]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--comment=['fast', 'balanced', 'accurate']"]
+
+
+def test_resolve_sbatch_extra_args_domain_empty_when_not_set():
+    """${{ variables.X.domain }} returns [] when variable has no domain."""
+    args = ["--comment=${{ variables.X.domain }}"]
+    result = _resolve_sbatch_extra_args(args, [], ["X=42"])
+    assert result == ["--comment=[]"]
+
+
+def test_resolve_sbatch_extra_args_value_and_domain_together(tmp_path):
+    """Value and domain can be accessed in the same arg list."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "version: '0.1'\n"
+        "variables:\n"
+        "  NODES:\n"
+        "    value: 4\n"
+        "    domain: [1, 2, 4, 8]\n"
+    )
+    args = [
+        "--segment=${{ variables.NODES }}",
+        "--comment=${{ variables.NODES.domain }}",
+    ]
+    result = _resolve_sbatch_extra_args(args, [cfg], None)
+    assert result == ["--segment=4", "--comment=[1, 2, 4, 8]"]
+
+
+# --- CLI integration tests: -e expression in generated sbatch scripts ---
+
+
+def test_batch_sbatch_extra_args_expression_resolved_in_script(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: -e with ${{ variables.X }} produces resolved #SBATCH directive."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 4\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "4",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --segment=4" in script
+    assert "${{" not in script.split("#SBATCH --segment")[1].split("\n")[0]
+
+
+def test_batch_sbatch_extra_args_expression_with_set_override(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: --set overrides variable before -e expression resolution."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 2\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "8",
+            "--sbatch-path", str(sbatch_path),
+            "--set", "SLURM_NODES=8",
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --segment=8" in script
+
+
+def test_batch_sbatch_extra_args_expression_mixed_with_plain(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: mix of plain and expression -e args in generated script."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    value: 3\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "3",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--exclusive",
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+            "-e", "--gres=gpu:8",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --exclusive" in script
+    assert "#SBATCH --segment=3" in script
+    assert "#SBATCH --gres=gpu:8" in script
+
+
+def test_batch_sbatch_extra_args_expression_jinja2_arithmetic(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: Jinja2 arithmetic in -e expression."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    type: integer\n"
+        "    value: 4\n"
+        "  GPUS_PER_NODE:\n"
+        "    type: integer\n"
+        "    value: 8\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "4",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--gres=gpu:${{ variables.GPUS_PER_NODE }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --gres=gpu:8" in script
+
+
+def test_batch_sbatch_extra_args_domain_in_script(
+    mock_sflow_app, tmp_path
+):
+    """Full CLI: -e with ${{ variables.X.domain }} produces resolved #SBATCH directive."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  CONCURRENCY:\n"
+        "    value: 16\n"
+        "    type: integer\n"
+        "    domain: [1, 4, 16, 64]\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file", str(workflow_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "--nodes", "1",
+            "--sbatch-path", str(sbatch_path),
+            "-e", "--comment=${{ variables.CONCURRENCY.domain }}",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script = sbatch_path.read_text()
+    assert "#SBATCH --comment=[1, 4, 16, 64]" in script
+
+
+def test_bulk_input_sbatch_extra_args_expression_per_row(mock_sflow_app, tmp_path):
+    """Bulk-input: -e expression resolved independently per CSV row."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  SLURM_NODES:\n"
+        "    type: integer\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(
+        "sflow_config_file,SLURM_NODES\n"
+        f"{workflow_file.name},2\n"
+        f"{workflow_file.name},5\n"
+    )
+    out_dir = tmp_path / "output"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-input", str(csv_file),
+            "--partition", "batch",
+            "--account", "testaccount",
+            "-e", "--segment=${{ variables.SLURM_NODES }}",
+            "--output-dir", str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+
+    scripts = sorted(out_dir.rglob("*.sh"))
+    assert len(scripts) == 2
+
+    script_1 = scripts[0].read_text()
+    script_2 = scripts[1].read_text()
+    assert "#SBATCH --segment=2" in script_1
+    assert "#SBATCH --segment=5" in script_2
+
+
+class _FakeSflowDistribution:
+    def __init__(self, *, version: str, direct_url_text: str | None = None):
+        self.version = version
+        self._direct_url_text = direct_url_text
+
+    def read_text(self, name: str) -> str | None:
+        assert name == "direct_url.json"
+        return self._direct_url_text
+
+
+def test_resolve_effective_sflow_version_uses_requested_revision():
+    dist = _FakeSflowDistribution(
+        version="0.2.0",
+        direct_url_text=(
+            '{"url":"https://github.com/NVIDIA/nv-sflow.git",'
+            '"vcs_info":{"vcs":"git","requested_revision":"feature/infmax_v3","commit_id":"abc123"}}'
+        ),
+    )
+
+    with patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist):
+        assert batch_mod._resolve_effective_sflow_version(None) == "feature/infmax_v3"
+
+
+def test_resolve_effective_sflow_version_uses_editable_repo_branch(tmp_path):
+    repo_path = tmp_path / "nv-sflow"
+    repo_path.mkdir()
+    dist = _FakeSflowDistribution(
+        version="0.2.0",
+        direct_url_text=(
+            '{"url":"file://'
+            + str(repo_path)
+            + '","dir_info":{"editable":true}}'
+        ),
+    )
+
+    with (
+        patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist),
+        patch("sflow.cli.batch._git_current_ref", return_value="feature/infmax_v3"),
+    ):
+        assert batch_mod._resolve_effective_sflow_version(None) == "feature/infmax_v3"
+
+
+def test_resolve_effective_sflow_version_falls_back_to_installed_package_version():
+    dist = _FakeSflowDistribution(version="0.2.0", direct_url_text=None)
+
+    with patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist):
+        assert batch_mod._resolve_effective_sflow_version(None) == "0.2.0"
+
+
+def test_batch_defaults_sflow_version_from_execution_env(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    sbatch_path = tmp_path / "test.sh"
+
+    with patch(
+        "sflow.cli.batch._resolve_effective_sflow_version",
+        return_value="feature/infmax_v3",
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "batch",
+                "--file",
+                str(temp_workflow_file),
+                "--partition",
+                "batch",
+                "--account",
+                "testaccount",
+                "--nodes",
+                "1",
+                "--sbatch-path",
+                str(sbatch_path),
+            ],
+        )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert (
+        "git+https://github.com/NVIDIA/nv-sflow.git@feature/infmax_v3"
+        in script_content
+    )

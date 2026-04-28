@@ -192,7 +192,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 |-------|----------|------|---------|-------------|
 | `nodes.indices` | | list[int / expr] | `null` | Specific node indices (e.g. `[0]`). |
 | `nodes.count` | | int / expr | `null` | Number of nodes. |
-| `gpus.count` | Yes | int / expr | — | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). |
+| `nodes.exclude` | | int / list[int] / expr | `null` | Node indices to remove from the placement pool before `indices`, `count`, or GPU packing. |
+| `gpus.count` | If `gpus` is set | int / expr | — | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). |
 
 ## Task Replicas
 
@@ -221,7 +222,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | Field | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
 | `delay` | | int / expr | `0` | Initial delay before probing (seconds). |
-| `timeout` | | int / expr | `60` | Max wait time (seconds). |
+| `timeout` | | int / expr | `1200` | Max readiness wait time (seconds). Failure probes do not use this as an overall deadline. |
+| `each_check_timeout` | | int / expr | `30` | Timeout for a single probe check attempt. |
 | `interval` | | int / expr | `5` | Check interval (seconds). |
 | `success_threshold` | | int / expr | `1` | Consecutive successes required. |
 | `failure_threshold` | | int / expr | `3` | Consecutive failures before failing. |
@@ -233,7 +235,7 @@ Exactly one probe type must be set per probe:
 | `tcp_port` | `port` | `host`, `on_node` (`"first"` / `"each"`) | TCP connection check. |
 | `http_get` | `url` | `headers` | HTTP GET health check. |
 | `http_post` | `url` | `headers`, `body` | HTTP POST health check. |
-| `log_watch` | `regex_pattern` | `logger`, `match_count` | Match pattern in task logs. |
+| `log_watch` | `regex_pattern` or `match_pattern` | `logger`, `match_count` | Match pattern in task logs. Literal by default; prefix with `re:` or `regex:` for regular expressions. |
 
 ## Task Outputs
 
@@ -254,6 +256,7 @@ Fields marked **int / expr** or **string / expr** support `${{ ... }}` expressio
 | Expression | Example |
 |------------|---------|
 | Variable | `${{ variables.MY_VAR }}` |
+| Variable domain | `${{ variables.MY_VAR.domain }}` |
 | Backend node IP | `${{ backends.slurm_cluster.nodes[0].ip_address }}` |
 | Artifact path | `${{ artifacts.model_dir.path }}` |
 | Task node IP | `${{ task.server.nodes[0].ip_address }}` |

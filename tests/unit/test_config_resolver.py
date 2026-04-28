@@ -4,6 +4,7 @@
 import pytest
 
 from sflow.config.resolver import ExpressionResolver
+from sflow.core.variable import VariableValue
 
 
 @pytest.fixture
@@ -84,3 +85,66 @@ def test_resolve_with_partial_context_without_ignore_undefined_errors(resolver):
         resolver.resolve_with_partial_context(
             "${{ unknown }}", context={}, ignore_undefined=False
         )
+
+
+# -- VariableValue in expression context -------------------------------------
+
+
+class TestVariableValueInExpressions:
+    """Verify VariableValue works seamlessly as a Jinja context value."""
+
+    def test_domain_access(self, resolver):
+        ctx = {"variables": {"CONC": VariableValue(16, domain=[1, 4, 16, 64])}}
+        result = resolver.resolve("${{ variables.CONC.domain }}", ctx)
+        assert result == "[1, 4, 16, 64]"
+
+    def test_domain_empty_when_not_set(self, resolver):
+        ctx = {"variables": {"X": VariableValue("hello")}}
+        result = resolver.resolve("${{ variables.CONC.domain }}", {**ctx, "variables": {"CONC": VariableValue(1)}})
+        assert result == "[]"
+
+    def test_renders_as_value(self, resolver):
+        ctx = {"variables": {"ISL": VariableValue(1024, domain=[1024, 8192])}}
+        assert resolver.resolve("${{ variables.ISL }}", ctx) == "1024"
+
+    def test_string_value_renders(self, resolver):
+        ctx = {"variables": {"IMG": VariableValue("nginx:latest")}}
+        assert resolver.resolve("${{ variables.IMG }}", ctx) == "nginx:latest"
+
+    def test_arithmetic(self, resolver):
+        ctx = {"variables": {"ISL": VariableValue(1024)}}
+        assert resolver.resolve("${{ variables.ISL * 5 }}", ctx) == "5120"
+
+    def test_arithmetic_between_two_variables(self, resolver):
+        ctx = {"variables": {"A": VariableValue(10), "B": VariableValue(3)}}
+        assert resolver.resolve("${{ variables.A + variables.B }}", ctx) == "13"
+
+    def test_comparison(self, resolver):
+        ctx = {"variables": {"N": VariableValue(4)}}
+        result = resolver.resolve("${{ 'yes' if variables.N > 2 else 'no' }}", ctx)
+        assert result == "yes"
+
+    def test_shorthand_access(self, resolver):
+        """${{ X }} shorthand (via **variables_ctx spread) works with VariableValue."""
+        vv = VariableValue(42, domain=[1, 2, 42])
+        ctx = {"variables": {"X": vv}, "X": vv}
+        assert resolver.resolve("${{ X }}", ctx) == "42"
+        assert resolver.resolve("${{ X.domain }}", ctx) == "[1, 2, 42]"
+
+    def test_string_concatenation(self, resolver):
+        ctx = {"variables": {"HOST": VariableValue("10.0.0.1"), "PORT": VariableValue(8080)}}
+        result = resolver.resolve("${{ variables.HOST }}:${{ variables.PORT }}", ctx)
+        assert result == "10.0.0.1:8080"
+
+    def test_range_list_expression(self, resolver):
+        ctx = {
+            "variables": {
+                "INFRA_NODE_INDEX": VariableValue(0),
+                "NUM_FRONTENDS": VariableValue(2),
+            }
+        }
+        result = resolver.resolve(
+            "${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}",
+            ctx,
+        )
+        assert result == "[0, 1]"

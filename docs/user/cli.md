@@ -21,12 +21,15 @@ sflow run --file sflow.yaml
 
 Common options:
 
-- `--file, -f <path>`: config file path (default: `sflow.yaml`)
+- Positional files or `--file, -f <path>`: workflow YAML file(s). Multiple files are merged the same way as `sflow compose`.
 - `--dry-run`: validate + print execution plan, without running tasks
 - `--tui`: enable Rich TUI (left: tasks + backends, right: auto-tail logs)
 - `--set, -s KEY=VALUE`: override variables (repeatable); variable must already exist in `variables`
 - `--artifact, -a NAME=URI`: override artifacts (repeatable); artifact must already exist in `artifacts`
 - `--missable-tasks, -M <pattern>`: task names or glob patterns (e.g. `prefill_*`) that may be absent when composing multiple files. Missing missable tasks are removed from `depends_on` and probes with a warning. Only valid with multiple input files. Repeatable.
+- `--extra-args, -e <arg>`: extra args passed to the Slurm backend; values are merged with backend config `extra_args` and deduplicated
+- `--bulk-input, -b <csv>`: resolve workflow files and overrides from one CSV row
+- `--row <selector>`: required with `--bulk-input`; `sflow run` accepts exactly one row selector
 - `--workspace-dir <dir>`: workspace root directory (default: current directory)
 - `--output-dir <dir>`: output root directory (default: `<workspace-dir>/sflow_output`)
 - `--log-level <level>`: `debug|info|warning|error|critical` (default: `info`)
@@ -35,6 +38,8 @@ Notes:
 
 - `--tui` is ignored in `--dry-run` mode.
 - In `--tui` mode, logs are captured and rendered in the right pane (to avoid interleaving console logs with the live UI).
+- CSV paths in `sflow_config_file` are resolved relative to the CSV file. CLI `-f` files are prepended to the row's files and deduplicated by resolved path.
+- `--row=-1` selects the last CSV row, `--row=-2` the second-to-last, etc. Use the `--row=N` form for negative rows so Typer does not treat the value as a flag.
 
 Output structure (non dry-run):
 
@@ -79,6 +84,9 @@ sflow compose backends.yaml tasks.yaml --resolve -o resolved.yaml
 # Bulk compose: generate one composed YAML per CSV row
 sflow compose --bulk-input jobs.csv -o output_dir
 
+# Bulk compose with common files prepended to each CSV row
+sflow compose common.yaml --bulk-input jobs.csv -o output_dir
+
 # Bulk compose with validation
 sflow compose --bulk-input jobs.csv --validate -o output_dir
 ```
@@ -93,7 +101,7 @@ Common options:
 - `--validate, -vl`: run dry-run validation on each composed config to check for resource issues (e.g. GPU over-subscription)
 - `--missable-tasks, -M <pattern>`: task names or glob patterns that may be absent when composing multiple files (repeatable). Missing references are removed with a warning. Only valid with multiple input files or `--bulk-input`.
 - `--bulk-input, -b <csv>`: CSV file for bulk compose (one YAML per row). Supports a `missable_tasks` column for per-row missable task patterns.
-- `--row`: process specific CSV rows (supports ranges, e.g. `--row 1:4`)
+- `--row`: process specific CSV rows. Supports single rows, repeated flags, comma lists, Python-style slices with exclusive end (`--row 1:4` -> rows 1, 2, 3), open-ended slices, and negative row indices (`--row=-1`).
 - `--log-level`: logging level (default: `info`)
 - `--verbose, -v`: enable verbose output
 
@@ -137,26 +145,28 @@ Common options:
 - `--partition, -p <name>`: Slurm partition (auto-detected if not specified)
 - `--account, -A <name>`: Slurm account (auto-detected if not specified)
 - `--time <limit>`: time limit (e.g., `02:00:00`)
-- `--nodes, -N <count>`: number of nodes. Required for single-job mode. For bulk modes, auto-detected from the config's slurm backend `nodes` field.
-- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology (default: 4). Applied to slurm backend config, not as a sbatch directive. Use `-e '--gpus-per-node=N'` if your cluster requires the sbatch directive.
+- `--nodes, -N <count>`: number of nodes. If omitted, single-job and bulk-submit modes derive it from the config's Slurm backend `nodes` field. Bulk-input mode requires either this flag or a CSV node-count column (`SLURM_NODES`, `NUM_SLURM_NODES`, or `NUM_NODES`).
+- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation, not as a sbatch directive. Use `-e '--gpus-per-node=N'` if your cluster requires the sbatch directive.
 - `--job-name, -J <name>`: Slurm job name (default: `sflow`)
 - `--set, -s KEY=VALUE`: override variables (repeatable)
 - `--artifact, -a NAME=URI`: override artifacts (repeatable)
 - `--missable-tasks, -M <pattern>`: task names or glob patterns that may be absent when composing modular configs (repeatable). Missing references are removed with a warning. Only valid with multiple input files or `--bulk-input`/`--bulk-submit`.
 - `--sflow-venv-path <path>`: path to existing Python venv for compute nodes
-- `--sbatch-extra-args, -e <arg>`: additional `#SBATCH` directives (repeatable)
+- `--sflow-version <ref>`: Git branch, tag, or ref to install in generated batch scripts. If omitted, scripts try to reuse the currently installed sflow git ref/version before falling back to `main`.
+- `--sbatch-extra-args, -e <arg>`: additional `#SBATCH` directives (repeatable). Supports `${{ variables.X }}` and shorthand `${{ X }}` expressions resolved from config defaults, `--set`, and CSV row values.
 - `--sbatch-output, -O <pattern>`: Slurm stdout pattern (default: `sflow_output/%j-sflow-submit.out`)
 - `--sbatch-error, -E <pattern>`: Slurm stderr pattern (default: `sflow_output/%j-sflow-submit.err`)
 
 ### Bulk-input mode (`--bulk-input`)
 
-- `--bulk-input, -b <csv>`: CSV file with a required `sflow_config_file` column and optional `job_name` column. All other columns are matched to variable or artifact names.
-- `--row`: process specific rows (e.g. `--row 1:4`, `--row 1,3,5`)
+- `--bulk-input, -b <csv>`: CSV file with a required `sflow_config_file` column and optional `job_name` column. Space-separated YAML paths in `sflow_config_file` are merged for that row. All other columns are matched to variable or artifact names.
+- `--row`: process specific rows. Supports the same selectors as `sflow compose --row`.
 - `--resolve, -r`: resolve variables in the generated merged YAML configs (same as `sflow compose --resolve`)
-- Override precedence: for variables, CSV values override CLI `--set`. For artifacts, CLI `--artifact` overrides CSV values.
+- Override precedence: CLI `--set` overrides CSV values; CLI `--artifact` overrides CSV values.
 - Generates both `.sh` (sbatch script) and `.yaml` (merged config) files per row.
 - Always writes a `results.csv` with job IDs, output directories, and status.
 - Reserved CSV column `missable_tasks`: space-separated task names or glob patterns per row. Merged with CLI `--missable-tasks`. Allows mixed disagg/agg rows in the same CSV where different rows have different absent tasks. Columns that only exist in some row configs (e.g. `NUM_AGG_SERVERS` for agg rows, `NUM_CTX_SERVERS` for disagg rows) are automatically handled.
+- If `job_name` is blank or absent, sflow derives a name from unique config-file stems, node count, and differing short CSV values, then appends a row suffix such as `_001`.
 
 ### Bulk-submit mode (`--bulk-submit`)
 
@@ -164,7 +174,7 @@ Common options:
 - Each YAML is processed as a self-contained workflow (no merging).
 - CLI flags (`--set`, `--artifact`, etc.) are applied to every config. Warns when `--set` overrides a variable already defined in a config.
 - Node count is auto-detected from the config's slurm backend.
-- Always writes a `results.csv` with job IDs and status.
+- Always writes a `results.csv` with job IDs and status. With `--resolve`, the results include the generated composed YAML path.
 
 ### Notes
 

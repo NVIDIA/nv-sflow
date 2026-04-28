@@ -186,8 +186,23 @@ class TestSflowConfigSchema:
             LogWatchProbeConfig()
 
         # Defaults
-        assert p.timeout == 60
+        assert p.timeout == 1200
+        assert p.each_check_timeout == 30
         assert p.interval == 5
+
+        # Backwards compatibility: the old single readiness probe object is still valid.
+        single_probe = ProbeConfig(tcp_port=TcpPortProbeConfig(port=8080))
+        probes = ProbesConfig(readiness=single_probe)
+        assert probes.readiness == single_probe
+
+        # Multiple readiness probes are allowed and evaluated as an AND at runtime.
+        probes = ProbesConfig(
+            readiness=[
+                ProbeConfig(tcp_port=TcpPortProbeConfig(port=8080)),
+                ProbeConfig(http_get=HttpProbeConfig(url="http://localhost/health")),
+            ]
+        )
+        assert len(probes.readiness) == 2
 
     def test_task_config_required_fields(self):
         """
@@ -222,6 +237,16 @@ class TestSflowConfigSchema:
         t = TaskConfig(name="res_task", script=["run"], resources=r)
         assert t.resources.nodes.count == 2
         assert t.resources.gpus.count == 4
+
+        expr_resources = ResourcesConfig(
+            nodes=NodeResourceConfig(
+                indices="${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}"
+            )
+        )
+        expr_task = TaskConfig(name="expr_task", script=["run"], resources=expr_resources)
+        assert expr_task.resources.nodes.indices == (
+            "${{ range(variables.INFRA_NODE_INDEX, variables.INFRA_NODE_INDEX + variables.NUM_FRONTENDS) | list }}"
+        )
 
     def test_replica_policy(self):
         """
@@ -349,9 +374,14 @@ class TestValidateNodeExcludeIndices:
         with pytest.raises(ValueError, match="out of range for 2 allocated"):
             validate_node_exclude_indices(cfg)
 
-    def test_concrete_nodes_negative_exclude(self):
-        """Negative exclude index should raise."""
+    def test_concrete_nodes_negative_exclude_wraps(self):
+        """Negative exclude index wraps Python-style: -1 is last node."""
         cfg = _make_config(nodes_val=3, exclude_val=[-1])
+        validate_node_exclude_indices(cfg)  # -1 → index 2, valid for 3 nodes
+
+    def test_concrete_nodes_negative_exclude_out_of_range(self):
+        """Negative exclude index too large should raise."""
+        cfg = _make_config(nodes_val=3, exclude_val=[-4])
         with pytest.raises(ValueError, match="out of range for 3 allocated"):
             validate_node_exclude_indices(cfg)
 

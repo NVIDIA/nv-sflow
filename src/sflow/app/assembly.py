@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import math
 import re
 import shutil
@@ -26,7 +27,7 @@ from sflow.core.compute_node import ComputeNode
 from sflow.core.state import SflowState
 from sflow.core.task import OutputSpec, RetryPolicy, Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
-from sflow.core.variable import Variable, VariableType
+from sflow.core.variable import Variable, VariableType, build_variables_ctx
 from sflow.core.workflow import Workflow
 from sflow.logging import get_logger
 
@@ -272,9 +273,7 @@ def preflight_validate_container_images(config: SflowConfig, state: SflowState) 
     """
     from sflow.plugins.operators.srun import _is_valid_container_image
 
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     ctx: dict[str, Any] = {"variables": variables_ctx, **variables_ctx}
 
     def _try_resolve(raw: Any) -> str:
@@ -425,9 +424,7 @@ def resolve_artifacts(
     out_dir = Path(output_dir) if output_dir is not None else ws_dir / "sflow_output"
     cache_dir = ws_dir / ".sflow_cache" / "artifacts"
 
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     backends_ctx: dict[str, Any] = {
         name: b.to_dict() for name, b in (state.backends or {}).items()
     }
@@ -722,11 +719,8 @@ def resolve_backends(config: SflowConfig, state: SflowState) -> SflowState:
 
     ensure_builtin_backends_registered()
 
-    # Build a simple context from resolved variables (values only)
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
-    ctx = {"variables": variables_ctx, **variables_ctx}
+    variables_ctx = build_variables_ctx(state.variables)
+    ctx: dict[str, Any] = {"variables": variables_ctx, **variables_ctx}
 
     backends: dict[str, Backend] = dict(state.backends or {})
 
@@ -847,9 +841,7 @@ def resolve_workflow_variables(
     backends_ctx: dict[str, Any] = {
         name: b.to_dict() for name, b in (state.backends or {}).items()
     }
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     # If caller constructed `state` manually (e.g. unit tests) without resolving artifacts,
     # populate artifacts from config so expressions like `${{ artifacts.NAME.path }}` work.
     if (not state.artifacts) and (config.artifacts):
@@ -913,9 +905,7 @@ def build_task_graph(
     operator_adapter = operator_config_type_adapter()
 
     # Context for resolving expressions (scripts/resources/etc.)
-    variables_ctx: dict[str, Any] = {
-        name: var.value for name, var in (state.variables or {}).items()
-    }
+    variables_ctx = build_variables_ctx(state.variables)
     if (not state.artifacts) and (config.artifacts):
         state = resolve_artifacts(
             config, state, workspace_dir=workspace_dir, materialize=False
@@ -1067,6 +1057,39 @@ def build_task_graph(
             f"Task '{task_name}' {field} must resolve to int, got {type(resolved).__name__}"
         )
 
+    def _is_http_probe_config(p_conf: Any) -> bool:
+        """Return True if the probe config uses http_get or http_post."""
+        return (
+            getattr(p_conf, "http_get", None) is not None
+            or getattr(p_conf, "http_post", None) is not None
+        )
+
+    def _http_probe_references_vars(p_conf: Any, var_names: list[str]) -> bool:
+        """Check if an HTTP probe config's URL or body references any of the given variable names.
+
+        Inspects the raw (pre-resolved) strings so per-replica variable references like
+        ``${{ variables.CONCURRENCY }}``, ``${CONCURRENCY}``, or ``${SFLOW_REPLICA_INDEX}``
+        are detected.  ``var_names`` should include both user-declared sweep variables and
+        reserved replica variables (e.g. ``SFLOW_REPLICA_INDEX``).
+        """
+        if not var_names:
+            return False
+        texts: list[str] = []
+        http = getattr(p_conf, "http_get", None) or getattr(p_conf, "http_post", None)
+        if http is None:
+            return False
+        texts.append(str(http.url))
+        body = getattr(http, "body", None)
+        if body is not None:
+            texts.append(str(body))
+        combined = " ".join(texts)
+        return any(var_name in combined for var_name in var_names)
+
+    def _probe_config_list(p_conf: Any) -> list[Any]:
+        if p_conf is None:
+            return []
+        return p_conf if isinstance(p_conf, list) else [p_conf]
+
     def _build_probe(
         task_name: str,
         *,
@@ -1080,6 +1103,9 @@ def build_task_graph(
         delay = int(getattr(p_conf, "delay", 0))
         timeout = _resolve_int(
             task_name, field=f"probes.{p_type}.timeout", value=p_conf.timeout
+        )
+        each_check_timeout = _resolve_int(
+            task_name, field=f"probes.{p_type}.each_check_timeout", value=p_conf.each_check_timeout
         )
         interval = _resolve_int(
             task_name, field=f"probes.{p_type}.interval", value=p_conf.interval
@@ -1099,6 +1125,8 @@ def build_task_graph(
             raise ValueError(f"Task '{task_name}' probes.{p_type}.delay must be >= 0")
         if timeout < 0:
             raise ValueError(f"Task '{task_name}' probes.{p_type}.timeout must be >= 0")
+        if each_check_timeout < 0:
+            raise ValueError(f"Task '{task_name}' probes.{p_type}.each_check_timeout must be >= 0")
         if interval < 0:
             raise ValueError(
                 f"Task '{task_name}' probes.{p_type}.interval must be >= 0"
@@ -1116,6 +1144,7 @@ def build_task_graph(
             type=p_type,
             delay=delay,
             timeout=timeout,
+            each_check_timeout=each_check_timeout,
             interval=interval,
             success_threshold=success_threshold,
             failure_threshold=failure_threshold,
@@ -1195,10 +1224,20 @@ def build_task_graph(
         )
 
     def _resolve_int_list(
-        task_name: str, *, field: str, values: list[Any]
+        task_name: str, *, field: str, values: Any
     ) -> list[int]:
+        resolved_values = (
+            resolver.resolve(values, ctx) if resolver.has_expression(values) else values
+        )
+        if isinstance(resolved_values, str):
+            try:
+                resolved_values = json.loads(resolved_values)
+            except json.JSONDecodeError as e:
+                pass
+        if not isinstance(resolved_values, list):
+            resolved_values = [resolved_values]
         out: list[int] = []
-        for i, v in enumerate(values):
+        for i, v in enumerate(resolved_values):
             out.append(_resolve_int(task_name, field=f"{field}[{i}]", value=v))
         return out
 
@@ -1235,51 +1274,51 @@ def build_task_graph(
         if nodes_exclude_raw is not None:
             raw = (
                 nodes_exclude_raw
-                if isinstance(nodes_exclude_raw, list)
+                if isinstance(nodes_exclude_raw, list) or resolver.has_expression(nodes_exclude_raw)
                 else [nodes_exclude_raw]
             )
-            exclude_indices = set(
-                _resolve_int_list(
-                    task_name, field="resources.nodes.exclude", values=raw
-                )
+            n = len(alloc_nodes)
+            raw_indices = _resolve_int_list(
+                task_name, field="resources.nodes.exclude", values=raw
             )
-            out_of_range = {
-                i for i in exclude_indices if i < 0 or i >= len(alloc_nodes)
-            }
-            if out_of_range:
-                raise ValueError(
-                    f"Task '{task_name}' resources.nodes.exclude contains index(es) "
-                    f"{sorted(out_of_range)} out of range for {len(alloc_nodes)} allocated node(s) "
-                    f"(valid: 0..{len(alloc_nodes) - 1})"
-                )
+            resolved_exclude: set[int] = set()
+            for idx in raw_indices:
+                ri = idx if idx >= 0 else idx + n
+                if ri < 0 or ri >= n:
+                    raise ValueError(
+                        f"Task '{task_name}' resources.nodes.exclude contains index {idx} "
+                        f"out of range for {n} allocated node(s) "
+                        f"(valid: {-n}..{n - 1})"
+                    )
+                resolved_exclude.add(ri)
             alloc_nodes = [
-                n for i, n in enumerate(alloc_nodes) if i not in exclude_indices
+                node for i, node in enumerate(alloc_nodes) if i not in resolved_exclude
             ]
             if not alloc_nodes:
                 raise ValueError(
                     f"Task '{task_name}' resources.nodes.exclude removed all nodes from the pool"
                 )
 
-        if nodes_indices_raw is not None and nodes_count_raw is not None:
-            raise ValueError(
-                f"Task '{task_name}' resources.nodes cannot set both 'indices' and 'count'"
-            )
-
+        selected_nodes = alloc_nodes
         if nodes_indices_raw is not None:
             indices = _resolve_int_list(
                 task_name,
                 field="resources.nodes.indices",
-                values=list(nodes_indices_raw),
+                values=nodes_indices_raw,
             )
-            chosen: list[str] = []
+            n = len(alloc_nodes)
+            chosen_nodes: list[ComputeNode] = []
             for idx in indices:
-                if idx < 0 or idx >= len(alloc_nodes):
+                resolved_idx = idx if idx >= 0 else idx + n
+                if resolved_idx < 0 or resolved_idx >= n:
                     raise ValueError(
                         f"Task '{task_name}' resources.nodes.indices contains out-of-range index {idx}; "
-                        f"allocation has {len(alloc_nodes)} nodes"
+                        f"allocation has {n} nodes (valid: {-n}..{n - 1})"
                     )
-                chosen.append(alloc_nodes[idx].name)
-            return chosen, False
+                chosen_nodes.append(alloc_nodes[resolved_idx])
+            selected_nodes = chosen_nodes
+            if nodes_count_raw is None:
+                return [node.name for node in selected_nodes], False
 
         if nodes_count_raw is not None:
             count = _resolve_int(
@@ -1291,12 +1330,12 @@ def build_task_graph(
                 )
             start = 0 if replica_policy == "sequential" else replica_index * count
             end = start + count
-            if end > len(alloc_nodes):
+            if end > len(selected_nodes):
                 raise ValueError(
                     f"Task '{task_name}' needs {count} nodes (replica_index={replica_index}, policy={replica_policy}), "
-                    f"but allocation has only {len(alloc_nodes)} nodes"
+                    f"but allocation has only {len(selected_nodes)} nodes"
                 )
-            return [n.name for n in alloc_nodes[start:end]], False
+            return [node.name for node in selected_nodes[start:end]], False
 
         # If nodes are not explicitly requested but GPUs are, first try to "pack" the task onto
         # a single allocation node that still has enough remaining GPUs.
@@ -1872,12 +1911,32 @@ def build_task_graph(
             task_logger.propagate = False
 
             # Resolve `${{ ... }}` expressions inside task scripts using the current context.
-            # Note: we intentionally do NOT expand `$FOO` style shell variables here; those are
-            # handled by `task.envs` + the shell at runtime.
-            # Note: `${{ task.* }}` expressions are resolved in a second pass after all tasks are
-            # built (see below).
+            # For replicas with sweep variables, overlay per-replica values so that
+            # ${{ variables.CONCURRENCY }} resolves to the replica-specific value.
+            # Note: `${{ task.* }}` expressions are resolved in a second pass after
+            # all tasks are built (see below).
+            replica_env = replica_envs.get(node_name, {})
+            if replica_env:
+                from sflow.core.variable import VariableValue
+
+                replica_ctx = dict(ctx)
+                replica_variables = dict(ctx.get("variables", {}))
+                for k, v in replica_env.items():
+                    if k == "SFLOW_REPLICA_INDEX":
+                        continue
+                    existing = replica_variables.get(k)
+                    domain = existing.domain if isinstance(existing, VariableValue) else None
+                    typed_v = _maybe_int(v)
+                    wrapped = VariableValue(typed_v, domain=domain)
+                    replica_variables[k] = wrapped
+                    replica_ctx[k] = wrapped
+                replica_ctx["variables"] = replica_variables
+                resolve_ctx = replica_ctx
+            else:
+                resolve_ctx = ctx
+
             script = [
-                str(resolver.resolve(line, ctx))
+                str(resolver.resolve(line, resolve_ctx))
                 if resolver.has_expression(line) and "task." not in line
                 else line
                 for line in list(t_conf.script)
@@ -1934,24 +1993,82 @@ def build_task_graph(
                 except Exception:
                     default_probe_host = None
 
-                if t_conf.probes.readiness is not None:
-                    task.probes.append(
-                        _build_probe(
-                            node_name,
-                            p_conf=t_conf.probes.readiness,
-                            p_type=ProbeType.READINESS,
-                            default_host=default_probe_host,
+                # For parallel replicated tasks, skip HTTP probes on non-first
+                # replicas when the probe URL/body don't reference any per-replica
+                # variables — the probes would send identical requests, creating
+                # unnecessary duplicate load.  Per-replica variables include
+                # user-declared sweep variables and reserved variables like
+                # SFLOW_REPLICA_INDEX.
+                #
+                # Sequential replicas always get their own probe because each
+                # replica runs at a different time and needs an independent
+                # timeout deadline.
+                replica_var_names: list[str] = []
+                if t_conf.replicas and len(concrete_nodes) > 1:
+                    per_replica_env = replica_envs.get(node_name, {})
+                    replica_var_names = list(per_replica_env.keys())
+                is_non_first_replica = idx > 0 and len(concrete_nodes) > 1
+                can_share_probe = (
+                    is_non_first_replica and replica_policy == "parallel"
+                )
+
+                readiness_probe_configs = _probe_config_list(t_conf.probes.readiness)
+                if readiness_probe_configs:
+                    skip = (
+                        can_share_probe
+                        and all(
+                            _is_http_probe_config(p_conf)
+                            and not _http_probe_references_vars(
+                                p_conf, replica_var_names
+                            )
+                            for p_conf in readiness_probe_configs
                         )
                     )
+                    if skip:
+                        _logger.debug(
+                            "Skipping readiness HTTP probe on parallel replica '%s' "
+                            "(identical to first replica)",
+                            node_name,
+                        )
+                        first_task = task_graph.get_task(concrete_nodes[0])
+                        if first_task is not None:
+                            first_task.readiness_followers.append(node_name)
+                    else:
+                        for p_conf in readiness_probe_configs:
+                            task.probes.append(
+                                _build_probe(
+                                    node_name,
+                                    p_conf=p_conf,
+                                    p_type=ProbeType.READINESS,
+                                    default_host=default_probe_host,
+                                )
+                            )
                 if t_conf.probes.failure is not None:
-                    task.probes.append(
-                        _build_probe(
-                            node_name,
-                            p_conf=t_conf.probes.failure,
-                            p_type=ProbeType.FAILURE,
-                            default_host=default_probe_host,
+                    skip = (
+                        can_share_probe
+                        and _is_http_probe_config(t_conf.probes.failure)
+                        and not _http_probe_references_vars(
+                            t_conf.probes.failure, replica_var_names
                         )
                     )
+                    if skip:
+                        _logger.debug(
+                            "Skipping failure HTTP probe on parallel replica '%s' "
+                            "(identical to first replica)",
+                            node_name,
+                        )
+                        first_task = task_graph.get_task(concrete_nodes[0])
+                        if first_task is not None:
+                            first_task.failure_followers.append(node_name)
+                    else:
+                        task.probes.append(
+                            _build_probe(
+                                node_name,
+                                p_conf=t_conf.probes.failure,
+                                p_type=ProbeType.FAILURE,
+                                default_host=default_probe_host,
+                            )
+                        )
             task.backend_name = backend.name
             # Optional retry policy (REQ-3.6).
             if t_conf.retries:

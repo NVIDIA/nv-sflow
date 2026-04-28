@@ -6,10 +6,14 @@ CLI command for generating sbatch scripts to run sflow in batch mode.
 """
 
 import csv
+import json
 import shlex
 from datetime import datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import typer
 
@@ -128,6 +132,155 @@ def _resolve_slurm_defaults(
     return partition, account
 
 
+def _git_current_ref(repo_path: Path) -> str | None:
+    """Return the current git branch, or detached HEAD commit if needed."""
+    import subprocess
+
+    try:
+        branch = subprocess.check_output(
+            ["git", "-C", str(repo_path), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        if branch:
+            return branch
+    except Exception:
+        pass
+
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        if commit:
+            return commit
+    except Exception:
+        pass
+
+    return None
+
+
+def _repo_path_from_direct_url(url: str) -> Path | None:
+    """Resolve a local repo path from a PEP 610 direct_url entry."""
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+
+    raw_path = url2pathname(parsed.path)
+    if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+        raw_path = f"//{parsed.netloc}{raw_path}"
+
+    repo_path = Path(raw_path)
+    if repo_path.exists():
+        return repo_path
+    return None
+
+
+def _resolve_effective_sflow_version(sflow_version: str | None) -> str | None:
+    """Resolve the git ref/version that generated batch scripts should install."""
+    if sflow_version:
+        return sflow_version
+
+    try:
+        dist = importlib_metadata.distribution("sflow")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+    try:
+        direct_url_text = dist.read_text("direct_url.json")
+    except Exception:
+        direct_url_text = None
+
+    if direct_url_text:
+        try:
+            direct_url = json.loads(direct_url_text)
+        except json.JSONDecodeError:
+            direct_url = {}
+
+        vcs_info = direct_url.get("vcs_info") or {}
+        requested_revision = vcs_info.get("requested_revision")
+        if requested_revision:
+            return str(requested_revision)
+
+        repo_url = direct_url.get("url")
+        if isinstance(repo_url, str):
+            repo_path = _repo_path_from_direct_url(repo_url)
+            if repo_path:
+                repo_ref = _git_current_ref(repo_path)
+                if repo_ref:
+                    return repo_ref
+
+    version = getattr(dist, "version", None)
+    if version:
+        return str(version)
+
+    try:
+        return importlib_metadata.version("sflow")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _resolve_sbatch_extra_args(
+    extra_args: list[str],
+    config_files: list[Path],
+    set_var: list[str] | None,
+) -> list[str]:
+    """Resolve ``${{ }}`` expressions in sbatch extra args.
+
+    Supports both ``${{ variables.SLURM_NODES }}`` (full path) and
+    ``${{ SLURM_NODES }}`` (shorthand).  Builds a variable context from the
+    config YAML files (defaults) with ``set_var`` overrides applied on top,
+    then resolves any Jinja2 expressions found in the extra args.
+
+    Variable values are wrapped in :class:`VariableValue` so that
+    ``${{ variables.X.domain }}`` is accessible.
+    """
+    if not any("${{" in arg for arg in extra_args):
+        return list(extra_args)
+
+    from sflow.config.resolver import ExpressionResolver
+    from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
+
+    var_map: dict[str, Any] = {}
+    domain_map: dict[str, list[Any]] = {}
+    for cfg_path in config_files:
+        try:
+            import yaml as _yaml
+
+            with open(cfg_path) as fh:
+                data = _yaml.safe_load(fh)
+            if data:
+                var_map.update(_build_var_map(data))
+                domain_map.update(extract_domains_from_raw_config(data))
+        except Exception:
+            pass
+
+    if set_var:
+        for override in set_var:
+            if "=" in override:
+                k, v = override.split("=", 1)
+                var_map[k] = v
+
+    wrapped = build_variables_ctx_from_raw(var_map, domain_map)
+    ctx: dict[str, Any] = {"variables": wrapped}
+    ctx.update(wrapped)
+    resolver = ExpressionResolver()
+
+    resolved: list[str] = []
+    for arg in extra_args:
+        if "${{" in arg:
+            try:
+                resolved.append(str(resolver.resolve(arg, ctx)))
+            except Exception:
+                resolved.append(arg)
+        else:
+            resolved.append(arg)
+    return resolved
+
+
 def _generate_sbatch_script(
     *,
     files: list[Path],
@@ -191,7 +344,10 @@ def _generate_sbatch_script(
         sbatch_directives.append(f"#SBATCH --time={time}")
 
     if sbatch_extra_args:
-        for extra_arg in sbatch_extra_args:
+        resolved_extra_args = _resolve_sbatch_extra_args(
+            sbatch_extra_args, files, set_var
+        )
+        for extra_arg in resolved_extra_args:
             sbatch_directives.append(f"#SBATCH {extra_arg}")
 
     script_lines = [
@@ -214,35 +370,47 @@ def _generate_sbatch_script(
 
     activate_path_str = shlex.quote(str(activate_script))
     venv_parent = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))
-    git_ref = sflow_version if sflow_version else "main"
+    effective_sflow_version = _resolve_effective_sflow_version(sflow_version)
+    git_ref = effective_sflow_version if effective_sflow_version else "main"
+
+    lock_file = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent / ".sflow_venv.lock"))
+
+    sflow_install_cmd = f"'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{git_ref}' --prerelease=allow"
 
     script_lines.extend(
         [
             f"SFLOW_ACTIVATE={activate_path_str}",
+            f"SFLOW_LOCK={lock_file}",
+            "",
+            "# Use flock to prevent concurrent venv creation/install across Slurm jobs",
+            f"mkdir -p {venv_parent}",
+            '(flock -w 600 9 || { echo "ERROR: timed out waiting for sflow venv lock"; exit 1; }',
             "",
             'if [ -f "$SFLOW_ACTIVATE" ]; then',
             "    # Activate existing Python virtual environment for sflow",
-            "    # Make sure this venv is compatible with your compute node arch (x86 / arm64)",
             '    source "$SFLOW_ACTIVATE"',
         ]
     )
-    if sflow_version:
+    if effective_sflow_version:
         script_lines.append(
-            f"    uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{sflow_version}' --prerelease=allow"
+            f'    "$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}'
         )
     script_lines.extend(
         [
             "else",
             "    # Venv not found; create from scratch and install sflow",
-            "    # Using compute node python to avoid login-node vs compute-node arch mismatch (x86 vs arm64)",
-            f"    mkdir -p {venv_parent}",
             f"    cd {venv_parent}",
-            "    /usr/bin/python3 -m venv .sflow_venv",
+            "    python3 -m venv .sflow_venv",
             "    source .sflow_venv/bin/activate",
-            "    pip install uv",
-            f"    uv pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{git_ref}' --prerelease=allow",
-            "    sflow --help",
+            '    "$VIRTUAL_ENV/bin/pip" install uv',
+            f'    "$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}',
+            '    "$VIRTUAL_ENV/bin/sflow" --help',
             "fi",
+            "",
+            ') 9>"$SFLOW_LOCK"',
+            "",
+            "# Activate venv outside the lock (lock is only for creation/install)",
+            'source "$SFLOW_ACTIVATE"',
             "",
         ]
     )
@@ -289,18 +457,26 @@ _RESERVED_CSV_COLUMNS = frozenset({"sflow_config_file", "job_name", "missable_ta
 _NODE_COLUMN_NAMES = frozenset({"SLURM_NODES", "NUM_SLURM_NODES", "NUM_NODES"})
 
 
-def parse_row_selector(values: list[str]) -> list[int]:
+def parse_row_selector(values: list[str], *, n_rows: int | None = None) -> list[int]:
     """Parse ``--row`` values into a flat sorted list of 1-based row indices.
 
     Supported formats (all 1-based; slice end is **exclusive** like Python):
 
     * Single int:        ``--row 1``
+    * Negative int:      ``--row -1``       →  last row
     * Comma-separated:   ``--row 1,3,5``   or   ``--row [1,3,5]``
     * Slice:             ``--row 1:4``      →  rows 1, 2, 3
     * Slice with step:   ``--row 1:6:2``    →  rows 1, 3, 5
+    * Open-ended slice:  ``--row 3:``       →  row 3 to last (needs *n_rows*)
+    * Negative slice:    ``--row -3:``      →  last 3 rows   (needs *n_rows*)
     * Brackets optional: ``--row [1:4]``    same as ``--row 1:4``
 
     Multiple ``--row`` flags are combined:  ``--row 1:3 --row 7``  →  [1, 2, 7]
+
+    Negative indices follow Python semantics: ``-1`` is the last row, ``-2``
+    is second-to-last, etc.  When *n_rows* is ``None``, negative indices and
+    open-ended slices are kept as-is (callers must resolve them later via
+    :func:`resolve_row_indices`).
     """
     indices: set[int] = set()
     for raw in values:
@@ -311,27 +487,78 @@ def parse_row_selector(values: list[str]) -> list[int]:
             for part in token.split(","):
                 part = part.strip()
                 if part:
-                    indices.update(_parse_single_or_slice(part))
+                    indices.update(_parse_single_or_slice(part, n_rows=n_rows))
         else:
-            indices.update(_parse_single_or_slice(token))
-    return sorted(indices)
+            indices.update(_parse_single_or_slice(token, n_rows=n_rows))
+    result = sorted(indices, key=lambda x: (x < 0, x))
+    if n_rows is not None:
+        result = resolve_row_indices(result, n_rows)
+    return result
 
 
-def _parse_single_or_slice(token: str) -> list[int]:
-    """Parse a single int or a start:stop[:step] slice into 1-based indices."""
+def resolve_row_indices(indices: list[int], n_rows: int) -> list[int]:
+    """Resolve negative 1-based row indices to positive ones.
+
+    Negative indices map like Python: ``-1 → n_rows``, ``-2 → n_rows - 1``, etc.
+    After resolution, indices outside ``[1, n_rows]`` are dropped with a warning.
+    """
+    resolved: set[int] = set()
+    for idx in indices:
+        pos = n_rows + 1 + idx if idx < 0 else idx
+        if 1 <= pos <= n_rows:
+            resolved.add(pos)
+        else:
+            typer.echo(
+                f"  Warning: row index {idx} (resolved to {pos}) "
+                f"is out of range [1, {n_rows}]; skipping.",
+                err=True,
+            )
+    return sorted(resolved)
+
+
+def _parse_single_or_slice(token: str, *, n_rows: int | None = None) -> list[int]:
+    """Parse a single int or a start:stop[:step] slice into 1-based indices.
+
+    Open-ended slices (``3:``, ``:-2``) require *n_rows* to resolve the missing
+    bound.  When *n_rows* is ``None`` and the slice is open-ended, a
+    :class:`typer.BadParameter` is raised.
+    """
     if ":" in token:
         parts = token.split(":")
         if len(parts) == 2:
-            start, stop = int(parts[0]), int(parts[1])
+            start_s, stop_s = parts
             step = 1
         elif len(parts) == 3:
-            start, stop, step = int(parts[0]), int(parts[1]), int(parts[2])
+            start_s, stop_s, step_s = parts
+            step = int(step_s) if step_s else 1
         else:
             raise typer.BadParameter(
                 f"Invalid slice: '{token}' (expected start:stop or start:stop:step)"
             )
         if step == 0:
             raise typer.BadParameter("Slice step cannot be zero")
+
+        has_open_end = not start_s or not stop_s
+        if has_open_end and n_rows is None:
+            raise typer.BadParameter(
+                f"Open-ended slice '{token}' requires known row count. "
+                f"This will be resolved automatically when used with --bulk-input."
+            )
+
+        if not start_s:
+            start = 1
+        else:
+            start = int(start_s)
+            if start < 0 and n_rows is not None:
+                start = n_rows + 1 + start
+
+        if not stop_s:
+            stop = n_rows + 1  # type: ignore[operator]
+        else:
+            stop = int(stop_s)
+            if stop < 0 and n_rows is not None:
+                stop = n_rows + 1 + stop
+
         return list(range(start, stop, step))
     return [int(token)]
 
@@ -699,6 +926,8 @@ def _classify_csv_columns(
     var_names: set[str] = set()
     art_names: set[str] = set()
     seen: set[tuple[str, ...]] = set()
+    load_errors: list[tuple[tuple[str, ...], Exception]] = []
+    loaded_count = 0
 
     for config_files, row_missable in row_configs:
         key = tuple(str(f) for f in config_files)
@@ -709,8 +938,10 @@ def _classify_csv_columns(
             config = ConfigLoader().load_configs(
                 config_files, missable_tasks=row_missable
             )
-        except Exception:
+        except Exception as exc:
+            load_errors.append((key, exc))
             continue
+        loaded_count += 1
         for v in config.variables or []:
             var_names.add(v.name)
         wf = config.workflow
@@ -719,6 +950,21 @@ def _classify_csv_columns(
                 var_names.add(v.name)
         for a in config.artifacts or []:
             art_names.add(a.name)
+
+    if load_errors:
+        _logger.warning(
+            f"{len(load_errors)} config file set(s) failed to load "
+            f"({loaded_count} succeeded):"
+        )
+        for files, exc in load_errors:
+            file_list = " + ".join(files)
+            _logger.warning(f"  ⚠ [{file_list}]: {exc}")
+        if loaded_count == 0:
+            _logger.warning(
+                "  No config sets loaded successfully. If tasks from one file "
+                "reference tasks in another, consider adding --missable-tasks / -M "
+                "or a 'missable_tasks' CSV column."
+            )
 
     var_cols: set[str] = set()
     art_cols: set[str] = set()
@@ -730,10 +976,159 @@ def _classify_csv_columns(
         elif col in art_names:
             art_cols.add(col)
         else:
-            raise ValueError(
-                f"CSV column '{col}' is not a variable or artifact defined in any of the config file sets"
+            msg = (
+                f"CSV column '{col}' is not a variable or artifact "
+                f"defined in any of the config file sets"
             )
+            if load_errors and loaded_count == 0:
+                msg += (
+                    f". Note: all {len(load_errors)} config set(s) failed to load"
+                    f" — the root cause is likely a config loading error above, "
+                    f"not a missing variable. Common fix: add --missable-tasks / -M "
+                    f"for tasks referenced in depends_on that don't exist in "
+                    f"all files, or add a 'missable_tasks' column to the CSV."
+                )
+            raise ValueError(msg)
     return var_cols, art_cols
+
+
+def read_bulk_csv(csv_path: Path) -> tuple[list[str], list[dict]]:
+    """Read and validate a bulk-input CSV file.
+
+    Returns (columns, rows).
+    Raises ValueError if the file is empty or lacks the ``sflow_config_file`` column.
+    """
+    import csv
+
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV file is empty: {csv_path}")
+        columns = list(reader.fieldnames)
+        if "sflow_config_file" not in columns:
+            raise ValueError(
+                f"CSV must contain a 'sflow_config_file' column. Found: {columns}"
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"CSV file has no data rows: {csv_path}")
+    return columns, rows
+
+
+def resolve_row_files(
+    row: dict, csv_dir: Path, resolved_cli_files: list[Path],
+) -> list[Path]:
+    """Resolve and dedup config file paths for a single CSV row.
+
+    CLI files are prepended; CSV paths are resolved relative to *csv_dir*.
+    """
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for p in resolved_cli_files + [(csv_dir / x).resolve() for x in row["sflow_config_file"].split()]:
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+    return paths
+
+
+def row_missable(row: dict, cli_missable: list[str] | None) -> list[str] | None:
+    """Merge CLI and CSV ``missable_tasks`` for a single row."""
+    m = list(cli_missable) if cli_missable else []
+    csv_m = (row.get("missable_tasks") or "").strip()
+    if csv_m:
+        m.extend(csv_m.split())
+    return m or None
+
+
+def build_all_row_configs(
+    rows: list[dict],
+    csv_dir: Path,
+    resolved_cli_files: list[Path],
+    cli_missable: list[str] | None,
+) -> list[tuple[list[Path], list[str] | None]]:
+    """Build (config_files, missable) tuples for all rows, for column classification."""
+    return [
+        (resolve_row_files(r, csv_dir, resolved_cli_files), row_missable(r, cli_missable))
+        for r in rows
+    ]
+
+
+def _parse_kv_list(entries: list[str] | None) -> dict[str, str]:
+    """Parse a list of 'KEY=VALUE' strings into a dict."""
+    result: dict[str, str] = {}
+    for entry in entries or []:
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            result[k] = v
+    return result
+
+
+def merge_row_overrides(
+    row: dict,
+    var_cols: set[str],
+    art_cols: set[str],
+    cli_var_map: dict[str, str],
+    cli_art_map: dict[str, str],
+) -> tuple[list[str] | None, list[str] | None]:
+    """Merge CLI and CSV overrides for a single row.
+
+    For variables, CLI ``--set`` takes precedence over CSV values.
+    For artifacts, CLI ``--artifact`` takes precedence over CSV values.
+
+    Returns (set_var_list, artifact_list).
+    """
+    merged_vars: dict[str, str] = {}
+    for col in var_cols:
+        if row.get(col):
+            merged_vars[col] = row[col]
+    merged_vars.update(cli_var_map)
+    set_var = [f"{k}={v}" for k, v in merged_vars.items()] or None
+
+    merged_arts: dict[str, str] = {}
+    for col in art_cols:
+        if row.get(col):
+            merged_arts[col] = row[col]
+    merged_arts.update(cli_art_map)
+    artifacts = [f"{k}={v}" for k, v in merged_arts.items()] or None
+
+    return set_var, artifacts
+
+
+def resolve_csv_row(
+    csv_path: Path,
+    row_idx: int,
+    cli_files: list[Path] | None = None,
+    cli_set_var: list[str] | None = None,
+    cli_artifact: list[str] | None = None,
+    cli_missable: list[str] | None = None,
+) -> tuple[list[Path], list[str] | None, list[str] | None, list[str] | None]:
+    """Resolve a single CSV row into (config_files, set_var, artifact, missable_tasks).
+
+    High-level convenience that reads the CSV, classifies columns, and merges
+    overrides for the selected row (1-based index).
+    Used by ``sflow run --bulk-input``.
+    """
+    columns, rows = read_bulk_csv(csv_path)
+    if row_idx < 0:
+        row_idx = len(rows) + 1 + row_idx
+    if row_idx < 1 or row_idx > len(rows):
+        raise IndexError(f"Row {row_idx} out of range (CSV has {len(rows)} rows)")
+
+    csv_dir = csv_path.parent
+    resolved_cli = [fp.resolve() for fp in (cli_files or [])]
+
+    all_row_configs = build_all_row_configs(rows, csv_dir, resolved_cli, cli_missable)
+    var_cols, art_cols = _classify_csv_columns(columns, all_row_configs)
+
+    row = rows[row_idx - 1]
+    config_files = resolve_row_files(row, csv_dir, resolved_cli)
+    missable = row_missable(row, cli_missable)
+
+    cli_var_map = _parse_kv_list(cli_set_var)
+    cli_art_map = _parse_kv_list(cli_artifact)
+    set_var, artifacts = merge_row_overrides(row, var_cols, art_cols, cli_var_map, cli_art_map)
+
+    return config_files, set_var, artifacts, missable
 
 
 def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
@@ -896,15 +1291,17 @@ def _run_bulk_submit(
             err_short = str(e).split("\n")[0]
             summary.append(f"  [{idx}] {yaml_file.name}: SKIPPED (dry-run failed)")
             failures.append(f"  [{idx}] {yaml_file.name}: {err_short}")
-            result_rows.append(
-                {
-                    "sflow_config_file": str(yaml_file),
-                    "job_name": job_name,
-                    "slurm_job_id": "FAILED",
-                    "sflow_output_dir": "",
-                    "status": "dry-run failed",
-                }
-            )
+            fail_row: dict[str, str] = {
+                "sflow_config_file": str(yaml_file),
+                "job_name": job_name,
+                "slurm_job_id": "FAILED",
+                "sflow_output_dir": "",
+                "sflow_batch_dir": bulk_dir.name,
+                "status": "dry-run failed",
+            }
+            if resolve:
+                fail_row["composed_sflow_config"] = ""
+            result_rows.append(fail_row)
             continue
 
         # Determine node count from config if not given via CLI
@@ -957,6 +1354,7 @@ def _run_bulk_submit(
         script_path.chmod(0o755)
 
         # Generate composed/resolved YAML alongside the sbatch script
+        composed_yaml_path: str = ""
         try:
             from sflow.cli.compose import _compose_files
 
@@ -971,6 +1369,7 @@ def _run_bulk_submit(
             )
             yaml_path = bulk_dir / f"{job_name}.yaml"
             yaml_path.write_text(yaml_output)
+            composed_yaml_path = str(yaml_path)
         except Exception as e:
             typer.echo(
                 f"  Warning: could not generate composed config for {yaml_file.name}: {e}",
@@ -991,19 +1390,21 @@ def _run_bulk_submit(
 
         sflow_output_dir = f"{effective_output}/{job_id}-*" if job_id else ""
         summary.append(f"  [{idx}] {script_path.name}: {yaml_file.name} -> {status}")
-        result_rows.append(
-            {
-                "sflow_config_file": str(yaml_file),
-                "job_name": job_name,
-                "slurm_job_id": job_id
-                if job_id
-                else ("not submitted" if not submit else "FAILED"),
-                "sflow_output_dir": sflow_output_dir
-                if sflow_output_dir
-                else ("not submitted" if not submit else ""),
-                "status": status,
-            }
-        )
+        success_row: dict[str, str] = {
+            "sflow_config_file": str(yaml_file),
+            "job_name": job_name,
+            "slurm_job_id": job_id
+            if job_id
+            else ("not submitted" if not submit else "FAILED"),
+            "sflow_output_dir": sflow_output_dir
+            if sflow_output_dir
+            else ("not submitted" if not submit else ""),
+            "sflow_batch_dir": bulk_dir.name,
+            "status": status,
+        }
+        if resolve:
+            success_row["composed_sflow_config"] = composed_yaml_path
+        result_rows.append(success_row)
 
     generated = len(yaml_files) - failed_count
     typer.echo(
@@ -1029,8 +1430,11 @@ def _run_bulk_submit(
             "job_name",
             "slurm_job_id",
             "sflow_output_dir",
+            "sflow_batch_dir",
             "status",
         ]
+        if resolve:
+            fieldnames.append("composed_sflow_config")
         with open(results_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -1063,7 +1467,7 @@ def _run_bulk_edit(
     sflow_venv_path: Path | None,
     sflow_version: str | None,
     submit: bool,
-    row_filter: list[int] | None = None,
+    row_selectors: list[str] | None = None,
     resolve: bool = False,
     missable_tasks: list[str] | None = None,
 ) -> None:
@@ -1135,7 +1539,7 @@ def _run_bulk_edit(
     for name in sorted(overlap_vars):
         typer.echo(
             f"  Warning: variable '{name}' specified via --set and also in CSV; "
-            f"CSV value will take precedence per row.",
+            f"CLI --set value will take precedence over CSV.",
             err=True,
         )
     for name in sorted(overlap_arts):
@@ -1159,7 +1563,9 @@ def _run_bulk_edit(
     result_rows: list[dict[str, str]] = []
     effective_output_dir = output_dir or Path.cwd() / "sflow_output"
 
-    row_indices = set(row_filter) if row_filter else None
+    row_indices: set[int] | None = None
+    if row_selectors:
+        row_indices = set(parse_row_selector(row_selectors, n_rows=len(rows)))
     naming_ctx = build_row_naming_ctx(rows, fallback_base=job_name, cli_nodes=nodes)
 
     for idx, row in enumerate(rows, start=1):
@@ -1167,23 +1573,17 @@ def _run_bulk_edit(
             continue
         config_files = _resolve_config_paths(row["sflow_config_file"])
 
-        merged_vars = dict(cli_var_map)
-        for col in csv_var_names:
-            if row.get(col):
-                merged_vars[col] = row[col]
-        set_var = [f"{k}={v}" for k, v in merged_vars.items()]
-
-        merged_arts: dict[str, str] = {}
-        for col in csv_art_names:
-            if row.get(col):
-                merged_arts[col] = row[col]
-        merged_arts.update(cli_art_map)
-        artifacts = [f"{k}={v}" for k, v in merged_arts.items()]
+        set_var_opt, artifacts_opt = merge_row_overrides(
+            row, csv_var_names, csv_art_names, cli_var_map, cli_art_map
+        )
+        set_var = set_var_opt or []
+        artifacts = artifacts_opt or []
 
         all_overrides: dict[str, str] = {}
         for col in columns:
             if col not in _RESERVED_CSV_COLUMNS and row.get(col):
                 all_overrides[col] = row[col]
+        all_overrides.update(cli_var_map)
         all_overrides.update(cli_art_map)
         overrides_desc = ", ".join(f"{k}={v}" for k, v in all_overrides.items())
 
@@ -1229,6 +1629,9 @@ def _run_bulk_edit(
             dry_run_failures.append(f"  [{idx}] {err_short}")
             result_row["slurm_job_id"] = "FAILED"
             result_row["sflow_output_dir"] = ""
+            result_row["sflow_batch_dir"] = bulk_dir.name
+            if resolve:
+                result_row["composed_sflow_config"] = ""
             result_rows.append(result_row)
             continue
 
@@ -1265,9 +1668,11 @@ def _run_bulk_edit(
 
         row_name = _derive_row_name(row, idx, naming_ctx)
 
+        composed_config_path = ""
         if yaml_output:
             merged_yaml_path = bulk_dir / f"{row_name}.yaml"
             merged_yaml_path.write_text(yaml_output)
+            composed_config_path = str(merged_yaml_path)
 
         script_path = bulk_dir / f"{row_name}.sh"
         script = _generate_sbatch_script(
@@ -1309,6 +1714,9 @@ def _run_bulk_edit(
         result_row["sflow_output_dir"] = (
             f"{effective_output_dir}/{job_id}-*" if job_id else ""
         )
+        result_row["sflow_batch_dir"] = bulk_dir.name
+        if resolve:
+            result_row["composed_sflow_config"] = composed_config_path
         result_rows.append(result_row)
         summary.append(f"  [{idx}] {script_path.name}: ({overrides_desc}) -> {status}")
 
@@ -1336,7 +1744,9 @@ def _run_bulk_edit(
 
     if result_rows:
         results_csv = bulk_dir / "results.csv"
-        result_columns = columns + ["slurm_job_id", "sflow_output_dir"]
+        result_columns = columns + ["slurm_job_id", "sflow_output_dir", "sflow_batch_dir"]
+        if resolve:
+            result_columns.append("composed_sflow_config")
         for rr in result_rows:
             if not rr.get("slurm_job_id"):
                 rr["slurm_job_id"] = "not submitted" if not submit else ""
@@ -1494,7 +1904,12 @@ def batch(
         typer.Option(
             "--sbatch-extra-args",
             "-e",
-            help="Additional sbatch directives to append (e.g., '--exclusive', '--segment=NUM_NODES'). Can be used multiple times, will be in script as '#SBATCH directives'.",
+            help="Additional sbatch directives to append as '#SBATCH' lines. "
+            "Supports ${{ variables.X }} or ${{ X }} expressions resolved from the sflow config "
+            "(e.g., -e '--segment=${{ SLURM_NODES }}'). "
+            "Variable values from --set overrides and CSV bulk-input columns are applied "
+            "before resolution. Use single quotes to prevent shell expansion. "
+            "Can be used multiple times.",
         ),
     ] = None,
     # runtime options
@@ -1514,7 +1929,10 @@ def batch(
         Optional[str],
         typer.Option(
             "--sflow-version",
-            help="Git ref (branch or tag) to install from the GitHub repo (e.g., 'main', 'v0.1.0'). If not specified, reuse the installed version in the existing venv, or create a new venv and install the latest main version.",
+            help="Git ref (branch or tag) to install from the GitHub repo (e.g., 'main', 'v0.1.0'). "
+            "If not specified, generated scripts default to the currently executing sflow environment's "
+            "installed git ref when available, otherwise the installed package version, and only fall back "
+            "to 'main' when neither can be determined.",
         ),
     ] = None,
     missable_tasks: Annotated[
@@ -1566,9 +1984,12 @@ def batch(
         typer.Option(
             "--row",
             help="Only process specific CSV row(s) by 1-based index. "
-            "Supports: single (--row 1), multiple (--row 1 --row 3), "
-            "comma-separated (--row 1,3,5), and Python-style slices with exclusive end "
-            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]). "
+            "Supports: single (--row 1), negative (--row=-1 → last row), "
+            "multiple (--row 1 --row 3), "
+            "comma-separated (--row 1,3,5), Python-style slices with exclusive end "
+            "(--row 1:4 → rows 1,2,3; --row 1:6:2 → rows 1,3,5; --row [1:4]), "
+            "and open-ended/negative slices (--row=-3: → last 3 rows; --row 3: → row 3 to end). "
+            "Negative indices use --row=N syntax to avoid flag ambiguity. "
             "Requires --bulk-input.",
         ),
     ] = None,
@@ -1675,8 +2096,8 @@ def batch(
         # With custom virtual environment
         sflow batch workflow.yaml --sflow-venv-path /path/to/.venv
 
-        # With extra sbatch directives
-        sflow batch workflow.yaml --sbatch-extra-args "--exclusive" --sbatch-extra-args "--segment=NUM_NODES"
+        # With extra sbatch directives (supports ${{ variables.X }} expressions)
+        sflow batch workflow.yaml -e "--exclusive" -e "--segment=${{ variables.SLURM_NODES }}"
 
         # Bulk input: generate one job per CSV row (--nodes not required)
         sflow batch --bulk-input jobs.csv --partition gpu --account myaccount
@@ -1700,7 +2121,6 @@ def batch(
 
     # --- Bulk-edit mode ---
     if bulk_input is not None:
-        parsed_rows = parse_row_selector(row) if row else None
         try:
             _run_bulk_edit(
                 csv_path=bulk_input,
@@ -1721,7 +2141,7 @@ def batch(
                 sflow_venv_path=sflow_venv_path,
                 sflow_version=sflow_version,
                 submit=submit,
-                row_filter=parsed_rows,
+                row_selectors=row,
                 resolve=resolve,
                 missable_tasks=missable_tasks,
             )
@@ -1740,6 +2160,19 @@ def batch(
             all_paths.extend(src_files)
         if file:
             all_paths.extend(file)
+
+        csv_in_bulk_submit = [p for p in all_paths if p.is_file() and p.suffix.lower() == ".csv"]
+        if csv_in_bulk_submit:
+            names = ", ".join(str(f) for f in csv_in_bulk_submit)
+            typer.echo(
+                f"Error: CSV file(s) detected in --bulk-submit input: {names}\n"
+                f"  --bulk-submit expects sflow YAML files or directories, not CSV.\n"
+                f"  Did you mean to use --bulk-input (-b)?\n"
+                f"  Example: sflow batch --bulk-input {csv_in_bulk_submit[0]}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
         yaml_files = _scan_sflow_yamls(all_paths)
         if not yaml_files:
             typer.echo(
@@ -1784,6 +2217,19 @@ def batch(
     files = list(src_files or []) + list(file or [])
     if not files:
         files = [Path("sflow.yaml").resolve()]
+
+    csv_files = [f for f in files if f.suffix.lower() == ".csv"]
+    if csv_files:
+        names = ", ".join(str(f) for f in csv_files)
+        typer.echo(
+            f"Error: CSV file(s) detected in input: {names}\n"
+            f"  CSV files cannot be used as workflow YAML inputs directly.\n"
+            f"  Did you mean to use --bulk-input (-b)?\n"
+            f"  Example: sflow batch --bulk-input {csv_files[0]}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     if missable_tasks and len(files) < 2:
         typer.echo(
             "Error: --missable-tasks is only valid with multiple input files (modular configs).",
