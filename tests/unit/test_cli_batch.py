@@ -1837,6 +1837,50 @@ def test_bulk_input_generates_merged_yaml(mock_sflow_app, tmp_path):
     assert "workflow:" in content
 
 
+def test_bulk_input_with_cli_files_includes_them_in_sbatch_script(
+    mock_sflow_app, tmp_path
+):
+    """CLI -f files should be prepended to each CSV row in generated sbatch scripts."""
+    f_common = tmp_path / "common.yaml"
+    f_common.write_text('version: "0.1"\nvariables:\n  - name: SHARED\n    value: yes\n')
+    f_task = tmp_path / "task.yaml"
+    f_task.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: wf\n"
+        "  tasks:\n"
+        "    - name: t1\n"
+        "      script:\n"
+        "        - echo ${{ variables.SHARED }}\n"
+    )
+    out_dir = tmp_path / "sflow_output"
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file\n{f_task}\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "-f", str(f_common),
+            "--bulk-input", str(csv_file),
+            "--partition", "gpu",
+            "--account", "test",
+            "--nodes", "1",
+            "--output-dir", str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+
+    bulk_dirs = list(out_dir.glob("bulk_*"))
+    assert len(bulk_dirs) == 1
+    script = next(bulk_dirs[0].glob("*.sh")).read_text()
+    common_arg = f"--file {shlex.quote(str(f_common.resolve()))}"
+    task_arg = f"--file {shlex.quote(str(f_task.resolve()))}"
+    assert common_arg in script
+    assert task_arg in script
+    assert script.index(common_arg) < script.index(task_arg)
+
+
 def test_single_job_stdout_hint(mock_sflow_app, temp_workflow_file):
     """Without -o, a hint is shown that output is stdout only."""
     result = runner.invoke(

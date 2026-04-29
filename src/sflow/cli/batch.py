@@ -1450,6 +1450,7 @@ def _run_bulk_submit(
 def _run_bulk_edit(
     *,
     csv_path: Path,
+    cli_files: list[Path] | None,
     cli_set_var: list[str] | None,
     cli_artifact: list[str] | None,
     log_level: str,
@@ -1476,33 +1477,9 @@ def _run_bulk_edit(
     CLI ``--set`` and ``--artifact`` flags provide baseline overrides.
     CSV columns override those baselines per row (with a warning).
     """
-    cli_var_map: dict[str, str] = {}
-    for entry in cli_set_var or []:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            cli_var_map[k] = v
-
-    cli_art_map: dict[str, str] = {}
-    for entry in cli_artifact or []:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            cli_art_map[k] = v
-
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise ValueError(f"CSV file is empty: {csv_path}")
-        columns = list(reader.fieldnames)
-        if "sflow_config_file" not in columns:
-            raise ValueError(
-                f"CSV file must contain a 'sflow_config_file' column "
-                f"(use spaces to list multiple YAML files per row, e.g. 'backend.yaml workflow.yaml'). "
-                f"Found columns: {columns}"
-            )
-        rows: list[dict[str, Any]] = list(reader)
-
-    if not rows:
-        raise ValueError(f"CSV file has no data rows: {csv_path}")
+    cli_var_map = _parse_kv_list(cli_set_var)
+    cli_art_map = _parse_kv_list(cli_artifact)
+    columns, rows = read_bulk_csv(csv_path)
 
     if nodes is None and not (_NODE_COLUMN_NAMES & set(columns)):
         raise ValueError(
@@ -1512,24 +1489,14 @@ def _run_bulk_edit(
         )
 
     csv_dir = csv_path.parent
+    resolved_cli_files = [p.resolve() for p in (cli_files or [])]
 
-    def _resolve_config_paths(raw: str) -> list[Path]:
-        paths = []
-        for p in raw.split():
-            fp = Path(p)
-            if not fp.is_absolute():
-                fp = csv_dir / fp
-            paths.append(fp.resolve())
-        return paths
-
-    row_configs: list[tuple[list[Path], list[str] | None]] = []
-    for r in rows:
-        cfg_files = _resolve_config_paths(r["sflow_config_file"])
-        row_m = list(missable_tasks) if missable_tasks else []
-        csv_m = (r.get("missable_tasks") or "").strip()
-        if csv_m:
-            row_m.extend(csv_m.split())
-        row_configs.append((cfg_files, row_m or None))
+    row_configs = build_all_row_configs(
+        rows,
+        csv_dir,
+        resolved_cli_files,
+        missable_tasks,
+    )
     var_cols, art_cols = _classify_csv_columns(columns, row_configs)
 
     csv_var_names = var_cols
@@ -1571,7 +1538,7 @@ def _run_bulk_edit(
     for idx, row in enumerate(rows, start=1):
         if row_indices is not None and idx not in row_indices:
             continue
-        config_files = _resolve_config_paths(row["sflow_config_file"])
+        config_files = resolve_row_files(row, csv_dir, resolved_cli_files)
 
         set_var_opt, artifacts_opt = merge_row_overrides(
             row, csv_var_names, csv_art_names, cli_var_map, cli_art_map
@@ -1588,12 +1555,7 @@ def _run_bulk_edit(
         overrides_desc = ", ".join(f"{k}={v}" for k, v in all_overrides.items())
 
         result_row = dict(row)
-
-        row_missable = list(missable_tasks) if missable_tasks else []
-        csv_missable = (row.get("missable_tasks") or "").strip()
-        if csv_missable:
-            row_missable.extend(csv_missable.split())
-        effective_missable = row_missable or None
+        effective_missable = row_missable(row, missable_tasks)
 
         # Derive gpus_per_node: config/CSV value wins over CLI
         config_gpus = _derive_gpus_per_node(config_files, cli_overrides=set_var)
@@ -2124,6 +2086,7 @@ def batch(
         try:
             _run_bulk_edit(
                 csv_path=bulk_input,
+                cli_files=list(src_files or []) + list(file or []),
                 cli_set_var=set_var,
                 cli_artifact=artifact,
                 log_level=log_level,
