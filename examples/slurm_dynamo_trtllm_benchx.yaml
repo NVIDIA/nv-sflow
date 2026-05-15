@@ -1,0 +1,709 @@
+version: "0.1"
+
+# =============================================================================
+# benchx — Dynamo + TRT-LLM disagg variant driven by RWLT (Real-World Load
+# Test, https://github.com/.../artificial-analysis) instead of aiperf.
+#
+# RWLT replays multi-turn agentic coding trajectories with cache-busting, ISL
+# offsets, closed-loop traffic, and per-phase concurrency sweeps. It sends
+# X-Session-ID + X-Correlation-ID routing headers so the dynamo kv router can
+# exercise session-affinity logic against the same prefixes across turns.
+#
+# This file mirrors `slurm_dynamo_trtllm_disagg.yaml`; the differentiating
+# pieces are:
+#   * `--router-mode kv --no-router-kv-events --router-ttl-secs 480.0` on the
+#     frontend (approximate-KV routing — measured to beat event-based routing
+#     for the agentic-coding workload).
+#   * `HOSTCACHE` (host KV offload) and `WORKER_METRICS` knobs from the bench
+#     scripts, applied to the prefill engine config / worker flags.
+#   * Eagle3 spec-decode in both ctx and gen engine configs (gpt-oss-120b +
+#     `nvidia_gpt-oss-120b-Eagle3-next` draft model).
+#   * Closed-loop RWLT benchmark task in place of aiperf.
+#   * CONCURRENCY sweep default `1,2,3,6,8,10,16,32,48,64,80,96,112,128,144,160`.
+# =============================================================================
+
+variables:
+  # Variables has 2 ways of access, and can be overridden by --set flag in sflow batch / sflow run command
+  # 1. In YAML expressions: `${{ variables.NAME }}`, sflow will automatically resolve the expression and inject the value before the workflow is executed, it works across any fields in the yaml file, such as backends, operators, workflow, tasks, scripts, etc.
+  # 2. In task scripts (as env var): `${NAME}`, the variable can also be accessed as an environment variable in the task script
+
+  # Slurm Configuration - These will be skipped if you use 'sflow batch -f sflow.yaml --submit' to launch the workflow and overwrite the variables in cli args
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: 240
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 4
+  SLURM_NODES:
+    description: "Number of nodes (1 for 1ctx+1gen single-node, 2 for the TP2 layouts where ctx lives on NODE0 and gen workers on NODE1)"
+    value: 1
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name (must match what RWLT requests)"
+    value: openai/gpt-oss-120b
+  MODEL_NAME:
+    description: "Model identifier (HF id, informational)"
+    value: openai/gpt-oss-120b
+
+  # Prefill Server Configuration
+  NUM_CTX_SERVERS:
+    description: "Number of context/prefill servers"
+    value: 1
+  CTX_TP_SIZE:
+    description: "Context tensor parallel size"
+    type: integer
+    value: 1
+  CTX_DP_SIZE:
+    description: "Context data parallel size"
+    type: integer
+    value: 1
+  CTX_EP_SIZE:
+    description: "Context expert parallel size"
+    type: integer
+    value: 1
+  CTX_MOE_TP_SIZE:
+    description: "Context MOE tensor parallel size"
+    type: integer
+    value: 1
+  CTX_PP_SIZE:
+    description: "Context pipeline parallel size"
+    type: integer
+    value: 1
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+  CTX_BATCH_SIZE:
+    description: "Context batch size"
+    value: 128
+  CTX_MAX_NUM_TOKENS:
+    description: "Context max number of tokens (chunked-prefill chunk size)"
+    value: 20000
+  CTX_MAX_SEQ_LEN:
+    description: "Context max sequence length"
+    value: 131072
+  CTX_FREE_GPU_MEMORY_FRACTION:
+    description: "Context free GPU memory fraction"
+    value: 0.9
+  CTX_ENABLE_ATTENTION_DP:
+    description: "Context enable attention DP"
+    value: false
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+
+  # Decode Server Configuration
+  NUM_GEN_SERVERS:
+    description: "Number of generation/decode servers (1 for 1ctx+1gen, 2 for the 1ctx+2gen layout)"
+    value: 1
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size (1 for TP1 baseline, 2 for TP2 variants)"
+    type: integer
+    value: 1
+  GEN_DP_SIZE:
+    description: "Generation data parallel size"
+    type: integer
+    value: 1
+  GEN_EP_SIZE:
+    description: "Generation expert parallel size"
+    type: integer
+    value: 1
+  GEN_MOE_TP_SIZE:
+    description: "Generation MOE tensor parallel size"
+    type: integer
+    value: 1
+  GEN_PP_SIZE:
+    description: "Generation pipeline parallel size"
+    type: integer
+    value: 1
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+  GEN_BATCH_SIZE:
+    description: "Generation batch size"
+    value: 128
+  GEN_MAX_NUM_TOKENS:
+    description: "Generation max number of tokens"
+    value: 512
+  GEN_MAX_SEQ_LEN:
+    description: "Generation max sequence length"
+    value: 131072
+  GEN_FREE_GPU_MEMORY_FRACTION:
+    description: "Generation free GPU memory fraction"
+    value: 0.9
+  GEN_ENABLE_ATTENTION_DP:
+    description: "Generation enable attention DP"
+    value: false
+
+  # Eagle3 spec-decode (applied to both ctx and gen engines)
+  SPEC_DRAFT_MODEL_PATH:
+    description: "Path to Eagle3 draft model checkpoint"
+    value: /path/to/your/nvidia_gpt-oss-120b-Eagle3-next
+  SPEC_MAX_DRAFT_LEN:
+    description: "Max draft tokens per Eagle3 step"
+    type: integer
+    value: 3
+
+  # benchx-specific knobs
+  HOSTCACHE:
+    description: "1 = enable kv_cache_config.host_cache_size: 80GB on ctx engine; 0 = host offload disabled (default)"
+    type: integer
+    value: 0
+    domain: [0, 1]
+  WORKER_METRICS:
+    description: "1 = pass --publish-events-and-metrics to dynamo.trtllm workers; 0 = disabled (default; reduces publisher GIL pressure on workers)"
+    type: integer
+    value: 0
+    domain: [0, 1]
+  CTX_HOST_CACHE_SIZE:
+    description: "Host KV cache size in bytes when HOSTCACHE=1 (default 80 GiB)"
+    value: 85899345920
+
+  # Dynamo KV router knobs (approximate-KV mode — see benchx README)
+  ROUTER_MODE:
+    description: "Dynamo frontend router mode (kv | round-robin | random)"
+    value: kv
+  ROUTER_TTL_SECS:
+    description: "Approximate-KV router TTL in seconds (how long the router remembers a prefix on a worker)"
+    value: 480.0
+  ROUTER_QUEUE_THRESHOLD:
+    description: "DYN_ROUTER_QUEUE_THRESHOLD — disable queue-balancing fallback for high-concurrency runs"
+    value: 100000
+  DYN_TCP_WORKER_POOL_SIZE:
+    description: "DYN_TCP_WORKER_POOL_SIZE — TCP transport worker pool"
+    value: 100000
+
+  # Extra Arguments - You can append any optional arguments to the trtllm-llmapi-launch / dynamo.frontend commands
+  EXTRA_FRONTEND_ARGS:
+    description: "Extra frontend arguments"
+    value: ""
+  EXTRA_PREFILL_ARGS:
+    description: "Extra prefill arguments"
+    value: ""
+  EXTRA_DECODE_ARGS:
+    description: "Extra decode arguments"
+    value: ""
+
+  # RWLT Benchmark Configuration
+  TRAJECTORY_PATH:
+    description: "Path to RWLT trajectory JSONL file (agentic coding dataset)"
+    value: /path/to/your/data/agentic_coding_v2_full.jsonl
+  RWLT_REPO_DIR:
+    description: "Path to the artificial-analysis repo checkout (contains rwlt/ and analysis/)"
+    value: /path/to/your/artificial-analysis
+  CONCURRENCY:
+    description: "Concurrency sweep (one phase per value); RWLT runs closed-loop at each level"
+    value: 1
+    domain: [1, 2, 3, 6, 8, 10, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160]
+  PHASE_TIMEOUT_SECONDS:
+    description: "RWLT hard safety timeout per phase"
+    value: 1800
+  USER_SPAWN_RATE:
+    description: "RWLT users spawned per second during ramp-up"
+    value: 1.0
+  SETTLING_TIME_SECONDS:
+    description: "RWLT settling time after all users spawned before measurement"
+    value: 60
+  MIN_MEASUREMENT_SECONDS:
+    description: "RWLT min steady-state measurement window"
+    value: 300.0
+  MIN_TOTAL_TRAJECTORIES:
+    description: "RWLT min total trajectory completions before stopping"
+    value: 30
+  MIN_TRAJECTORIES_PER_USER:
+    description: "RWLT min trajectories each user must complete"
+    value: 3
+  TRAJECTORIES_PER_USER:
+    description: "Number of trajectories assigned per user"
+    value: 30
+  MAX_STARTING_LINE_OFFSET:
+    description: "ISL offset cap (each user starts at a random position [0, offset] in their first trajectory)"
+    value: 10
+  RWLT_SEED:
+    description: "Deterministic seed for trajectory assignment"
+    value: 42
+  REQUEST_TIMEOUT_SECONDS:
+    description: "Per-request timeout in seconds"
+    value: 300.0
+  MAX_TOKENS:
+    description: "Max output tokens per request"
+    value: 16384
+  REASONING_EFFORT:
+    description: "Reasoning effort (low | medium | high) — gpt-oss-style reasoning control"
+    value: high
+
+  # Container Images
+  RWLT_IMAGE:
+    description: "Container used to run RWLT — needs python3 + uv (any recent python:3.x or the dynamo image both work)"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.8.0
+  DYNAMO_IMAGE:
+    description: "Dynamo TRTLLM container image (benchx default: dynamo_trtllm_989902)"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.8.0
+
+  # Network device information, change per your cluster or comment out if not needed
+  # NCCL_SOCKET_IFNAME:
+  #   description: "NCCL socket interface name"
+  #   value: enP5p9s0
+  # GLOO_SOCKET_IFNAME:
+  #   description: "Gloo socket interface name"
+  #   value: enP5p9s0
+  # TRTLLM_UCX_INTERFACE:
+  #   description: "TRTLLM UCX interface"
+  #   value: enP5p9s0
+
+artifacts:
+  # file type artifacts will be generated by sflow with the content defined in this yaml file, accessible as `${{ artifacts.NAME.path }}` in task scripts
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model/openai/gpt-oss-120b
+  - name: PREFILL_CONFIG
+    uri: file://prefill_config.yaml
+    content: |
+      backend: pytorch
+      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      pipeline_parallel_size: ${{ variables.CTX_PP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.CTX_MOE_TP_SIZE }}
+      max_batch_size: ${{ variables.CTX_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.CTX_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.CTX_MAX_SEQ_LEN }}
+      stream_interval: 10
+      trust_remote_code: true
+      disable_overlap_scheduler: false
+      enable_chunked_prefill: true
+      enable_attention_dp: ${{ variables.CTX_ENABLE_ATTENTION_DP }}
+      num_postprocess_workers: 4
+      sampler_type: auto
+      scheduler_config:
+        capacity_scheduler_policy: MAX_UTILIZATION
+        context_chunking_policy: FIRST_COME_FIRST_SERVED
+      kv_cache_config:
+        event_buffer_max_size: 16384
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+        free_gpu_memory_fraction: ${{ variables.CTX_FREE_GPU_MEMORY_FRACTION }}
+        enable_block_reuse: true
+      moe_config:
+        backend: TRTLLM
+      cuda_graph_config:
+        enable_padding: true
+        batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_SEQ_LEN }}
+        backend: DEFAULT
+      speculative_config:
+        decoding_type: Eagle
+        max_draft_len: ${{ variables.SPEC_MAX_DRAFT_LEN }}
+        speculative_model: ${{ variables.SPEC_DRAFT_MODEL_PATH }}
+        eagle3_one_model: true
+        eagle3_layers_to_capture: [23, 29, 35]
+      enable_iter_perf_stats: true
+      enable_iter_req_stats: false
+      print_iter_log: false
+  - name: DECODE_CONFIG
+    uri: file://decode_config.yaml
+    content: |
+      backend: pytorch
+      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      pipeline_parallel_size: ${{ variables.GEN_PP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.GEN_MOE_TP_SIZE }}
+      max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.GEN_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.GEN_MAX_SEQ_LEN }}
+      stream_interval: 10
+      trust_remote_code: true
+      enable_chunked_prefill: true
+      enable_attention_dp: ${{ variables.GEN_ENABLE_ATTENTION_DP }}
+      num_postprocess_workers: 4
+      sampler_type: auto
+      scheduler_config:
+        capacity_scheduler_policy: MAX_UTILIZATION
+        context_chunking_policy: FIRST_COME_FIRST_SERVED
+      kv_cache_config:
+        event_buffer_max_size: 16384
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+        free_gpu_memory_fraction: ${{ variables.GEN_FREE_GPU_MEMORY_FRACTION }}
+        enable_block_reuse: true
+      moe_config:
+        backend: TRTLLM
+      cuda_graph_config:
+        enable_padding: true
+        batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.GEN_MAX_SEQ_LEN }}
+        backend: DEFAULT
+      speculative_config:
+        decoding_type: Eagle
+        max_draft_len: ${{ variables.SPEC_MAX_DRAFT_LEN }}
+        speculative_model: ${{ variables.SPEC_DRAFT_MODEL_PATH }}
+        eagle3_one_model: true
+        eagle3_layers_to_capture: [23, 29, 35]
+      enable_iter_perf_stats: true
+      enable_iter_req_stats: false
+      print_iter_log: false
+  - name: RWLT_CONFIG
+    uri: file://rwlt_config.yaml
+    content: |
+      base_url: http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1
+      model: ${{ variables.SERVED_MODEL_NAME }}
+      concurrencies: [${CONCURRENCY}]
+      phase_timeout_seconds: ${{ variables.PHASE_TIMEOUT_SECONDS }}
+      user_spawn_rate: ${{ variables.USER_SPAWN_RATE }}
+      settling_time_seconds: ${{ variables.SETTLING_TIME_SECONDS }}
+      min_measurement_seconds: ${{ variables.MIN_MEASUREMENT_SECONDS }}
+      min_total_trajectories: ${{ variables.MIN_TOTAL_TRAJECTORIES }}
+      min_trajectories_per_user: ${{ variables.MIN_TRAJECTORIES_PER_USER }}
+      trajectory_path: ${{ variables.TRAJECTORY_PATH }}
+      trajectories_per_user: ${{ variables.TRAJECTORIES_PER_USER }}
+      max_starting_line_offset: ${{ variables.MAX_STARTING_LINE_OFFSET }}
+      seed: ${{ variables.RWLT_SEED }}
+      timeout_seconds: ${{ variables.REQUEST_TIMEOUT_SECONDS }}
+      max_tokens: ${{ variables.MAX_TOKENS }}
+      reasoning_effort: ${{ variables.REASONING_EFFORT }}
+      record_err_reasons: true
+      record_err_reasons_include_input: false
+      tool_calls_args_only: true
+      send_conversation_routing_headers: true
+      exp_prefix: benchx_c${CONCURRENCY}
+      results_dir: ${SFLOW_WORKFLOW_OUTPUT_DIR}/rwlt_concurrency_${CONCURRENCY}
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # In some cluster like Corewaeve / OCI, you may need to add --gpus-per-node=N directive to the sbatch / salloc command
+    # For GB200 / GB300 clusters, you may need to add --segment=N directive to make sure allocated nodes are in same network domain
+    # extra_args:
+    #   - "--gpus-per-node=${{ variables.GPUS_PER_NODE }}"
+    #   - "--segment=${{ variables.SLURM_NODES }}"
+
+operators:
+  - name: dynamo_trtllm
+    type: srun
+    container_image: ${{ variables.DYNAMO_IMAGE }}
+    container_writable: true
+    mpi: pmix
+  - name: rwlt
+    type: srun
+    container_image: ${{ variables.RWLT_IMAGE }}
+    container_writable: true
+    mpi: pmix
+
+workflow:
+  name: dynamo_trtllm_benchx
+  timeout: 235m # Slightly less than SLURM_TIMELIMIT
+
+  variables:
+    # Workflow level variables will overwrite the variables defined in global variables section if using same name
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: load_image
+      operator:
+        name: dynamo_trtllm
+        ntasks: ${{ variables.SLURM_NODES }}
+        ntasks_per_node: 1
+      script:
+        - echo "Image Loaded"
+        - sleep 7200
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Image Loaded"
+            match_count: ${{ variables.SLURM_NODES }}
+          timeout: 1200
+          interval: 2
+
+    - name: gpu_monitor
+      operator:
+        name: dynamo_trtllm
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: ${{ variables.SLURM_NODES }}
+      script:
+        - echo "Starting gpu monitor"
+        - >
+          nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used
+          --format=csv,noheader,nounits -lms 2000 |
+          while IFS= read -r input || [ -n "$input" ] ;
+          do timestamp=$(date +%s%3N);
+          printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}" "${input}";
+          done
+          >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Starting gpu monitor"
+          timeout: 300
+          interval: 2
+      depends_on:
+        - load_image
+
+    - name: nats_server
+      operator: dynamo_trtllm
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 300
+          interval: 2
+      depends_on:
+        - load_image
+
+    - name: etcd_server
+      operator: dynamo_trtllm
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 300
+          interval: 2
+      depends_on:
+        - load_image
+
+    - name: frontend_server
+      operator: dynamo_trtllm
+      script:
+        - >
+          python3 -m dynamo.frontend
+          --http-port 8000
+          --request-plane tcp
+          --router-mode ${{ variables.ROUTER_MODE }}
+          --no-router-kv-events
+          --router-ttl-secs ${{ variables.ROUTER_TTL_SECS }}
+          ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 300
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: prefill_server
+      operator:
+        name: dynamo_trtllm
+        ntasks: ${{ variables.CTX_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.CTX_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        # benchx tunings: disable GC in worker, raise router queue threshold, force UCX off TCP.
+        - export TRTLLM_SERVER_DISABLE_GC=1
+        - export TRTLLM_WORKER_DISABLE_GC=1
+        - export DYN_ROUTER_QUEUE_THRESHOLD=${{ variables.ROUTER_QUEUE_THRESHOLD }}
+        - export UCX_TLS=^tcp
+        - export NCCL_P2P_LEVEL=NVL
+        - export DYN_TCP_WORKER_POOL_SIZE=${{ variables.DYN_TCP_WORKER_POOL_SIZE }}
+        - export DYN_TCP_WORK_QUEUE_SIZE=$(( ${{ variables.DYN_TCP_WORKER_POOL_SIZE }} * 4 ))
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        # HOSTCACHE: optionally append host_cache_size into the ctx kv_cache_config block.
+        - >
+          if [ "${{ variables.HOSTCACHE }}" = "1" ]; then
+            sed -i '/^kv_cache_config:/a\  host_cache_size: ${{ variables.CTX_HOST_CACHE_SIZE }}' ${{ artifacts.PREFILL_CONFIG.path }};
+          fi
+        # WORKER_METRICS: optionally publish events+metrics from the worker (turn on capture_metrics sidecar separately).
+        - >
+          WORKER_METRICS_FLAG="";
+          if [ "${{ variables.WORKER_METRICS }}" = "1" ]; then WORKER_METRICS_FLAG="--publish-events-and-metrics"; fi;
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode prefill
+          --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }}
+          --request-plane tcp
+          ${WORKER_METRICS_FLAG} ${EXTRA_PREFILL_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 2700
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+      retries:
+        count: 3
+        interval: 30
+        backoff: 2
+
+    - name: decode_server
+      operator:
+        name: dynamo_trtllm
+        ntasks: ${{ variables.GEN_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.GEN_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - export TRTLLM_SERVER_DISABLE_GC=1
+        - export TRTLLM_WORKER_DISABLE_GC=1
+        - export DYN_ROUTER_QUEUE_THRESHOLD=${{ variables.ROUTER_QUEUE_THRESHOLD }}
+        - export UCX_TLS=^tcp
+        - export NCCL_P2P_LEVEL=NVL
+        - export DYN_TCP_WORKER_POOL_SIZE=${{ variables.DYN_TCP_WORKER_POOL_SIZE }}
+        - export DYN_TCP_WORK_QUEUE_SIZE=$(( ${{ variables.DYN_TCP_WORKER_POOL_SIZE }} * 4 ))
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        - >
+          WORKER_METRICS_FLAG="";
+          if [ "${{ variables.WORKER_METRICS }}" = "1" ]; then WORKER_METRICS_FLAG="--publish-events-and-metrics"; fi;
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode decode
+          --extra-engine-args ${{ artifacts.DECODE_CONFIG.path }}
+          --request-plane tcp
+          ${WORKER_METRICS_FLAG} ${EXTRA_DECODE_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 2700
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+      retries:
+        count: 3
+        interval: 30
+        backoff: 2
+
+    - name: benchmark
+      operator:
+        name: rwlt
+        ntasks: 1
+      script:
+        - set -x
+        - export COLUMNS=200
+        # Render the RWLT config for this concurrency level. Using a heredoc
+        # (rather than ${{ artifacts.RWLT_CONFIG.path }} directly) so $CONCURRENCY
+        # is interpolated from the replica env per task.
+        - mkdir -p ${SFLOW_TASK_OUTPUT_DIR}/rwlt_concurrency_${CONCURRENCY}
+        - >
+          cat > ${SFLOW_TASK_OUTPUT_DIR}/rwlt_config_c${CONCURRENCY}.yaml <<RWLTEOF
+          base_url: http://${HEAD_NODE_IP}:8000/v1
+          model: ${SERVED_MODEL_NAME}
+          concurrencies: [${CONCURRENCY}]
+          phase_timeout_seconds: ${{ variables.PHASE_TIMEOUT_SECONDS }}
+          user_spawn_rate: ${{ variables.USER_SPAWN_RATE }}
+          settling_time_seconds: ${{ variables.SETTLING_TIME_SECONDS }}
+          min_measurement_seconds: ${{ variables.MIN_MEASUREMENT_SECONDS }}
+          min_total_trajectories: ${{ variables.MIN_TOTAL_TRAJECTORIES }}
+          min_trajectories_per_user: ${{ variables.MIN_TRAJECTORIES_PER_USER }}
+          trajectory_path: ${{ variables.TRAJECTORY_PATH }}
+          trajectories_per_user: ${{ variables.TRAJECTORIES_PER_USER }}
+          max_starting_line_offset: ${{ variables.MAX_STARTING_LINE_OFFSET }}
+          seed: ${{ variables.RWLT_SEED }}
+          timeout_seconds: ${{ variables.REQUEST_TIMEOUT_SECONDS }}
+          max_tokens: ${{ variables.MAX_TOKENS }}
+          reasoning_effort: ${{ variables.REASONING_EFFORT }}
+          record_err_reasons: true
+          record_err_reasons_include_input: false
+          tool_calls_args_only: true
+          send_conversation_routing_headers: true
+          exp_prefix: benchx_c${CONCURRENCY}
+          results_dir: ${SFLOW_TASK_OUTPUT_DIR}/rwlt_concurrency_${CONCURRENCY}
+          RWLTEOF
+        # Snapshot frontend metrics pre-bench.
+        - >
+          curl -fsS --max-time 5 http://${HEAD_NODE_IP}:8000/metrics
+          > ${SFLOW_TASK_OUTPUT_DIR}/rwlt_concurrency_${CONCURRENCY}/frontend_metrics_pre.prom
+          || echo "WARN: pre snapshot failed"
+        # Run RWLT (closed-loop, X-Session-ID routing headers enabled).
+        - >
+          cd ${{ variables.RWLT_REPO_DIR }} &&
+          uv run --isolated --with openai --with httpx --with pyyaml --with pydantic
+          python rwlt/run.py --config ${SFLOW_TASK_OUTPUT_DIR}/rwlt_config_c${CONCURRENCY}.yaml
+        # Snapshot frontend metrics post-bench.
+        - >
+          curl -fsS --max-time 5 http://${HEAD_NODE_IP}:8000/metrics
+          > ${SFLOW_TASK_OUTPUT_DIR}/rwlt_concurrency_${CONCURRENCY}/frontend_metrics_post.prom
+          || echo "WARN: post snapshot failed"
+        - echo "Benchmarking finished for concurrency=${CONCURRENCY}"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      depends_on:
+        - prefill_server
+        - decode_server
+        - frontend_server
