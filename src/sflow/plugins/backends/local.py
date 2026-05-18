@@ -90,9 +90,11 @@ class LocalBackend(Backend):
                 raise ValueError(
                     f"Backend '{conf.name}' gpus_per_node must resolve to int, got {resolved!r}"
                 ) from e
-            if gpus_per_node <= 0:
+            # 0 explicitly declares a CPU-only host; downstream rejects GPU
+            # requests against zero-capacity nodes.
+            if gpus_per_node < 0:
                 raise ValueError(
-                    f"Backend '{conf.name}' gpus_per_node must be > 0, got {gpus_per_node}"
+                    f"Backend '{conf.name}' gpus_per_node must be >= 0, got {gpus_per_node}"
                 )
 
         return LocalBackendConfig(

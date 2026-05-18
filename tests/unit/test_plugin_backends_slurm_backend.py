@@ -112,6 +112,8 @@ def test_allocate_success_single_node(monkeypatch, slurm_test_logger):
         "--job-name",
         "test_job",
         "--no-shell",
+        "--gpus-per-node",
+        "8",
         "--exclusive",
     ]
     assert fake_launcher.calls[1]["command"] == ["scontrol", "getaddrs", "node001"]
@@ -631,3 +633,230 @@ def test_srun_fallback_extracts_short_hostname_from_fqdn(monkeypatch, slurm_test
         ("node01", "10.0.0.14"),
         ("node02", "10.0.0.15"),
     ]
+
+
+def test_allocate_omits_gpus_per_node_when_capacity_unknown(
+    monkeypatch, slurm_test_logger
+):
+    """When backend GPU capacity is unknown (e.g. CPU-only partition declared
+    with no gpus_per_node), salloc must not receive --gpus-per-node. Slurm
+    rejects --gpus-per-node=0 on most clusters."""
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="cpu_backend",
+            type="slurm",
+            account="test_account",
+            partition="cpu",
+            nodes=1,
+            time="00:10:00",
+            job_name="test_job",
+            gpus_per_node=8,
+        )
+    )
+    # Simulate capacity-unknown state regardless of which branch's schema
+    # policy applies; this exercises the `is not None` guard in allocate().
+    backend._gpu_per_node = None
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 6666666",
+                    "salloc: Nodes cpu001 are ready for job",
+                ],
+            ),
+            (0, ["cpu001: 10.0.0.5:123"]),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    asyncio.run(backend.allocate())
+
+    salloc_cmd = list(fake_launcher.calls[0]["command"])
+    assert "--gpus-per-node" not in salloc_cmd
+    assert not any(a.startswith("--gpus-per-node=") for a in salloc_cmd)
+
+
+def test_allocate_defers_to_user_extra_args_gpus_per_node_equals_form(
+    monkeypatch, slurm_test_logger
+):
+    """User-provided --gpus-per-node=N in extra_args wins; sflow does not duplicate."""
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="test_backend",
+            type="slurm",
+            account="test_account",
+            partition="batch",
+            nodes=1,
+            time="00:10:00",
+            job_name="test_job",
+            extra_args=["--gpus-per-node=4"],
+            gpus_per_node=8,
+        )
+    )
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 1010101",
+                    "salloc: Nodes node001 are ready for job",
+                ],
+            ),
+            (0, ["node001: 10.0.0.1:123"]),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    asyncio.run(backend.allocate())
+
+    salloc_cmd = list(fake_launcher.calls[0]["command"])
+    gpn_args = [
+        a
+        for a in salloc_cmd
+        if a == "--gpus-per-node" or a.startswith("--gpus-per-node=")
+    ]
+    assert gpn_args == ["--gpus-per-node=4"]
+
+
+def test_allocate_defers_to_user_extra_args_gpus_per_node_separated_form(
+    monkeypatch, slurm_test_logger
+):
+    """User-provided ['--gpus-per-node', 'N'] in extra_args also disables auto-add."""
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="test_backend",
+            type="slurm",
+            account="test_account",
+            partition="batch",
+            nodes=1,
+            time="00:10:00",
+            job_name="test_job",
+            extra_args=["--gpus-per-node", "4"],
+            gpus_per_node=8,
+        )
+    )
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 2020202",
+                    "salloc: Nodes node001 are ready for job",
+                ],
+            ),
+            (0, ["node001: 10.0.0.1:123"]),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    asyncio.run(backend.allocate())
+
+    salloc_cmd = list(fake_launcher.calls[0]["command"])
+    # Only the user's pair should be present; sflow should not have added its own.
+    assert salloc_cmd.count("--gpus-per-node") == 1
+    gpn_idx = salloc_cmd.index("--gpus-per-node")
+    assert salloc_cmd[gpn_idx + 1] == "4"
+
+
+def test_cpu_only_slurm_backend_allocates_with_zero_gpu_capacity(
+    monkeypatch, slurm_test_logger
+):
+    """`gpus_per_node=0` declares a CPU-only partition.
+
+    Allocated ComputeNodes carry num_gpus=0, which downstream packing logic
+    treats as "no GPUs available" (skip pack, reject `resources.gpus`).
+    """
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="cpu_backend",
+            type="slurm",
+            account="test_account",
+            partition="cpu",
+            nodes=2,
+            time="00:10:00",
+            job_name="cpu_job",
+            gpus_per_node=0,
+        )
+    )
+    assert backend._gpu_per_node == 0
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 6666666",
+                    "salloc: Nodes cpu001,cpu002 are ready for job",
+                ],
+            ),
+            (
+                0,
+                [
+                    "cpu001: 10.0.0.1:123",
+                    "cpu002: 10.0.0.2:123",
+                ],
+            ),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    allocation = asyncio.run(backend.allocate())
+
+    assert allocation.allocation_id == "6666666"
+    assert [(n.name, n.ip_address, n.index, n.num_gpus) for n in allocation.nodes] == [
+        ("cpu001", "10.0.0.1", 0, 0),
+        ("cpu002", "10.0.0.2", 1, 0),
+    ]
+
+
+def test_cpu_only_slurm_backend_via_env_allocation(monkeypatch, slurm_test_logger):
+    """Reusing an env-provided allocation with `gpus_per_node=0` keeps num_gpus=0."""
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="cpu_backend",
+            type="slurm",
+            account="test_account",
+            partition="cpu",
+            nodes=1,
+            time="00:10:00",
+            job_name="cpu_job",
+            gpus_per_node=0,
+        )
+    )
+
+    monkeypatch.setenv("SLURM_JOB_ID", "1010101")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "cpu001")
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[(0, ["cpu001: 10.0.0.1:123"])]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    allocation = asyncio.run(backend.allocate())
+
+    assert allocation.allocation_id == "1010101"
+    assert [(n.name, n.num_gpus) for n in allocation.nodes] == [("cpu001", 0)]

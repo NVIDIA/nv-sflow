@@ -26,8 +26,9 @@ class SlurmBackendConfig(BackendConfig):
     partition: Resolvable[str]
     time: Resolvable[str | int]
     nodes: Resolvable[int]
-    # Slurm backend requires GPUs-per-node to be specified so we can correctly
-    # populate ComputeNode.num_gpus for scheduling/packing/validation.
+    # Required. Set to 0 for CPU-only partitions; in that case tasks must not
+    # declare `resources.gpus` (sflow will reject GPU requests against a
+    # zero-capacity node with a clear error).
     gpus_per_node: Resolvable[int]
     extra_args: list[Resolvable[str]] | None = None
     job_name: str | None = None
@@ -244,6 +245,21 @@ class SlurmBackend(Backend):
             .add_opt("--job-name", self._job_name)
             .add_opt("--no-shell")
         )
+
+        # Slurm rejects --gpus-per-node=0 on most clusters; defer to extra_args
+        # when set (some clusters reject the flag entirely — extra_args opt-out).
+        # Skip when capacity is unknown (None) or zero.
+        user_provided_gpn = any(
+            a == "--gpus-per-node" or a.startswith("--gpus-per-node=")
+            for a in self._extra_args
+        )
+        if (
+            self._gpu_per_node is not None
+            and self._gpu_per_node > 0
+            and not user_provided_gpn
+        ):
+            command.add_opt("--gpus-per-node", self._gpu_per_node)
+
         for arg in self._extra_args:
             command.add_opt(arg)
 
@@ -358,9 +374,11 @@ class SlurmBackend(Backend):
             raise ValueError(
                 f"Backend '{conf.name}' gpus_per_node must resolve to int, got {resolved!r}"
             ) from e
-        if gpus_per_node <= 0:
+        # 0 is valid: it explicitly declares a CPU-only partition. Negative
+        # values remain a user error.
+        if gpus_per_node < 0:
             raise ValueError(
-                f"Backend '{conf.name}' gpus_per_node must be > 0, got {gpus_per_node}"
+                f"Backend '{conf.name}' gpus_per_node must be >= 0, got {gpus_per_node}"
             )
 
         return SlurmBackendConfig(

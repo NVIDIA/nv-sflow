@@ -55,6 +55,7 @@ backends:
     partition: "your_slurm_partition"
     time: "00:10:00"
     nodes: 1
+    gpus_per_node: 8        # required; set to 0 for CPU-only partitions
 
 workflow:
   name: wf
@@ -63,6 +64,12 @@ workflow:
       script:
         - echo hello
 ```
+
+:::tip CPU-only partitions
+Set `gpus_per_node: 0` to target a CPU-only Slurm partition. With zero capacity,
+tasks that declare `resources.gpus` will be rejected up front with a clear error,
+preventing silent CUDA failures at runtime.
+:::
 
 ```mermaid
 flowchart TD

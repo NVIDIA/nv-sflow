@@ -88,3 +88,79 @@ def test_sflow_config_rejects_slurm_backend_when_required_fields_missing():
                 "workflow": _minimal_workflow().model_dump(),
             }
         )
+
+
+def test_sflow_config_accepts_slurm_backend_with_zero_gpus_per_node():
+    """CPU-only Slurm partitions: gpus_per_node=0 is allowed."""
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "cpu_cluster",
+                    "type": "slurm",
+                    "default": True,
+                    "account": "acct",
+                    "partition": "cpu",
+                    "time": "00:10:00",
+                    "nodes": 1,
+                    "gpus_per_node": 0,
+                }
+            ],
+            "workflow": _minimal_workflow().model_dump(),
+        }
+    )
+    backend_conf = config.backends[0]
+    assert backend_conf.type == "slurm"
+    assert backend_conf.gpus_per_node == 0
+
+
+def test_sflow_config_rejects_negative_gpus_per_node():
+    """Negative `gpus_per_node` remains a hard error."""
+    with pytest.raises(ValidationError):
+        SflowConfig.model_validate(
+            {
+                "version": "0.1",
+                "backends": [
+                    {
+                        "name": "bad",
+                        "type": "slurm",
+                        "default": True,
+                        "account": "acct",
+                        "partition": "cpu",
+                        "time": "00:10:00",
+                        "nodes": 1,
+                        "gpus_per_node": -1,
+                    }
+                ],
+                "workflow": _minimal_workflow().model_dump(),
+            }
+        )
+
+
+def test_resolve_backends_instantiates_cpu_only_slurm_backend():
+    """resolve_backends should accept gpus_per_node=0 and propagate it as 0."""
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "cpu_cluster",
+                "type": "slurm",
+                "default": True,
+                "account": "acct",
+                "partition": "cpu",
+                "time": "00:10:00",
+                "nodes": 1,
+                "gpus_per_node": 0,
+            }
+        ],
+        workflow=_minimal_workflow(),
+    )
+
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+    state = resolve_global_variables(config, state)
+    state = resolve_backends(config, state)
+
+    backend = state.backends["cpu_cluster"]
+    assert isinstance(backend, SlurmBackend)
+    assert backend._gpu_per_node == 0

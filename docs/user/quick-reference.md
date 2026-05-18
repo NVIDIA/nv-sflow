@@ -67,7 +67,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `partition` | Yes | string / expr | — | Slurm partition. |
 | `time` | Yes | string / expr | — | Time limit (e.g. `00:30:00`). |
 | `nodes` | Yes | int / expr | — | Number of nodes. |
-| `gpus_per_node` | Yes | int / expr | — | GPUs per node. |
+| `gpus_per_node` | Yes | int / expr | — | GPUs per node. Set to `0` for CPU-only partitions; tasks that request `resources.gpus` against a zero-capacity backend will be rejected. |
 | `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`). |
 | `job_name` | | string | `null` | Job name; defaults to workflow name. |
 
