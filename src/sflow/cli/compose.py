@@ -16,7 +16,11 @@ from jinja2 import StrictUndefined, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 
 from sflow.cli import DOCS_URL, app
-from sflow.config.loader import ConfigLoader, merge_config_dicts
+from sflow.config.loader import (
+    ConfigLoader,
+    _normalize_script_plain_mappings,
+    merge_config_dicts,
+)
 from sflow.config.resolver import ExpressionResolver
 from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
 from sflow.logging import configure_logging, get_logger
@@ -492,6 +496,7 @@ def _compose_files(
             data = yaml.safe_load(f)
         if data is None:
             raise ValueError(f"Configuration file is empty: {path}")
+        _normalize_script_plain_mappings(data)
         syntax = resolver.validate_syntax(data, location=str(path))
         if not syntax.valid:
             details = "\n".join(str(e) for e in syntax.errors)

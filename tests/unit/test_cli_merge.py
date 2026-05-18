@@ -56,6 +56,29 @@ def test_compose_two_files_outputs_valid_yaml_to_stdout(tmp_path: Path):
     assert len(merged["workflow"]["tasks"]) == 1
 
 
+def test_compose_preserves_plain_script_command_with_colon(tmp_path: Path):
+    f = tmp_path / "colon_script.yaml"
+    f.write_text(
+        """
+version: "0.1"
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo "My GPUs: $CUDA_VISIBLE_DEVICES"
+""".lstrip()
+    )
+
+    result = runner.invoke(app, ["compose", str(f)], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    merged = yaml.safe_load(result.output)
+    assert merged["workflow"]["tasks"][0]["script"] == [
+        'echo "My GPUs: $CUDA_VISIBLE_DEVICES"'
+    ]
+
+
 def test_compose_writes_to_output_file(tmp_path: Path):
     f1 = _write_yaml(
         tmp_path / "a.yaml",

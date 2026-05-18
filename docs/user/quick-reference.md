@@ -47,7 +47,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 |-------|----------|------|---------|-------------|
 | `type` | Yes | string | — | `local` or `slurm`. |
 | `default` | | bool | `false` | Mark as the default backend (only one allowed). |
-| `gpus_per_node` | | int / expr | `null` | GPUs per node for allocation / packing. |
+| `gpus_per_node` | | int / expr | `null` | GPUs per node for sflow planning / packing. Does not add Slurm GPU allocation flags. |
 
 ## Backends — Local
 
@@ -67,8 +67,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `partition` | Yes | string / expr | — | Slurm partition. |
 | `time` | Yes | string / expr | — | Time limit (e.g. `00:30:00`). |
 | `nodes` | Yes | int / expr | — | Number of nodes. |
-| `gpus_per_node` | Yes | int / expr | — | GPUs per node. Set to `0` for CPU-only partitions; tasks that request `resources.gpus` against a zero-capacity backend will be rejected. |
-| `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`). |
+| `gpus_per_node` | Yes | int / expr | — | GPUs per node for planning. Set to `0` for CPU-only partitions; tasks that request `resources.gpus` against a zero-capacity backend will be rejected. |
+| `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`, `--gpus-per-node=8`). |
 | `job_name` | | string | `null` | Job name; defaults to workflow name. |
 
 ## Operators — Common Fields

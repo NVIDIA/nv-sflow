@@ -125,9 +125,14 @@ backends:
     partition: ${{ variables.SLURM_PARTITION }}
     time: 00:30:00
     nodes: 2
+    gpus_per_node: 8        # sflow planning only
     extra_args:
-      - "--gpus-per-node=8"
+      - "--gpus-per-node=8" # passed to salloc
 ```
+
+`gpus_per_node` tells sflow how many GPU indices each node has for planning and
+packing. It does not add `--gpus-per-node` to `salloc`; include that flag in
+`extra_args` when your cluster requires it.
 
 If you are already inside a Slurm allocation (e.g. via `salloc` or `sbatch`), you can use:
 

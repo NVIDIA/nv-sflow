@@ -88,6 +88,14 @@ def test_allocate_success_single_node(monkeypatch, slurm_test_logger):
         ]
     )
     backend._subprocess_launcher = fake_launcher
+    warning_messages: list[str] = []
+
+    class WarningCapture(logging.Handler):
+        def emit(self, record: logging.LogRecord):
+            if record.levelno >= logging.WARNING:
+                warning_messages.append(record.getMessage())
+
+    slurm_test_logger.addHandler(WarningCapture())
 
     allocation = asyncio.run(backend.allocate())
 
@@ -112,11 +120,16 @@ def test_allocate_success_single_node(monkeypatch, slurm_test_logger):
         "--job-name",
         "test_job",
         "--no-shell",
-        "--gpus-per-node",
-        "8",
         "--exclusive",
     ]
     assert fake_launcher.calls[1]["command"] == ["scontrol", "getaddrs", "node001"]
+    assert any(
+        "backend.gpus_per_node=8" in msg
+        and "salloc" in msg
+        and "srun" in msg
+        and "sbatch" in msg
+        for msg in warning_messages
+    )
 
 
 def test_allocate_success_multiple_nodes(monkeypatch, slurm_test_logger):
@@ -686,7 +699,7 @@ def test_allocate_omits_gpus_per_node_when_capacity_unknown(
 def test_allocate_defers_to_user_extra_args_gpus_per_node_equals_form(
     monkeypatch, slurm_test_logger
 ):
-    """User-provided --gpus-per-node=N in extra_args wins; sflow does not duplicate."""
+    """User-provided --gpus-per-node=N in extra_args is passed through."""
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     monkeypatch.delenv("SLURM_JOBID", raising=False)
     monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
@@ -734,7 +747,7 @@ def test_allocate_defers_to_user_extra_args_gpus_per_node_equals_form(
 def test_allocate_defers_to_user_extra_args_gpus_per_node_separated_form(
     monkeypatch, slurm_test_logger
 ):
-    """User-provided ['--gpus-per-node', 'N'] in extra_args also disables auto-add."""
+    """User-provided ['--gpus-per-node', 'N'] in extra_args is passed through."""
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     monkeypatch.delenv("SLURM_JOBID", raising=False)
     monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
@@ -771,7 +784,6 @@ def test_allocate_defers_to_user_extra_args_gpus_per_node_separated_form(
     asyncio.run(backend.allocate())
 
     salloc_cmd = list(fake_launcher.calls[0]["command"])
-    # Only the user's pair should be present; sflow should not have added its own.
     assert salloc_cmd.count("--gpus-per-node") == 1
     gpn_idx = salloc_cmd.index("--gpus-per-node")
     assert salloc_cmd[gpn_idx + 1] == "4"

@@ -146,7 +146,7 @@ Common options:
 - `--account, -A <name>`: Slurm account (auto-detected if not specified)
 - `--time <limit>`: time limit (e.g., `02:00:00`)
 - `--nodes, -N <count>`: number of nodes. If omitted, single-job and bulk-submit modes derive it from the config's Slurm backend `nodes` field. Bulk-input mode requires either this flag or a CSV node-count column (`SLURM_NODES`, `NUM_SLURM_NODES`, or `NUM_NODES`).
-- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation, not as a sbatch directive. Use `-e '--gpus-per-node=N'` if your cluster requires the sbatch directive.
+- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation and planning only, not as a Slurm directive. Use `-e '--gpus-per-node=N'` for `sflow batch`, or backend `extra_args` for `sflow run`, if your cluster requires the Slurm allocation flag.
 - `--job-name, -J <name>`: Slurm job name (default: `sflow`)
 - `--set, -s KEY=VALUE`: override variables (repeatable)
 - `--artifact, -a NAME=URI`: override artifacts (repeatable)
@@ -178,7 +178,7 @@ Common options:
 
 ### Notes
 
-- A dry-run validation is performed before generating each sbatch script. CLI `--nodes` and `--gpus-per-node` are applied directly to the slurm backend during validation.
+- A dry-run validation is performed before generating each sbatch script. CLI `--nodes` and `--gpus-per-node` are applied directly to the slurm backend during validation; `--gpus-per-node` still only describes topology unless also passed as an explicit sbatch extra arg.
 - Sbatch stdout/stderr logs are automatically copied into the sflow workflow output directory at the end of each generated script.
 - Without `--submit`, a hint is shown to remind you to add `--submit` for actual submission.
 

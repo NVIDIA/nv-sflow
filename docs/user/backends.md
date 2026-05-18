@@ -55,7 +55,7 @@ backends:
     partition: "your_slurm_partition"
     time: "00:10:00"
     nodes: 1
-    gpus_per_node: 8        # required; set to 0 for CPU-only partitions
+    gpus_per_node: 8        # required for sflow planning; set to 0 for CPU-only partitions
 
 workflow:
   name: wf
@@ -69,6 +69,12 @@ workflow:
 Set `gpus_per_node: 0` to target a CPU-only Slurm partition. With zero capacity,
 tasks that declare `resources.gpus` will be rejected up front with a clear error,
 preventing silent CUDA failures at runtime.
+:::
+
+:::note
+`gpus_per_node` describes cluster topology for sflow resource planning and GPU
+index assignment. It does not add `--gpus-per-node` to `salloc`. If your cluster
+requires that Slurm allocation flag, add it explicitly in backend `extra_args`.
 :::
 
 ```mermaid
@@ -110,6 +116,7 @@ backends:
     partition: "gpu"
     time: "01:00:00"
     nodes: 2
+    gpus_per_node: 8
     extra_args:
       - "--gpus-per-node=8"
       - "--segment=2"

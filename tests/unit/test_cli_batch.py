@@ -225,6 +225,42 @@ def test_batch_without_sbatch_extra_args(mock_sflow_app, temp_workflow_file, tmp
     )  # job-name, output, error, mem, partition, account, nodes
 
 
+def test_batch_gpus_per_node_warns_it_is_not_sbatch_directive(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--gpus-per-node",
+            "4",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert "backend.gpus_per_node=4" in result.output
+    assert "salloc" in result.output
+    assert "srun" in result.output
+    assert "sbatch" in result.output
+
+    script_content = sbatch_path.read_text()
+    assert "#SBATCH --gpus-per-node" not in script_content
+    assert "WARNING: backend.gpus_per_node=4" not in script_content
+    assert "sflow planning only" not in script_content
+
+
 def test_single_job_with_nodes_succeeds(mock_sflow_app, temp_workflow_file, tmp_path):
     """Single-job mode + --nodes => should succeed."""
     sbatch_path = tmp_path / "test.sh"
