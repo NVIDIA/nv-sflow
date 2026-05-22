@@ -3,7 +3,7 @@
 
 import pytest
 
-from sflow.config.resolver import ExpressionResolver
+from sflow.resolution import ExpressionResolver
 from sflow.core.variable import VariableValue
 
 

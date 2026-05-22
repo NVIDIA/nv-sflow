@@ -19,8 +19,10 @@ import typer
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
-from sflow.config.resolver import enrich_error_with_location
 from sflow.logging import configure_logging, get_logger
+from sflow.resolution import enrich_error_with_location
+from sflow.runtime_info import log_runtime_info
+from sflow.utils.slurm import emit_gpus_per_node_semantics_warning
 
 _logger = get_logger(__name__)
 
@@ -241,7 +243,7 @@ def _resolve_sbatch_extra_args(
     if not any("${{" in arg for arg in extra_args):
         return list(extra_args)
 
-    from sflow.config.resolver import ExpressionResolver
+    from sflow.resolution import ExpressionResolver
     from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
 
     var_map: dict[str, Any] = {}
@@ -1261,6 +1263,11 @@ def _run_bulk_submit(
         # Derive gpus_per_node: config value wins over CLI
         config_gpus = _derive_gpus_per_node([yaml_file], cli_overrides=cli_set_var)
         row_gpus = config_gpus if config_gpus is not None else gpus_per_node
+        emit_gpus_per_node_semantics_warning(
+            row_gpus,
+            lambda message: typer.echo(message, err=True),
+            prefix="  Warning: ",
+        )
         if (
             gpus_per_node is not None
             and config_gpus is not None
@@ -1560,6 +1567,11 @@ def _run_bulk_edit(
         # Derive gpus_per_node: config/CSV value wins over CLI
         config_gpus = _derive_gpus_per_node(config_files, cli_overrides=set_var)
         row_gpus = config_gpus if config_gpus is not None else gpus_per_node
+        emit_gpus_per_node_semantics_warning(
+            row_gpus,
+            lambda message: typer.echo(message, err=True),
+            prefix="  Warning: ",
+        )
         if (
             gpus_per_node is not None
             and config_gpus is not None
@@ -2074,6 +2086,7 @@ def batch(
         sflow batch -B ./examples/ --set SLURM_NODES=2 --partition gpu --submit
     """
     configure_logging(level=log_level, console=True)
+    log_runtime_info()
 
     partition, account = _resolve_slurm_defaults(partition, account)
 
@@ -2223,6 +2236,11 @@ def batch(
                 f"  Info: --gpus-per-node not specified, derived from config: {gpus_per_node}",
                 err=True,
             )
+    emit_gpus_per_node_semantics_warning(
+        gpus_per_node,
+        lambda message: typer.echo(message, err=True),
+        prefix="  Warning: ",
+    )
 
     # Run dry-run validation before generating sbatch script
     typer.echo("Running dry-run validation before generating sbatch script...")

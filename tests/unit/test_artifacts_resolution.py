@@ -161,6 +161,208 @@ def test_workflow_variables_can_reference_artifacts_ctx(tmp_path: Path):
     assert state.variables["P"].value == str(tmp_path / "data.txt")
 
 
+def test_global_variables_can_defer_artifacts_ctx(tmp_path: Path):
+    cfg = SflowConfig(
+        version="0.1",
+        variables=[
+            {
+                "name": "P",
+                "value": "${{ artifacts.A.path }}",
+                "type": "string",
+            }
+        ],
+        artifacts=[{"name": "A", "uri": "file://data.txt"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=[
+                        "echo jinja=${{ variables.P }}",
+                        "echo shell=${P}",
+                    ],
+                )
+            ],
+        ),
+    )
+
+    state = asyncio.run(build_state(cfg, allocate=False, workspace_dir=tmp_path))
+    t1 = state.workflow.task_graph.get_task("t1")
+
+    assert state.variables["P"].value == str(tmp_path / "data.txt")
+    assert t1.script[0] == f"echo jinja={tmp_path / 'data.txt'}"
+    assert t1.envs["P"] == str(tmp_path / "data.txt")
+
+
+def test_artifacts_can_reference_backend_deferred_global_variable(tmp_path: Path):
+    cfg = SflowConfig(
+        version="0.1",
+        variables=[
+            {
+                "name": "HEAD_NODE_IP",
+                "value": "${{ backends.slurm_cluster.nodes[0].ip_address }}",
+                "type": "string",
+            }
+        ],
+        backends=[
+            {
+                "name": "slurm_cluster",
+                "type": "slurm",
+                "default": True,
+                "account": "acct",
+                "partition": "batch",
+                "time": "00:10:00",
+                "nodes": 2,
+                "gpus_per_node": 4,
+            }
+        ],
+        artifacts=[
+            {
+                "name": "SERVER_CONFIG",
+                "uri": "file://server_config.yaml",
+                "content": "hostname: ${{ variables.HEAD_NODE_IP }}",
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo hi"])],
+        ),
+    )
+
+    state = asyncio.run(build_state(cfg, allocate=False, workspace_dir=tmp_path))
+
+    assert state.variables["HEAD_NODE_IP"].value == "0.0.0.1"
+
+
+def test_artifacts_reject_artifact_deferred_global_variable_reference(tmp_path: Path):
+    cfg = SflowConfig(
+        version="0.1",
+        variables=[
+            {
+                "name": "ARTIFACT_PATH",
+                "value": "${{ artifacts.A.path }}",
+                "type": "string",
+            }
+        ],
+        artifacts=[
+            {
+                "name": "A",
+                "uri": "file://${{ variables.ARTIFACT_PATH }}",
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo hi"])],
+        ),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        asyncio.run(build_state(cfg, allocate=False, workspace_dir=tmp_path))
+
+    message = str(exc_info.value)
+    assert "Deferred global variable 'ARTIFACT_PATH'" in message
+    assert "artifact definition 'artifacts.A'" in message
+    assert "cannot be used while resolving artifacts" in message
+
+
+def test_artifacts_reject_get_alias_artifact_deferred_global_variable_reference(
+    tmp_path: Path,
+):
+    cfg = SflowConfig(
+        version="0.1",
+        variables=[
+            {
+                "name": "ARTIFACT_PATH",
+                "value": "${{ artifacts.A.path }}",
+                "type": "string",
+            },
+            {
+                "name": "ARTIFACT_ALIAS",
+                "value": "${{ variables.get('ARTIFACT_PATH') }}",
+                "type": "string",
+            },
+        ],
+        artifacts=[
+            {
+                "name": "A",
+                "uri": "file://${{ variables.ARTIFACT_ALIAS }}",
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo hi"])],
+        ),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        asyncio.run(build_state(cfg, allocate=False, workspace_dir=tmp_path))
+
+    message = str(exc_info.value)
+    assert "Deferred global variable 'ARTIFACT_ALIAS'" in message
+    assert "artifact definition 'artifacts.A'" in message
+
+
+def test_global_variables_defer_artifact_root_until_artifacts_exist(tmp_path: Path):
+    cfg = SflowConfig(
+        version="0.1",
+        variables=[
+            {
+                "name": "ARTIFACT_COUNT",
+                "value": "${{ artifacts | length }}",
+                "type": "integer",
+            }
+        ],
+        artifacts=[{"name": "A", "uri": "file://data.txt"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo ${ARTIFACT_COUNT}"])],
+        ),
+    )
+
+    state = asyncio.run(build_state(cfg, allocate=False, workspace_dir=tmp_path))
+
+    assert state.variables["ARTIFACT_COUNT"].value == 1
+
+
+def test_global_variables_can_defer_mixed_backend_and_artifact_contexts(
+    tmp_path: Path,
+):
+    cfg = SflowConfig(
+        version="0.1",
+        variables=[
+            {
+                "name": "ENDPOINT",
+                "value": "${{ backends.slurm_cluster.nodes[0].ip_address }}:${{ artifacts.A.path }}",
+                "type": "string",
+            }
+        ],
+        backends=[
+            {
+                "name": "slurm_cluster",
+                "type": "slurm",
+                "default": True,
+                "account": "acct",
+                "partition": "batch",
+                "time": "00:10:00",
+                "nodes": 2,
+                "gpus_per_node": 4,
+            }
+        ],
+        artifacts=[{"name": "A", "uri": "file://data.txt"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo ${{ variables.ENDPOINT }}"])],
+        ),
+    )
+
+    state = asyncio.run(build_state(cfg, allocate=False, workspace_dir=tmp_path))
+    t1 = state.workflow.task_graph.get_task("t1")
+    expected = f"0.0.0.1:{tmp_path / 'data.txt'}"
+
+    assert state.variables["ENDPOINT"].value == expected
+    assert t1.script[0] == f"echo {expected}"
+
+
 def test_resolve_artifacts_with_backend_expression_in_content(tmp_path: Path):
     """
     Artifact content can reference backend node info after allocation.

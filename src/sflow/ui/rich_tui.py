@@ -3,21 +3,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 import time
 from collections import deque
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, Iterable
+from typing import Callable, Deque, Iterable
 
-from rich.align import Align
-from rich.console import Console, Group
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
+from rich.console import Console
 from rich.table import Table
 from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import DataTable, RichLog, Static
 
 from sflow.core.task import Task, TaskStatus
 from sflow.core.workflow import Workflow
@@ -26,16 +27,25 @@ from sflow.core.workflow import Workflow
 class _TuiLogHandler(logging.Handler):
     """A logging handler that appends LogRecords to a deque."""
 
-    def __init__(self, sink: Deque[logging.LogRecord], *, level: int = logging.INFO):
+    def __init__(
+        self,
+        sink: Deque[logging.LogRecord],
+        *,
+        level: int = logging.INFO,
+        log_lock: threading.Lock | None = None,
+    ):
         super().__init__(level=level)
         self._sink = sink
+        self._lock = log_lock or threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             # Copy to avoid surprises if other handlers mutate the record.
-            self._sink.append(logging.makeLogRecord(record.__dict__.copy()))
+            record = logging.makeLogRecord(record.__dict__.copy())
         except Exception:
             # Best-effort: never break the workflow due to UI.
+            pass
+        with self._lock:
             self._sink.append(record)
 
 
@@ -50,14 +60,15 @@ class RichTuiConfig:
     max_log_lines: int = 4000
     # If <= 0, auto-compute based on the right panel height.
     tail_log_lines: int = 0
-    refresh_per_second: int = 10
+    refresh_per_second: int = 2
 
 
 class RichTui(AbstractContextManager["RichTui"]):
     """
-    Rich terminal UI:
-    - Left: task table (name/status/attempt/backend/next retry)
-    - Right: scrolling log tail (last N lines)
+    Compatibility facade for the Textual terminal UI.
+
+    The public name is kept so callers do not need to know whether the TUI is
+    implemented by Rich Live or Textual.
     """
 
     def __init__(
@@ -69,6 +80,7 @@ class RichTui(AbstractContextManager["RichTui"]):
         config: RichTuiConfig | None = None,
         logger_name: str = "sflow",
         log_buffer: Deque[logging.LogRecord] | None = None,
+        log_lock: threading.Lock | None = None,
         attach_log_handler: bool = True,
     ):
         self._workflow = workflow
@@ -85,15 +97,20 @@ class RichTui(AbstractContextManager["RichTui"]):
             if log_buffer is not None
             else deque(maxlen=self._config.max_log_lines)
         )
+        self._logs_lock = log_lock or threading.Lock()
         self._handler: _TuiLogHandler | None = None
         if self._attach_log_handler:
-            self._handler = _TuiLogHandler(self._logs, level=logging.DEBUG)
-            # We render LogRecords ourselves in the panel with Rich styles.
-
-        self._layout = self._build_layout()
-        self._live: Live | None = None
+            self._handler = _TuiLogHandler(
+                self._logs,
+                level=logging.DEBUG,
+                log_lock=self._logs_lock,
+            )
 
         self._start_time = time.time()
+        self._app = _SflowTextualApp(self)
+        self._app_task: asyncio.Task | None = None
+        self._app_thread: threading.Thread | None = None
+        self._interrupt_handler: Callable[[], None] | None = None
 
     @property
     def workflow(self) -> Workflow | None:
@@ -104,37 +121,92 @@ class RichTui(AbstractContextManager["RichTui"]):
         if not self._workflow_name:
             self._workflow_name = workflow.name
 
-    def __enter__(self) -> "RichTui":
-        # Attach a log capture handler to the sflow logger (optional; caller may attach earlier).
-        if self._handler is not None:
-            logger = logging.getLogger(self._logger_name)
-            logger.addHandler(self._handler)
+    def set_interrupt_handler(self, handler: Callable[[], None] | None) -> None:
+        self._interrupt_handler = handler
 
-        self._live = Live(
-            self._layout,
-            console=self._console,
-            refresh_per_second=self._config.refresh_per_second,
-            transient=False,
+    def _request_interrupt(self) -> None:
+        if self._interrupt_handler is not None:
+            self._interrupt_handler()
+
+    def __enter__(self) -> "RichTui":
+        # Synchronous context use is retained for non-interactive tests and callers.
+        # Interactive Textual runs must use start_async() so Textual can install
+        # signal handlers on the main thread.
+        # Attach a log capture handler to the sflow logger (optional; caller may attach earlier).
+        self._attach_handler()
+        self._app_thread = threading.Thread(
+            target=self._run_headless_app,
+            name="sflow-textual-tui",
+            daemon=True,
         )
-        self._live.__enter__()
-        # Render an initial frame immediately.
+        self._app_thread.start()
         self.refresh()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        self._request_app_exit_from_thread()
+        if self._app_thread is not None:
+            self._app_thread.join(timeout=2.0)
+            self._app_thread = None
+
+        self._detach_handler()
+
+    async def start_async(self) -> None:
+        self._attach_handler()
+        if self._app_task is None:
+            self._app_task = asyncio.create_task(
+                self._app.run_async(
+                    headless=not bool(getattr(self._console, "is_terminal", False)),
+                    mouse=True,
+                )
+            )
+            await asyncio.sleep(0)
+        self.refresh()
+
+    async def stop_async(self) -> None:
+        try:
+            if self._app.is_running:
+                self._app.exit()
+        except Exception:
+            pass
+        if self._app_task is not None:
+            try:
+                await asyncio.wait_for(self._app_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                self._app_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._app_task
+            except Exception:
+                pass
+            finally:
+                self._app_task = None
+        self._detach_handler()
+
+    def _run_headless_app(self) -> None:
+        try:
+            self._app.run(headless=True, mouse=False)
+        except Exception:
+            # Best effort: UI failures must not break workflow execution.
+            logging.getLogger(self._logger_name).debug("Textual TUI exited", exc_info=True)
+
+    def _request_app_exit_from_thread(self) -> None:
+        try:
+            if self._app.is_running:
+                self._app.call_from_thread(self._app.exit)
+        except Exception:
+            pass
+
+    def _attach_handler(self) -> None:
         if self._handler is not None:
             logger = logging.getLogger(self._logger_name)
-            try:
-                if self._handler in logger.handlers:
-                    logger.removeHandler(self._handler)
-            finally:
-                if self._live is not None:
-                    self._live.__exit__(exc_type, exc, tb)
-                    self._live = None
-        else:
-            if self._live is not None:
-                self._live.__exit__(exc_type, exc, tb)
-                self._live = None
+            if self._handler not in logger.handlers:
+                logger.addHandler(self._handler)
+
+    def _detach_handler(self) -> None:
+        if self._handler is not None:
+            logger = logging.getLogger(self._logger_name)
+            if self._handler in logger.handlers:
+                logger.removeHandler(self._handler)
 
     @staticmethod
     def _status_style(status: TaskStatus) -> str:
@@ -166,18 +238,23 @@ class RichTui(AbstractContextManager["RichTui"]):
             if isinstance(nodes, str):
                 nodes_str = nodes
             else:
-                nodes_list = list(nodes)
-                if len(nodes_list) <= 2:
-                    nodes_str = ",".join(nodes_list)
-                else:
-                    nodes_str = (
-                        f"{nodes_list[0]},{nodes_list[1]},…(+{len(nodes_list) - 2})"
-                    )
+                nodes_str = ",".join(str(node) for node in nodes)
 
             t.add_row(task.name, status_text, exit_str, nodes_str)
         return t
 
-    def _build_backend_panel(self, tasks: list[Task]) -> Panel:
+    def _ordered_tasks(self) -> list[Task]:
+        if self._workflow is None:
+            return []
+        try:
+            return [
+                self._workflow.get_task(name)
+                for name in self._workflow.task_graph.dag.topological_sort()
+            ]
+        except Exception:
+            return self._workflow.get_tasks()
+
+    def _backend_rows(self, tasks: list[Task]) -> list[tuple[str, str, str, str, str]]:
         # Best-effort backend allocation summary derived from tasks / operator configs.
         # - backend name: task.backend_name (assembly populates it)
         # - allocation id: for srun operator, config.job_id
@@ -214,143 +291,73 @@ class RichTui(AbstractContextManager["RichTui"]):
                 except Exception:
                     pass
 
-        table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
-        table.add_column("Backend")
-        table.add_column("Alloc", overflow="fold")
-        table.add_column("Nodes", overflow="fold")
-        table.add_column("Tasks", justify="right", width=5)
-
+        rows = []
         for b, info in sorted(by_backend.items(), key=lambda x: x[0]):
             alloc_ids = sorted(list(info["alloc_ids"]))  # type: ignore[arg-type]
             nodes = sorted(list(info["nodes"]))  # type: ignore[arg-type]
             alloc = ",".join(alloc_ids) if alloc_ids else ""
-            if len(nodes) <= 2:
-                nodes_str = ",".join(nodes)
-            elif nodes:
-                nodes_str = f"{nodes[0]},{nodes[1]},…(+{len(nodes) - 2})"
-            else:
-                nodes_str = ""
-            table.add_row(b, alloc, nodes_str, str(info["tasks"]))
+            nodes_str = ",".join(nodes)
+            rows.append((b, alloc, str(len(nodes)), str(info["tasks"]), nodes_str))
+        return rows
 
-        return Panel(
-            table, title=self._config.backend_panel_title, border_style="magenta"
+    @staticmethod
+    def _level_style(levelno: int) -> str:
+        if levelno >= logging.CRITICAL:
+            return "bold red"
+        if levelno >= logging.ERROR:
+            return "red"
+        if levelno >= logging.WARNING:
+            return "yellow"
+        if levelno >= logging.INFO:
+            return "green"
+        return "dim"
+
+    def _record_to_text(self, rec: logging.LogRecord) -> Text:
+        ts = datetime.fromtimestamp(getattr(rec, "created", time.time())).strftime(
+            "%H:%M:%S"
+        )
+        level = getattr(rec, "levelname", "INFO")
+        name = getattr(rec, "name", "")
+        try:
+            msg = rec.getMessage()
+        except Exception:
+            msg = str(getattr(rec, "msg", ""))
+
+        line = Text.assemble(
+            (ts, "dim"),
+            " ",
+            (f"{level:<8}", self._level_style(getattr(rec, "levelno", logging.INFO))),
+            " ",
+            (f"{name}:", "cyan"),
+            " ",
+            (msg, ""),
         )
 
-    def _build_log_panel(self) -> Panel:
-        # Show only the last N *visual* lines (after wrapping to pane width) to simulate scrolling.
-        # If configured tail <= 0, auto-fit to the right panel height.
-
-        # Approximate available content width/height in the right pane.
-        # - console width includes everything
-        # - left pane is fixed-width
-        # - panel borders/padding take a few extra columns
-        try:
-            total_w = int(getattr(self._console.size, "width", 0) or 0)
-        except Exception:
-            total_w = 0
-
-        try:
-            total_h = int(getattr(self._console.size, "height", 0) or 0)
-        except Exception:
-            total_h = 0
-
-        # Layout uses a fixed header size.
-        body_h = max(1, total_h - int(self._config.header_height)) if total_h > 0 else 0
-        # Panel border consumes 2 rows.
-        inner_h = max(1, body_h - 2) if body_h > 0 else 0
-
-        cfg_tail = int(self._config.tail_log_lines)
-        if cfg_tail <= 0 and inner_h > 0:
-            tail_n = max(10, inner_h)
-        else:
-            tail_n = max(10, cfg_tail)
-
-        if total_w <= 0:
-            # Fallback width; will still behave well.
-            content_w = 80
-        else:
-            content_w = max(20, total_w - int(self._config.left_width) - 6)
-
-        def _level_style(levelno: int) -> str:
-            if levelno >= logging.CRITICAL:
-                return "bold red"
-            if levelno >= logging.ERROR:
-                return "red"
-            if levelno >= logging.WARNING:
-                return "yellow"
-            if levelno >= logging.INFO:
-                return "green"
-            return "dim"
-
-        def _record_to_text(rec: logging.LogRecord) -> Text:
-            ts = datetime.fromtimestamp(getattr(rec, "created", time.time())).strftime(
-                "%H:%M:%S"
-            )
-            level = getattr(rec, "levelname", "INFO")
-            name = getattr(rec, "name", "")
-            msg = ""
+        if getattr(rec, "exc_info", None):
             try:
-                msg = rec.getMessage()
+                exc_text = logging.Formatter().formatException(rec.exc_info)  # type: ignore[arg-type]
+                line.append("\n")
+                line.append(exc_text, style="red")
             except Exception:
-                msg = str(getattr(rec, "msg", ""))
+                pass
+        return line
 
-            line = Text.assemble(
-                (ts, "dim"),
-                " ",
-                (f"{level:<8}", _level_style(getattr(rec, "levelno", logging.INFO))),
-                " ",
-                (f"{name}:", "cyan"),
-                " ",
-                (msg, ""),
-            )
-
-            if getattr(rec, "exc_info", None):
-                try:
-                    exc_text = logging.Formatter().formatException(rec.exc_info)  # type: ignore[arg-type]
-                    line.append("\n")
-                    line.append(exc_text, style="red")
-                except Exception:
-                    pass
-
-            return line
-
-        # Build tail *visual* lines from the end, bounded by tail_n.
-        tail_lines: Deque[Text] = deque()
-        for rec in reversed(self._logs):
-            t = _record_to_text(rec)
-            # Split explicit newlines, then wrap each line.
-            for t_line in reversed(t.split("\n")):
-                wrapped = t_line.wrap(self._console, width=content_w, overflow="fold")
-                for w in reversed(wrapped):
-                    tail_lines.appendleft(w)
-                    if len(tail_lines) >= tail_n:
-                        break
-                if len(tail_lines) >= tail_n:
-                    break
-            if len(tail_lines) >= tail_n:
-                break
-
-        body_renderable = Group(*tail_lines) if tail_lines else Text("")
-        # Important: Align.bottom makes the view "auto scroll" to the newest lines.
-        return Panel(
-            Align(body_renderable, vertical="bottom"),
-            title=self._config.log_panel_title,
-            border_style="blue",
-        )
-
-    def _build_header(self) -> Panel:
-        elapsed = time.time() - self._start_time
-
-        tasks = list(self._workflow.get_tasks()) if self._workflow is not None else []
+    def _done_count(self, tasks: list[Task]) -> tuple[int, int, dict[str, int]]:
         total = len(tasks)
         counts: dict[str, int] = {}
         for t in tasks:
             k = str(t.status)
             counts[k] = counts.get(k, 0) + 1
-
         done = sum(
-            counts.get(k, 0) for k in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED")
+            counts.get(k, 0)
+            for k in ("READY", "COMPLETED", "FAILED", "TIMEOUT", "CANCELLED")
         )
+        return done, total, counts
+
+    def _header_text(self) -> str:
+        elapsed = time.time() - self._start_time
+        tasks = list(self._workflow.get_tasks()) if self._workflow is not None else []
+        done, total, counts = self._done_count(tasks)
 
         def _bar(done_n: int, total_n: int, width: int = 22) -> str:
             if total_n <= 0:
@@ -371,90 +378,178 @@ class RichTui(AbstractContextManager["RichTui"]):
                 run_id = out_dir.rstrip("/").split("/")[-1]
             except Exception:
                 run_id = ""
-
-        # Header layout: 2-column grid.
-        grid = Table.grid(expand=True)
-        grid.add_column(ratio=2)
-        grid.add_column(justify="right", ratio=3)
-
-        left = Group(
-            Text("sflow", style="bold cyan"),
-            Text(
-                f"workflow: {(self._workflow.name if self._workflow is not None else self._workflow_name)}"
-                + (f"  |  run: {run_id}" if run_id else ""),
-                style="bold",
-            ),
+        workflow_name = self._workflow.name if self._workflow is not None else self._workflow_name
+        counts_text = "  ".join(
+            [
+                f"RUNNING {counts.get('RUNNING', 0)}",
+                f"READY {counts.get('READY', 0)}",
+                f"FAILED {counts.get('FAILED', 0)}",
+                f"CANCELLED {counts.get('CANCELLED', 0)}",
+            ]
         )
-
-        right = Group(
-            Text(
+        return "\n".join(
+            [
+                f"sflow | workflow: {workflow_name}" + (f" | run: {run_id}" if run_id else ""),
                 f"{_bar(done, total)}  {done}/{total} done",
-                style="green" if counts.get("FAILED", 0) == 0 else "yellow",
-            ),
-            Text(
-                "  ".join(
-                    [
-                        f"RUNNING {counts.get('RUNNING', 0)}",
-                        f"READY {counts.get('READY', 0)}",
-                        f"FAILED {counts.get('FAILED', 0)}",
-                        f"CANCELLED {counts.get('CANCELLED', 0)}",
-                    ]
-                ),
-                style="dim",
-            ),
-            Text(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  elapsed {elapsed:.1f}s",
-                style="dim",
-            ),
+                counts_text,
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | elapsed {elapsed:.1f}s",
+                f"output: {out_dir}" if out_dir else "",
+            ]
         )
-
-        grid.add_row(left, right)
-
-        if out_dir:
-            extra = Text(f"output: {out_dir}", style="dim")
-            return Panel(Group(grid, extra), border_style="dim")
-
-        return Panel(grid, border_style="dim")
-
-    def _build_layout(self) -> Layout:
-        layout = Layout(name="root")
-        layout.split_column(
-            Layout(name="header", size=int(self._config.header_height)),
-            Layout(name="body", ratio=1),
-        )
-        layout["body"].split_row(
-            Layout(name="left", size=self._config.left_width),
-            Layout(name="right", ratio=1),
-        )
-        layout["left"].split_column(
-            Layout(name="left_tasks", ratio=1),
-            Layout(name="left_backends", size=int(self._config.backend_panel_height)),
-        )
-        return layout
 
     def refresh(self) -> None:
         """Re-render current workflow state + log tail."""
-        # Header
-        self._layout["header"].update(self._build_header())
+        if self._app.is_running:
+            try:
+                self._app.refresh_from_owner()
+            except Exception:
+                try:
+                    self._app.call_from_thread(self._app.refresh_from_owner)
+                except Exception:
+                    pass
 
-        # Tasks (sorted by name for stable display)
-        tasks = (
-            sorted(self._workflow.get_tasks(), key=lambda x: x.name)
-            if self._workflow is not None
-            else []
-        )
-        table = self._build_task_table(tasks)
-        self._layout["left_tasks"].update(
-            Panel(table, title=self._config.task_panel_title, border_style="green")
-        )
-        self._layout["left_backends"].update(self._build_backend_panel(tasks))
+class _SflowTextualApp(App[None]):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #header {
+        height: 5;
+        border: round gray;
+        padding: 0 1;
+    }
+    #body {
+        layout: horizontal;
+        height: 1fr;
+    }
+    #left {
+        width: 56;
+        layout: vertical;
+    }
+    #tasks {
+        height: 1fr;
+        border: round green;
+    }
+    #backends {
+        height: 6;
+        border: round magenta;
+    }
+    #logs {
+        width: 1fr;
+        border: round blue;
+    }
+    """
 
-        # Logs
-        self._layout["right"].update(self._build_log_panel())
+    BINDINGS = [
+        ("ctrl+c", "interrupt", "cancel run"),
+        ("q", "quit", "quit"),
+        ("tab", "focus_next", "focus next"),
+    ]
 
-        # Force a refresh if Live is active.
-        if self._live is not None:
-            self._live.refresh()
+    def __init__(self, owner: RichTui):
+        super().__init__()
+        self._owner = owner
+        self._last_rendered_log_record: logging.LogRecord | None = None
+        self._task_rows_snapshot: tuple[tuple[str, str, str, str], ...] | None = None
+        self._backend_rows_snapshot: (
+            tuple[tuple[str, str, str, str, str], ...] | None
+        ) = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="header")
+        with Horizontal(id="body"):
+            with Vertical(id="left"):
+                yield DataTable(id="tasks")
+                yield DataTable(id="backends")
+            yield RichLog(
+                id="logs",
+                max_lines=self._owner._config.max_log_lines,
+                wrap=True,
+                highlight=False,
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#logs", RichLog).focus()
+        self.refresh_from_owner(force=True)
+
+    def action_interrupt(self) -> None:
+        self._owner._request_interrupt()
+        self.exit(return_code=130)
+
+    def refresh_from_owner(self, *, force: bool = False) -> None:
+        self._update_header()
+        tasks = self._owner._ordered_tasks()
+        self._update_tasks(tasks, force=force)
+        self._update_backends(tasks, force=force)
+        self._update_logs(force=force)
+
+    def _update_header(self) -> None:
+        self.query_one("#header", Static).update(self._owner._header_text())
+
+    def _task_rows(self, tasks: list[Task]) -> tuple[tuple[str, str, str, str], ...]:
+        rows = []
+        for task in tasks:
+            exit_code = getattr(task, "exit_code", None)
+            exit_str = "" if exit_code is None else str(int(exit_code))
+            nodes = getattr(task, "assigned_nodes", None) or []
+            if isinstance(nodes, str):
+                nodes_str = nodes
+            else:
+                nodes_str = ",".join(str(node) for node in nodes)
+            rows.append((task.name, str(task.status), exit_str, nodes_str))
+        return tuple(rows)
+
+    def _update_tasks(self, tasks: list[Task], *, force: bool = False) -> None:
+        rows = self._task_rows(tasks)
+        if not force and rows == self._task_rows_snapshot:
+            return
+        self._task_rows_snapshot = rows
+
+        table = self.query_one("#tasks", DataTable)
+        table.clear(columns=True)
+        table.add_columns("Task", "Status", "Exit", "Nodes")
+
+        for name, status, exit_str, nodes_str in rows:
+            table.add_row(
+                name,
+                Text(status, style=self._owner._status_style(TaskStatus(status))),
+                exit_str,
+                nodes_str,
+            )
+
+    def _update_backends(self, tasks: list[Task], *, force: bool = False) -> None:
+        rows = tuple(self._owner._backend_rows(tasks))
+        if not force and rows == self._backend_rows_snapshot:
+            return
+        self._backend_rows_snapshot = rows
+
+        table = self.query_one("#backends", DataTable)
+        table.clear(columns=True)
+        table.add_columns("Backend", "Alloc", "Node Count", "Tasks", "Nodes")
+        for row in rows:
+            table.add_row(*row)
+
+    def _update_logs(self, *, force: bool = False) -> None:
+        log = self.query_one("#logs", RichLog)
+        records = list(self._owner._logs)
+        start_index = 0
+
+        if force:
+            log.clear()
+        elif self._last_rendered_log_record is not None:
+            for idx, record in enumerate(records):
+                if record is self._last_rendered_log_record:
+                    start_index = idx + 1
+                    break
+            else:
+                # The bounded deque rolled over since the last refresh.
+                log.clear()
+                start_index = 0
+
+        for record in records[start_index:]:
+            log.write(self._owner._record_to_text(record), scroll_end=None)
+        self._last_rendered_log_record = records[-1] if records else None
 
 
 def maybe_rich_tui(
@@ -463,6 +558,7 @@ def maybe_rich_tui(
     *,
     tail_log_lines: int | None = None,
     log_buffer: Deque[logging.LogRecord] | None = None,
+    log_lock: threading.Lock | None = None,
     attach_log_handler: bool = True,
 ) -> AbstractContextManager[RichTui] | nullcontext:
     if not enabled:
@@ -474,6 +570,7 @@ def maybe_rich_tui(
         workflow,
         config=cfg,
         log_buffer=log_buffer,
+        log_lock=log_lock,
         attach_log_handler=attach_log_handler,
     )
 
@@ -483,9 +580,10 @@ def attach_tui_log_buffer(
     *,
     logger_name: str = "sflow",
     level: int = logging.DEBUG,
+    log_lock: threading.Lock | None = None,
 ) -> logging.Handler:
     """Attach a handler that appends LogRecords to `log_buffer`."""
-    h = _TuiLogHandler(log_buffer, level=level)
+    h = _TuiLogHandler(log_buffer, level=level, log_lock=log_lock)
     logging.getLogger(logger_name).addHandler(h)
     return h
 

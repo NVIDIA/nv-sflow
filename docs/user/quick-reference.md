@@ -47,7 +47,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 |-------|----------|------|---------|-------------|
 | `type` | Yes | string | — | `local` or `slurm`. |
 | `default` | | bool | `false` | Mark as the default backend (only one allowed). |
-| `gpus_per_node` | | int / expr | `null` | GPUs per node for allocation / packing. |
+| `gpus_per_node` | | int / expr | `null` | GPUs per node for sflow planning / packing. Does not add Slurm GPU allocation flags. |
 
 ## Backends — Local
 
@@ -67,8 +67,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `partition` | Yes | string / expr | — | Slurm partition. |
 | `time` | Yes | string / expr | — | Time limit (e.g. `00:30:00`). |
 | `nodes` | Yes | int / expr | — | Number of nodes. |
-| `gpus_per_node` | Yes | int / expr | — | GPUs per node. |
-| `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`). |
+| `gpus_per_node` | Yes | int / expr | — | GPUs per node for planning. Set to `0` for CPU-only partitions; tasks that request `resources.gpus` against a zero-capacity backend will be rejected. |
+| `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`, `--gpus-per-node=8`). |
 | `job_name` | | string | `null` | Job name; defaults to workflow name. |
 
 ## Operators — Common Fields
@@ -193,7 +193,11 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `nodes.indices` | | list[int / expr] | `null` | Specific node indices (e.g. `[0]`). |
 | `nodes.count` | | int / expr | `null` | Number of nodes. |
 | `nodes.exclude` | | int / list[int] / expr | `null` | Node indices to remove from the placement pool before `indices`, `count`, or GPU packing. |
+| `nodes.release_after` | | string | inferred | When node reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. |
 | `gpus.count` | If `gpus` is set | int / expr | — | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). |
+| `gpus.release_after` | | string | inferred | When GPU reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. |
+
+For nodes, `release_after` only creates an exclusive node reservation when explicitly set; omitted `nodes.indices` and `nodes.count` are placement constraints and may overlap with other planned tasks. For GPUs, omitted `release_after` is inferred: tasks without readiness probes release GPUs after task completion for downstream dependents, while tasks with readiness probes keep GPUs until workflow completion unless explicitly set to `task_ready`. `task_ready` releases after readiness succeeds. `task_completion` releases after any terminal task status (`COMPLETED`, `FAILED`, `TIMEOUT`, or `CANCELLED`). Dry-run rehearses these resource lifetimes across the DAG.
 
 ## Task Replicas
 

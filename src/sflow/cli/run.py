@@ -5,6 +5,7 @@
 CLI command for running workflows.
 """
 
+import threading
 from collections import deque
 from pathlib import Path
 from typing import Annotated, List, Optional
@@ -13,12 +14,22 @@ import typer
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
-from sflow.config.resolver import enrich_error_with_location
 from sflow.logging import configure_logging, get_logger
+from sflow.resolution import enrich_error_with_location
+from sflow.runtime_info import log_runtime_info
 
 _logger = get_logger(__name__)
 
 _sflow_app = SflowApp()
+
+
+def _print_run_artifacts(workflow_out_dir: Path, *, err: bool = False) -> None:
+    typer.echo(f"  Output folder: {workflow_out_dir}", err=err)
+    typer.echo(f"  Summary: {workflow_out_dir / 'sflow_summary.log'}", err=err)
+    command_logs = sorted(workflow_out_dir.glob("*_cmds.log"))
+    if command_logs:
+        paths = ", ".join(str(path) for path in command_logs)
+        typer.echo(f"  Command logs: {paths}", err=err)
 
 
 def _resolve_bulk_input_row(
@@ -287,15 +298,18 @@ def run(
         # Configure logging as early as possible.
         # - TUI mode: disable console handler so Live UI isn't interleaved with plain logs.
         configure_logging(level=log_level, console=not tui_enabled)
+        log_runtime_info()
 
         # In TUI mode, capture all logs into a shared buffer used by the right pane.
         log_buffer = None
+        log_lock = None
         log_handler = None
         if tui_enabled:
             from sflow.ui.rich_tui import attach_tui_log_buffer, detach_tui_log_buffer
 
             log_buffer = deque(maxlen=4000)
-            log_handler = attach_tui_log_buffer(log_buffer)
+            log_lock = threading.Lock()
+            log_handler = attach_tui_log_buffer(log_buffer, log_lock=log_lock)
 
         if task:
             _logger.info(f"Running specific task: {task}")
@@ -324,6 +338,7 @@ def run(
                 output_dir=output_dir,
                 tui=tui_enabled,
                 tui_log_buffer=log_buffer,
+                tui_log_lock=log_lock,
                 tui_refresh_per_second=tui_refresh if tui_enabled else None,
             )
         finally:
@@ -337,36 +352,30 @@ def run(
             _logger.info("Workflow completed successfully")
             typer.echo("✓ Workflow completed")
             if workflow_out_dir:
-                typer.echo(f"  Output folder: {workflow_out_dir}")
+                _print_run_artifacts(workflow_out_dir)
 
     except ValueError as e:
         msg = enrich_error_with_location(str(e), files)
         _logger.error(f"Configuration error: {msg}")
         typer.echo(f"✗ Configuration error: {msg}", err=True)
         if _sflow_app.last_workflow_output_dir:
-            typer.echo(
-                f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True
-            )
+            _print_run_artifacts(_sflow_app.last_workflow_output_dir, err=True)
         raise typer.Exit(code=1)
     except FileNotFoundError as e:
         _logger.error(f"File not found: {e}")
         typer.echo(f"✗ File not found: {e}", err=True)
         if _sflow_app.last_workflow_output_dir:
-            typer.echo(
-                f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True
-            )
+            _print_run_artifacts(_sflow_app.last_workflow_output_dir, err=True)
         raise typer.Exit(code=1)
     except KeyboardInterrupt:
         _logger.info("Workflow cancelled by user")
         typer.echo("\n⚠ Workflow cancelled")
         if _sflow_app.last_workflow_output_dir:
-            typer.echo(f"  Output folder: {_sflow_app.last_workflow_output_dir}")
+            _print_run_artifacts(_sflow_app.last_workflow_output_dir)
         raise typer.Exit(code=130)
     except Exception as e:
         _logger.exception(f"Workflow execution failed: {e}")
         typer.echo(f"✗ Workflow failed: {e}", err=True)
         if _sflow_app.last_workflow_output_dir:
-            typer.echo(
-                f"  Output folder: {_sflow_app.last_workflow_output_dir}", err=True
-            )
+            _print_run_artifacts(_sflow_app.last_workflow_output_dir, err=True)
         raise typer.Exit(code=1)

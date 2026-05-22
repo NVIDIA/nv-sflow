@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import logging
-
 import pytest
 
 from sflow.app.assembly import build_task_graph, resolve_artifacts
@@ -10,12 +8,14 @@ from collections.abc import Sequence
 from sflow.core.operator import Operator
 from sflow.config.schema import (
     GpuResourceConfig,
+    LogWatchProbeConfig,
     NodeResourceConfig,
+    ProbeConfig,
+    ProbesConfig,
     ReplicaConfig,
     ResourcesConfig,
     SflowConfig,
     TaskConfig,
-    VariableConfig,
     WorkflowConfig,
 )
 from sflow.core.backend import Allocation, Backend
@@ -868,6 +868,262 @@ def test_build_task_graph_resources_nodes_count_compact_allocation_for_parallel_
     assert t11.operator.config.nodelist == ["n3", "n4"]
 
 
+def test_build_task_graph_nodes_count_without_release_after_allows_parallel_overlap():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="nodes-siblings",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="a",
+                    script=["echo a"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=1)),
+                ),
+                TaskConfig(
+                    name="b",
+                    script=["echo b"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=1)),
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("a").operator.config.nodelist == ["n1"]
+    assert tg.get_task("b").operator.config.nodelist == ["n1"]
+
+
+def test_build_task_graph_nodes_count_with_explicit_release_after_reserves_nodes():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="nodes-siblings-explicit",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="a",
+                    script=["echo a"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            count=1,
+                            release_after="workflow_completion",
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="b",
+                    script=["echo b"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=1)),
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("a").operator.config.nodelist == ["n1"]
+    assert tg.get_task("b").operator.config.nodelist == ["n2"]
+
+
+def test_build_task_graph_nodes_workflow_completion_blocks_downstream_reuse():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="nodes-held",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="service",
+                    script=["echo service"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            count=1,
+                            release_after="workflow_completion",
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=1)),
+                    depends_on=["service"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="node.*remain available"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_node_indices_can_colocate_with_parallel_node_count_task():
+    """Pinned node indices are placement constraints, not exclusive node claims."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="nodes-indices-colocate",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="monitor",
+                    script=["echo monitor"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=2)),
+                ),
+                TaskConfig(
+                    name="service",
+                    script=["echo service"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(indices=[0])),
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("monitor").operator.config.nodelist == ["n1", "n2"]
+    assert tg.get_task("service").operator.config.nodelist == ["n1"]
+
+
+def test_build_task_graph_node_indices_with_explicit_release_after_reserves_node():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="nodes-indices-explicit",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="service",
+                    script=["echo service"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            indices=[0],
+                            release_after="workflow_completion",
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=1)),
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="node.*remain available"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_nodes_task_completion_releases_downstream_reuse():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="nodes-reuse",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="setup",
+                    script=["echo setup"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(
+                            count=1,
+                            release_after="task_completion",
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=1)),
+                    depends_on=["setup"],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("setup").operator.config.nodelist == ["n1"]
+    assert tg.get_task("worker").operator.config.nodelist == ["n1"]
+
+
 def test_build_task_graph_resources_nodes_indices_and_count_follow_selected_order():
     """indices defines the pool; count slices that pool in order across replicas."""
     state = _state()
@@ -1300,8 +1556,8 @@ def test_build_task_graph_multi_node_decode_avoids_node_fully_consumed_by_sequen
     """
     Match the reported dry-run scenario:
     - 3 nodes with 4 GPUs each
-    - prefill replicas (sequential) consume all 4 GPUs on node0 (1 GPU per replica, 4 replicas)
-    - decode needs 8 GPUs total -> should use node1 + node2 (skip node0)
+    - prefill replicas (sequential, no readiness) reuse GPU 0 on node0 by inferred task_completion release
+    - decode is independent of prefill, so it cannot reuse prefill's still-live reservation and should use node1 + node2
     """
     state = _state()
     state.backends = {
@@ -1341,20 +1597,444 @@ def test_build_task_graph_multi_node_decode_avoids_node_fully_consumed_by_sequen
 
     tg = build_task_graph(config, state)
 
-    # Prefill fully consumes n1.
+    # Prefill replicas are sequential and release at task completion by default.
     assert tg.get_task("prefill_0").operator.config.nodelist == ["n1"]
     assert tg.get_task("prefill_1").operator.config.nodelist == ["n1"]
     assert tg.get_task("prefill_2").operator.config.nodelist == ["n1"]
     assert tg.get_task("prefill_3").operator.config.nodelist == ["n1"]
     assert tg.get_task("prefill_0").envs["CUDA_VISIBLE_DEVICES"] == "0"
-    assert tg.get_task("prefill_1").envs["CUDA_VISIBLE_DEVICES"] == "1"
-    assert tg.get_task("prefill_2").envs["CUDA_VISIBLE_DEVICES"] == "2"
-    assert tg.get_task("prefill_3").envs["CUDA_VISIBLE_DEVICES"] == "3"
+    assert tg.get_task("prefill_1").envs["CUDA_VISIBLE_DEVICES"] == "0"
+    assert tg.get_task("prefill_2").envs["CUDA_VISIBLE_DEVICES"] == "0"
+    assert tg.get_task("prefill_3").envs["CUDA_VISIBLE_DEVICES"] == "0"
 
-    # Decode should avoid n1 and use n2+n3.
+    # Decode should avoid n1 because it is not downstream of prefill.
     decode = tg.get_task("decode")
     assert decode.operator.config.nodelist == ["n2", "n3"]
     assert decode.envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+
+
+def test_build_task_graph_multi_node_error_reports_only_first_insufficient_node():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="multi-node-blocked",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1, num_gpus=4),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="first",
+                    script=["echo first"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0, 1]),
+                        gpus=GpuResourceConfig(
+                            count=8,
+                            release_after="workflow_completion",
+                        ),
+                    ),
+                ),
+                TaskConfig(
+                    name="second",
+                    script=["echo second"],
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0, 1]),
+                        gpus=GpuResourceConfig(count=2),
+                    ),
+                    depends_on=["first"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="lacks enough non-conflicting GPUs") as exc_info:
+        build_task_graph(config, state)
+
+    message = str(exc_info.value)
+    assert "GPU reservation graph on node 'n1'" in message
+    assert "GPU reservation graph on node 'n2'" not in message
+    assert "first" in message
+
+
+def test_build_task_graph_default_gpu_release_infers_task_completion_for_batch_dependency():
+    """Without release_after, no-readiness upstream tasks release resources at completion."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel0",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=8)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="check_entire_env",
+                    script=["echo check"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=8)),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    replicas=ReplicaConfig(count=4, policy="parallel"),
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=2)),
+                    depends_on=["check_entire_env"],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("check_entire_env").envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+    assert tg.get_task("worker_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert tg.get_task("worker_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert tg.get_task("worker_2").envs["CUDA_VISIBLE_DEVICES"] == "4,5"
+    assert tg.get_task("worker_3").envs["CUDA_VISIBLE_DEVICES"] == "6,7"
+
+
+def test_build_task_graph_explicit_workflow_completion_overrides_inferred_release():
+    """Explicit workflow_completion keeps the old conservative behavior."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel0b",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=8)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="check_entire_env",
+                    script=["echo check"],
+                    resources=ResourcesConfig(
+                        gpus=GpuResourceConfig(
+                            count=8,
+                            release_after="workflow_completion",
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    replicas=ReplicaConfig(count=4, policy="parallel"),
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=2)),
+                    depends_on=["check_entire_env"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="remain available") as exc_info:
+        build_task_graph(config, state)
+    message = str(exc_info.value)
+    assert "GPU reservation graph on node 'n1' while planning task 'worker_0':" in message
+    assert "GPU 0: check_entire_env" in message
+    assert "release_after=workflow_completion" in message
+    assert "blocking:" in message
+    assert "- check_entire_env: release_after=workflow_completion; held until workflow completion" in message
+    assert "reusable:" not in message
+    assert "workflow completion\nConsider increasing backend nodes" in message
+
+
+def test_build_task_graph_omitted_release_after_with_readiness_stays_conservative():
+    """A readiness task may still be running after READY, so omitted policy should not release."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel0c",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="service",
+                    script=["echo ready", "sleep 100"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=4)),
+                    probes=ProbesConfig(
+                        readiness=ProbeConfig(
+                            log_watch=LogWatchProbeConfig(match_pattern="ready")
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=4)),
+                    depends_on=["service"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="remain available") as exc_info:
+        build_task_graph(config, state)
+    message = str(exc_info.value)
+    assert "GPU reservation graph on node 'n1' while planning task 'worker':" in message
+    assert "GPU 0: service" in message
+    assert "service" in message
+    assert "inferred workflow_completion because task has readiness probes" in message
+
+
+def test_build_task_graph_task_completion_releases_gpus_for_downstream_replicas():
+    """A terminal upstream task can release GPUs for later parallel workers."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel1",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=8)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="check_entire_env",
+                    script=["echo check"],
+                    resources=ResourcesConfig(
+                        gpus=GpuResourceConfig(
+                            count=8,
+                            release_after="task_completion",
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    replicas=ReplicaConfig(count=4, policy="parallel"),
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=2)),
+                    depends_on=["check_entire_env"],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("check_entire_env").envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+    assert tg.get_task("worker_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert tg.get_task("worker_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert tg.get_task("worker_2").envs["CUDA_VISIBLE_DEVICES"] == "4,5"
+    assert tg.get_task("worker_3").envs["CUDA_VISIBLE_DEVICES"] == "6,7"
+
+
+def test_build_task_graph_task_ready_releases_gpus_after_readiness_probe():
+    """A ready-released service can hand GPUs to downstream work after readiness."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel2",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="warmup",
+                    script=["echo ready", "sleep 100"],
+                    resources=ResourcesConfig(
+                        gpus=GpuResourceConfig(count=4, release_after="task_ready")
+                    ),
+                    probes=ProbesConfig(
+                        readiness=ProbeConfig(
+                            log_watch=LogWatchProbeConfig(match_pattern="ready")
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=4)),
+                    depends_on=["warmup"],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("warmup").envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert tg.get_task("worker").envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+
+
+def test_build_task_graph_task_completion_with_readiness_does_not_release_at_ready():
+    """completion-release cannot be reused by a downstream task that may start at READY."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel3",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="service",
+                    script=["echo ready", "sleep 100"],
+                    resources=ResourcesConfig(
+                        gpus=GpuResourceConfig(
+                            count=4,
+                            release_after="task_completion",
+                        )
+                    ),
+                    probes=ProbesConfig(
+                        readiness=ProbeConfig(
+                            log_watch=LogWatchProbeConfig(match_pattern="ready")
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="worker",
+                    script=["echo worker"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=4)),
+                    depends_on=["service"],
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="remain available"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_release_after_does_not_reuse_between_parallel_siblings():
+    """Independent tasks can overlap, so they cannot reuse release_after reservations."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel4",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="a",
+                    script=["echo a"],
+                    resources=ResourcesConfig(
+                        gpus=GpuResourceConfig(
+                            count=4,
+                            release_after="task_completion",
+                        )
+                    ),
+                ),
+                TaskConfig(
+                    name="b",
+                    script=["echo b"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=4)),
+                ),
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="remain available"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_sequential_replicas_can_reuse_task_completion_gpus():
+    """Sequential replicas can reuse the same GPU slice when each replica releases at terminal state."""
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="rel5",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=4)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="bench",
+                    script=["echo bench"],
+                    replicas=ReplicaConfig(count=2, policy="sequential"),
+                    resources=ResourcesConfig(
+                        gpus=GpuResourceConfig(
+                            count=4,
+                            release_after="task_completion",
+                        )
+                    ),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    assert tg.get_task("bench_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert tg.get_task("bench_1").envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
 
 
 def test_build_task_graph_replica_tasks_have_independent_container_mounts(tmp_path):

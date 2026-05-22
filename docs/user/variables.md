@@ -47,9 +47,13 @@ sflow variables offer significant advantages over traditional environment variab
 
 2. **Dynamic resolution**: Access runtime information like node IPs and task assignments
    ```yaml
+   variables:
+     HEAD_NODE:
+       value: "${{ backends.cluster.nodes[0].ip_address }}"  # Deferred until after allocation
+
    workflow:
      variables:
-       HEAD_NODE: 
+       WORKER_NODE:
          value: "${{ backends.cluster.nodes[0].ip_address }}"  # Resolved after allocation
      tasks:
        - name: worker
@@ -82,16 +86,43 @@ When using `${{ ... }}` expressions, you have access to these contexts:
 | `workflow` | `${{ workflow.name }}` | Workflow metadata |
 | `task` | `${{ task.my_task.nodes[0].ip_address }}` | Task-specific node and GPU info (scripts only) |
 
+### Top-Level Static and Deferred Variables
+
+Top-level `variables` are resolved in two passes:
+
+1. Static variables are resolved before backend configuration. These can be used in pre-allocation fields such as `backends`, for example `partition: ${{ variables.PARTITION }}`.
+2. Variables that reference `backends.*` or `artifacts.*` are deferred until after backend allocation and artifact resolution. These can be used later in workflow variables, task scripts, probes, and other post-allocation fields.
+
+Backend-derived globals are resolved before artifact definitions, so artifact content can reference them. Artifact-derived globals are resolved after artifacts exist, so they cannot be used to define the same artifact context.
+
+Deferred variables cannot be used to configure the backend or artifact that they depend on:
+
+```yaml
+variables:
+  HEAD_NODE_IP:
+    value: "${{ backends.cluster.nodes[0].ip_address }}"
+
+backends:
+  - name: cluster
+    type: slurm
+    # Invalid: backend allocation must be configured before HEAD_NODE_IP exists.
+    partition: "${{ variables.HEAD_NODE_IP }}"
+```
+
+When a value is mainly derived from runtime workflow context, `workflow.variables` is still the clearest place to define it because those variables are intentionally resolved after allocation.
+
 ### Backend Node Access
 
 After Slurm allocation, you can access node information:
 
 ```yaml
+variables:
+  HEAD_NODE_IP:
+    value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+
 workflow:
   variables:
-    HEAD_NODE_IP:
-      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
-    SECOND_NODE:
+    SECOND_NODE_NAME:
       value: "${{ backends.slurm_cluster.nodes[1].name }}"
 ```
 

@@ -140,6 +140,12 @@ resources:
 
 Negative indices in `indices` are resolved after `exclude`. For example, `exclude: [3]` and `indices: [-1]` on a four-node allocation selects node 2, because node 3 is removed first.
 
+:::important Node resources overlap by default
+`resources.nodes.indices` and `resources.nodes.count` are placement constraints unless you also set `resources.nodes.release_after`.
+
+That means two tasks can select the same node by default. This is intentional for common server/client or colocated workload patterns. Add `resources.nodes.release_after` only when the selected node should be treated as an exclusive reservation with a lifecycle.
+:::
+
 ## GPU packing
 
 Set `resources.gpus.count` to reserve GPU IDs and set `CUDA_VISIBLE_DEVICES` for the task. sflow packs GPU requests onto the selected node pool and advances to later nodes when earlier nodes are full.
@@ -164,3 +170,75 @@ workflow:
 ```
 
 If a GPU request cannot fit on one node but is an exact multiple of `backends.<name>.gpus_per_node`, sflow can expand the task across multiple nodes. If the request is not a valid multiple or the selected pool is too small, validation fails before execution.
+
+## Resource reuse with `release_after`
+
+`resources.nodes.release_after` and `resources.gpus.release_after` control when a task-level reservation can be reused by later tasks in the DAG.
+
+Supported values:
+
+- `workflow_completion`: hold the reservation until the whole workflow finishes
+- `task_ready`: release after the task's readiness probe succeeds
+- `task_completion`: release after the task reaches a terminal state (`COMPLETED`, `FAILED`, `TIMEOUT`, or `CANCELLED`)
+
+GPU reservations infer a safe default when `release_after` is omitted:
+
+- tasks without readiness probes release GPUs after task completion for downstream dependents
+- tasks with readiness probes hold GPUs until workflow completion, because they may still be serving after becoming `READY`
+
+Node placement behaves differently from GPU placement: **node selections can overlap by default**. `resources.nodes.indices` and `resources.nodes.count` only constrain where a task may run. They do not reserve those nodes exclusively unless `resources.nodes.release_after` is explicitly set. Add `resources.nodes.release_after` when you want an explicit exclusive node reservation with a lifecycle.
+
+Example: a one-time environment check can release all GPUs after it completes, allowing downstream workers to reuse them:
+
+```yaml
+workflow:
+  name: release_after_check
+  tasks:
+    - name: check_entire_node
+      resources:
+        gpus:
+          count: 8
+          release_after: task_completion
+      script:
+        - nvidia-smi
+
+    - name: worker
+      depends_on: [check_entire_node]
+      replicas:
+        count: 4
+        policy: parallel
+      resources:
+        gpus:
+          count: 2
+      script:
+        - echo "worker GPUs=${CUDA_VISIBLE_DEVICES}"
+```
+
+Example: a setup service can release an explicit node reservation after readiness if it no longer needs exclusive placement once clients start:
+
+```yaml
+workflow:
+  name: release_after_ready
+  tasks:
+    - name: bootstrap
+      resources:
+        nodes:
+          indices: [0]
+          release_after: task_ready
+      script:
+        - python -m http.server 8000
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+
+    - name: client
+      depends_on: [bootstrap]
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - curl -sf http://127.0.0.1:8000/ > /dev/null
+```
+
+Dry-run rehearses these lifetimes across the DAG, so oversubscription errors include the tasks and release policies that block placement.

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -12,23 +11,15 @@ from pydantic import Field, model_validator
 from sflow.core.command import Command
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.operator_registry import register_operator
-
-# Matches remote registry references: [registry[:port]/][org/]name[:tag][@digest]
-_REGISTRY_IMAGE_RE = re.compile(
-    r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*(@[a-zA-Z][a-zA-Z0-9]*:[a-fA-F0-9]+)?$"
+from sflow.utils.container import (
+    is_valid_container_image,
+    merge_container_mounts_from_extra_args,
 )
 
 
 def _is_valid_container_image(image: str) -> bool:
-    """Return True if *image* looks like a remote registry reference or a local .sqsh file."""
-    if not image or not image.strip():
-        return False
-    image = image.strip()
-    if "${{" in image or "${" in image:
-        return True
-    if image.endswith(".sqsh"):
-        return True
-    return bool(_REGISTRY_IMAGE_RE.match(image))
+    """Backward-compatible alias for the public container image validator."""
+    return is_valid_container_image(image)
 
 
 class SrunOperatorConfig(OperatorConfig):
@@ -98,7 +89,7 @@ class SrunOperatorConfig(OperatorConfig):
             "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag') "
             "or a local .sqsh file path (e.g. '/path/to/image.sqsh')"
         )
-        if self.container_image and not _is_valid_container_image(self.container_image):
+        if self.container_image and not is_valid_container_image(self.container_image):
             raise ValueError(
                 f"srun operator config: 'container_image' does not look like a valid "
                 f"container image. {_invalid_img_hint}, got: '{self.container_image}'"
@@ -109,7 +100,7 @@ class SrunOperatorConfig(OperatorConfig):
                 _img_val = _arg.split("=", 1)[1]
             elif _arg == "--container-image" and _i + 1 < len(self.extra_args):
                 _img_val = self.extra_args[_i + 1]
-            if _img_val is not None and not _is_valid_container_image(_img_val):
+            if _img_val is not None and not is_valid_container_image(_img_val):
                 raise ValueError(
                     f"srun operator config: '--container-image' in extra_args does not "
                     f"look like a valid container image. {_invalid_img_hint}, "
@@ -265,23 +256,11 @@ class SrunOperator(Operator):
             if c.container_remap_root:
                 command.add_opt("--container-remap-root")
 
-        # Merge container_mounts from config with any --container-mounts in extra_args
-        all_mounts: list[str] = list(c.container_mounts) if c.container_mounts else []
-        filtered_extra_args: list[str] = []
-        i = 0
-        while i < len(c.extra_args):
-            arg = c.extra_args[i]
-            if arg == "--container-mounts" and i + 1 < len(c.extra_args):
-                extra_mounts = c.extra_args[i + 1].split(",")
-                all_mounts.extend(extra_mounts)
-                i += 2
-            elif arg.startswith("--container-mounts="):
-                extra_mounts = arg.split("=", 1)[1].split(",")
-                all_mounts.extend(extra_mounts)
-                i += 1
-            else:
-                filtered_extra_args.append(arg)
-                i += 1
+        # Merge container_mounts from config with any --container-mounts in extra_args.
+        all_mounts, filtered_extra_args = merge_container_mounts_from_extra_args(
+            c.container_mounts or [],
+            list(c.extra_args),
+        )
 
         if _has_container and all_mounts:
             command.add_opt("--container-mounts", ",".join(all_mounts))

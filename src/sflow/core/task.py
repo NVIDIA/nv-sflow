@@ -100,6 +100,8 @@ class Task:
     assigned_nodes: list[str] = field(default_factory=list)
     # Sweep variable names for this replica (empty if not a sweep replica).
     sweep_variables: list[str] = field(default_factory=list)
+    # Resource lifetime policies used by dry-run/rehearsal reporting.
+    resource_release_after: dict[str, str] = field(default_factory=dict)
 
     # Task names that should mirror this task's readiness/failure probe result.
     # Populated when HTTP probes are deduplicated across replicas with identical check info.

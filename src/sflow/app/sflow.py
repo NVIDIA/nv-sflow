@@ -5,13 +5,32 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sflow.app.assembly import build_state, release_backends
+from sflow.app.run_support import (
+    build_run_paths,
+    check_enroot_credentials,
+    configure_task_runtime,
+    preflight_validate_artifacts,
+    validate_container_mounts,
+)
 from sflow.config.loader import ConfigLoader
+from sflow.core.command_log import (
+    CommandLogRouter,
+    reset_active_command_log_router,
+    set_active_command_log_router,
+)
+from sflow.core.execution_summary import SflowSummaryWriter
 from sflow.logging import add_log_file, get_logger
+from sflow.runtime_info import format_runtime_info
+from sflow.utils.container import (
+    extract_container_mounts_from_extra_args as _extract_container_mounts_from_extra_args,
+)
+from sflow.utils.gpu import parse_cuda_visible_devices
 
 if TYPE_CHECKING:
     from sflow.config.schema import SflowConfig
@@ -20,60 +39,8 @@ _logger = get_logger(__name__)
 
 
 def extract_container_mounts_from_extra_args(extra_args: list[str]) -> list[str]:
-    """
-    Extract --container-mounts values from extra_args.
-
-    Handles both formats:
-    - --container-mounts /path1:/path2
-    - --container-mounts=/path1:/path2
-
-    Multiple comma-separated mounts are split into individual entries.
-    """
-    mounts: list[str] = []
-    i = 0
-    while i < len(extra_args):
-        arg = extra_args[i]
-        if arg == "--container-mounts" and i + 1 < len(extra_args):
-            mounts.extend(extra_args[i + 1].split(","))
-            i += 2
-        elif arg.startswith("--container-mounts="):
-            mounts.extend(arg.split("=", 1)[1].split(","))
-            i += 1
-        else:
-            i += 1
-    return mounts
-
-
-def parse_cuda_visible_devices(cuda_visible: str | None) -> list[int]:
-    """
-    Parse CUDA_VISIBLE_DEVICES into a list of GPU indices.
-
-    Supports comma-separated indices and simple ranges like ``0-3``.
-    Non-numeric tokens are ignored.
-    """
-    if not cuda_visible:
-        return []
-
-    indices: list[int] = []
-    for part in str(cuda_visible).split(","):
-        token = part.strip()
-        if not token:
-            continue
-        if "-" in token:
-            start_s, end_s = token.split("-", 1)
-            try:
-                start_i = int(start_s)
-                end_i = int(end_s)
-            except ValueError:
-                continue
-            if start_i <= end_i:
-                indices.extend(range(start_i, end_i + 1))
-            continue
-        try:
-            indices.append(int(token))
-        except ValueError:
-            continue
-    return indices
+    """Extract --container-mounts values from extra_args."""
+    return _extract_container_mounts_from_extra_args(extra_args)
 
 
 def build_allocation_map_lines(tasks: list[Any], backends: dict[str, Any]) -> list[str]:
@@ -89,11 +56,6 @@ def build_allocation_map_lines(tasks: list[Any], backends: dict[str, Any]) -> li
                 seen.add(value)
                 out.append(value)
         return out
-
-    def _shorten(value: str, max_len: int = 18) -> str:
-        if len(value) <= max_len:
-            return value
-        return value[: max_len - 3] + "..."
 
     lines: list[str] = []
     for backend_name, backend in backends.items():
@@ -159,13 +121,43 @@ def build_allocation_map_lines(tasks: list[Any], backends: dict[str, Any]) -> li
             if num_gpus is not None and num_gpus > 0:
                 for gpu_idx in range(num_gpus):
                     owners = _unique_preserve(entry["gpu_owners"].get(gpu_idx, []))
-                    label = _shorten("/".join(owners) if owners else ".")
+                    label = " -> ".join(owners) if owners else "."
                     lines.append(f"    │  GPU {gpu_idx}: {label}")
             else:
                 lines.append("    │  GPUs: n/a")
             lines.append(
                 "    │  Tasks: " + (", ".join(task_names) if task_names else "(none)")
             )
+    return lines
+
+
+def build_resource_rehearsal_lines(tasks: list[Any]) -> list[str]:
+    """Build dry-run lines describing task resource release boundaries."""
+
+    def _resource_label(resource: str) -> str:
+        return "GPUs" if resource == "gpus" else resource
+
+    def _policy_description(resource: str, policy: str) -> str:
+        label = _resource_label(resource)
+        if policy == "task_ready":
+            return f"releases {label} after task readiness"
+        if policy == "task_completion":
+            return f"releases {label} after task completion"
+        if policy == "workflow_completion":
+            return f"keeps {label} until workflow completion"
+        return f"{label} release policy: {policy}"
+
+    lines: list[str] = []
+    for task in tasks:
+        release_after = getattr(task, "resource_release_after", None) or {}
+        if not release_after:
+            continue
+        parts = [
+            _policy_description(resource, policy)
+            for resource, policy in sorted(release_after.items())
+        ]
+        if parts:
+            lines.append(f"  - {task.name}: " + "; ".join(parts))
     return lines
 
 
@@ -224,6 +216,7 @@ class SflowApp:
         output_dir: Path | None = None,
         tui: bool = False,
         tui_log_buffer: deque[logging.LogRecord] | None = None,
+        tui_log_lock: threading.Lock | None = None,
         tui_refresh_per_second: int | None = None,
     ) -> Path | None:
         """
@@ -234,9 +227,6 @@ class SflowApp:
             or None for dry-run mode.
         """
         import asyncio
-        import secrets
-        from datetime import datetime
-
         if resume is not None:
             raise NotImplementedError("--resume is not implemented yet")
 
@@ -303,6 +293,9 @@ class SflowApp:
             received_signal: signal.Signals | None = None
             atexit_cleaned = False
             owned_allocation_ids: list[str] = []
+            summary_writer: SflowSummaryWriter | None = None
+            command_log_router: CommandLogRouter | None = None
+            command_log_token = None
 
             async def _ui_loop() -> None:
                 # Refresh at a higher rate than Orchestrator poll_interval so logs feel like tail -f.
@@ -335,40 +328,52 @@ class SflowApp:
                     workflow_name=config.workflow.name,
                     config=cfg,
                     log_buffer=tui_log_buffer,
+                    log_lock=tui_log_lock,
                     attach_log_handler=False if tui_log_buffer is not None else True,
                 )
 
-            ui_cm = ui if ui is not None else contextlib.nullcontext()
-            with ui_cm:
+            async with contextlib.AsyncExitStack() as cleanup_stack:
                 if ui is not None:
+                    await ui.start_async()
+                    cleanup_stack.push_async_callback(ui.stop_async)
                     ui.refresh()
                     ui_task = asyncio.create_task(_ui_loop())
 
-                # Workspace/output dirs are needed early for artifact resolution.
-                ws_dir = (
-                    Path(workspace_dir) if workspace_dir is not None else Path.cwd()
-                )
-                out_dir = (
-                    Path(output_dir)
-                    if output_dir is not None
-                    else ws_dir / "sflow_output"
-                )
+                    async def _stop_ui_loop() -> None:
+                        if ui_task is not None:
+                            ui_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await ui_task
 
-                # Compute workflow_out_dir early so inline file:// artifacts are
-                # written under the run output folder rather than the workspace.
-                if dry_run:
-                    workflow_out_dir = out_dir / "_dry_run" / config.workflow.name
-                else:
-                    run_id = f"{config.workflow.name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
-                    slurm_job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get(
-                        "SLURM_JOBID"
-                    )
-                    if slurm_job_id:
-                        run_id = f"{slurm_job_id}-{run_id}"
-                    workflow_out_dir = out_dir / run_id
+                    cleanup_stack.push_async_callback(_stop_ui_loop)
+
+                # Workspace/output dirs are needed early for artifact resolution.
+                run_paths = build_run_paths(
+                    workflow_name=config.workflow.name,
+                    dry_run=dry_run,
+                    workspace_dir=workspace_dir,
+                    output_dir=output_dir,
+                    slurm_job_id=os.environ.get("SLURM_JOB_ID")
+                    or os.environ.get("SLURM_JOBID"),
+                )
+                ws_dir = run_paths.workspace_dir
+                out_dir = run_paths.output_dir
+                workflow_out_dir = run_paths.workflow_output_dir
+
+                # Inline file:// artifacts are written under workflow_out_dir
+                # rather than the workspace when this is a real run.
+                if not dry_run:
                     self.last_workflow_output_dir = workflow_out_dir
                     out_dir.mkdir(parents=True, exist_ok=True)
                     workflow_out_dir.mkdir(parents=True, exist_ok=True)
+                    command_log_router = CommandLogRouter(workflow_out_dir)
+                    command_log_token = set_active_command_log_router(
+                        command_log_router
+                    )
+                    cleanup_stack.callback(
+                        reset_active_command_log_router,
+                        command_log_token,
+                    )
 
                 # -----------------------------------------------------------------
                 # Signal handling (SRD REQ-5.3)
@@ -397,98 +402,17 @@ class SflowApp:
                     except (NotImplementedError, RuntimeError):
                         # Not supported on some platforms / threads.
                         pass
+                if ui is not None:
+                    ui.set_interrupt_handler(lambda: _on_signal(signal.SIGINT))
 
                 # Pre-flight: validate artifact paths before allocation.
                 # fs:// artifacts must already exist; fail early so we never waste
                 # a Slurm allocation on a missing path.
-                def _preflight_validate_artifacts(
-                    artifact_configs: list | None,
-                    workspace_dir: Path,
-                    *,
-                    dry_run: bool = False,
-                ) -> list[str]:
-                    from urllib.parse import urlparse
-
-                    from sflow.core.artifact_registry import (
-                        resolve_file_like_uri_to_path,
-                    )
-
-                    raw_vars: dict[str, Any] = {}
-                    for v_conf in config.variables or []:
-                        if hasattr(v_conf, "name") and hasattr(v_conf, "value"):
-                            val = v_conf.value
-                            if val is not None and not (
-                                isinstance(val, str) and "${{" in val
-                            ):
-                                raw_vars[v_conf.name] = val
-
-                    errors: list[str] = []
-                    warnings: list[str] = []
-                    for a_conf in artifact_configs or []:
-                        uri = str(a_conf.uri)
-                        if "${{" in uri:
-                            import re as _re_art
-
-                            def _resolve_var(m: _re_art.Match) -> str:
-                                ref = m.group(1).strip()
-                                if ref.startswith("variables."):
-                                    name = ref[len("variables.") :]
-                                    if name in raw_vars:
-                                        return str(raw_vars[name])
-                                return m.group(0)
-
-                            uri = _re_art.sub(r"\$\{\{(.+?)\}\}", _resolve_var, uri)
-                            if "${{" in uri:
-                                continue
-                        try:
-                            scheme = (urlparse(uri).scheme or "").lower()
-                        except Exception:
-                            continue
-                        if scheme not in {"fs", "file"}:
-                            continue
-                        # file:// artifacts with inline content are generated at runtime
-                        # under the workflow output directory — no need to check existence.
-                        if (
-                            scheme == "file"
-                            and getattr(a_conf, "content", None) is not None
-                        ):
-                            continue
-                        try:
-                            resolved = resolve_file_like_uri_to_path(
-                                uri, workspace_dir=workspace_dir
-                            )
-                        except Exception:
-                            continue
-                        path_str = str(resolved)
-                        if "$" in path_str or "{" in path_str:
-                            continue
-                        if not resolved.exists():
-                            if scheme == "fs":
-                                if dry_run:
-                                    warnings.append(
-                                        f"Artifact '{a_conf.name}' (fs://) path does not exist: {resolved}"
-                                    )
-                                else:
-                                    errors.append(
-                                        f"Artifact '{a_conf.name}' (fs://) path does not exist: {resolved}"
-                                    )
-                            else:
-                                warnings.append(
-                                    f"Artifact '{a_conf.name}' (file://) path does not exist: {resolved}"
-                                )
-                    if errors:
-                        for e in errors:
-                            _logger.error(f"  ✗ {e}")
-                    if warnings and not dry_run:
-                        for w in warnings:
-                            _logger.warning(f"  ⚠ {w}")
-                    if errors:
-                        details = "\n".join(f"  - {e}" for e in errors)
-                        raise ValueError(f"Artifact path validation failed:\n{details}")
-                    return warnings
-
-                _artifact_warnings = _preflight_validate_artifacts(
-                    config.artifacts, ws_dir, dry_run=dry_run
+                _artifact_warnings = preflight_validate_artifacts(
+                    config.artifacts,
+                    config.variables,
+                    workspace_dir=ws_dir,
+                    dry_run=dry_run,
                 )
 
                 # build the state:
@@ -556,93 +480,17 @@ class SflowApp:
                 # -----------------------------------------------------------------
                 tg = state.workflow.task_graph
 
-                # -----------------------------------------------------------------
-                # Container mount hygiene for Slurm/Pyxis runs
-                # -----------------------------------------------------------------
-                # When using Pyxis containers, tasks typically run inside a container filesystem.
-                # Our built-in SFLOW_* env vars point at host paths (workspace/output dirs), so
-                # we must mount those host paths into the container at the same absolute paths.
-                #
-                # This is intentionally done here (after we compute SFLOW_* dirs) rather than in
-                # assembly, because assembly does not know the final output directory layout.
-                def _ensure_sflow_dir_mounts_for_srun_container(
-                    *,
-                    task: Any,
-                    ws_dir: Path,
-                    out_dir: Path,
-                    workflow_out_dir: Path,
-                    task_out_dir: Path,
-                ) -> None:
-                    try:
-                        op = getattr(task, "operator", None)
-                        op_conf = getattr(op, "config", None)
-                        if op_conf is None:
-                            return
-                        if getattr(op_conf, "type", None) != "srun":
-                            return
-                        # Only relevant when using a container (Pyxis flags).
-                        if not (
-                            getattr(op_conf, "container_image", None)
-                            or getattr(op_conf, "container_name", None)
-                        ):
-                            return
-
-                        def _mount_key(mount: str) -> tuple[str, str] | None:
-                            parts = str(mount).split(":", 2)
-                            if len(parts) < 2:
-                                return None
-                            return (parts[0], parts[1])
-
-                        existing_mounts = list(
-                            getattr(op_conf, "container_mounts", None) or []
-                        )
-                        existing_keys: set[tuple[str, str]] = set()
-                        for m in existing_mounts:
-                            k = _mount_key(m)
-                            if k is not None:
-                                existing_keys.add(k)
-
-                        auto_mounts: list[str] = []
-                        for p in (ws_dir, out_dir, workflow_out_dir, task_out_dir):
-                            src = str(p)
-                            dst = src  # preserve absolute path inside container
-                            key = (src, dst)
-                            if key in existing_keys:
-                                continue
-                            auto_mounts.append(f"{src}:{dst}:rw")
-                            existing_keys.add(key)
-
-                        if auto_mounts:
-                            setattr(
-                                op_conf,
-                                "container_mounts",
-                                existing_mounts + auto_mounts,
-                            )
-                    except Exception:
-                        # Best-effort only; do not break planning/execution due to mount inference.
-                        return
-
                 if not dry_run:
                     # Add a global sflow log file under the workflow output dir.
                     add_log_file(str(workflow_out_dir / "sflow.log"))
 
                 for t in tg.get_tasks():
-                    task_out_dir = workflow_out_dir / t.name
-                    if not dry_run:
-                        task_out_dir.mkdir(parents=True, exist_ok=True)
-
-                    t.envs.setdefault("SFLOW_WORKSPACE_DIR", str(ws_dir))
-                    t.envs.setdefault("SFLOW_OUTPUT_DIR", str(out_dir))
-                    t.envs.setdefault(
-                        "SFLOW_WORKFLOW_OUTPUT_DIR", str(workflow_out_dir)
-                    )
-                    t.envs.setdefault("SFLOW_TASK_OUTPUT_DIR", str(task_out_dir))
-                    _ensure_sflow_dir_mounts_for_srun_container(
-                        task=t,
+                    task_out_dir = configure_task_runtime(
+                        t,
                         ws_dir=ws_dir,
                         out_dir=out_dir,
                         workflow_out_dir=workflow_out_dir,
-                        task_out_dir=task_out_dir,
+                        dry_run=dry_run,
                     )
 
                     if not dry_run:
@@ -669,45 +517,7 @@ class SflowApp:
                     order = tg.dag.topological_sort()
 
                     # Validate container mount paths (REQ: warn users about invalid mounts)
-                    def _validate_container_mounts(
-                        tasks: list, *, sflow_output_dir: Path
-                    ) -> list[str]:
-                        """Check if container mount source paths exist on the filesystem."""
-                        warnings: list[str] = []
-                        sflow_out_str = str(sflow_output_dir)
-                        for task in tasks:
-                            op = getattr(task, "operator", None)
-                            op_conf = getattr(op, "config", None)
-                            if op_conf is None:
-                                continue
-
-                            # Check srun container_mounts
-                            mounts = getattr(op_conf, "container_mounts", None) or []
-                            # Also check docker mounts
-                            if not mounts:
-                                mounts = getattr(op_conf, "mounts", None) or []
-
-                            for mount_spec in mounts:
-                                # Mount format: /host/path:/container/path[:options]
-                                parts = str(mount_spec).split(":", 2)
-                                if len(parts) < 2:
-                                    continue
-                                host_path = parts[0]
-                                if not host_path:
-                                    continue
-                                # Skip environment variable references (not resolvable at plan time)
-                                if "$" in host_path or "{" in host_path:
-                                    continue
-                                # Skip auto-generated sflow output directories (created at runtime)
-                                if host_path.startswith(sflow_out_str):
-                                    continue
-                                if not Path(host_path).exists():
-                                    warnings.append(
-                                        f"Task '{task.name}': mount source path does not exist: {host_path}"
-                                    )
-                        return warnings
-
-                    mount_warnings = _validate_container_mounts(
+                    mount_warnings = validate_container_mounts(
                         plan_tasks, sflow_output_dir=out_dir
                     )
                     if mount_warnings:
@@ -850,6 +660,15 @@ class SflowApp:
                         _logger.info("")
                         _logger.info("Allocation map (finalized node/GPU assignment):")
                         for line in allocation_map_lines:
+                            _logger.info(line)
+
+                    resource_rehearsal_lines = build_resource_rehearsal_lines(
+                        [tg.get_task(name) for name in order]
+                    )
+                    if resource_rehearsal_lines:
+                        _logger.info("")
+                        _logger.info("Resource release rehearsal:")
+                        for line in resource_rehearsal_lines:
                             _logger.info(line)
 
                     all_mounts: set[str] = set()
@@ -1076,35 +895,7 @@ class SflowApp:
                         _logger.info("=" * 60)
 
                     # Check enroot credentials for srun operators using containers
-                    def _check_enroot_credentials(tasks: list) -> str | None:
-                        """Warn if any srun task uses a container but enroot credentials are missing."""
-                        uses_container = False
-                        for task in tasks:
-                            op_conf = getattr(
-                                getattr(task, "operator", None), "config", None
-                            )
-                            if op_conf is None:
-                                continue
-                            if getattr(op_conf, "type", None) != "srun":
-                                continue
-                            if getattr(op_conf, "container_image", None) or getattr(
-                                op_conf, "container_name", None
-                            ):
-                                uses_container = True
-                                break
-                        if not uses_container:
-                            return None
-                        creds_path = Path.home() / ".config" / "enroot" / ".credentials"
-                        if not creds_path.exists():
-                            return (
-                                f"srun operator uses container images but enroot credentials "
-                                f"file not found at {creds_path}. "
-                                f"Container pulls from authenticated registries (e.g. nvcr.io) "
-                                f"may fail. See: https://github.com/NVIDIA/enroot/blob/master/doc/cmd/import.md"
-                            )
-                        return None
-
-                    enroot_warning = _check_enroot_credentials(plan_tasks)
+                    enroot_warning = check_enroot_credentials(plan_tasks)
                     if enroot_warning:
                         _logger.warning(f"  ⚠ {enroot_warning}")
 
@@ -1128,8 +919,37 @@ class SflowApp:
 
                 # run the workflow and always release backend allocations
                 try:
-                    orch = Orchestrator(workflow=state.workflow, poll_interval=1)
+                    if not dry_run:
+                        command_log_paths = (
+                            command_log_router.planned_paths()
+                            if command_log_router is not None
+                            else {}
+                        )
+                        summary_writer = SflowSummaryWriter(
+                            workflow_out_dir / "sflow_summary.log"
+                        )
+                        summary_writer.start(
+                            workflow=state.workflow,
+                            output_dir=workflow_out_dir,
+                            runtime_info_text=format_runtime_info(),
+                            command_log_paths=command_log_paths,
+                        )
+
+                    orch = Orchestrator(
+                        workflow=state.workflow,
+                        poll_interval=1,
+                        execution_summary=summary_writer,
+                    )
                     await orch.run()
+                    # Give any loop-level signal callback queued during the final
+                    # orchestrator turn a chance to set received_signal before
+                    # task-status post-processing.
+                    await asyncio.sleep(0)
+
+                    if received_signal is not None:
+                        if received_signal == signal.SIGINT:
+                            raise KeyboardInterrupt()
+                        raise SystemExit(128 + int(received_signal))
 
                     # Determine overall success based on final task statuses (not just "orchestrator returned").
                     from sflow.core.task import TaskStatus
@@ -1143,14 +963,34 @@ class SflowApp:
                     cancelled = [t for t in tasks if t.status == TaskStatus.CANCELLED]
                     if failed:
                         names = ", ".join(t.name for t in failed)
+                        detail = (
+                            f"Workflow '{config.workflow.name}' failed: "
+                            f"{len(failed)} task(s) failed ({names})"
+                        )
+                        if summary_writer is not None:
+                            summary_writer.workflow_finished(
+                                status="FAILED", detail=detail
+                            )
                         raise RuntimeError(
-                            f"Workflow '{config.workflow.name}' failed: {len(failed)} task(s) failed ({names})"
+                            detail
                         )
                     # Treat cancellations as non-success (covers fail-fast dependents and future user-cancel).
                     if cancelled:
                         names = ", ".join(t.name for t in cancelled)
+                        detail = (
+                            f"Workflow '{config.workflow.name}' cancelled: "
+                            f"{len(cancelled)} task(s) cancelled ({names})"
+                        )
+                        if summary_writer is not None:
+                            summary_writer.workflow_finished(
+                                status="CANCELLED", detail=detail
+                            )
+                        if received_signal is not None:
+                            if received_signal == signal.SIGINT:
+                                raise KeyboardInterrupt()
+                            raise SystemExit(128 + int(received_signal))
                         raise RuntimeError(
-                            f"Workflow '{config.workflow.name}' cancelled: {len(cancelled)} task(s) cancelled ({names})"
+                            detail
                         )
                 finally:
                     # Always attempt to release owned backend allocations.
@@ -1162,10 +1002,6 @@ class SflowApp:
                         for sig in installed_signals:
                             with suppress(Exception):
                                 loop.remove_signal_handler(sig)
-                    if ui_task is not None:
-                        ui_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await ui_task
                     if ui is not None:
                         ui.refresh()
 

@@ -123,11 +123,13 @@ class BackendConfig(BaseModel):
     default: bool = False
     # If set, this value will be used to populate ComputeNode.num_gpus for all nodes
     # returned by this backend allocation. This enables better GPU packing/validation.
+    # `0` is allowed and means "CPU-only" (tasks requesting GPUs will be rejected
+    # downstream with a clear error).
     gpus_per_node: Optional[Resolvable[int]] = None
 
     @field_validator("gpus_per_node")
     @classmethod
-    def gpu_per_node_must_be_positive_if_concrete(cls, v: Any) -> Any:
+    def gpu_per_node_must_be_non_negative_if_concrete(cls, v: Any) -> Any:
         # Allow unresolved expressions; validate concrete ints only.
         if v is None or is_expression(v):
             return v
@@ -137,8 +139,8 @@ class BackendConfig(BaseModel):
             raise ValueError(
                 f"gpus_per_node must be an int or expression, got {v!r}"
             ) from e
-        if iv <= 0:
-            raise ValueError(f"gpus_per_node must be > 0, got {iv}")
+        if iv < 0:
+            raise ValueError(f"gpus_per_node must be >= 0, got {iv}")
         return iv
 
 
@@ -253,12 +255,21 @@ class OutputConfig(StrictBaseModel):
     metrics: Optional[Dict[str, OutputMetricConfig]] = None
 
 
+class ResourceReleaseAfter(str, Enum):
+    """When a task-level resource reservation can be reused."""
+
+    WORKFLOW_COMPLETION = "workflow_completion"
+    TASK_READY = "task_ready"
+    TASK_COMPLETION = "task_completion"
+
+
 class NodeResourceConfig(StrictBaseModel):
     """Node resource configuration for a task."""
 
     indices: Optional[Union[List[Resolvable[int]], str]] = None  # Can be [0, 1], ["${{ ... }}"], or "${{ ... }}" resolving to a list
     count: Optional[Resolvable[int]] = None  # Can be int or expression
     exclude: Optional[Union[List[Resolvable[int]], Resolvable[int]]] = None
+    release_after: ResourceReleaseAfter = ResourceReleaseAfter.WORKFLOW_COMPLETION
 
     @field_validator("indices")
     @classmethod
@@ -274,6 +285,7 @@ class GpuResourceConfig(StrictBaseModel):
     """GPU resource configuration for a task."""
 
     count: Resolvable[int]  # Can be int or expression like "${{ variables.GPU_COUNT }}"
+    release_after: ResourceReleaseAfter = ResourceReleaseAfter.WORKFLOW_COMPLETION
 
 
 class ResourcesConfig(StrictBaseModel):

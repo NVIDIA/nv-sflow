@@ -11,6 +11,7 @@ import pytest
 
 from sflow.app.sflow import (
     build_allocation_map_lines,
+    build_resource_rehearsal_lines,
     extract_container_mounts_from_extra_args,
     parse_cuda_visible_devices,
 )
@@ -163,3 +164,60 @@ class TestBuildAllocationMapLines:
         assert "Tasks: prefill_0, decode_0, frontend" in rendered
         assert "GPU 0: decode_1" in rendered
         assert "GPU 3: decode_1" in rendered
+
+    def test_does_not_truncate_long_gpu_owner_names(self):
+        backend = SimpleNamespace(
+            allocation=Allocation(
+                allocation_id="job-2",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0, num_gpus=1),
+                ],
+            )
+        )
+        tasks = [
+            SimpleNamespace(
+                name="check_entire_env",
+                backend_name="slurm_cluster",
+                assigned_nodes=["n1"],
+                envs={"CUDA_VISIBLE_DEVICES": "0"},
+                operator=None,
+            ),
+            SimpleNamespace(
+                name="worker_0",
+                backend_name="slurm_cluster",
+                assigned_nodes=["n1"],
+                envs={"CUDA_VISIBLE_DEVICES": "0"},
+                operator=None,
+            ),
+        ]
+
+        rendered = "\n".join(
+            build_allocation_map_lines(tasks, {"slurm_cluster": backend})
+        )
+
+        assert "GPU 0: check_entire_env -> worker_0" in rendered
+        assert "check_entire_en..." not in rendered
+
+
+class TestBuildResourceRehearsalLines:
+    def test_describes_release_policies_as_lifecycle_actions(self):
+        tasks = [
+            SimpleNamespace(
+                name="check_entire_env",
+                resource_release_after={"gpus": "task_completion"},
+            ),
+            SimpleNamespace(
+                name="server",
+                resource_release_after={
+                    "gpus": "task_ready",
+                    "nodes": "workflow_completion",
+                },
+            ),
+        ]
+
+        lines = build_resource_rehearsal_lines(tasks)
+
+        assert lines == [
+            "  - check_entire_env: releases GPUs after task completion",
+            "  - server: releases GPUs after task readiness; keeps nodes until workflow completion",
+        ]

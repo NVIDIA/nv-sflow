@@ -68,6 +68,31 @@ class _ControlledReadinessProbe(Probe):
         return self._results.pop(0) if self._results else False
 
 
+class _RecordingSummary:
+    def __init__(self):
+        self.ready: list[str] = []
+        self.failed: list[tuple[str, str | None]] = []
+        self.cancelled: list[tuple[str, str | None]] = []
+
+    def task_unblocked(self, task, **kwargs):
+        pass
+
+    def task_submitted(self, task, **kwargs):
+        pass
+
+    def task_ready(self, task, **kwargs):
+        self.ready.append(task.name)
+
+    def task_failed(self, task, *, reason=None, **kwargs):
+        self.failed.append((task.name, reason))
+
+    def task_cancelled(self, task, *, reason=None, **kwargs):
+        self.cancelled.append((task.name, reason))
+
+    def workflow_finished(self, **kwargs):
+        pass
+
+
 def test_multiple_readiness_probes_require_all_to_trigger():
     """A task is ready only after every readiness probe has triggered."""
     tg = TaskGraph()
@@ -83,11 +108,13 @@ def test_multiple_readiness_probes_require_all_to_trigger():
     )
     tg.dag.add_node("server", server)
 
+    summary = _RecordingSummary()
     orch = Orchestrator(
         workflow=wf,
         poll_interval=0.01,
         launcher=_HangingLauncher(),
         fail_fast=True,
+        execution_summary=summary,
     )
 
     asyncio.run(orch._run_probe(first_probe, server))
@@ -101,6 +128,7 @@ def test_multiple_readiness_probes_require_all_to_trigger():
     asyncio.run(orch._run_probe(second_probe, server))
     assert second_probe.status == ProbeStatus.TRIGGERED
     assert server.status == TaskStatus.READY
+    assert summary.ready == ["server"]
 
 
 def test_failure_probe_sets_failed_by_probe_and_cancels_workflow(tmp_path: Path):
@@ -125,11 +153,13 @@ def test_failure_probe_sets_failed_by_probe_and_cancels_workflow(tmp_path: Path)
     tg.dag.add_node("bench", bench)
     tg.dag.add_edge("server", "bench")
 
+    summary = _RecordingSummary()
     orch = Orchestrator(
         workflow=wf,
         poll_interval=0.01,
         launcher=_HangingLauncher(),
         fail_fast=True,
+        execution_summary=summary,
     )
 
     asyncio.run(asyncio.wait_for(orch.run(), timeout=10))
@@ -137,6 +167,8 @@ def test_failure_probe_sets_failed_by_probe_and_cancels_workflow(tmp_path: Path)
     assert server.status == TaskStatus.FAILED
     assert server.failed_by_probe is True
     assert bench.status == TaskStatus.CANCELLED
+    assert summary.failed == [("server", "failure probe")]
+    assert summary.cancelled == [("bench", "fail-fast")]
 
 
 class _LogCapture(logging.Handler):

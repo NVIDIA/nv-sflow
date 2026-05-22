@@ -12,6 +12,7 @@ from typing import Mapping, Optional
 from sflow.logging import get_logger
 
 from .command import Command, format_command
+from .command_log import record_active_command
 
 _logger = get_logger(__name__)
 
@@ -113,6 +114,7 @@ class SubprocessLauncher:
                 env=proc_env,
                 close_fds=True,
             )
+            record_active_command(command, task_name=task_name, shell=shell)
         except Exception as e:
             os.close(master_fd)
             os.close(slave_fd)

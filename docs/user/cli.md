@@ -10,8 +10,13 @@ sidebar_position: 11
 - `sflow batch` – Generate sbatch script for Slurm batch mode
 - `sflow visualize` – Visualize workflow DAG
 - `sflow sample` – List and copy sample workflows
+- `sflow skill` – Copy bundled AI-agent skills for writing and debugging sflow YAML
 
 > Note: `--resume` / `--task` are currently marked as not implemented in code and will error immediately.
+
+Global option:
+
+- `sflow --version` / `sflow -V`: print executable/runtime details, including package version, binary path, Python path, install mode, source label, repo path when known, and git branch/commit when available
 
 ## sflow run
 
@@ -32,18 +37,23 @@ Common options:
 - `--row <selector>`: required with `--bulk-input`; `sflow run` accepts exactly one row selector
 - `--workspace-dir <dir>`: workspace root directory (default: current directory)
 - `--output-dir <dir>`: output root directory (default: `<workspace-dir>/sflow_output`)
+- `--tui-refresh <fps>`: TUI refresh rate in frames per second (default: `2`, minimum: `1`)
 - `--log-level <level>`: `debug|info|warning|error|critical` (default: `info`)
+- `--verbose, -v`: enable verbose output
 
 Notes:
 
 - `--tui` is ignored in `--dry-run` mode.
 - In `--tui` mode, logs are captured and rendered in the right pane (to avoid interleaving console logs with the live UI).
+- Each run logs the same executable/runtime details shown by `sflow --version`, which helps identify whether a local editable checkout, branch build, or release package is running.
 - CSV paths in `sflow_config_file` are resolved relative to the CSV file. CLI `-f` files are prepended to the row's files and deduplicated by resolved path.
 - `--row=-1` selects the last CSV row, `--row=-2` the second-to-last, etc. Use the `--row=N` form for negative rows so Typer does not treat the value as a flag.
 
 Output structure (non dry-run):
 
 - `<output-dir>/<run_id>/sflow.log`: global log
+- `<output-dir>/<run_id>/sflow_summary.log`: live execution summary, updated during the run and finalized on completion or failure
+- `<output-dir>/<run_id>/*_cmds.log`: command-only launch logs, grouped by command family when commands are executed
 - `<output-dir>/<run_id>/<task>/<task>.log`: per-task log
 
 ## sflow visualize
@@ -146,7 +156,7 @@ Common options:
 - `--account, -A <name>`: Slurm account (auto-detected if not specified)
 - `--time <limit>`: time limit (e.g., `02:00:00`)
 - `--nodes, -N <count>`: number of nodes. If omitted, single-job and bulk-submit modes derive it from the config's Slurm backend `nodes` field. Bulk-input mode requires either this flag or a CSV node-count column (`SLURM_NODES`, `NUM_SLURM_NODES`, or `NUM_NODES`).
-- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation, not as a sbatch directive. Use `-e '--gpus-per-node=N'` if your cluster requires the sbatch directive.
+- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation and planning only, not as a Slurm directive. Use `-e '--gpus-per-node=N'` for `sflow batch`, or backend `extra_args` for `sflow run`, if your cluster requires the Slurm allocation flag.
 - `--job-name, -J <name>`: Slurm job name (default: `sflow`)
 - `--set, -s KEY=VALUE`: override variables (repeatable)
 - `--artifact, -a NAME=URI`: override artifacts (repeatable)
@@ -178,7 +188,7 @@ Common options:
 
 ### Notes
 
-- A dry-run validation is performed before generating each sbatch script. CLI `--nodes` and `--gpus-per-node` are applied directly to the slurm backend during validation.
+- A dry-run validation is performed before generating each sbatch script. CLI `--nodes` and `--gpus-per-node` are applied directly to the slurm backend during validation; `--gpus-per-node` still only describes topology unless also passed as an explicit sbatch extra arg.
 - Sbatch stdout/stderr logs are automatically copied into the sflow workflow output directory at the end of each generated script.
 - Without `--submit`, a hint is shown to remind you to add `--submit` for actual submission.
 
@@ -229,3 +239,27 @@ Common options:
 - `--output, -o <path>`: output path (default: `./<sample_name>`)
 - `--force, -f`: overwrite existing file/folder if it exists
 - `--list, -l`: list all available samples
+
+## sflow skill
+
+Copy bundled AI-agent skills into a project. These skills help coding agents write sflow YAML and diagnose workflow errors.
+
+```bash
+# List available skills
+sflow skill --list
+
+# Copy skills to ./skills
+sflow skill
+
+# Copy to a custom skills directory
+sflow skill --output .cursor/skills
+
+# Overwrite existing bundled skill files
+sflow skill --force
+```
+
+Common options:
+
+- `--output, -o <dir>`: output directory (default: `./skills`)
+- `--force, -f`: overwrite existing files when merging into an existing directory
+- `--list, -l`: list available bundled skills

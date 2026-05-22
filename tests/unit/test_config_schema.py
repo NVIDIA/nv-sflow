@@ -104,6 +104,80 @@ class TestSflowConfigSchema:
         assert config.workflow.tasks[1].depends_on == ["other_task"]
         assert config.backends[0].default is True
 
+    def test_resource_release_after_accepts_independent_node_and_gpu_policies(self):
+        """resources.nodes/gpus.release_after should allow different policies."""
+        config = SflowConfig.model_validate({
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {
+                        "name": "t1",
+                        "script": ["echo 1"],
+                        "resources": {
+                            "nodes": {
+                                "indices": [0],
+                                "release_after": "workflow_completion",
+                            },
+                            "gpus": {
+                                "count": 8,
+                                "release_after": "task_completion",
+                            },
+                        },
+                    }
+                ],
+            },
+        })
+
+        resources = config.workflow.tasks[0].resources
+        assert resources.nodes.release_after == "workflow_completion"
+        assert resources.gpus.release_after == "task_completion"
+
+    def test_resource_release_after_defaults_to_workflow_completion(self):
+        """Unannotated resources retain the current conservative lifetime."""
+        config = SflowConfig.model_validate({
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {
+                        "name": "t1",
+                        "script": ["echo 1"],
+                        "resources": {
+                            "nodes": {"count": 1},
+                            "gpus": {"count": 1},
+                        },
+                    }
+                ],
+            },
+        })
+
+        resources = config.workflow.tasks[0].resources
+        assert resources.nodes.release_after == "workflow_completion"
+        assert resources.gpus.release_after == "workflow_completion"
+
+    def test_resource_release_after_rejects_invalid_policy(self):
+        """release_after only accepts documented resource lifetime policies."""
+        with pytest.raises(ValidationError, match="release_after"):
+            SflowConfig.model_validate({
+                "version": "0.1",
+                "workflow": {
+                    "name": "wf",
+                    "tasks": [
+                        {
+                            "name": "t1",
+                            "script": ["echo 1"],
+                            "resources": {
+                                "gpus": {
+                                    "count": 1,
+                                    "release_after": "after_launch",
+                                },
+                            },
+                        }
+                    ],
+                },
+            })
+
     def test_variable_config(self):
         """
         REQ-1.3: Variable System. Support strongly typed variables.

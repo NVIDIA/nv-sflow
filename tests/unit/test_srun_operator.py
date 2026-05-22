@@ -7,8 +7,8 @@ from pydantic import ValidationError
 from sflow.plugins.operators.srun import (
     SrunOperator,
     SrunOperatorConfig,
-    _is_valid_container_image,
 )
+from sflow.utils.container import is_valid_container_image
 
 
 def test_srun_operator_supports_pyxis_container_image_flags_and_common_args():
@@ -251,7 +251,7 @@ def test_srun_operator_container_mounts_only_from_extra_args():
     ],
 )
 def test_valid_container_images(image: str):
-    assert _is_valid_container_image(image), f"Expected valid: {image}"
+    assert is_valid_container_image(image), f"Expected valid: {image}"
 
 
 @pytest.mark.parametrize(
@@ -265,7 +265,7 @@ def test_valid_container_images(image: str):
     ],
 )
 def test_invalid_container_images(image: str):
-    assert not _is_valid_container_image(image), f"Expected invalid: {image}"
+    assert not is_valid_container_image(image), f"Expected invalid: {image}"
 
 
 def test_srun_operator_rejects_invalid_container_image():

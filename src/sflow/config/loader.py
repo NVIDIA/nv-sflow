@@ -9,8 +9,8 @@ from pydantic import ValidationError
 
 from fnmatch import fnmatch
 
-from sflow.config.resolver import ExpressionResolver
 from sflow.logging import get_logger
+from sflow.resolution import ExpressionResolver
 
 from .schema import SflowConfig
 
@@ -114,6 +114,60 @@ def _tasks_to_list(tasks: Any) -> list:
             for k, v in tasks.items()
         ]
     return []
+
+
+def _render_plain_scalar(value: Any) -> str:
+    """Render simple YAML scalar values back to their plain text form."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _normalize_script_plain_mappings(config_data: Dict[str, Any]) -> None:
+    """Recover script commands that YAML parsed as mappings due to ``: ``.
+
+    YAML treats an unquoted list item like ``- echo "x: y"`` as a mapping.
+    ``script`` only accepts command strings, so a one-entry mapping there is
+    interpreted as the original shell line rather than a structured object.
+    """
+    workflow = config_data.get("workflow")
+    if not isinstance(workflow, dict):
+        return
+
+    tasks = workflow.get("tasks")
+    if isinstance(tasks, list):
+        task_items = tasks
+    elif isinstance(tasks, dict):
+        task_items = tasks.values()
+    else:
+        return
+
+    for task in task_items:
+        if not isinstance(task, dict):
+            continue
+        script = task.get("script")
+        if not isinstance(script, list):
+            continue
+
+        normalized: list[Any] = []
+        changed = False
+        for item in script:
+            if isinstance(item, dict) and len(item) == 1:
+                key, value = next(iter(item.items()))
+                if not isinstance(value, (dict, list)):
+                    rendered_value = _render_plain_scalar(value)
+                    suffix = f" {rendered_value}" if rendered_value else ""
+                    normalized.append(f"{key}:{suffix}")
+                    changed = True
+                    continue
+            normalized.append(item)
+
+        if changed:
+            task["script"] = normalized
 
 
 def _extract_value(entry: Any) -> Any:
@@ -359,6 +413,8 @@ class ConfigLoader:
         if config_data is None:
             raise ValueError(f"Configuration file is empty: {path}")
 
+        _normalize_script_plain_mappings(config_data)
+
         syntax = self._resolver.validate_syntax(config_data, location=str(path))
         if not syntax.valid:
             details = "\n".join(str(e) for e in syntax.errors)
@@ -418,6 +474,8 @@ class ConfigLoader:
                 raise ValueError(f"Error parsing YAML configuration ({path}): {e}")
             if data is None:
                 raise ValueError(f"Configuration file is empty: {path}")
+
+            _normalize_script_plain_mappings(data)
 
             syntax = self._resolver.validate_syntax(data, location=str(path))
             if not syntax.valid:

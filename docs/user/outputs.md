@@ -12,10 +12,39 @@ Default output root is `./sflow_output/` (relative to `--workspace-dir`, default
 For a real run (non dry-run):
 
 - `<output_dir>/<run_id>/sflow.log`: global sflow log
+- `<output_dir>/<run_id>/sflow_summary.log`: live execution summary, updated during the run and finalized when the workflow exits
+- `<output_dir>/<run_id>/*_cmds.log`: command-only launch logs, grouped by command family such as `bash`, `slurm`, `docker`, `ssh`, or `python`
 - `<output_dir>/<run_id>/<task>/<task>.log`: per-task log
 - `<output_dir>/<run_id>/...`: anything your scripts write
 
 Dry-run does not `mkdir` anything; it only prints planned output paths.
+
+After a successful run, `sflow run` prints the output folder, summary path, and any command-log paths. When a run fails or is interrupted after the workflow output directory exists, the same paths are printed on the error path so you can jump straight to diagnostics.
+
+## Execution summary
+
+`sflow_summary.log` is a terminal-friendly status report for the whole run. It is useful for quick triage because it collects the most important details in one place:
+
+- workflow status, start/end time, duration, output directory, and task counts
+- executable/runtime details, including package version, binary path, Python path, install mode, repo path, and git branch/commit when available
+- task duration timeline and task event timeline
+- GPU and node usage charts when resource placement data exists
+- command-log paths
+- workflow DAG and dependency list
+- failure hints with task name, attempts, reason, and task log path when a task fails or is cancelled
+
+## Command logs
+
+Command logs record launch commands without mixing in task stdout/stderr. They are grouped by command family and written only when matching commands are executed:
+
+- `slurm_cmds.log` for `salloc`, `srun`, `scontrol`, `scancel`, and `sbatch`
+- `bash_cmds.log` for `bash` / `sh`
+- `docker_cmds.log` for Docker commands
+- `ssh_cmds.log` for SSH commands
+- `python_cmds.log` for Python commands
+- `backend_cmds.log` for other backend commands
+
+Each entry includes a timestamp, command family, task name when applicable, whether it used a shell, and the formatted command. Use these logs to reproduce launch commands or verify generated Slurm/container flags without scanning full task logs.
 
 ## Built-in env vars
 
