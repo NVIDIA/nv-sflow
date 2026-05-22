@@ -227,6 +227,10 @@ agent_scratchpad
 tools
 sflow_output
 .sflow_cache
+docs-site/.generated/
+docs-site/versioned_docs/
+docs-site/versioned_sidebars/
+docs-site/versions.json
 sflow_compute_node_venv/
 logs/
 workflow_outputs/

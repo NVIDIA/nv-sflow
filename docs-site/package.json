@@ -3,8 +3,11 @@
   "private": true,
   "version": "0.0.0",
   "scripts": {
-    "start": "docusaurus start --host 0.0.0.0 --port 3000",
-    "build": "docusaurus build",
+    "prepare:versions": "node scripts/prepare-versioned-docs.js",
+    "test:versions": "node --test scripts/prepare-versioned-docs.test.js",
+    "build:site": "docusaurus build",
+    "start": "npm run prepare:versions && docusaurus start --host 0.0.0.0 --port 3000",
+    "build": "npm run prepare:versions && npm run build:site",
     "serve": "docusaurus serve --host 0.0.0.0 --port 3000",
     "clear": "docusaurus clear"
   },

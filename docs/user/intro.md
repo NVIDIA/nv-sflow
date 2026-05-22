@@ -15,6 +15,16 @@ The current focus is **Slurm**, which — unlike Kubernetes or Docker — lacks 
 
 ![sflow TUI](/img/sflow_tui.gif)
 
+## Docs versions
+
+The docs site version selector intentionally shows only maintained documentation streams:
+
+- **`develop`**: verified pre-release documentation for tested features that are queued for the next release.
+- **`main`**: stable documentation aligned with the latest released state.
+- **`vX.Y.Z` release tags**: immutable documentation snapshots for a specific release.
+
+Both `develop` and `main` are kept up to date. Use `main` or a release tag for production/stable behavior, and use `develop` when validating upcoming tested features before the next release.
+
 ## Use Cases
 
 ### Complex Slurm Workflows
