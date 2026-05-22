@@ -3,13 +3,18 @@
 const path = require("path");
 const fs = require("fs");
 
-function readReleasedDocVersions() {
+function readVersionedDocIds() {
   try {
     const p = path.resolve(__dirname, "versions.json");
     return JSON.parse(fs.readFileSync(p, "utf8"));
   } catch {
     return [];
   }
+}
+
+function currentDocsPath() {
+  const generated = path.resolve(__dirname, ".generated", "current-docs");
+  return fs.existsSync(generated) ? generated : path.resolve(__dirname, "..", "docs");
 }
 
 const baseUrl = process.env.DOCS_BASE_URL || "/";
@@ -41,16 +46,22 @@ const config = {
       /** @type {import('@docusaurus/preset-classic').Options} */
       ({
         docs: {
-          // Reuse the existing markdown under repo-level docs/
-          path: path.resolve(__dirname, "..", "docs"),
+          // Builds use generated docs from the develop branch. Local dev falls
+          // back to the repo-level docs/ directory if generation has not run.
+          path: currentDocsPath(),
           routeBasePath: "docs",
           sidebarPath: require.resolve("./sidebars.js"),
-          // Keep current (unreleased) docs at /docs/... so existing links don't break.
-          // Released versions will live under /docs/<version>/...
+          // Keep develop docs at /docs/... so existing links don't break.
+          // Main and released tags live under /docs/<version>/...
           lastVersion: "current",
           versions: {
             current: {
-              label: "dev",
+              label: "develop",
+              banner: "none",
+            },
+            main: {
+              label: "main",
+              banner: "none",
             },
           },
           showLastUpdateAuthor: false,
@@ -74,20 +85,22 @@ const config = {
     [
       "@docusaurus/plugin-client-redirects",
       {
-        // Add a stable alias path for "dev" so /docs/dev/... redirects to /docs/...
-        // This is useful for sharing links that always target the latest docs.
+        // Add a stable alias path for "develop" so /docs/develop/... redirects to /docs/...
+        // This is useful for sharing links that explicitly target develop docs.
         createRedirects(existingPath) {
-          // Only alias CURRENT docs, not released versions (e.g. /docs/0.1/...).
-          const released = new Set(readReleasedDocVersions());
+          // Only alias CURRENT docs, not versioned docs (e.g. /docs/main/...).
+          const versioned = new Set(readVersionedDocIds());
           const parts = existingPath.split("/").filter(Boolean); // ["docs", ...]
           if (parts[0] !== "docs") return undefined;
-          if (parts.length >= 2 && released.has(parts[1])) return undefined;
+          if (parts.length >= 2 && versioned.has(parts[1])) return undefined;
 
-          // Alias /docs/<...> => /docs/dev/<...>
-          return [existingPath.replace(/^\/docs(\/|$)/, "/docs/dev$1")];
+          // Alias /docs/<...> => /docs/develop/<...>
+          return [existingPath.replace(/^\/docs(\/|$)/, "/docs/develop$1")];
         },
-        // /docs is not a real route by default; redirect to an existing doc page.
-        redirects: [{ from: "/docs/dev", to: "/docs/user/intro" }],
+        redirects: [
+          // /docs is not a real route by default; redirect to an existing doc page.
+          { from: "/docs/develop", to: "/docs/user/intro" },
+        ],
       },
     ],
   ],
