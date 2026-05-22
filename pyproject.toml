@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=69.0.0", "wheel"]
+requires = ["setuptools>=69.0.0", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sflow"
-version = "0.2.3.dev0+develop.48a51ab"
+dynamic = ["version"]
 description = "A Python CLI tool designed to automate and manage benchmarking workflows on multiple backends."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.11.10",
     "pyyaml>=6.0.3",
     "rich>=13.7.0",
+    "textual>=8.2.7",
     "typer>=0.19.2",
 ]
 
@@ -51,6 +52,9 @@ dev = [
     "pytest-cov>=7.0.0",
     "pytest-subprocess>=1.5.3",
 ]
+
+[tool.setuptools_scm]
+version_file = "src/sflow/_version.py"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
