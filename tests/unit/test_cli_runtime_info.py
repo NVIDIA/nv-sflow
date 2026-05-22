@@ -130,6 +130,30 @@ def test_format_runtime_info_reports_local_direct_url(monkeypatch, tmp_path):
     assert "source  : local build" in info
 
 
+def test_format_runtime_info_reports_vcs_direct_url_source(monkeypatch):
+    class FakeDistribution:
+        def read_text(self, name):
+            assert name == "direct_url.json"
+            return (
+                '{"url": "https://github.com/NVIDIA/nv-sflow.git", '
+                '"vcs_info": {"vcs": "git", "requested_revision": "develop", '
+                '"commit_id": "0858dce39"}}'
+            )
+
+    monkeypatch.setattr(
+        runtime_info.importlib_metadata,
+        "distribution",
+        lambda _name: FakeDistribution(),
+    )
+    monkeypatch.setattr(runtime_info, "_git_info_for_repo", lambda _repo: "")
+
+    info = runtime_info.format_runtime_info()
+
+    assert "install : direct-url" in info
+    assert "source  : https://github.com/NVIDIA/nv-sflow.git@develop" in info
+    assert "repo    :" not in info
+
+
 def test_format_runtime_info_reports_imported_repo_source_as_editable(
     monkeypatch, tmp_path
 ):

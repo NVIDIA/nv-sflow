@@ -46,6 +46,24 @@ def _path_from_file_url(url: str | None) -> str | None:
     return unquote(parsed.path)
 
 
+def _vcs_source_url(direct_url: dict) -> str | None:
+    url = direct_url.get("url")
+    vcs_info = direct_url.get("vcs_info")
+    if not url or not isinstance(vcs_info, dict):
+        return None
+    requested_revision = vcs_info.get("requested_revision")
+    if requested_revision:
+        return f"{url}@{requested_revision}"
+    return url
+
+
+def _is_remote_url(value: str | None) -> bool:
+    if not value:
+        return False
+    parsed = urlparse(value)
+    return bool(parsed.scheme and parsed.scheme != "file")
+
+
 def _install_info() -> tuple[str, str | None]:
     try:
         dist = importlib_metadata.distribution("sflow")
@@ -60,6 +78,10 @@ def _install_info() -> tuple[str, str | None]:
         direct_url = json.loads(direct_url_text)
     except json.JSONDecodeError:
         return "installed", None
+
+    vcs_source = _vcs_source_url(direct_url)
+    if vcs_source:
+        return "direct-url", vcs_source
 
     repo = _path_from_file_url(direct_url.get("url"))
     if direct_url.get("dir_info", {}).get("editable"):
@@ -90,6 +112,8 @@ def _repo_for_git_info(
     install_mode: str, install_repo: str | None, package_path: Path
 ) -> Path | None:
     if install_repo:
+        if _is_remote_url(install_repo):
+            return None
         return Path(install_repo).resolve()
     if install_mode == "source-tree":
         return _find_repo_root(package_path)
@@ -106,6 +130,8 @@ def _version_local_segment(version: str) -> str:
 def _source_label(install_mode: str, install_repo: str | None, version: str) -> str:
     if install_mode == "editable":
         return "local editable dev"
+    if install_mode == "direct-url" and _is_remote_url(install_repo):
+        return install_repo
     if install_mode == "direct-url" and install_repo:
         return "local build"
     if install_mode == "source-tree":
@@ -169,7 +195,7 @@ def format_runtime_info() -> str:
         ("install", install_mode),
         ("source", _source_label(install_mode, install_repo, __version__)),
     ]
-    if install_repo:
+    if install_repo and not _is_remote_url(install_repo):
         fields.append(("repo", install_repo))
     if git_info:
         fields.append(("git", git_info))
