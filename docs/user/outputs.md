@@ -33,6 +33,64 @@ After a successful run, `sflow run` prints the output folder, summary path, and 
 - workflow DAG and dependency list
 - failure hints with task name, attempts, reason, and task log path when a task fails or is cancelled
 
+Example `sflow_summary.log`:
+
+```text
+Sflow Summary
+=============
+Workflow : quickstart_dag
+Status   : COMPLETED
+Started  : 2026-05-22T12:31:32+08:00
+Ended    : 2026-05-22T12:31:41+08:00
+Duration : 9.017s
+Output   : /workspace/sflow_output/quickstart_dag-20260522-123132-1ba51e
+Tasks    : 6
+Summary  : /workspace/sflow_output/quickstart_dag-20260522-123132-1ba51e/sflow_summary.log
+Counts   : COMPLETED=6
+
+Runtime
+-------
+sflow executable:
+  version : 0.2.2.dev7+g0858dce39.d20260522
+  bin     : /workspace/.venv/bin/sflow
+  python  : /workspace/.venv/bin/python
+  package : /workspace/.venv/lib/python3.12/site-packages/sflow
+  install : direct-url
+  source  : https://github.com/NVIDIA/nv-sflow.git@develop
+
+Task Duration Chart
+-------------------
+prepare_data         |###...........................| 1.002s COMPLETED
+preprocess           |.......####...................| 1.002s COMPLETED
+train                |..............####............| 1.001s COMPLETED
+evaluate_on_dataset1 |.....................#####....| 1.004s COMPLETED
+evaluate_on_dataset2 |.....................#####....| 1.003s COMPLETED
+export_model         |............................##| 0.002s COMPLETED
+
+Timeline
+--------
+Time      Elapsed   Task                  Event      Summary
+--------  --------  --------------------  ---------  -------------------------------
+12:31:33  +01.001s  prepare_data          SUBMITTED  attempt=1
+12:31:34  +02.003s  prepare_data          COMPLETED  exit=0
+12:31:37  +05.007s  train                 SUBMITTED  attempt=1
+12:31:38  +06.008s  train                 COMPLETED  exit=0
+12:31:41  +09.017s  export_model          COMPLETED  exit=0
+
+Command Logs
+------------
+bash: /workspace/sflow_output/quickstart_dag-20260522-123132-1ba51e/bash_cmds.log
+
+Dependencies
+------------
+START -> prepare_data
+prepare_data -> preprocess
+preprocess -> train
+train -> evaluate_on_dataset1
+train -> evaluate_on_dataset2
+evaluate_on_dataset1, evaluate_on_dataset2 -> export_model
+```
+
 ## Command logs
 
 Command logs record launch commands without mixing in task stdout/stderr. They are grouped by command family and written only when matching commands are executed:
