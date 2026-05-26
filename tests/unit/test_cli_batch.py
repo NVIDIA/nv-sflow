@@ -2642,6 +2642,12 @@ def test_batch_bulk_input_variable_cli_wins_over_csv(mock_sflow_app, tmp_path):
     script = scripts[0].read_text()
     assert "--set TP_SIZE=2" in script
     assert "--set TP_SIZE=8" not in script
+    import csv as csv_mod
+
+    results_csv = list(out_dir.glob("bulk_*/results.csv"))[0]
+    with open(results_csv) as f:
+        rows = list(csv_mod.DictReader(f))
+    assert rows[0]["TP_SIZE"] == "2"
 
 
 def test_batch_bulk_input_artifact_cli_wins_over_csv(mock_sflow_app, tmp_path):

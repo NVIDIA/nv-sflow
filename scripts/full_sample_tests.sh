@@ -9,52 +9,96 @@ MAX_JOBS=16
 CLI_MODEL_PATH=""
 CLI_PARTITION=""
 CLI_ACCOUNT=""
-while getopts "asmSPj:M:p:A:" opt; do
-    case "$opt" in
-        a) TEST_TYPE="a" ;;
-        s) TEST_TYPE="s" ;;
-        m) TEST_TYPE="m" ;;
-        S) SUBMIT="--submit" ;;
-        P) PREFLIGHT_ONLY="1" ;;
-        j) MAX_JOBS="$OPTARG" ;;
-        M) CLI_MODEL_PATH="$OPTARG" ;;
-        p) CLI_PARTITION="$OPTARG" ;;
-        A) CLI_ACCOUNT="$OPTARG" ;;
-        *) echo "Usage: $0 [-a|-s|-m] [-S] [-P] [-j N] [-M model_path] [-p partition] [-A account]"
-           echo "  -a  all tests (default)"
-           echo "  -s  self-contained examples only"
-           echo "  -m  modular examples only"
-           echo "  -S  submit jobs to Slurm"
-           echo "  -P  preflight checks only (skip job submission even if -S is set)"
-           echo "  -j  max parallel jobs (default: 16, 0 for unlimited)"
-           echo "  -M  model path (default: \$MODEL_PATH or /home/)"
-           echo "  -p  Slurm partition (default: dummy_part for preflight, my_partition for e2e)"
-           echo "  -A  Slurm account (default: dummy_acct for preflight, user for e2e)"
-           exit 1 ;;
+usage() {
+    echo "Usage: $0 [-a|-s|-m|-inf|-smoke] [-S] [-P] [-j N] [-M model_path] [-p partition] [-A account]"
+    echo "  -a  all tests (default)"
+    echo "  -s  self-contained examples only"
+    echo "  -m  modular examples only"
+    echo "  -inf  infmax batch suites only"
+    echo "  -smoke  curated Slurm smoke subset with broad coverage"
+    echo "  -S  submit jobs to Slurm"
+    echo "  -P  preflight checks only (skip job submission even if -S is set)"
+    echo "  -j  max parallel jobs (default: 16, 0 for unlimited)"
+    echo "  -M  model path (default: \$MODEL_PATH or /home/)"
+    echo "  -p  Slurm partition (default: dummy_part for preflight, my_partition for e2e)"
+    echo "  -A  Slurm account (default: dummy_acct for preflight, user for e2e)"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -a) TEST_TYPE="a" ;;
+        -s) TEST_TYPE="s" ;;
+        -m) TEST_TYPE="m" ;;
+        -inf) TEST_TYPE="inf" ;;
+        -smoke) TEST_TYPE="smoke" ;;
+        -S) SUBMIT="--submit" ;;
+        -P) PREFLIGHT_ONLY="1" ;;
+        -j) [ $# -ge 2 ] || { usage; exit 1; }; shift; MAX_JOBS="$1" ;;
+        -M) [ $# -ge 2 ] || { usage; exit 1; }; shift; CLI_MODEL_PATH="$1" ;;
+        -p) [ $# -ge 2 ] || { usage; exit 1; }; shift; CLI_PARTITION="$1" ;;
+        -A) [ $# -ge 2 ] || { usage; exit 1; }; shift; CLI_ACCOUNT="$1" ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 1 ;;
     esac
+    shift
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$SCRIPT_DIR/.."
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXAMPLES_DIR="$REPO_DIR/examples"
 CSV_FILE="$EXAMPLES_DIR/inference_x_v2/bulk_input.csv"
 MODEL_PATH="${CLI_MODEL_PATH:-${MODEL_PATH:-/home/}}"
 PARTITION="${CLI_PARTITION:-dummy_part}"
 ACCOUNT="${CLI_ACCOUNT:-dummy_acct}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+INFMAX_DIR="$REPO_DIR/tests/e2e_tests/infmax"
+INFMAX_CSV_NAME="${INFMAX_CSV_NAME:-1k1k_jobs.csv}"
+INFMAX_ROW="${INFMAX_ROW:-1}"
+INFMAX_RECIPE_REPO="${INFMAX_RECIPE_REPO:-}"
+INFMAX_RECIPE_REF="${INFMAX_RECIPE_REF:-}"
+INFMAX_RECIPE_SUBDIR="${INFMAX_RECIPE_SUBDIR:-}"
+INFMAX_REFRESH_RECIPES="${INFMAX_REFRESH_RECIPES:-}"
+INFMAX_BENCH_SERVING_DIR="${INFMAX_BENCH_SERVING_DIR:-$INFMAX_DIR/nvidia_submission/sa-bench}"
+PREFLIGHT_SKIP_NOTES=""
+INFMAX_RECIPE_SKIP_REASON=""
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 PREFLIGHT_DIR="$REPO_DIR/sflow_output/preflight_$STAMP"
 mkdir -p "$PREFLIGHT_DIR"
 
-RESULTS_DIR=$(mktemp -d)
-trap 'rm -rf "$RESULTS_DIR"' EXIT
-TEST_ID=0
-EXPECTED_BATCH_SFLOW_VERSION=$(python - <<'PY'
-from sflow.cli.batch import _resolve_effective_sflow_version
+source "$SCRIPT_DIR/use_under_dev_sflow.sh"
+RESULTS_DIR=""
+cleanup() {
+    if [ -n "$RESULTS_DIR" ]; then
+        rm -rf "$RESULTS_DIR"
+    fi
+    cleanup_under_dev_sflow
+}
+trap cleanup EXIT
+setup_under_dev_sflow "$REPO_DIR"
 
-print(_resolve_effective_sflow_version(None) or "main")
-PY
-)
+RESULTS_DIR=$(mktemp -d)
+TEST_ID=0
+EXPECTED_BATCH_SFLOW_VERSION="$SFLOW_UNDER_DEV_REF"
+
+abs_path() {
+    local path="$1"
+    if [ -d "$path" ]; then
+        (cd "$path" && pwd)
+        return
+    fi
+    if [ -e "$path" ]; then
+        local dir base
+        dir="$(dirname "$path")"
+        base="$(basename "$path")"
+        printf '%s/%s\n' "$(cd "$dir" && pwd)" "$base"
+        return
+    fi
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+        *) printf '%s/%s\n' "$PWD" "$path" ;;
+    esac
+}
 
 throttle() {
     if [ "$MAX_JOBS" -gt 0 ]; then
@@ -62,6 +106,85 @@ throttle() {
             sleep 0.1
         done
     fi
+}
+
+record_preflight_skip() {
+    local note="$1"
+    case "$PREFLIGHT_SKIP_NOTES" in
+        *"$note"*) ;;
+        *) PREFLIGHT_SKIP_NOTES="${PREFLIGHT_SKIP_NOTES}  - ${note}\n" ;;
+    esac
+}
+
+fetch_infmax_recipes() {
+    INFMAX_RECIPE_SKIP_REASON=""
+    local need_fetch="$INFMAX_REFRESH_RECIPES"
+    local required_path
+
+    for required_path in \
+        "$INFMAX_DIR/dsr1-fp8-gb200-multi_node-sglang/$INFMAX_CSV_NAME" \
+        "$INFMAX_DIR/dsr1-fp4-gb200-multi_node-trtllm/$INFMAX_CSV_NAME" \
+        "$INFMAX_DIR/kimik2.5-fp4-gb200-multi_node-vllm/$INFMAX_CSV_NAME" \
+        "$INFMAX_BENCH_SERVING_DIR"; do
+        if [ ! -e "$required_path" ]; then
+            need_fetch="1"
+            break
+        fi
+    done
+
+    if [ -z "$need_fetch" ]; then
+        return 0
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        INFMAX_RECIPE_SKIP_REASON="git is not available"
+        echo "WARN: skipping Infmax recipe fetch because git is not available." >&2
+        return 1
+    fi
+    if ! command -v rsync >/dev/null 2>&1; then
+        INFMAX_RECIPE_SKIP_REASON="rsync is not available"
+        echo "WARN: skipping Infmax recipe fetch because rsync is not available." >&2
+        return 1
+    fi
+
+    if [ -z "$INFMAX_RECIPE_REPO" ] || [ -z "$INFMAX_RECIPE_REF" ] || [ -z "$INFMAX_RECIPE_SUBDIR" ]; then
+        INFMAX_RECIPE_SKIP_REASON="recipe source env is incomplete"
+        echo "WARN: skipping Infmax recipe fetch because recipe source env is incomplete." >&2
+        echo "      Set INFMAX_RECIPE_REPO, INFMAX_RECIPE_REF, and INFMAX_RECIPE_SUBDIR to enable these checks." >&2
+        return 1
+    fi
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    echo "Fetching infmax recipes ($INFMAX_RECIPE_REF:$INFMAX_RECIPE_SUBDIR) ..."
+    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$INFMAX_RECIPE_REF" "$INFMAX_RECIPE_REPO" "$tmp_dir/repo" >/dev/null 2>&1; then
+        rm -rf "$tmp_dir"
+        INFMAX_RECIPE_SKIP_REASON="recipe repo clone failed"
+        echo "WARN: skipping Infmax checks because recipe repo clone failed." >&2
+        return 1
+    fi
+
+    local source_dir="$tmp_dir/repo/$INFMAX_RECIPE_SUBDIR"
+    if [ ! -d "$source_dir" ]; then
+        rm -rf "$tmp_dir"
+        INFMAX_RECIPE_SKIP_REASON="recipe subdir was not found"
+        echo "WARN: skipping Infmax checks because recipe subdir was not found: $INFMAX_RECIPE_SUBDIR" >&2
+        return 1
+    fi
+
+    rsync -a --delete --exclude='batch_test.sh' "$source_dir/" "$INFMAX_DIR/"
+    rm -rf "$tmp_dir"
+    return 0
+}
+
+set_infmax_suite_overrides() {
+    INFMAX_SUITE_OVERRIDES=(-s "CONCURRENCY=[16,32]")
+    case "$1" in
+        kimik2.5-fp4-gb200-multi_node-vllm)
+            INFMAX_SUITE_OVERRIDES+=(-s "DYNAMO_VERSION=1.0.1" -e "--container-remap-root")
+            ;;
+    esac
 }
 
 run_check() {
@@ -125,6 +248,47 @@ if true; then
     echo "===== Running tests in parallel (max_jobs=${MAX_JOBS:-unlimited}) ====="
     echo ""
 
+    VERSION_INFO_LOG="$PREFLIGHT_DIR/sflow_version.log"
+    run_check "sflow --version runtime info" \
+        bash -c "sflow --version > '$VERSION_INFO_LOG' 2>&1 && \
+            grep -F -- 'sflow executable' '$VERSION_INFO_LOG' && \
+            grep -F -- 'version :' '$VERSION_INFO_LOG' && \
+            grep -F -- 'bin     :' '$VERSION_INFO_LOG' && \
+            grep -F -- 'python  :' '$VERSION_INFO_LOG' && \
+            grep -F -- 'package :' '$VERSION_INFO_LOG' && \
+            grep -F -- 'install :' '$VERSION_INFO_LOG' && \
+            ! grep -E '^sflow [0-9]' '$VERSION_INFO_LOG'"
+
+    if [ "$TEST_TYPE" = "inf" ]; then
+        INFMAX_BATCH_PREFLIGHT_DIR="$PREFLIGHT_DIR/infmax_batch"
+        if fetch_infmax_recipes; then
+            INFMAX_TARGET_DIRS=(
+                "$INFMAX_DIR/dsr1-fp8-gb200-multi_node-sglang"
+                "$INFMAX_DIR/dsr1-fp4-gb200-multi_node-trtllm"
+                "$INFMAX_DIR/kimik2.5-fp4-gb200-multi_node-vllm"
+            )
+            for suite_dir in "${INFMAX_TARGET_DIRS[@]}"; do
+                suite_name=$(basename "$suite_dir")
+                set_infmax_suite_overrides "$suite_name"
+                run_check "infmax multi-node batch $suite_name" \
+                    sflow batch \
+                        --bulk-input "$suite_dir/$INFMAX_CSV_NAME" \
+                        --row "$INFMAX_ROW" \
+                        -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                        -a "BENCH_SERVING_DIR=fs://$INFMAX_BENCH_SERVING_DIR" \
+                        -G "$GPUS_PER_NODE" \
+                        -A "$ACCOUNT" \
+                        -p "$PARTITION" \
+                        --log-level warn \
+                        "${INFMAX_SUITE_OVERRIDES[@]}" \
+                        --output-dir "$INFMAX_BATCH_PREFLIGHT_DIR/$suite_name"
+            done
+        else
+            record_preflight_skip "Infmax batch preflight checks skipped: ${INFMAX_RECIPE_SKIP_REASON:-recipe source unavailable}"
+            echo "  SKIP: Infmax recipe source unavailable; skipping Infmax batch preflight checks."
+        fi
+    else
+
     # -- sflow run --dry-run: local examples --
     run_check "local_hello_world" \
         sflow run "$EXAMPLES_DIR/local_hello_world.yaml" --dry-run
@@ -139,6 +303,313 @@ if true; then
     run_check "run local_variable_domain (live, optional)" \
         sflow run "$EXAMPLES_DIR/local_variable_domain.yaml" \
             --output-dir "$DOMAIN_RUN_DIR"
+
+    # -- sflow run/batch: plain script commands containing ':' must stay strings --
+    COLON_SCRIPT_DIR="$PREFLIGHT_DIR/colon_in_task_script"
+    COLON_SCRIPT_FIXTURE="$COLON_SCRIPT_DIR/colon_in_task_script.yaml"
+    COLON_SCRIPT_DRYRUN_LOG="$COLON_SCRIPT_DIR/dry_run.log"
+    COLON_SCRIPT_COMPOSED="$COLON_SCRIPT_DIR/colon_in_task_script_composed.yaml"
+    COLON_SCRIPT_BATCH="$COLON_SCRIPT_DIR/colon_in_task_script_batch.sh"
+    COLON_SCRIPT_BATCH_CONFIG="$COLON_SCRIPT_DIR/colon_in_task_script_batch.yaml"
+    mkdir -p "$COLON_SCRIPT_DIR"
+    cat > "$COLON_SCRIPT_FIXTURE" <<'EOF'
+version: "0.1"
+
+variables:
+  SLURM_ACCOUNT:
+    value: dummy_acct
+  SLURM_PARTITION:
+    value: dummy_part
+  SLURM_TIMELIMIT:
+    value: "00:10:00"
+  SLURM_NODES:
+    value: 1
+  GPUS_PER_NODE:
+    value: 4
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: srun_no_container
+    type: srun
+    ntasks_per_node: 1
+    mpi: pmix
+
+workflow:
+  name: colon_in_task_script
+  tasks:
+    - name: worker
+      operator: srun_no_container
+      resources:
+        gpus:
+          count: 1
+      script:
+        - echo "My GPUs: $CUDA_VISIBLE_DEVICES"
+        - echo "COLON_SCRIPT_E2E_PASS"
+EOF
+    run_check "run colon in task script (dry-run)" \
+        bash -c "sflow run \"$COLON_SCRIPT_FIXTURE\" --dry-run > \"$COLON_SCRIPT_DRYRUN_LOG\" 2>&1"
+    run_check "compose colon in task script" \
+        sflow compose "$COLON_SCRIPT_FIXTURE" \
+            -o "$COLON_SCRIPT_COMPOSED"
+    run_check "batch colon in task script" \
+        sflow batch -f "$COLON_SCRIPT_FIXTURE" \
+            -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+            -o "$COLON_SCRIPT_BATCH"
+
+    if [ "$TEST_TYPE" = "m" ] || [ "$TEST_TYPE" = "a" ]; then
+        INFMAX_BATCH_PREFLIGHT_DIR="$PREFLIGHT_DIR/infmax_batch"
+        if fetch_infmax_recipes; then
+            INFMAX_TARGET_DIRS=(
+                "$INFMAX_DIR/dsr1-fp8-gb200-multi_node-sglang"
+                "$INFMAX_DIR/dsr1-fp4-gb200-multi_node-trtllm"
+                "$INFMAX_DIR/kimik2.5-fp4-gb200-multi_node-vllm"
+            )
+            for suite_dir in "${INFMAX_TARGET_DIRS[@]}"; do
+                suite_name=$(basename "$suite_dir")
+                set_infmax_suite_overrides "$suite_name"
+                run_check "infmax multi-node batch $suite_name" \
+                    sflow batch \
+                        --bulk-input "$suite_dir/$INFMAX_CSV_NAME" \
+                        --row "$INFMAX_ROW" \
+                        -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" \
+                        -a "BENCH_SERVING_DIR=fs://$INFMAX_BENCH_SERVING_DIR" \
+                        -G "$GPUS_PER_NODE" \
+                        -A "$ACCOUNT" \
+                        -p "$PARTITION" \
+                        --log-level warn \
+                        "${INFMAX_SUITE_OVERRIDES[@]}" \
+                        --output-dir "$INFMAX_BATCH_PREFLIGHT_DIR/$suite_name"
+            done
+        else
+            record_preflight_skip "Infmax batch preflight checks skipped: ${INFMAX_RECIPE_SKIP_REASON:-recipe source unavailable}"
+            echo "  SKIP: Infmax recipe source unavailable; skipping Infmax batch preflight checks."
+        fi
+    fi
+
+    # -- sflow run/batch/compose: release_after enables dynamic resource rehearsal --
+    RELEASE_AFTER_DIR="$PREFLIGHT_DIR/release_after_resource_rehearsal"
+    RELEASE_AFTER_FIXTURE="$RELEASE_AFTER_DIR/release_after_inferred_task_completion.yaml"
+    RELEASE_AFTER_NEGATIVE_FIXTURE="$RELEASE_AFTER_DIR/release_after_explicit_workflow_completion.yaml"
+    RELEASE_AFTER_NODES_OMITTED_FIXTURE="$RELEASE_AFTER_DIR/nodes_release_after_omitted_overlap.yaml"
+    RELEASE_AFTER_NODES_COUNT_NEGATIVE_FIXTURE="$RELEASE_AFTER_DIR/nodes_release_after_explicit_count.yaml"
+    RELEASE_AFTER_NODES_INDICES_NEGATIVE_FIXTURE="$RELEASE_AFTER_DIR/nodes_release_after_explicit_indices.yaml"
+    RELEASE_AFTER_DRYRUN_LOG="$RELEASE_AFTER_DIR/dry_run.log"
+    RELEASE_AFTER_NEGATIVE_LOG="$RELEASE_AFTER_DIR/negative_dry_run.log"
+    RELEASE_AFTER_NODES_OMITTED_LOG="$RELEASE_AFTER_DIR/nodes_omitted_dry_run.log"
+    RELEASE_AFTER_NODES_COUNT_NEGATIVE_LOG="$RELEASE_AFTER_DIR/nodes_count_negative_dry_run.log"
+    RELEASE_AFTER_NODES_INDICES_NEGATIVE_LOG="$RELEASE_AFTER_DIR/nodes_indices_negative_dry_run.log"
+    RELEASE_AFTER_COMPOSE_LOG="$RELEASE_AFTER_DIR/compose_validate.log"
+    RELEASE_AFTER_COMPOSED="$RELEASE_AFTER_DIR/composed.yaml"
+    RELEASE_AFTER_BATCH="$RELEASE_AFTER_DIR/release_after_batch.sh"
+    mkdir -p "$RELEASE_AFTER_DIR"
+    cat > "$RELEASE_AFTER_FIXTURE" <<'EOF'
+version: "0.1"
+
+variables:
+  SLURM_ACCOUNT:
+    value: dummy_acct
+  SLURM_PARTITION:
+    value: dummy_part
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: "00:10:00"
+    nodes: 1
+    gpus_per_node: 8
+
+workflow:
+  name: release_after_inferred_task_completion
+  tasks:
+    - name: check_entire_env
+      resources:
+        gpus:
+          count: 8
+      script:
+        - echo "$CUDA_VISIBLE_DEVICES"
+
+    - name: worker
+      replicas:
+        count: 4
+        policy: parallel
+      resources:
+        gpus:
+          count: 2
+      script:
+        - echo "worker GPUs: $CUDA_VISIBLE_DEVICES"
+      depends_on:
+        - check_entire_env
+EOF
+    cat > "$RELEASE_AFTER_NEGATIVE_FIXTURE" <<'EOF'
+version: "0.1"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: dummy_acct
+    partition: dummy_part
+    time: "00:10:00"
+    nodes: 1
+    gpus_per_node: 8
+
+workflow:
+  name: release_after_explicit_workflow_completion
+  tasks:
+    - name: check_entire_env
+      resources:
+        gpus:
+          count: 8
+          release_after: workflow_completion
+      script:
+        - echo "$CUDA_VISIBLE_DEVICES"
+
+    - name: worker
+      replicas:
+        count: 4
+        policy: parallel
+      resources:
+        gpus:
+          count: 2
+      script:
+        - echo "worker GPUs: $CUDA_VISIBLE_DEVICES"
+      depends_on:
+        - check_entire_env
+EOF
+    cat > "$RELEASE_AFTER_NODES_OMITTED_FIXTURE" <<'EOF'
+version: "0.1"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: dummy_acct
+    partition: dummy_part
+    time: "00:10:00"
+    nodes: 1
+    gpus_per_node: 0
+
+workflow:
+  name: nodes_release_after_omitted_overlap
+  tasks:
+    - name: count_a
+      resources:
+        nodes:
+          count: 1
+      script:
+        - echo count_a
+
+    - name: count_b
+      resources:
+        nodes:
+          count: 1
+      script:
+        - echo count_b
+
+    - name: pinned_a
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - echo pinned_a
+
+    - name: pinned_b
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - echo pinned_b
+EOF
+    cat > "$RELEASE_AFTER_NODES_COUNT_NEGATIVE_FIXTURE" <<'EOF'
+version: "0.1"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: dummy_acct
+    partition: dummy_part
+    time: "00:10:00"
+    nodes: 1
+    gpus_per_node: 0
+
+workflow:
+  name: nodes_release_after_explicit_count
+  tasks:
+    - name: exclusive_count
+      resources:
+        nodes:
+          count: 1
+          release_after: workflow_completion
+      script:
+        - echo exclusive_count
+
+    - name: sibling
+      resources:
+        nodes:
+          count: 1
+      script:
+        - echo sibling
+EOF
+    cat > "$RELEASE_AFTER_NODES_INDICES_NEGATIVE_FIXTURE" <<'EOF'
+version: "0.1"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: dummy_acct
+    partition: dummy_part
+    time: "00:10:00"
+    nodes: 1
+    gpus_per_node: 0
+
+workflow:
+  name: nodes_release_after_explicit_indices
+  tasks:
+    - name: exclusive_index
+      resources:
+        nodes:
+          indices: [0]
+          release_after: workflow_completion
+      script:
+        - echo exclusive_index
+
+    - name: sibling
+      resources:
+        nodes:
+          count: 1
+      script:
+        - echo sibling
+EOF
+    run_check "run release_after resource rehearsal (dry-run)" \
+        bash -c "sflow run \"$RELEASE_AFTER_FIXTURE\" --dry-run > \"$RELEASE_AFTER_DRYRUN_LOG\" 2>&1 && grep -q 'Resource release rehearsal' \"$RELEASE_AFTER_DRYRUN_LOG\""
+    run_check "batch release_after resource rehearsal" \
+        sflow batch -f "$RELEASE_AFTER_FIXTURE" \
+            -p "$PARTITION" -A "$ACCOUNT" --log-level warn \
+            -o "$RELEASE_AFTER_BATCH"
+    run_check "compose release_after resource rehearsal (validate)" \
+        bash -c "sflow compose \"$RELEASE_AFTER_FIXTURE\" --validate -o \"$RELEASE_AFTER_COMPOSED\" > \"$RELEASE_AFTER_COMPOSE_LOG\" 2>&1 && grep -q 'Dry-run validation passed' \"$RELEASE_AFTER_COMPOSE_LOG\" && ! grep -q 'WARNING: dry-run validation failed' \"$RELEASE_AFTER_COMPOSE_LOG\""
+    run_check "run explicit workflow_completion resource lifetime (expect fail)" \
+        bash -c "! sflow run \"$RELEASE_AFTER_NEGATIVE_FIXTURE\" --dry-run > \"$RELEASE_AFTER_NEGATIVE_LOG\" 2>&1 && grep -q 'remain available' \"$RELEASE_AFTER_NEGATIVE_LOG\""
+    run_check "run omitted node release_after allows overlap (dry-run)" \
+        bash -c "sflow run \"$RELEASE_AFTER_NODES_OMITTED_FIXTURE\" --dry-run > \"$RELEASE_AFTER_NODES_OMITTED_LOG\" 2>&1 && grep -q 'Dry-run complete' \"$RELEASE_AFTER_NODES_OMITTED_LOG\" && ! grep -q 'remain available' \"$RELEASE_AFTER_NODES_OMITTED_LOG\""
+    run_check "run explicit node count workflow_completion (expect fail)" \
+        bash -c "! sflow run \"$RELEASE_AFTER_NODES_COUNT_NEGATIVE_FIXTURE\" --dry-run > \"$RELEASE_AFTER_NODES_COUNT_NEGATIVE_LOG\" 2>&1 && grep -q 'remain available' \"$RELEASE_AFTER_NODES_COUNT_NEGATIVE_LOG\" && grep -q 'exclusive_count: release_after=workflow_completion' \"$RELEASE_AFTER_NODES_COUNT_NEGATIVE_LOG\""
+    run_check "run explicit node indices workflow_completion (expect fail)" \
+        bash -c "! sflow run \"$RELEASE_AFTER_NODES_INDICES_NEGATIVE_FIXTURE\" --dry-run > \"$RELEASE_AFTER_NODES_INDICES_NEGATIVE_LOG\" 2>&1 && grep -q 'remain available' \"$RELEASE_AFTER_NODES_INDICES_NEGATIVE_LOG\" && grep -q 'exclusive_index: release_after=workflow_completion' \"$RELEASE_AFTER_NODES_INDICES_NEGATIVE_LOG\""
 
     # -- sflow run --dry-run: readiness accepts a list and builds multiple readiness probes --
     READINESS_AND_DIR="$PREFLIGHT_DIR/readiness_probe_and"
@@ -203,6 +674,111 @@ EOF
             sflow run "$f" --dry-run \
                 -a "LOCAL_MODEL_PATH=fs://$MODEL_PATH"
     done
+
+    # -- sflow run (fake Slurm): backend gpus_per_node is planning-only; --gpus-per-node is extra_args-only --
+    SLURM_GPN_DIR="$PREFLIGHT_DIR/slurm_gpus_per_node_extra_args_only"
+    SLURM_GPN_FIXTURE_DIR="$SLURM_GPN_DIR/fixture"
+    SLURM_GPN_FAKE_BIN="$SLURM_GPN_DIR/fake_bin"
+    SLURM_GPN_LOG_DIR="$SLURM_GPN_DIR/logs"
+    mkdir -p "$SLURM_GPN_FIXTURE_DIR" "$SLURM_GPN_FAKE_BIN" "$SLURM_GPN_LOG_DIR"
+    cat > "$SLURM_GPN_FAKE_BIN/salloc" <<'EOF'
+#!/bin/bash
+{
+    printf 'salloc'
+    for arg in "$@"; do
+        printf ' %s' "$arg"
+    done
+    printf '\n'
+} >> "$SFLOW_FAKE_SLURM_LOG_DIR/salloc.args"
+echo "salloc: Granted job allocation 424242"
+echo "salloc: Nodes fake-node are ready for job"
+EOF
+    cat > "$SLURM_GPN_FAKE_BIN/scontrol" <<'EOF'
+#!/bin/bash
+if [ "$1" = "getaddrs" ]; then
+    echo "fake-node: 127.0.0.1:123"
+    exit 0
+fi
+exit 1
+EOF
+    cat > "$SLURM_GPN_FAKE_BIN/srun" <<'EOF'
+#!/bin/bash
+{
+    printf 'srun'
+    for arg in "$@"; do
+        printf ' %s' "$arg"
+    done
+    printf '\n'
+} >> "$SFLOW_FAKE_SLURM_LOG_DIR/srun.args"
+exit 0
+EOF
+    cat > "$SLURM_GPN_FAKE_BIN/scancel" <<'EOF'
+#!/bin/bash
+echo "scancel $*" >> "$SFLOW_FAKE_SLURM_LOG_DIR/scancel.args"
+exit 0
+EOF
+    chmod +x "$SLURM_GPN_FAKE_BIN"/salloc "$SLURM_GPN_FAKE_BIN"/scontrol \
+        "$SLURM_GPN_FAKE_BIN"/srun "$SLURM_GPN_FAKE_BIN"/scancel
+    cat > "$SLURM_GPN_FIXTURE_DIR/no_extra_args.yaml" <<'EOF'
+version: "0.1"
+backends:
+  - name: fake_slurm
+    type: slurm
+    default: true
+    account: acct
+    partition: gpu
+    time: "00:05:00"
+    nodes: 1
+    gpus_per_node: 4
+workflow:
+  name: slurm_no_implicit_gpus_per_node
+  tasks:
+    - name: worker
+      script:
+        - echo no implicit gpus-per-node
+EOF
+    cat > "$SLURM_GPN_FIXTURE_DIR/with_extra_args.yaml" <<'EOF'
+version: "0.1"
+backends:
+  - name: fake_slurm
+    type: slurm
+    default: true
+    account: acct
+    partition: gpu
+    time: "00:05:00"
+    nodes: 1
+    gpus_per_node: 4
+    extra_args:
+      - "--gpus-per-node=4"
+workflow:
+  name: slurm_explicit_gpus_per_node
+  tasks:
+    - name: worker
+      script:
+        - echo explicit gpus-per-node
+EOF
+    run_check "run fake slurm gpus-per-node extra_args-only" \
+        bash -c "set -euo pipefail
+            export PATH='$SLURM_GPN_FAKE_BIN':\"\$PATH\"
+            export SFLOW_FAKE_SLURM_LOG_DIR='$SLURM_GPN_LOG_DIR'
+            rm -f \"\$SFLOW_FAKE_SLURM_LOG_DIR\"/*.args
+            no_extra_log='$SLURM_GPN_DIR/no_extra_run.log'
+            with_extra_log='$SLURM_GPN_DIR/with_extra_run.log'
+            sflow run '$SLURM_GPN_FIXTURE_DIR/no_extra_args.yaml' \
+                --output-dir '$SLURM_GPN_DIR/no_extra_run' \
+                > \"\$no_extra_log\" 2>&1
+            first_salloc=\$(sed -n '1p' \"\$SFLOW_FAKE_SLURM_LOG_DIR/salloc.args\")
+            if printf '%s\n' \"\$first_salloc\" | grep -q -- '--gpus-per-node'; then
+                echo \"unexpected implicit --gpus-per-node in: \$first_salloc\"
+                exit 1
+            fi
+            grep -F -- 'backend.gpus_per_node=4 is sflow planning only' \"\$no_extra_log\"
+            sflow run '$SLURM_GPN_FIXTURE_DIR/with_extra_args.yaml' \
+                --output-dir '$SLURM_GPN_DIR/with_extra_run' \
+                > \"\$with_extra_log\" 2>&1
+            second_salloc=\$(sed -n '2p' \"\$SFLOW_FAKE_SLURM_LOG_DIR/salloc.args\")
+            printf '%s\n' \"\$second_salloc\" | grep -F -- '--gpus-per-node=4'
+            grep -F -- 'backend.gpus_per_node=4 is sflow planning only' \"\$with_extra_log\""
 
     # -- sflow run --dry-run: modular (multi-file) --
     SLURM_CFG="$EXAMPLES_DIR/inference_x_v2/slurm_config.yaml"
@@ -668,6 +1244,8 @@ PY"
         sflow sample inference_x_v2 \
             --output "$SAMPLE_MODULAR_DIR/inference_x_v2"
 
+    fi
+
     # =====================================================================
     # Wait for all parallel tests and aggregate results
     # =====================================================================
@@ -679,6 +1257,7 @@ PY"
     FAIL=0
     TOTAL=0
     FAILED_LABELS=""
+    FAILED_DETAILS=""
     for result_file in "$RESULTS_DIR"/*.result; do
         [ -f "$result_file" ] || continue
         TOTAL=$((TOTAL + 1))
@@ -706,7 +1285,14 @@ PY"
             FAIL=$((FAIL + 1))
             echo "  [$id] $label ... FAIL"
             echo "       \$ $cmd"
-            head -20 "$output_file" 2>/dev/null | sed 's/^/       /'
+            echo "       Reason (captured output):"
+            if [ -s "$output_file" ]; then
+                sed -n '1,80p' "$output_file" 2>/dev/null | sed 's/^/       /'
+                FAILED_DETAILS="$FAILED_DETAILS\n[$id] $label\n  \$ $cmd\n$(sed -n '1,80p' "$output_file" 2>/dev/null | sed 's/^/  /')\n"
+            else
+                echo "       (no output captured)"
+                FAILED_DETAILS="$FAILED_DETAILS\n[$id] $label\n  \$ $cmd\n  (no output captured)\n"
+            fi
             FAILED_LABELS="$FAILED_LABELS  - $label\n"
         fi
     done
@@ -734,6 +1320,8 @@ PY"
         echo "  \$ $log_cmd" >> "$TEST_LOG"
         echo "" >> "$TEST_LOG"
     done
+
+    if [ "$TEST_TYPE" != "inf" ]; then
 
     # -- Post-wait: verify replica sweep resolves per-replica values + domain --
     SFLOW_LOG=$(find "$DOMAIN_RUN_DIR" -name "sflow.log" -print -quit 2>/dev/null)
@@ -772,6 +1360,69 @@ PY"
             TOTAL=$((TOTAL + REPLICA_FAIL))
             FAILED_LABELS="$FAILED_LABELS  - replica sweep value/domain resolution\n"
         fi
+    fi
+
+    # -- Post-wait: verify live run summary and command-only command logs --
+    SFLOW_SUMMARY_LOG=$(find "$DOMAIN_RUN_DIR" -name "sflow_summary.log" -print -quit 2>/dev/null)
+    if [ -f "$SFLOW_SUMMARY_LOG" ]; then
+        SUMMARY_FAIL=0
+        DOMAIN_WORKFLOW_DIR=$(dirname "$SFLOW_SUMMARY_LOG")
+        for summary_pattern in \
+            'Sflow Summary' \
+            'Runtime' \
+            'Workflow DAG' \
+            'Timeline' \
+            'Task Duration Chart' \
+            'Counts       :' \
+            'FAILED/CANCELLED Tasks :' \
+            'SUBMITTED'; do
+            if ! grep -Fq "$summary_pattern" "$SFLOW_SUMMARY_LOG"; then
+                echo "  FAIL: sflow_summary.log missing '$summary_pattern'"
+                SUMMARY_FAIL=1
+            fi
+        done
+        if ! grep -Eq 'COMPLETED|FAILED|CANCELLED|READY' "$SFLOW_SUMMARY_LOG"; then
+            echo "  FAIL: sflow_summary.log missing terminal task event"
+            SUMMARY_FAIL=1
+        fi
+        if grep -Fq 'Traceback' "$SFLOW_SUMMARY_LOG"; then
+            echo "  FAIL: sflow_summary.log contains traceback"
+            SUMMARY_FAIL=1
+        fi
+
+        FIRST_CMD_LOG=$(find "$DOMAIN_WORKFLOW_DIR" -name "*_cmds.log" -print -quit 2>/dev/null)
+        if [ -z "$FIRST_CMD_LOG" ]; then
+            echo "  FAIL: no command log found under $DOMAIN_WORKFLOW_DIR"
+            SUMMARY_FAIL=1
+        fi
+        BASH_CMD_LOG="$DOMAIN_WORKFLOW_DIR/bash_cmds.log"
+        if [ -f "$BASH_CMD_LOG" ]; then
+            if ! grep -Fq 'bash -c' "$BASH_CMD_LOG"; then
+                echo "  FAIL: bash_cmds.log missing bash -c command"
+                SUMMARY_FAIL=1
+            fi
+            if grep -xFq 'concurrency=1' "$BASH_CMD_LOG" || \
+               grep -xFq 'framework=sglang' "$BASH_CMD_LOG"; then
+                echo "  FAIL: bash_cmds.log contains raw task output lines"
+                SUMMARY_FAIL=1
+            fi
+        else
+            echo "  FAIL: bash_cmds.log missing under $DOMAIN_WORKFLOW_DIR"
+            SUMMARY_FAIL=1
+        fi
+
+        if [ "$SUMMARY_FAIL" -eq 0 ]; then
+            echo "  PASS: sflow_summary.log and command logs generated for live run"
+        else
+            FAIL=$((FAIL + SUMMARY_FAIL))
+            TOTAL=$((TOTAL + SUMMARY_FAIL))
+            FAILED_LABELS="$FAILED_LABELS  - sflow summary/command logs\n"
+        fi
+    else
+        echo "  FAIL: sflow_summary.log not found under $DOMAIN_RUN_DIR"
+        FAIL=$((FAIL + 1))
+        TOTAL=$((TOTAL + 1))
+        FAILED_LABELS="$FAILED_LABELS  - sflow summary log missing\n"
     fi
 
     # -- Post-wait: verify ${{ variables.X.domain }} resolved in batch -e --
@@ -919,6 +1570,38 @@ PY
         FAIL=$((FAIL + COMPOSE_INDICES_DRYRUN_FAIL))
         TOTAL=$((TOTAL + COMPOSE_INDICES_DRYRUN_FAIL))
         FAILED_LABELS="$FAILED_LABELS  - dry-run nodes.indices+count ordering\n"
+    fi
+
+    # -- Post-wait: verify a ':' in an unquoted task script command remains a string --
+    COLON_SCRIPT_PREFLIGHT_FAIL=0
+    for colon_output in "$COLON_SCRIPT_COMPOSED" "$COLON_SCRIPT_BATCH_CONFIG"; do
+        if [ ! -f "$colon_output" ]; then
+            echo "  FAIL: colon task script output missing: $colon_output"
+            COLON_SCRIPT_PREFLIGHT_FAIL=1
+            continue
+        fi
+        export COLON_SCRIPT_OUTPUT="$colon_output"
+        if python - <<'PY'
+import os
+from pathlib import Path
+import yaml
+
+config_path = Path(os.environ["COLON_SCRIPT_OUTPUT"])
+data = yaml.safe_load(config_path.read_text())
+tasks = {task["name"]: task for task in data["workflow"]["tasks"]}
+assert tasks["worker"]["script"][0] == 'echo "My GPUs: $CUDA_VISIBLE_DEVICES"'
+PY
+        then
+            echo "  PASS: colon in task script is preserved as a plain command string in $(basename "$colon_output")"
+        else
+            echo "  FAIL: colon in task script was not preserved as a command string in $(basename "$colon_output")"
+            COLON_SCRIPT_PREFLIGHT_FAIL=1
+        fi
+    done
+    if [ "$COLON_SCRIPT_PREFLIGHT_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + COLON_SCRIPT_PREFLIGHT_FAIL))
+        TOTAL=$((TOTAL + COLON_SCRIPT_PREFLIGHT_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - colon in task script preservation\n"
     fi
 
     # -- Post-wait: verify readiness probe list appears as two readiness checks in dry-run plan --
@@ -1073,18 +1756,19 @@ PY
     for mode in batch_bulk_submit batch_bulk_input; do
         csv_file=$(find "$PREFLIGHT_DIR/$mode" -name results.csv -print -quit 2>/dev/null)
         if [ -f "$csv_file" ]; then
+            csv_file=$(abs_path "$csv_file")
             if head -1 "$csv_file" | grep -q "sflow_batch_dir"; then
                 bulk_dir=$(basename "$(dirname "$csv_file")")
                 if grep -q "$bulk_dir" "$csv_file"; then
-                    echo "  PASS: sflow_batch_dir column present and correct in $mode/results.csv"
+                    echo "  PASS: sflow_batch_dir column present and correct in $csv_file"
                 else
-                    echo "  FAIL: sflow_batch_dir value mismatch in $mode/results.csv"
+                    echo "  FAIL: sflow_batch_dir value mismatch in $csv_file"
                     FAIL=$((FAIL + 1))
                     TOTAL=$((TOTAL + 1))
                     FAILED_LABELS="$FAILED_LABELS  - sflow_batch_dir value mismatch ($mode)\n"
                 fi
             else
-                echo "  FAIL: sflow_batch_dir column missing from $mode/results.csv"
+                echo "  FAIL: sflow_batch_dir column missing from $csv_file"
                 FAIL=$((FAIL + 1))
                 TOTAL=$((TOTAL + 1))
                 FAILED_LABELS="$FAILED_LABELS  - sflow_batch_dir column missing ($mode)\n"
@@ -1092,25 +1776,30 @@ PY
         fi
     done
 
+    fi
+
     echo ""
     echo "===== Preflight Summary: $PASS/$TOTAL passed, $FAIL failed ====="
     echo ""
     echo "===== Results Directory: $PREFLIGHT_DIR ====="
     file_count=$(find "$PREFLIGHT_DIR" -type f | wc -l)
-    if command -v tree &>/dev/null; then
-        tree --noreport "$PREFLIGHT_DIR" | sed 's/^/  /'
-    else
-        find "$PREFLIGHT_DIR" -type f | sort | sed "s|^$PREFLIGHT_DIR/|  |"
-    fi
     echo "  ($file_count file(s) total)"
     echo ""
+
+    if [ -n "$PREFLIGHT_SKIP_NOTES" ]; then
+        echo "Skipped checks:"
+        echo -e "$PREFLIGHT_SKIP_NOTES"
+    fi
 
     if [ "$FAIL" -gt 0 ]; then
         echo "Failed tests:"
         echo -e "$FAILED_LABELS"
+        echo "Failure details:"
+        echo -e "$FAILED_DETAILS"
         echo "ERROR: $FAIL preflight check(s) failed — aborting before job submission."
         exit 1
     fi
+
 fi
 
 # =========================================================================
@@ -1124,7 +1813,15 @@ if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
     cd "$SCRIPT_DIR/../tests/e2e_tests"
     E2E_PARTITION="${CLI_PARTITION:-my_partition}"
     E2E_ACCOUNT="${CLI_ACCOUNT:-user}"
-    ./sample_test.sh -p "$E2E_PARTITION" -A "$E2E_ACCOUNT" -m "$MODEL_PATH" -t "$TEST_TYPE" --submit -- "-e --exclude=gb-nvl-137-compute09,gb-nvl-137-compute16" # 09 has some GPU issues
+    if [ -n "${COLON_SCRIPT_FIXTURE:-}" ] && [ -f "$COLON_SCRIPT_FIXTURE" ]; then
+        SFLOW_COLON_SCRIPT_FIXTURE="$COLON_SCRIPT_FIXTURE" \
+        SFLOW_COLON_SCRIPT_OUTPUT_DIR="$PWD/sflow_output/colon_in_task_script" \
+            ./sample_test.sh -p "$E2E_PARTITION" -A "$E2E_ACCOUNT" -m "$MODEL_PATH" -t "$TEST_TYPE" --submit -- "-e --exclude=gb-nvl-137-compute09,gb-nvl-137-compute16" # 09 has some GPU issues
+    else
+        ./sample_test.sh -p "$E2E_PARTITION" -A "$E2E_ACCOUNT" -m "$MODEL_PATH" -t "$TEST_TYPE" --submit -- "-e --exclude=gb-nvl-137-compute09,gb-nvl-137-compute16" # 09 has some GPU issues
+    fi
+
+    set +x
 elif [ -z "$SUBMIT" ]; then
     echo "Preflight only (no -S flag). To submit jobs, re-run with -S."
 else

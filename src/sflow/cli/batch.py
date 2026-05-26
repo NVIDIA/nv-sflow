@@ -1562,6 +1562,9 @@ def _run_bulk_edit(
         overrides_desc = ", ".join(f"{k}={v}" for k, v in all_overrides.items())
 
         result_row = dict(row)
+        for name, value in {**cli_var_map, **cli_art_map}.items():
+            if name in result_row:
+                result_row[name] = value
         effective_missable = row_missable(row, missable_tasks)
 
         # Derive gpus_per_node: config/CSV value wins over CLI
