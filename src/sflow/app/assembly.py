@@ -1996,6 +1996,7 @@ def build_task_graph(
             task.envs.update(replica_envs.get(node_name, {}))
             if cuda_visible is not None:
                 task.envs["CUDA_VISIBLE_DEVICES"] = cuda_visible
+                task.envs["NVIDIA_VISIBLE_DEVICES"] = cuda_visible
             task_graph.dag.add_node(node_name, task)
 
             # If the task is replicated sequentially, enforce replica order by chaining edges.

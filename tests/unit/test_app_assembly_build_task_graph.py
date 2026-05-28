@@ -629,6 +629,8 @@ def test_build_task_graph_resources_gpus_count_sets_cuda_visible_devices_with_of
     tg = build_task_graph(config, state)
     assert tg.get_task("t1_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert tg.get_task("t1_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert tg.get_task("t1_0").envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
+    assert tg.get_task("t1_1").envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
 
 
 def test_build_task_graph_resources_gpus_respects_compute_node_num_gpus():
@@ -663,6 +665,8 @@ def test_build_task_graph_resources_gpus_respects_compute_node_num_gpus():
     tg = build_task_graph(ok, state)
     assert tg.get_task("t1_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert tg.get_task("t1_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert tg.get_task("t1_0").envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
+    assert tg.get_task("t1_1").envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
 
     bad = SflowConfig(
         version="0.1",

@@ -5,14 +5,16 @@ sidebar_position: 7
 
 `resources` lets you constrain where a task runs (which nodes) and how many GPUs it should get.
 
-## GPUs: `CUDA_VISIBLE_DEVICES` slicing (Slurm)
+## GPUs: `CUDA_VISIBLE_DEVICES` / `NVIDIA_VISIBLE_DEVICES` slicing (Slurm)
 
 GPU resource example:
 
 Key idea:
 
 - Set `backends.<name>.gpus_per_node` so sflow can **pack and slice** GPU indices per task/replica.
-- Set `task.resources.gpus.count` to request GPUs for that task.
+- Set `task.resources.gpus.count` to request GPUs for that task. SFlow exports
+  the resulting slice as both `CUDA_VISIBLE_DEVICES` and `NVIDIA_VISIBLE_DEVICES`,
+  so CUDA-aware processes and NVIDIA container runtimes see the same GPU subset.
 
 Minimal example:
 
@@ -47,7 +49,7 @@ workflow:
         gpus:
           count: 2
       script:
-        - echo "replica=$SFLOW_REPLICA_INDEX CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+        - echo "replica=$SFLOW_REPLICA_INDEX CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES"
 ```
 
 ## Nodes: pin tasks to the same node
