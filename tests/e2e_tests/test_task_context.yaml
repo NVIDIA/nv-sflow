@@ -64,7 +64,7 @@ workflow:
         gpus:
           count: ${{ variables.PREFILL_GPUS_PER_SERVER }}
       script:
-        - echo "Starting prefill server ${SFLOW_REPLICA_INDEX} on nodes ${SFLOW_TASK_ASSIGNED_NODE_NAMES} with GPU ${CUDA_VISIBLE_DEVICES}"
+        - echo "Starting prefill server ${SFLOW_REPLICA_INDEX} on nodes ${SFLOW_TASK_ASSIGNED_NODE_NAMES} with GPU ${NVIDIA_VISIBLE_DEVICES}"
         - echo "Assigned IPs - ${SFLOW_TASK_ASSIGNED_NODE_IPS}"
 
     - name: decode_server
@@ -76,7 +76,7 @@ workflow:
           count: ${{ variables.DECODE_GPUS_PER_SERVER }}
       script:
         # Use SFLOW_TASK_ASSIGNED_* env vars to access this task's own assigned nodes
-        - echo "Starting decode server ${SFLOW_REPLICA_INDEX} on nodes ${SFLOW_TASK_ASSIGNED_NODE_NAMES} with GPU ${CUDA_VISIBLE_DEVICES}"
+        - echo "Starting decode server ${SFLOW_REPLICA_INDEX} on nodes ${SFLOW_TASK_ASSIGNED_NODE_NAMES} with GPU ${NVIDIA_VISIBLE_DEVICES}"
         - echo "Assigned IPs - ${SFLOW_TASK_ASSIGNED_NODE_IPS}"
     
     - name: client

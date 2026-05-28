@@ -10,7 +10,7 @@ class ComputeNode:
     name: str
     ip_address: str
     index: int
-    # GPU count available on this node (if known). Used for CUDA_VISIBLE_DEVICES packing/validation.
+    # GPU count available on this node (if known). Used for NVIDIA_VISIBLE_DEVICES packing/validation.
     num_gpus: int | None = None
 
     def to_dict(self) -> dict[str, Any]:

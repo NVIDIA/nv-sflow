@@ -44,18 +44,18 @@ def extract_container_mounts_from_extra_args(extra_args: list[str]) -> list[str]
     return mounts
 
 
-def parse_cuda_visible_devices(cuda_visible: str | None) -> list[int]:
+def parse_gpu_visible_devices(visible_devices: str | None) -> list[int]:
     """
-    Parse CUDA_VISIBLE_DEVICES into a list of GPU indices.
+    Parse a comma-separated GPU visibility string into a list of GPU indices.
 
     Supports comma-separated indices and simple ranges like ``0-3``.
     Non-numeric tokens are ignored.
     """
-    if not cuda_visible:
+    if not visible_devices:
         return []
 
     indices: list[int] = []
-    for part in str(cuda_visible).split(","):
+    for part in str(visible_devices).split(","):
         token = part.strip()
         if not token:
             continue
@@ -132,8 +132,8 @@ def build_allocation_map_lines(tasks: list[Any], backends: dict[str, Any]) -> li
             if not assigned_nodes and alloc.nodes:
                 assigned_nodes = [node.name for node in alloc.nodes]
 
-            gpu_indices = parse_cuda_visible_devices(
-                getattr(task, "envs", {}).get("CUDA_VISIBLE_DEVICES")
+            gpu_indices = parse_gpu_visible_devices(
+                getattr(task, "envs", {}).get("NVIDIA_VISIBLE_DEVICES")
             )
 
             for node_name in assigned_nodes:
@@ -889,7 +889,7 @@ class SflowApp:
                             op_type_str = getattr(op_conf, "type", None) or "unknown"
 
                             nodelist = getattr(op_conf, "nodelist", None) or []
-                            cuda_visible = t.envs.get("CUDA_VISIBLE_DEVICES")
+                            nvidia_visible = t.envs.get("NVIDIA_VISIBLE_DEVICES")
                             task_out_dir = t.envs.get("SFLOW_TASK_OUTPUT_DIR")
                             retry = getattr(t, "retries", None)
                             retry_str = (
@@ -908,9 +908,9 @@ class SflowApp:
                                 f"      ├─ depends_on: {list(deps) if deps else '[]'}"
                             )
                             _logger.info(f"      ├─ nodelist: {nodelist}")
-                            if cuda_visible:
+                            if nvidia_visible:
                                 _logger.info(
-                                    f"      ├─ CUDA_VISIBLE_DEVICES: {cuda_visible}"
+                                    f"      ├─ NVIDIA_VISIBLE_DEVICES: {nvidia_visible}"
                                 )
                             _logger.info(f"      ├─ task_output_dir: {task_out_dir}")
                             _logger.info(f"      ├─ retries: {retry_str}")
@@ -1234,12 +1234,12 @@ class SflowApp:
             )
 
         def _gpu_label(task) -> str:
-            cuda = task.envs.get("CUDA_VISIBLE_DEVICES")
-            if not cuda:
+            nvidia_visible = task.envs.get("NVIDIA_VISIBLE_DEVICES")
+            if not nvidia_visible:
                 return ""
             # "0,1,2" -> 3
             try:
-                n = len([x for x in cuda.split(",") if x.strip() != ""])
+                n = len([x for x in nvidia_visible.split(",") if x.strip() != ""])
             except Exception:
                 n = 0
             return f" gpus={n}"

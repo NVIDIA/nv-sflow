@@ -162,7 +162,7 @@ If `CONCURRENCY` has `domain: [8, 16, 32, 64]` (4 values), this works. If the do
 ## GPU Allocation with Replicas
 
 When combining replicas with GPU resources, sflow automatically slices
-`CUDA_VISIBLE_DEVICES` and `NVIDIA_VISIBLE_DEVICES` for each replica:
+`NVIDIA_VISIBLE_DEVICES` for each replica:
 
 ```yaml
 backends:
@@ -180,14 +180,14 @@ workflow:
         gpus:
           count: 2
       script:
-        - echo "My GPUs: $CUDA_VISIBLE_DEVICES / $NVIDIA_VISIBLE_DEVICES"
+        - echo "My GPUs: $NVIDIA_VISIBLE_DEVICES"
 ```
 
 Each replica gets 2 GPUs:
-- `worker_0`: `CUDA_VISIBLE_DEVICES=0,1`, `NVIDIA_VISIBLE_DEVICES=0,1`
-- `worker_1`: `CUDA_VISIBLE_DEVICES=2,3`, `NVIDIA_VISIBLE_DEVICES=2,3`
-- `worker_2`: `CUDA_VISIBLE_DEVICES=4,5`, `NVIDIA_VISIBLE_DEVICES=4,5`
-- `worker_3`: `CUDA_VISIBLE_DEVICES=6,7`, `NVIDIA_VISIBLE_DEVICES=6,7`
+- `worker_0`: `NVIDIA_VISIBLE_DEVICES=0,1`
+- `worker_1`: `NVIDIA_VISIBLE_DEVICES=2,3`
+- `worker_2`: `NVIDIA_VISIBLE_DEVICES=4,5`
+- `worker_3`: `NVIDIA_VISIBLE_DEVICES=6,7`
 
 ## Real-World Examples
 

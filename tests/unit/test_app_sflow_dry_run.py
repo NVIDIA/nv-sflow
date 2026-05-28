@@ -12,7 +12,7 @@ import pytest
 from sflow.app.sflow import (
     build_allocation_map_lines,
     extract_container_mounts_from_extra_args,
-    parse_cuda_visible_devices,
+    parse_gpu_visible_devices,
 )
 from sflow.core.backend import Allocation
 from sflow.core.compute_node import ComputeNode
@@ -94,18 +94,18 @@ class TestExtractContainerMountsFromExtraArgs:
         assert result == ["/host:/container:rw", "/data:/data:ro"]
 
 
-class TestParseCudaVisibleDevices:
+class TestParseGpuVisibleDevices:
     def test_none_returns_empty(self):
-        assert parse_cuda_visible_devices(None) == []
+        assert parse_gpu_visible_devices(None) == []
 
     def test_comma_separated_indices(self):
-        assert parse_cuda_visible_devices("0,2,3") == [0, 2, 3]
+        assert parse_gpu_visible_devices("0,2,3") == [0, 2, 3]
 
     def test_range_syntax(self):
-        assert parse_cuda_visible_devices("0-3") == [0, 1, 2, 3]
+        assert parse_gpu_visible_devices("0-3") == [0, 1, 2, 3]
 
     def test_mixed_tokens_ignores_invalid(self):
-        assert parse_cuda_visible_devices("0,abc,2-3") == [0, 2, 3]
+        assert parse_gpu_visible_devices("0,abc,2-3") == [0, 2, 3]
 
 
 class TestBuildAllocationMapLines:
@@ -124,14 +124,14 @@ class TestBuildAllocationMapLines:
                 name="prefill_0",
                 backend_name="slurm_cluster",
                 assigned_nodes=["n1"],
-                envs={"CUDA_VISIBLE_DEVICES": "0,1"},
+                envs={"NVIDIA_VISIBLE_DEVICES": "0,1"},
                 operator=None,
             ),
             SimpleNamespace(
                 name="decode_0",
                 backend_name="slurm_cluster",
                 assigned_nodes=["n1"],
-                envs={"CUDA_VISIBLE_DEVICES": "2"},
+                envs={"NVIDIA_VISIBLE_DEVICES": "2"},
                 operator=None,
             ),
             SimpleNamespace(
@@ -145,7 +145,7 @@ class TestBuildAllocationMapLines:
                 name="decode_1",
                 backend_name="slurm_cluster",
                 assigned_nodes=["n2"],
-                envs={"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+                envs={"NVIDIA_VISIBLE_DEVICES": "0,1,2,3"},
                 operator=None,
             ),
         ]

@@ -196,7 +196,7 @@ This user guide reflects actual code behavior. Not all planned features may be a
 | Named inputs (paths, images, etc.) | [Artifacts](./artifacts.md) |
 | Compute backends (local, Slurm) | [Backends](./backends.md) |
 | Task launch methods (bash, srun, containers) | [Operators](./operators.md) |
-| Node/GPU placement, CUDA_VISIBLE_DEVICES | [Resources](./resources.md) |
+| Node/GPU placement, NVIDIA_VISIBLE_DEVICES | [Resources](./resources.md) |
 | Parallel/sequential replicas, sweeps | [Replicas](./replicas.md) |
 | Composable configs, sweeps, missable tasks | [Modular Workflows](./modular-workflows.md) |
 | Readiness/failure gates for services | [Probes](./probes.md) |

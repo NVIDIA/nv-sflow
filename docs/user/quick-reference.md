@@ -192,7 +192,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 |-------|----------|------|---------|-------------|
 | `nodes.indices` | | list[int / expr] | `null` | Specific node indices (e.g. `[0]`). |
 | `nodes.count` | | int / expr | `null` | Number of nodes. |
-| `gpus.count` | Yes | int / expr | — | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). |
+| `gpus.count` | Yes | int / expr | — | Number of GPUs (sets `NVIDIA_VISIBLE_DEVICES`). |
 
 ## Task Replicas
 
@@ -273,7 +273,7 @@ These are automatically set by sflow and available in every task script.
 | `SFLOW_REPLICA_INDEX` | Zero-based replica index (`0`, `1`, `2`, ...). |
 | `SFLOW_TASK_ASSIGNED_NODE_NAMES` | Comma-separated hostnames of nodes assigned to this task. |
 | `SFLOW_TASK_ASSIGNED_NODE_IPS` | Comma-separated IP addresses of nodes assigned to this task. |
-| `CUDA_VISIBLE_DEVICES` | Comma-separated GPU indices allocated to this task (set when `resources.gpus.count` is used). |
+| `NVIDIA_VISIBLE_DEVICES` | Comma-separated GPU indices allocated to this task (set when `resources.gpus.count` is used). |
 
 In addition, all resolved `variables` and `artifacts` paths are injected as environment variables accessible via `${VAR_NAME}` in scripts.
 

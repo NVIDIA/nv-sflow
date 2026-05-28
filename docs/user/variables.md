@@ -148,7 +148,7 @@ Available task properties:
 - `task.<name>.nodes[i].ip_address` - IP address of the i-th assigned node
 - `task.<name>.nodes[i].index` - Index of the node within the task's assignment
 - `task.<name>.nodes[i].num_gpus` - Number of GPUs on the node
-- `task.<name>.gpus` - List of GPU indices assigned to the task (from `CUDA_VISIBLE_DEVICES`)
+- `task.<name>.gpus` - List of GPU indices assigned to the task (from `NVIDIA_VISIBLE_DEVICES`)
 - `task.<name>.backend` - Name of the backend used by the task
 - `task.<name>.operator` - Name of the operator used by the task
 

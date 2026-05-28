@@ -281,7 +281,7 @@ workflow:
         policy: "parallel"
       script:
         - set -x
-        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export FIRST_CUDA_DEVICE=$(echo ${NVIDIA_VISIBLE_DEVICES} | cut -d',' -f1)
         - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
         - export DYN_SYSTEM_PORT=$((8082 + ${FIRST_CUDA_DEVICE}))
         - >
@@ -325,7 +325,7 @@ workflow:
         policy: "parallel"
       script:
         - set -x
-        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export FIRST_CUDA_DEVICE=$(echo ${NVIDIA_VISIBLE_DEVICES} | cut -d',' -f1)
         - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
         - export DYN_SYSTEM_PORT=$((8082 + ${FIRST_CUDA_DEVICE}))
         - >

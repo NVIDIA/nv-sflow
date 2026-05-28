@@ -606,7 +606,7 @@ def test_build_task_graph_resources_nodes_count_compact_allocation_for_parallel_
     assert t11.operator.config.nodelist == ["n3", "n4"]
 
 
-def test_build_task_graph_resources_gpus_count_sets_cuda_visible_devices_with_offset():
+def test_build_task_graph_resources_gpus_count_sets_nvidia_visible_devices_with_offset():
     state = _state()
     state.backends = {"local": _FakeBackend("local", allocation=None)}
     state.default_backend = state.backends["local"]
@@ -627,10 +627,12 @@ def test_build_task_graph_resources_gpus_count_sets_cuda_visible_devices_with_of
     )
 
     tg = build_task_graph(config, state)
-    assert tg.get_task("t1_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
-    assert tg.get_task("t1_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
-    assert tg.get_task("t1_0").envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
-    assert tg.get_task("t1_1").envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
+    t10 = tg.get_task("t1_0")
+    t11 = tg.get_task("t1_1")
+    assert t10.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
+    assert t11.envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
+    assert "CUDA_VISIBLE_DEVICES" not in t10.envs
+    assert "CUDA_VISIBLE_DEVICES" not in t11.envs
 
 
 def test_build_task_graph_resources_gpus_respects_compute_node_num_gpus():
@@ -663,10 +665,12 @@ def test_build_task_graph_resources_gpus_respects_compute_node_num_gpus():
         ),
     )
     tg = build_task_graph(ok, state)
-    assert tg.get_task("t1_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
-    assert tg.get_task("t1_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
-    assert tg.get_task("t1_0").envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
-    assert tg.get_task("t1_1").envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
+    t10 = tg.get_task("t1_0")
+    t11 = tg.get_task("t1_1")
+    assert t10.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
+    assert t11.envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
+    assert "CUDA_VISIBLE_DEVICES" not in t10.envs
+    assert "CUDA_VISIBLE_DEVICES" not in t11.envs
 
     bad = SflowConfig(
         version="0.1",
@@ -765,7 +769,7 @@ def test_build_task_graph_resources_gpus_count_auto_expands_nodes_when_total_exc
     assert t1.operator.config.nodelist == ["n1", "n2"]
     assert t1.operator.config.nodes == 2
     # Multi-node request exposes a per-node slice (env is evaluated per node).
-    assert t1.envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert t1.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1,2,3"
 
 
 def test_build_task_graph_resources_gpus_count_requires_multiple_of_per_node_capacity_for_auto_expand():
@@ -860,12 +864,12 @@ def test_build_task_graph_resources_with_multiple_tasks_pins_distinct_nodes_and_
     assert t22.operator.config.nodelist == ["n2"]
     assert t23.operator.config.nodelist == ["n2"]
 
-    assert t10.envs["CUDA_VISIBLE_DEVICES"] == "0,1"
-    assert t11.envs["CUDA_VISIBLE_DEVICES"] == "2,3"
-    assert t20.envs["CUDA_VISIBLE_DEVICES"] == "0"
-    assert t21.envs["CUDA_VISIBLE_DEVICES"] == "1"
-    assert t22.envs["CUDA_VISIBLE_DEVICES"] == "2"
-    assert t23.envs["CUDA_VISIBLE_DEVICES"] == "3"
+    assert t10.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
+    assert t11.envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
+    assert t20.envs["NVIDIA_VISIBLE_DEVICES"] == "0"
+    assert t21.envs["NVIDIA_VISIBLE_DEVICES"] == "1"
+    assert t22.envs["NVIDIA_VISIBLE_DEVICES"] == "2"
+    assert t23.envs["NVIDIA_VISIBLE_DEVICES"] == "3"
 
 
 def test_build_task_graph_gpu_packing_allows_multiple_base_tasks_to_share_remaining_gpus_on_same_node():
@@ -922,17 +926,17 @@ def test_build_task_graph_gpu_packing_allows_multiple_base_tasks_to_share_remain
 
     # t1 consumes 2 GPUs on n1 -> leaves 2 GPUs (2,3) available on n1.
     assert t1.operator.config.nodelist == ["n1"]
-    assert t1.envs["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert t1.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
 
     # t2 replicas should use the remaining GPUs on n1.
     assert t20.operator.config.nodelist == ["n1"]
     assert t21.operator.config.nodelist == ["n1"]
-    assert t20.envs["CUDA_VISIBLE_DEVICES"] == "2"
-    assert t21.envs["CUDA_VISIBLE_DEVICES"] == "3"
+    assert t20.envs["NVIDIA_VISIBLE_DEVICES"] == "2"
+    assert t21.envs["NVIDIA_VISIBLE_DEVICES"] == "3"
 
     # t3 requests a full node (4 GPUs) -> should land on n2.
     assert t3.operator.config.nodelist == ["n2"]
-    assert t3.envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert t3.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1,2,3"
 
 
 def test_build_task_graph_multi_node_gpu_request_reserves_gpus_so_later_tasks_use_other_nodes():
@@ -985,12 +989,12 @@ def test_build_task_graph_multi_node_gpu_request_reserves_gpus_so_later_tasks_us
     d1 = tg.get_task("decode_1")
 
     assert prefill.operator.config.nodelist == ["n1", "n2"]
-    assert prefill.envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert prefill.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1,2,3"
 
     assert d0.operator.config.nodelist == ["n3"]
     assert d1.operator.config.nodelist == ["n3"]
-    assert d0.envs["CUDA_VISIBLE_DEVICES"] == "0,1"
-    assert d1.envs["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert d0.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1"
+    assert d1.envs["NVIDIA_VISIBLE_DEVICES"] == "2,3"
 
 
 def test_build_task_graph_multi_node_decode_avoids_node_fully_consumed_by_sequential_prefill_replicas():
@@ -1043,15 +1047,15 @@ def test_build_task_graph_multi_node_decode_avoids_node_fully_consumed_by_sequen
     assert tg.get_task("prefill_1").operator.config.nodelist == ["n1"]
     assert tg.get_task("prefill_2").operator.config.nodelist == ["n1"]
     assert tg.get_task("prefill_3").operator.config.nodelist == ["n1"]
-    assert tg.get_task("prefill_0").envs["CUDA_VISIBLE_DEVICES"] == "0"
-    assert tg.get_task("prefill_1").envs["CUDA_VISIBLE_DEVICES"] == "1"
-    assert tg.get_task("prefill_2").envs["CUDA_VISIBLE_DEVICES"] == "2"
-    assert tg.get_task("prefill_3").envs["CUDA_VISIBLE_DEVICES"] == "3"
+    assert tg.get_task("prefill_0").envs["NVIDIA_VISIBLE_DEVICES"] == "0"
+    assert tg.get_task("prefill_1").envs["NVIDIA_VISIBLE_DEVICES"] == "1"
+    assert tg.get_task("prefill_2").envs["NVIDIA_VISIBLE_DEVICES"] == "2"
+    assert tg.get_task("prefill_3").envs["NVIDIA_VISIBLE_DEVICES"] == "3"
 
     # Decode should avoid n1 and use n2+n3.
     decode = tg.get_task("decode")
     assert decode.operator.config.nodelist == ["n2", "n3"]
-    assert decode.envs["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert decode.envs["NVIDIA_VISIBLE_DEVICES"] == "0,1,2,3"
 
 
 def test_build_task_graph_replica_tasks_have_independent_container_mounts(tmp_path):
@@ -1591,7 +1595,7 @@ def test_build_task_graph_resources_nodes_exclude_with_gpus():
     t1 = tg.get_task("t1")
     # Pool after exclude: only n2. GPU packing should place task on n2.
     assert t1.operator.config.nodelist == ["n2"]
-    assert t1.envs.get("CUDA_VISIBLE_DEVICES") == "0,1"
+    assert t1.envs.get("NVIDIA_VISIBLE_DEVICES") == "0,1"
 
 
 def test_build_task_graph_resources_nodes_exclude_all_raises():

@@ -326,14 +326,14 @@ workflow:
 ```yaml
 resources:
   gpus:
-    count: 4                    # CUDA_VISIBLE_DEVICES slicing
+    count: 4                    # NVIDIA_VISIBLE_DEVICES slicing
   nodes:
     indices: [0]                # pin to specific node indices
     count: 2                    # OR request N nodes (mutually exclusive with indices)
 ```
 
 GPU allocation:
-- Each task/replica gets `count` GPUs via `CUDA_VISIBLE_DEVICES`
+- Each task/replica gets `count` GPUs via `NVIDIA_VISIBLE_DEVICES`
 - GPUs are sliced sequentially across replicas on each node
 - Total GPUs across all tasks must not exceed `nodes * gpus_per_node`
 

@@ -72,12 +72,12 @@ def _build_task_info(
                 }
             )
 
-    # Parse GPU indices from CUDA_VISIBLE_DEVICES env var
+    # Parse GPU indices from NVIDIA_VISIBLE_DEVICES env var.
     gpus: list[int] = []
-    cuda_visible = task.envs.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible:
+    nvidia_visible = task.envs.get("NVIDIA_VISIBLE_DEVICES")
+    if nvidia_visible:
         try:
-            gpus = [int(g.strip()) for g in cuda_visible.split(",") if g.strip()]
+            gpus = [int(g.strip()) for g in nvidia_visible.split(",") if g.strip()]
         except ValueError:
             gpus = []
 
@@ -1303,10 +1303,10 @@ def build_task_graph(
         #
         # This enables global GPU sharing across workflow tasks. Example:
         # - Node0 has 4 GPUs
-        # - Task A requests 2 GPUs -> gets CUDA_VISIBLE_DEVICES=0,1 on node0
-        # - Task B requests 2 GPUs -> gets CUDA_VISIBLE_DEVICES=2,3 on node0
+        # - Task A requests 2 GPUs -> gets NVIDIA_VISIBLE_DEVICES=0,1 on node0
+        # - Task B requests 2 GPUs -> gets NVIDIA_VISIBLE_DEVICES=2,3 on node0
         #
-        # We use the same planning-time cursor as CUDA_VISIBLE_DEVICES assignment (`gpu_next`)
+        # We use the same planning-time cursor as NVIDIA_VISIBLE_DEVICES assignment (`gpu_next`)
         # so the chosen node reflects already-reserved GPU slices from earlier tasks/replicas.
         if gpus_count_raw is not None and runtime_backend.allocation is not None:
             gpus_needed = _resolve_int(
@@ -1332,7 +1332,7 @@ def build_task_graph(
                 cursor_key = (runtime_backend.name, node.name)
                 start = gpu_next.get(cursor_key, 0)
                 if start + gpus_needed <= cap:
-                    # Pin to a single node; CUDA_VISIBLE_DEVICES will allocate a slice later.
+                    # Pin to a single node; NVIDIA_VISIBLE_DEVICES will allocate a slice later.
                     return [node.name], True
 
         # If nodes are not explicitly requested but GPUs are, we can infer a minimum node count
@@ -1364,7 +1364,7 @@ def build_task_graph(
                     # don't place a multi-node task onto nodes whose GPUs were already reserved by
                     # earlier tasks/replicas.
                     #
-                    # Additionally, since CUDA_VISIBLE_DEVICES is computed as a uniform slice across
+                    # Additionally, since NVIDIA_VISIBLE_DEVICES is computed as a uniform slice across
                     # the assigned nodes (per-node env), we require the selected nodes to share the
                     # same planning cursor (gpu_next) value.
                     alloc_nodes_map = {n.name: n for n in alloc_nodes_by_name}
@@ -1416,7 +1416,7 @@ def build_task_graph(
 
         return [n.name for n in alloc_nodes], False
 
-    def _cuda_visible_devices(
+    def _nvidia_visible_devices(
         *,
         task_name: str,
         base_task_name: str,
@@ -1496,13 +1496,13 @@ def build_task_graph(
                         f"Consider increasing backend nodes or reducing concurrent GPU requests."
                     )
 
-                # CUDA_VISIBLE_DEVICES is evaluated per-node, so indices must be local to that node.
+                # NVIDIA_VISIBLE_DEVICES is evaluated per-node, so indices must be local to that node.
                 slice_str = ",".join(str(i) for i in range(start, start + count))
                 gpu_next[cursor_key] = start + count
                 return slice_str
 
         # Multi-node GPU request: interpret `count` as a total GPU request across assigned nodes,
-        # and expose an even-ish per-node slice via CUDA_VISIBLE_DEVICES (since env is per-node).
+        # and expose an even-ish per-node slice via NVIDIA_VISIBLE_DEVICES (since env is per-node).
         if runtime_backend.allocation and assigned_nodes and len(assigned_nodes) > 1:
             alloc_nodes_by_name = {n.name: n for n in runtime_backend.allocation.nodes}
             caps: list[int] = []
@@ -1703,7 +1703,7 @@ def build_task_graph(
             if backend is None:
                 raise ValueError(f"Task '{t_conf.name}' references unknown backend")
 
-            # Apply resources -> runtime node subset + CUDA_VISIBLE_DEVICES env
+            # Apply resources -> runtime node subset + NVIDIA_VISIBLE_DEVICES env
             nodes_indices_raw = None
             nodes_count_raw = None
             nodes_exclude_raw = None
@@ -1857,7 +1857,7 @@ def build_task_graph(
             )
             if nodes_inferred_from_gpus:
                 nodes_are_pinned = True
-            cuda_visible = _cuda_visible_devices(
+            nvidia_visible = _nvidia_visible_devices(
                 task_name=node_name,
                 base_task_name=base,
                 runtime_backend=backend,
@@ -1994,9 +1994,8 @@ def build_task_graph(
                 if apath is not None:
                     task.envs.setdefault(aname, str(apath))
             task.envs.update(replica_envs.get(node_name, {}))
-            if cuda_visible is not None:
-                task.envs["CUDA_VISIBLE_DEVICES"] = cuda_visible
-                task.envs["NVIDIA_VISIBLE_DEVICES"] = cuda_visible
+            if nvidia_visible is not None:
+                task.envs["NVIDIA_VISIBLE_DEVICES"] = nvidia_visible
             task_graph.dag.add_node(node_name, task)
 
             # If the task is replicated sequentially, enforce replica order by chaining edges.
