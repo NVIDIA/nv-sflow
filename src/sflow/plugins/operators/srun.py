@@ -280,6 +280,11 @@ class SrunOperator(Operator):
         if c.container_remap_root:
             command.add_opt("--container-remap-root")
 
+        if c.container_image is not None and "NVIDIA_VISIBLE_DEVICES" in envs:
+            # Pyxis/enroot container setup needs this at container launch time in
+            # addition to the environment passed to the srun subprocess.
+            command.add_opt("--container-env", "NVIDIA_VISIBLE_DEVICES")
+
         for arg in filtered_extra_args:
             command.add_opt(arg)
 
