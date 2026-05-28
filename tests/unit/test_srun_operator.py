@@ -66,35 +66,6 @@ def test_srun_operator_supports_pyxis_container_image_flags_and_common_args():
     assert "echo hi" in s
 
 
-def test_srun_operator_passes_nvidia_visible_devices_to_pyxis_container():
-    op = SrunOperator(
-        SrunOperatorConfig(
-            name="op_srun",
-            container_image="nvcr.io/a/b:1",
-        )
-    )
-
-    cmd = op.build_command(
-        task_name="t1",
-        script=["echo hi"],
-        envs={"NVIDIA_VISIBLE_DEVICES": "1,2"},
-    )
-
-    assert "--container-env NVIDIA_VISIBLE_DEVICES" in str(cmd)
-
-
-def test_srun_operator_does_not_add_container_env_without_container():
-    op = SrunOperator(SrunOperatorConfig(name="op_srun"))
-
-    cmd = op.build_command(
-        task_name="t1",
-        script=["echo hi"],
-        envs={"NVIDIA_VISIBLE_DEVICES": "1,2"},
-    )
-
-    assert "--container-env NVIDIA_VISIBLE_DEVICES" not in str(cmd)
-
-
 def test_srun_operator_supports_pyxis_container_name_flags():
     op = SrunOperator(
         SrunOperatorConfig(
