@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from sflow.app.assembly import build_state, release_backends
 from sflow.config.loader import ConfigLoader
+from sflow.core.task_logging import TaskLogPolicy, TaskOutputSink, create_task_log_handler
 from sflow.logging import add_log_file, get_logger
 
 if TYPE_CHECKING:
@@ -225,6 +226,11 @@ class SflowApp:
         tui: bool = False,
         tui_log_buffer: deque[logging.LogRecord] | None = None,
         tui_refresh_per_second: int | None = None,
+        task_log_mode: str = "bounded",
+        task_log_keep_lines_per_second: int = 100,
+        task_log_keep_first_lines: int = 1000,
+        task_log_max_bytes: int = 64 * 1024 * 1024,
+        task_log_backup_count: int = 16,
     ) -> Path | None:
         """
         Run the workflow and return the workflow output directory path.
@@ -239,6 +245,14 @@ class SflowApp:
 
         if resume is not None:
             raise NotImplementedError("--resume is not implemented yet")
+
+        task_log_policy = TaskLogPolicy(
+            mode=task_log_mode,  # type: ignore[arg-type]
+            keep_lines_per_second=int(task_log_keep_lines_per_second),
+            keep_first_lines=int(task_log_keep_first_lines),
+            max_bytes=int(task_log_max_bytes),
+            backup_count=int(task_log_backup_count),
+        )
 
         # Reset from previous runs
         self.last_workflow_output_dir = None
@@ -626,6 +640,7 @@ class SflowApp:
                     # Add a global sflow log file under the workflow output dir.
                     add_log_file(str(workflow_out_dir / "sflow.log"))
 
+                task_output_sinks: dict[str, TaskOutputSink] = {}
                 for t in tg.get_tasks():
                     task_out_dir = workflow_out_dir / t.name
                     if not dry_run:
@@ -654,15 +669,15 @@ class SflowApp:
                             and getattr(h, "baseFilename", None) == str(log_path)
                         ]
                         if not existing:
-                            fh = logging.FileHandler(log_path)
-                            fh.setFormatter(
-                                logging.Formatter(
-                                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-                                )
-                            )
+                            fh = create_task_log_handler(log_path, task_log_policy)
                             t.logger.addHandler(fh)
                         t.logger.setLevel(logging.INFO)
                         t.logger.propagate = False
+                        if task_log_policy.mode == "bounded":
+                            task_output_sinks[t.name] = TaskOutputSink(
+                                logger=t.logger,
+                                policy=task_log_policy,
+                            )
 
                 if dry_run:
                     plan_tasks = tg.get_tasks()
@@ -1128,7 +1143,11 @@ class SflowApp:
 
                 # run the workflow and always release backend allocations
                 try:
-                    orch = Orchestrator(workflow=state.workflow, poll_interval=1)
+                    orch = Orchestrator(
+                        workflow=state.workflow,
+                        poll_interval=1,
+                        task_output_sinks=task_output_sinks,
+                    )
                     await orch.run()
 
                     # Determine overall success based on final task statuses (not just "orchestrator returned").

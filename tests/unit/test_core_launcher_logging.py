@@ -16,6 +16,7 @@ import logging
 import pytest
 
 from sflow.core.launcher import SubprocessLauncher
+from sflow.core.task_logging import TaskLogPolicy, TaskOutputSink, create_task_log_handler
 from sflow.logging import IN_TASK_OUTPUT_ATTR, add_log_file
 
 _SENTINEL = "SENTINEL_TASK_OUTPUT_LINE"
@@ -164,3 +165,175 @@ def test_add_log_file_excludes_in_task_output(tmp_path):
             sflow_logger.removeHandler(h)
             h.close()
         sflow_logger.setLevel(prev_level)
+
+
+def test_tty_echo_survives_bounded_task_log_suppression(
+    shared_logger_capture, tmp_path
+):
+    """Interactive/TUI stream is independent from bounded per-task persistence."""
+    shared_logger, shared_handler = shared_logger_capture
+    shared_logger.setLevel(logging.INFO)
+
+    task_logger = logging.getLogger("sflow.task.bounded_tty_unit")
+    task_logger.handlers = []
+    task_logger.setLevel(logging.INFO)
+    task_logger.propagate = False
+    handler = create_task_log_handler(
+        tmp_path / "bounded_tty_unit.log",
+        TaskLogPolicy(
+            mode="bounded",
+            keep_lines_per_second=0,
+            keep_first_lines=1,
+            max_bytes=1024 * 1024,
+            backup_count=1,
+        ),
+    )
+    task_logger.addHandler(handler)
+
+    launcher = SubprocessLauncher(echo_to_console=True)
+    launcher._emit_subprocess_line(
+        "kept on disk", prefix="[bounded_tty_unit] ", output_logger=task_logger
+    )
+    launcher._emit_subprocess_line(
+        "dropped on disk but live", prefix="[bounded_tty_unit] ", output_logger=task_logger
+    )
+    handler.close()
+
+    disk_contents = (tmp_path / "bounded_tty_unit.log").read_text()
+    assert "kept on disk" in disk_contents
+    assert "dropped on disk but live" not in disk_contents
+    assert any("kept on disk" in m for m in shared_handler.messages)
+    assert any("dropped on disk but live" in m for m in shared_handler.messages)
+    assert all(
+        getattr(r, IN_TASK_OUTPUT_ATTR, False)
+        for r in shared_handler.records
+        if "disk" in r.getMessage()
+    )
+
+
+def test_non_tty_does_not_echo_when_bounded_task_log_suppresses(
+    shared_logger_capture, tmp_path
+):
+    shared_logger, shared_handler = shared_logger_capture
+    shared_logger.setLevel(logging.INFO)
+
+    task_logger = logging.getLogger("sflow.task.bounded_notty_unit")
+    task_logger.handlers = []
+    task_logger.setLevel(logging.INFO)
+    task_logger.propagate = False
+    handler = create_task_log_handler(
+        tmp_path / "bounded_notty_unit.log",
+        TaskLogPolicy(
+            mode="bounded",
+            keep_lines_per_second=0,
+            keep_first_lines=1,
+            max_bytes=1024 * 1024,
+            backup_count=1,
+        ),
+    )
+    task_logger.addHandler(handler)
+
+    launcher = SubprocessLauncher(echo_to_console=False)
+    launcher._emit_subprocess_line(
+        "kept only in task log", prefix="[bounded_notty_unit] ", output_logger=task_logger
+    )
+    launcher._emit_subprocess_line(
+        "dropped everywhere shared", prefix="[bounded_notty_unit] ", output_logger=task_logger
+    )
+    handler.close()
+
+    disk_contents = (tmp_path / "bounded_notty_unit.log").read_text()
+    assert "kept only in task log" in disk_contents
+    assert "dropped everywhere shared" not in disk_contents
+    assert not any("kept only in task log" in m for m in shared_handler.messages)
+    assert not any("dropped everywhere shared" in m for m in shared_handler.messages)
+
+
+def test_on_output_line_callback_runs_before_task_log_suppression(tmp_path):
+    task_logger = logging.getLogger("sflow.task.callback_unit")
+    task_logger.handlers = []
+    task_logger.setLevel(logging.INFO)
+    task_logger.propagate = False
+    handler = create_task_log_handler(
+        tmp_path / "callback_unit.log",
+        TaskLogPolicy(
+            mode="bounded",
+            keep_lines_per_second=0,
+            keep_first_lines=0,
+            max_bytes=1024 * 1024,
+            backup_count=1,
+        ),
+    )
+    task_logger.addHandler(handler)
+    seen: list[tuple[str | None, str]] = []
+
+    SubprocessLauncher(echo_to_console=False)._emit_subprocess_line(
+        "callback-only line",
+        prefix="[callback_unit] ",
+        output_logger=task_logger,
+        on_output_line=lambda task_name, line: seen.append((task_name, line)),
+        task_name="callback_unit",
+    )
+    handler.close()
+
+    assert seen == [("callback_unit", "callback-only line")]
+    assert "callback-only line" not in (tmp_path / "callback_unit.log").read_text()
+
+
+def test_task_output_sink_replaces_output_logger_info_for_task_persistence(tmp_path):
+    task_logger = logging.getLogger("sflow.task.sink_unit")
+    task_logger.handlers = []
+    task_logger.setLevel(logging.INFO)
+    task_logger.propagate = False
+    handler = create_task_log_handler(
+        tmp_path / "sink_unit.log",
+        TaskLogPolicy(
+            mode="bounded",
+            keep_lines_per_second=0,
+            keep_first_lines=1,
+            max_bytes=1024 * 1024,
+            backup_count=1,
+        ),
+    )
+    task_logger.addHandler(handler)
+    sink = TaskOutputSink(
+        logger=task_logger,
+        policy=TaskLogPolicy(
+            mode="bounded",
+            keep_lines_per_second=0,
+            keep_first_lines=1,
+            max_bytes=1024 * 1024,
+            backup_count=1,
+        ),
+    )
+    original_info = task_logger.info
+    info_calls = 0
+
+    def counting_info(message: str) -> None:
+        nonlocal info_calls
+        info_calls += 1
+        original_info(message)
+
+    task_logger.info = counting_info  # type: ignore[method-assign]
+
+    launcher = SubprocessLauncher(echo_to_console=False)
+    launcher._emit_subprocess_line(
+        "kept",
+        prefix="[sink_unit] ",
+        output_logger=task_logger,
+        task_output_sink=sink,
+        task_name="sink_unit",
+    )
+    launcher._emit_subprocess_line(
+        "dropped",
+        prefix="[sink_unit] ",
+        output_logger=task_logger,
+        task_output_sink=sink,
+        task_name="sink_unit",
+    )
+    sink.close()
+
+    contents = (tmp_path / "sink_unit.log").read_text()
+    assert info_calls == 0
+    assert "kept" in contents
+    assert "dropped" not in contents

@@ -4,6 +4,7 @@
 import asyncio
 import time
 from datetime import timedelta
+from typing import Any
 
 from sflow.logging import get_logger
 
@@ -27,15 +28,19 @@ class Orchestrator:
         poll_interval: int = 1,
         launcher: SubprocessLauncher | None = None,
         fail_fast: bool = True,
+        task_output_sinks: dict[str, Any] | None = None,
     ):
         self.workflow = workflow
         self._poll_interval = poll_interval
         self._fail_fast = bool(fail_fast)
 
         self._subprocess_launcher = launcher or SubprocessLauncher()
+        self._task_output_sinks = task_output_sinks or {}
+        self._live_probe_index: dict[str, list[Probe]] = {}
         self._subprocess_tasks = dict[str, asyncio.Task]()
         self._stop_event = asyncio.Event()
         self._stop_reason: str | None = None
+        self._rebuild_live_probe_index()
 
     def request_stop(self, reason: str | None = None) -> None:
         """
@@ -43,6 +48,27 @@ class Orchestrator:
         """
         self._stop_reason = reason or self._stop_reason
         self._stop_event.set()
+
+    def _feed_output_line_to_probes(self, task_name: str | None, line: str) -> None:
+        if not task_name:
+            return
+        for probe in self._live_probe_index.get(task_name, []):
+            is_active = getattr(probe, "is_live_match_active", None)
+            if is_active is not None and not is_active():
+                continue
+            feed_line = getattr(probe, "feed_line", None)
+            if feed_line is not None:
+                feed_line(line)
+
+    def _rebuild_live_probe_index(self) -> None:
+        index: dict[str, list[Probe]] = {}
+        for task in self.workflow.get_tasks():
+            for probe in getattr(task, "probes", []) or []:
+                if getattr(probe, "feed_line", None) is None:
+                    continue
+                source_task = getattr(probe, "_logger_task_name", None) or task.name
+                index.setdefault(source_task, []).append(probe)
+        self._live_probe_index = index
 
     async def run(self):
         """
@@ -86,6 +112,7 @@ class Orchestrator:
                     task.attempts = int(getattr(task, "attempts", 0)) + 1
                     for p in getattr(task, "probes", []) or []:
                         p.reset()
+                    self._rebuild_live_probe_index()
                     self._subprocess_tasks[task.name] = asyncio.create_task(
                         self._launch_task_with_timeout(task)
                     )
@@ -292,6 +319,8 @@ class Orchestrator:
                     output_logger=task.logger,
                     env=task.envs,
                     task_name=task.name,
+                    on_output_line=self._feed_output_line_to_probes,
+                    task_output_sink=self._task_output_sinks.get(task.name),
                 )
         else:
             return await self._subprocess_launcher.run_async(
@@ -299,4 +328,6 @@ class Orchestrator:
                 output_logger=task.logger,
                 env=task.envs,
                 task_name=task.name,
+                on_output_line=self._feed_output_line_to_probes,
+                task_output_sink=self._task_output_sinks.get(task.name),
             )

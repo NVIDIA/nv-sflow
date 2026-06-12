@@ -301,6 +301,11 @@ def _generate_sbatch_script(
     sbatch_extra_args: list[str] | None,
     sflow_venv_path: Path | None,
     sflow_version: str | None,
+    task_log_mode: str = "bounded",
+    task_log_keep_lines_per_second: int = 100,
+    task_log_keep_first_lines: int = 1000,
+    task_log_max_bytes: int = 64 * 1024 * 1024,
+    task_log_backup_count: int = 16,
 ) -> str:
     """Generate the content of an sbatch script that wraps ``sflow run``."""
     sflow_cmd_parts = ["sflow", "run"]
@@ -321,6 +326,22 @@ def _generate_sbatch_script(
 
     if log_level != "info":
         sflow_cmd_parts.extend(["--log-level", log_level])
+
+    if task_log_mode != "full":
+        sflow_cmd_parts.extend(["--task-log-mode", shlex.quote(task_log_mode)])
+        sflow_cmd_parts.extend(
+            [
+                "--task-log-keep-lines-per-second",
+                str(int(task_log_keep_lines_per_second)),
+            ]
+        )
+        sflow_cmd_parts.extend(
+            ["--task-log-keep-first-lines", str(int(task_log_keep_first_lines))]
+        )
+        sflow_cmd_parts.extend(["--task-log-max-bytes", str(int(task_log_max_bytes))])
+        sflow_cmd_parts.extend(
+            ["--task-log-backup-count", str(int(task_log_backup_count))]
+        )
 
     if workspace_dir:
         sflow_cmd_parts.extend(["--workspace-dir", shlex.quote(str(workspace_dir))])
@@ -1194,6 +1215,11 @@ def _run_bulk_submit(
     sbatch_extra_args: list[str] | None,
     sflow_venv_path: Path | None,
     sflow_version: str | None,
+    task_log_mode: str,
+    task_log_keep_lines_per_second: int,
+    task_log_keep_first_lines: int,
+    task_log_max_bytes: int,
+    task_log_backup_count: int,
     submit: bool,
     missable_tasks: list[str] | None = None,
     resolve: bool = False,
@@ -1348,6 +1374,11 @@ def _run_bulk_submit(
             sbatch_extra_args=sbatch_extra_args,
             sflow_venv_path=sflow_venv_path,
             sflow_version=sflow_version,
+            task_log_mode=task_log_mode,
+            task_log_keep_lines_per_second=task_log_keep_lines_per_second,
+            task_log_keep_first_lines=task_log_keep_first_lines,
+            task_log_max_bytes=task_log_max_bytes,
+            task_log_backup_count=task_log_backup_count,
         )
         script_path = bulk_dir / f"{job_name}.sh"
         script_path.write_text(script)
@@ -1467,6 +1498,11 @@ def _run_bulk_edit(
     sbatch_extra_args: list[str] | None,
     sflow_venv_path: Path | None,
     sflow_version: str | None,
+    task_log_mode: str,
+    task_log_keep_lines_per_second: int,
+    task_log_keep_first_lines: int,
+    task_log_max_bytes: int,
+    task_log_backup_count: int,
     submit: bool,
     row_selectors: list[str] | None = None,
     resolve: bool = False,
@@ -1656,6 +1692,11 @@ def _run_bulk_edit(
             sbatch_extra_args=sbatch_extra_args,
             sflow_venv_path=sflow_venv_path,
             sflow_version=sflow_version,
+            task_log_mode=task_log_mode,
+            task_log_keep_lines_per_second=task_log_keep_lines_per_second,
+            task_log_keep_first_lines=task_log_keep_first_lines,
+            task_log_max_bytes=task_log_max_bytes,
+            task_log_backup_count=task_log_backup_count,
         )
         script_path.write_text(script)
         script_path.chmod(0o755)
@@ -1774,6 +1815,60 @@ def batch(
             help="Logging level for sflow run (debug, info, warning, error, critical). Default: info.",
         ),
     ] = "info",
+    task_log_mode: Annotated[
+        str,
+        typer.Option(
+            "--task-log-mode",
+            help=(
+                "Per-task log persistence mode for generated sflow run. Default: "
+                "bounded (keep the first N lines, then keep up to N lines/sec, "
+                "rotate by size, and summarize suppressed lines). Use 'full' to "
+                "persist every task output line."
+            ),
+        ),
+    ] = "bounded",
+    task_log_keep_lines_per_second: Annotated[
+        int,
+        typer.Option(
+            "--task-log-keep-lines-per-second",
+            help=(
+                "Bounded mode only: after the initial kept lines are used, persist "
+                "at most this many additional task output lines per second. Extra "
+                "lines are suppressed and summarized. Use 0 to suppress all later lines."
+            ),
+            min=0,
+        ),
+    ] = 100,
+    task_log_keep_first_lines: Annotated[
+        int,
+        typer.Option(
+            "--task-log-keep-first-lines",
+            help=(
+                "Bounded mode only: number of initial task output lines to persist "
+                "immediately before the per-second keep rate applies."
+            ),
+            min=0,
+        ),
+    ] = 1000,
+    task_log_max_bytes: Annotated[
+        int,
+        typer.Option(
+            "--task-log-max-bytes",
+            help="Bounded mode only: maximum bytes per per-task log file before rotation.",
+            min=0,
+        ),
+    ] = 64 * 1024 * 1024,
+    task_log_backup_count: Annotated[
+        int,
+        typer.Option(
+            "--task-log-backup-count",
+            help=(
+                "Bounded mode only: number of rotated backup task log files to retain "
+                "(total retained files is backup count plus the active log)."
+            ),
+            min=0,
+        ),
+    ] = 16,
     workspace_dir: Annotated[
         Optional[Path],
         typer.Option(
@@ -2103,6 +2198,11 @@ def batch(
                 sbatch_extra_args=sbatch_extra_args,
                 sflow_venv_path=sflow_venv_path,
                 sflow_version=sflow_version,
+                task_log_mode=task_log_mode,
+                task_log_keep_lines_per_second=task_log_keep_lines_per_second,
+                task_log_keep_first_lines=task_log_keep_first_lines,
+                task_log_max_bytes=task_log_max_bytes,
+                task_log_backup_count=task_log_backup_count,
                 submit=submit,
                 row_selectors=row,
                 resolve=resolve,
@@ -2164,6 +2264,11 @@ def batch(
                 sbatch_extra_args=sbatch_extra_args,
                 sflow_venv_path=sflow_venv_path,
                 sflow_version=sflow_version,
+                task_log_mode=task_log_mode,
+                task_log_keep_lines_per_second=task_log_keep_lines_per_second,
+                task_log_keep_first_lines=task_log_keep_first_lines,
+                task_log_max_bytes=task_log_max_bytes,
+                task_log_backup_count=task_log_backup_count,
                 submit=submit,
                 missable_tasks=missable_tasks,
                 resolve=resolve,
@@ -2273,6 +2378,11 @@ def batch(
         sbatch_extra_args=sbatch_extra_args,
         sflow_venv_path=sflow_venv_path,
         sflow_version=sflow_version,
+        task_log_mode=task_log_mode,
+        task_log_keep_lines_per_second=task_log_keep_lines_per_second,
+        task_log_keep_first_lines=task_log_keep_first_lines,
+        task_log_max_bytes=task_log_max_bytes,
+        task_log_backup_count=task_log_backup_count,
     )
 
     # Generate composed/resolved YAML alongside the sbatch script

@@ -68,6 +68,22 @@ class _ControlledReadinessProbe(Probe):
         return self._results.pop(0) if self._results else False
 
 
+class _CountingLogWatchProbe(LogWatchProbe):
+    def __init__(self, *, logger_task_name: str | None = None):
+        super().__init__(
+            regex_pattern="READY",
+            logger_task_name=logger_task_name,
+            type=ProbeType.READINESS,
+            interval=0,
+            timeout=1,
+        )
+        self.fed_lines: list[str] = []
+
+    def feed_line(self, line: str) -> bool:
+        self.fed_lines.append(line)
+        return super().feed_line(line)
+
+
 def test_multiple_readiness_probes_require_all_to_trigger():
     """A task is ready only after every readiness probe has triggered."""
     tg = TaskGraph()
@@ -101,6 +117,66 @@ def test_multiple_readiness_probes_require_all_to_trigger():
     asyncio.run(orch._run_probe(second_probe, server))
     assert second_probe.status == ProbeStatus.TRIGGERED
     assert server.status == TaskStatus.READY
+
+
+def test_live_probe_index_feeds_only_source_task_probes():
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+    server_probe = _CountingLogWatchProbe()
+    cross_probe = _CountingLogWatchProbe(logger_task_name="server")
+    unrelated_probe = _CountingLogWatchProbe()
+    server = Task(
+        name="server",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server"),
+        probes=[server_probe],
+    )
+    follower = Task(
+        name="follower",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.follower"),
+        probes=[cross_probe],
+    )
+    other = Task(
+        name="other",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.other"),
+        probes=[unrelated_probe],
+    )
+    tg.dag.add_node("server", server)
+    tg.dag.add_node("follower", follower)
+    tg.dag.add_node("other", other)
+    orch = Orchestrator(workflow=wf, poll_interval=0.01, launcher=_HangingLauncher())
+
+    orch._rebuild_live_probe_index()
+    orch._feed_output_line_to_probes("server", "READY")
+
+    assert server_probe.fed_lines == ["READY"]
+    assert cross_probe.fed_lines == ["READY"]
+    assert unrelated_probe.fed_lines == []
+
+
+def test_live_probe_feed_uses_index_without_scanning_workflow_each_line():
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+    probe = _CountingLogWatchProbe()
+    server = Task(
+        name="server",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server"),
+        probes=[probe],
+    )
+    tg.dag.add_node("server", server)
+    orch = Orchestrator(workflow=wf, poll_interval=0.01, launcher=_HangingLauncher())
+    orch._rebuild_live_probe_index()
+
+    def fail_get_tasks():
+        raise AssertionError("live output feed should use the probe index")
+
+    wf.get_tasks = fail_get_tasks  # type: ignore[method-assign]
+    orch._feed_output_line_to_probes("server", "READY")
+
+    assert probe.fed_lines == ["READY"]
 
 
 def test_failure_probe_sets_failed_by_probe_and_cancels_workflow(tmp_path: Path):

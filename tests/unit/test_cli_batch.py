@@ -245,7 +245,78 @@ def test_single_job_with_nodes_succeeds(mock_sflow_app, temp_workflow_file, tmp_
         ],
     )
     assert result.exit_code == 0, f"CLI failed: {result.output}"
-    assert "#SBATCH --nodes=2" in sbatch_path.read_text()
+    script_content = sbatch_path.read_text()
+    assert "#SBATCH --nodes=2" in script_content
+    assert "--task-log-mode bounded" in script_content
+    assert "--task-log-keep-lines-per-second 100" in script_content
+    assert "--task-log-keep-first-lines 1000" in script_content
+
+
+def test_batch_can_opt_out_to_full_task_log_mode(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "2",
+            "--sbatch-path",
+            str(sbatch_path),
+            "--task-log-mode",
+            "full",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert "--task-log-mode" not in sbatch_path.read_text()
+
+
+def test_batch_task_log_options_propagate_to_generated_sflow_run(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "2",
+            "--sbatch-path",
+            str(sbatch_path),
+            "--task-log-mode",
+            "bounded",
+            "--task-log-keep-lines-per-second",
+            "50",
+            "--task-log-keep-first-lines",
+            "500",
+            "--task-log-max-bytes",
+            "1048576",
+            "--task-log-backup-count",
+            "4",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert "--task-log-mode bounded" in script_content
+    assert "--task-log-keep-lines-per-second 50" in script_content
+    assert "--task-log-keep-first-lines 500" in script_content
+    assert "--task-log-max-bytes 1048576" in script_content
+    assert "--task-log-backup-count 4" in script_content
 
 
 def test_single_job_without_nodes_fails_when_not_derivable(mock_sflow_app, temp_workflow_file):

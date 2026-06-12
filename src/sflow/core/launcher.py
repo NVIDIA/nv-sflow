@@ -8,13 +8,15 @@ import pty
 import shlex
 import subprocess
 import sys
-from typing import Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from sflow.logging import IN_TASK_OUTPUT_ATTR, get_logger
 
 from .command import Command, format_command
 
 _logger = get_logger(__name__)
+
+OutputLineCallback = Callable[[str | None, str], None]
 
 
 def _strip_ansi(text: str) -> str:
@@ -58,6 +60,9 @@ class SubprocessLauncher:
         *,
         prefix: str,
         output_logger: Optional[logging.Logger],
+        on_output_line: OutputLineCallback | None = None,
+        task_name: str | None = None,
+        task_output_sink: Any | None = None,
     ) -> None:
         """
         Route one line of subprocess (in-task) output.
@@ -75,7 +80,14 @@ class SubprocessLauncher:
         """
         if not line_str:
             return
-        if output_logger is not None:
+        if on_output_line is not None:
+            try:
+                on_output_line(task_name, line_str)
+            except Exception as e:
+                _logger.warning(f"{prefix}Output line callback failed: {e}")
+        if task_output_sink is not None:
+            task_output_sink.emit_line(line_str)
+        elif output_logger is not None:
             output_logger.info(line_str)
         if self._echo_to_console and (
             output_logger is None or not output_logger.propagate
@@ -122,6 +134,8 @@ class SubprocessLauncher:
         output_logger: Optional[logging.Logger] = None,
         env: Mapping[str, str] | None = None,
         task_name: str | None = None,
+        on_output_line: OutputLineCallback | None = None,
+        task_output_sink: Any | None = None,
     ) -> int:
         pfx = self._console_prefix(task_name)
         _logger.info(f"{pfx}========== Command ==========")
@@ -208,7 +222,12 @@ class SubprocessLauncher:
                         # Strip ANSI escape sequences for cleaner logs
                         line_str = _strip_ansi(line_str).rstrip()
                         self._emit_subprocess_line(
-                            line_str, prefix=pfx, output_logger=output_logger
+                            line_str,
+                            prefix=pfx,
+                            output_logger=output_logger,
+                            on_output_line=on_output_line,
+                            task_name=task_name,
+                            task_output_sink=task_output_sink,
                         )
 
                 if ret is not None and not chunk:
@@ -218,7 +237,12 @@ class SubprocessLauncher:
                             buffer.decode("utf-8", errors="replace")
                         ).rstrip()
                         self._emit_subprocess_line(
-                            line_str, prefix=pfx, output_logger=output_logger
+                            line_str,
+                            prefix=pfx,
+                            output_logger=output_logger,
+                            on_output_line=on_output_line,
+                            task_name=task_name,
+                            task_output_sink=task_output_sink,
                         )
                     break
 

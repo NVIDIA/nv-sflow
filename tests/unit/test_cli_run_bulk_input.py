@@ -234,6 +234,7 @@ def test_cli_run_bulk_input_dry_run(mock_sflow_app, csv_file):
     overrides = call_kwargs.kwargs.get("variable_overrides") or []
     override_map = dict(v.split("=", 1) for v in overrides)
     assert override_map.get("MY_VAR") == "10"
+    assert call_kwargs.kwargs["task_log_mode"] == "bounded"
 
 
 def test_cli_run_bulk_input_row2(mock_sflow_app, csv_file):
@@ -252,6 +253,53 @@ def test_cli_run_bulk_input_row2(mock_sflow_app, csv_file):
     override_map = dict(v.split("=", 1) for v in overrides)
     assert override_map.get("MY_VAR") == "20"
     assert override_map.get("SERVER_PORT") == "8001"
+
+
+def test_cli_run_passes_bounded_task_log_options(mock_sflow_app, workflow_files):
+    base, _variant = workflow_files
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            str(base),
+            "--dry-run",
+            "--task-log-mode",
+            "bounded",
+            "--task-log-keep-lines-per-second",
+            "25",
+            "--task-log-keep-first-lines",
+            "250",
+            "--task-log-max-bytes",
+            "4096",
+            "--task-log-backup-count",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kwargs = mock_sflow_app.run.call_args.kwargs
+    assert kwargs["task_log_mode"] == "bounded"
+    assert kwargs["task_log_keep_lines_per_second"] == 25
+    assert kwargs["task_log_keep_first_lines"] == 250
+    assert kwargs["task_log_max_bytes"] == 4096
+    assert kwargs["task_log_backup_count"] == 3
+
+
+def test_cli_run_can_opt_out_to_full_task_log_mode(mock_sflow_app, workflow_files):
+    base, _variant = workflow_files
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            str(base),
+            "--dry-run",
+            "--task-log-mode",
+            "full",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_sflow_app.run.call_args.kwargs["task_log_mode"] == "full"
 
 
 def test_cli_run_bulk_input_without_row_fails(mock_sflow_app, csv_file):

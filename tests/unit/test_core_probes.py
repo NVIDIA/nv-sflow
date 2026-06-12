@@ -131,6 +131,96 @@ def test_log_watch_probe_match_count(tmp_path: Path):
     assert triggered is True
 
 
+def test_log_watch_probe_matches_live_fed_lines_without_disk_log():
+    t = Task(
+        name="svc",
+        logger=_DummyLogger(),  # type: ignore[arg-type]
+        operator=BashOperator(BashOperatorConfig(name="bash")),
+    )
+    p = LogWatchProbe(
+        regex_pattern="READY",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=1,
+    )
+
+    assert p.feed_line("server READY on node 17") is True
+    assert asyncio.run(p.probe(t)) is True
+
+
+def test_log_watch_probe_literal_live_matching_has_no_regex_semantics():
+    p = LogWatchProbe(
+        regex_pattern=r"READY\s+\d+",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=1,
+    )
+
+    assert p.feed_line("READY 123") is False
+    assert p.feed_line(r"READY\s+\d+") is True
+
+
+def test_log_watch_probe_live_matching_inactive_after_triggered():
+    p = LogWatchProbe(
+        regex_pattern="READY",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=1,
+    )
+
+    assert p.is_live_match_active() is True
+    p.status = ProbeStatus.TRIGGERED
+    assert p.is_live_match_active() is False
+
+
+def test_log_watch_probe_reset_clears_live_match_state():
+    t = Task(
+        name="svc",
+        logger=_DummyLogger(),  # type: ignore[arg-type]
+        operator=BashOperator(BashOperatorConfig(name="bash")),
+    )
+    p = LogWatchProbe(
+        regex_pattern="READY",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=1,
+    )
+
+    assert p.feed_line("READY") is True
+    p.reset()
+
+    assert asyncio.run(p.probe(t)) is False
+
+
+def test_log_watch_probe_disk_fallback_reads_only_new_bytes(tmp_path: Path):
+    wf_out = tmp_path / "wf"
+    (wf_out / "svc").mkdir(parents=True)
+    log_path = wf_out / "svc" / "svc.log"
+    log_path.write_text("READY\n")
+
+    t = Task(
+        name="svc",
+        logger=_DummyLogger(),  # type: ignore[arg-type]
+        operator=BashOperator(BashOperatorConfig(name="bash")),
+    )
+    t.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
+
+    p = LogWatchProbe(
+        regex_pattern="READY",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=1,
+        match_count=2,
+    )
+
+    assert asyncio.run(p.probe(t)) is False
+    # The first READY must not be counted again on the next check.
+    log_path.write_text(log_path.read_text() + "still booting\n")
+    assert asyncio.run(p.probe(t)) is False
+    log_path.write_text(log_path.read_text() + "READY\n")
+    assert asyncio.run(p.probe(t)) is True
+
+
 # --- TcpPortProbe on_node tests ---
 
 

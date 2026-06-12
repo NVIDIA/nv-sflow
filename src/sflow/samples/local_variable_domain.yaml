@@ -1,0 +1,28 @@
+version: "0.1"
+
+variables:
+  CONCURRENCY:
+    description: "Concurrency level"
+    value: 16
+    type: integer
+    domain: [1, 4, 16]
+  FRAMEWORK:
+    description: "Inference framework"
+    value: sglang
+    domain: [sglang, vllm, trtllm]
+
+workflow:
+  name: local_variable_domain
+  tasks:
+    - name: show_domain
+      script:
+        - "echo concurrency=${{ variables.CONCURRENCY }}"
+        - "echo concurrency_domain=${{ variables.CONCURRENCY.domain }}"
+        - "echo max_concurrency_value=${{ variables.CONCURRENCY.domain | max }}"
+        - "echo framework=${{ variables.FRAMEWORK }}"
+        - "echo framework_domain=${{ variables.FRAMEWORK.domain }}"
+      replicas:
+        variables:
+          - CONCURRENCY
+          - FRAMEWORK
+        policy: parallel

@@ -1,0 +1,31 @@
+version: "0.1"
+
+artifacts:
+  - name: CHATTY_SCRIPT
+    uri: file://chatty_bounded_logs.py
+    content: |
+      import time
+
+      for i in range(200):
+          print(f"bounded noisy line {i:03d}", flush=True)
+
+      print("BOUNDED_READY", flush=True)
+      time.sleep(1)
+
+workflow:
+  name: local_chatty_bounded_logs
+  tasks:
+    - name: chatty_service
+      script:
+        - python3 ${{ artifacts.CHATTY_SCRIPT.path }}
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "BOUNDED_READY"
+          interval: 0
+          timeout: 20
+    - name: after_bounded_ready
+      depends_on:
+        - chatty_service
+      script:
+        - echo "bounded live readiness observed" > "${SFLOW_WORKFLOW_OUTPUT_DIR}/bounded_ready_marker"

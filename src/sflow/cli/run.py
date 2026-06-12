@@ -185,6 +185,59 @@ def run(
             help="Logging level (debug, info, warning, error, critical). Default: info.",
         ),
     ] = "info",
+    task_log_mode: Annotated[
+        str,
+        typer.Option(
+            "--task-log-mode",
+            help=(
+                "Per-task log persistence mode. Default: bounded (keep the first "
+                "N lines, then keep up to N lines/sec, rotate by size, and summarize "
+                "suppressed lines). Use 'full' to persist every task output line."
+            ),
+        ),
+    ] = "bounded",
+    task_log_keep_lines_per_second: Annotated[
+        int,
+        typer.Option(
+            "--task-log-keep-lines-per-second",
+            help=(
+                "Bounded mode only: after the initial kept lines are used, persist "
+                "at most this many additional task output lines per second. Extra "
+                "lines are suppressed and summarized. Use 0 to suppress all later lines."
+            ),
+            min=0,
+        ),
+    ] = 100,
+    task_log_keep_first_lines: Annotated[
+        int,
+        typer.Option(
+            "--task-log-keep-first-lines",
+            help=(
+                "Bounded mode only: number of initial task output lines to persist "
+                "immediately before the per-second keep rate applies."
+            ),
+            min=0,
+        ),
+    ] = 1000,
+    task_log_max_bytes: Annotated[
+        int,
+        typer.Option(
+            "--task-log-max-bytes",
+            help="Bounded mode only: maximum bytes per per-task log file before rotation.",
+            min=0,
+        ),
+    ] = 64 * 1024 * 1024,
+    task_log_backup_count: Annotated[
+        int,
+        typer.Option(
+            "--task-log-backup-count",
+            help=(
+                "Bounded mode only: number of rotated backup task log files to retain "
+                "(total retained files is backup count plus the active log)."
+            ),
+            min=0,
+        ),
+    ] = 16,
     workspace_dir: Annotated[
         Optional[Path],
         typer.Option(
@@ -325,6 +378,11 @@ def run(
                 tui=tui_enabled,
                 tui_log_buffer=log_buffer,
                 tui_refresh_per_second=tui_refresh if tui_enabled else None,
+                task_log_mode=task_log_mode,
+                task_log_keep_lines_per_second=task_log_keep_lines_per_second,
+                task_log_keep_first_lines=task_log_keep_first_lines,
+                task_log_max_bytes=task_log_max_bytes,
+                task_log_backup_count=task_log_backup_count,
             )
         finally:
             if log_handler is not None:

@@ -132,6 +132,8 @@ if true; then
         sflow run "$EXAMPLES_DIR/local_dag.yaml" --dry-run
     run_check "local_variable_domain" \
         sflow run "$EXAMPLES_DIR/local_variable_domain.yaml" --dry-run
+    run_check "local_chatty_bounded_logs" \
+        sflow run "$EXAMPLES_DIR/local_chatty_bounded_logs.yaml" --dry-run
 
     # -- sflow run (live): verify replica sweep + domain resolution --
     # Note: may fail in sandboxed environments (pty device limits) with many parallel tasks.
@@ -195,6 +197,44 @@ workflow:
 EOF
     run_check "run single readiness probe compatibility (dry-run)" \
         bash -c "sflow run \"$READINESS_SINGLE_FIXTURE\" --dry-run > \"$READINESS_SINGLE_DRYRUN_LOG\" 2>&1"
+
+    # -- sflow run: bounded task logs keep probes live while limiting persisted task output --
+    BOUNDED_LOG_DIR="$PREFLIGHT_DIR/bounded_task_logs"
+    BOUNDED_LOG_FIXTURE="$EXAMPLES_DIR/local_chatty_bounded_logs.yaml"
+    mkdir -p "$BOUNDED_LOG_DIR"
+    run_check "run bounded task logs (live probe + suppression)" \
+        sflow run "$BOUNDED_LOG_FIXTURE" \
+            --output-dir "$BOUNDED_LOG_DIR" \
+            --task-log-mode bounded \
+            --task-log-keep-lines-per-second 0 \
+            --task-log-keep-first-lines 5 \
+            --task-log-max-bytes 1048576 \
+            --task-log-backup-count 2
+
+    ROTATING_LOG_DIR="$PREFLIGHT_DIR/bounded_task_log_rotation"
+    ROTATING_LOG_FIXTURE="$ROTATING_LOG_DIR/bounded_task_log_rotation.yaml"
+    mkdir -p "$ROTATING_LOG_DIR"
+    cat > "$ROTATING_LOG_FIXTURE" <<'EOF'
+version: "0.1"
+workflow:
+  name: bounded_task_log_rotation
+  tasks:
+    - name: rotating_task
+      script:
+        - |
+          python - <<'PY'
+          for i in range(120):
+              print(f"bounded rotation line {i:03d} " + ("x" * 160), flush=True)
+          PY
+EOF
+    run_check "run bounded task logs (rotation)" \
+        sflow run "$ROTATING_LOG_FIXTURE" \
+            --output-dir "$ROTATING_LOG_DIR" \
+            --task-log-mode bounded \
+            --task-log-keep-lines-per-second 10000 \
+            --task-log-keep-first-lines 10000 \
+            --task-log-max-bytes 2048 \
+            --task-log-backup-count 3
 
     # -- sflow run --dry-run: self-contained slurm examples --
     for f in "$EXAMPLES_DIR"/slurm_*.yaml; do
@@ -969,6 +1009,73 @@ PY
         FAILED_LABELS="$FAILED_LABELS  - single readiness probe compatibility\n"
     fi
 
+    # -- Post-wait: verify bounded task logs suppress persisted output but live probes still fire --
+    BOUNDED_LOG_FAIL=0
+    BOUNDED_RUN_DIR=$(find "$BOUNDED_LOG_DIR" -maxdepth 1 -type d -name "local_chatty_bounded_logs-*" -print -quit 2>/dev/null)
+    if [ -z "$BOUNDED_RUN_DIR" ]; then
+        echo "  FAIL: bounded task log run output missing"
+        BOUNDED_LOG_FAIL=1
+    else
+        BOUNDED_TASK_LOG="$BOUNDED_RUN_DIR/chatty_service/chatty_service.log"
+        if [ ! -f "$BOUNDED_RUN_DIR/bounded_ready_marker" ]; then
+            echo "  FAIL: bounded log live readiness marker missing"
+            BOUNDED_LOG_FAIL=1
+        fi
+        if [ ! -f "$BOUNDED_TASK_LOG" ]; then
+            echo "  FAIL: bounded task log file missing"
+            BOUNDED_LOG_FAIL=1
+        else
+            if grep -q "sflow: suppressed" "$BOUNDED_TASK_LOG"; then
+                echo "  PASS: bounded task log emitted suppression summary"
+            else
+                echo "  FAIL: bounded task log did not emit suppression summary"
+                BOUNDED_LOG_FAIL=1
+            fi
+            if grep -q "BOUNDED_READY" "$BOUNDED_TASK_LOG"; then
+                echo "  FAIL: readiness line was persisted despite bounded suppression"
+                BOUNDED_LOG_FAIL=1
+            fi
+            if grep -q "bounded noisy line 199" "$BOUNDED_TASK_LOG"; then
+                echo "  FAIL: late noisy line was persisted despite bounded suppression"
+                BOUNDED_LOG_FAIL=1
+            fi
+        fi
+    fi
+    if [ "$BOUNDED_LOG_FAIL" -eq 0 ]; then
+        echo "  PASS: bounded task logs preserve live probes while suppressing persisted output"
+    else
+        FAIL=$((FAIL + BOUNDED_LOG_FAIL))
+        TOTAL=$((TOTAL + BOUNDED_LOG_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - bounded task log live-probe/suppression coverage\n"
+    fi
+
+    # -- Post-wait: verify bounded task log rotation creates smaller side files --
+    BOUNDED_ROTATION_FAIL=0
+    ROTATING_RUN_DIR=$(find "$ROTATING_LOG_DIR" -maxdepth 1 -type d -name "bounded_task_log_rotation-*" -print -quit 2>/dev/null)
+    if [ -z "$ROTATING_RUN_DIR" ]; then
+        echo "  FAIL: bounded rotation run output missing"
+        BOUNDED_ROTATION_FAIL=1
+    else
+        ROTATING_TASK_LOG="$ROTATING_RUN_DIR/rotating_task/rotating_task.log"
+        if [ -f "$ROTATING_TASK_LOG.1" ]; then
+            echo "  PASS: bounded task log rotation created rotating_task.log.1"
+        else
+            echo "  FAIL: bounded task log rotation did not create rotating_task.log.1"
+            BOUNDED_ROTATION_FAIL=1
+        fi
+        if [ -f "$ROTATING_TASK_LOG" ] && [ "$(wc -c < "$ROTATING_TASK_LOG")" -le 4096 ]; then
+            :
+        else
+            echo "  FAIL: active bounded task log missing or unexpectedly large"
+            BOUNDED_ROTATION_FAIL=1
+        fi
+    fi
+    if [ "$BOUNDED_ROTATION_FAIL" -gt 0 ]; then
+        FAIL=$((FAIL + BOUNDED_ROTATION_FAIL))
+        TOTAL=$((TOTAL + BOUNDED_ROTATION_FAIL))
+        FAILED_LABELS="$FAILED_LABELS  - bounded task log rotation coverage\n"
+    fi
+
     # -- Post-wait: verify sflow sample copy flows --
     SAMPLE_SELF_OUT="$PREFLIGHT_DIR/sample_copy_self/local_hello_world.yaml"
     SAMPLE_MODULAR_OUT="$PREFLIGHT_DIR/sample_copy_modular/inference_x_v2"
@@ -1124,7 +1231,164 @@ if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
     cd "$SCRIPT_DIR/../tests/e2e_tests"
     E2E_PARTITION="${CLI_PARTITION:-my_partition}"
     E2E_ACCOUNT="${CLI_ACCOUNT:-user}"
+
+    set +x
+    echo ""
+    echo "===== Preparing local e2e sflow venv ====="
+    echo ""
+
+    if [ ! -d "$PWD/.sflow_venv" ]; then
+        srun -N 1 \
+             -p "$E2E_PARTITION" \
+             -A "$E2E_ACCOUNT" \
+             -t 00:10:00 \
+             --job-name=sflow_runtime_venv \
+             bash -c "
+                 set -x && \
+                 cd $PWD && \
+                 rm -rf .sflow_venv && \
+                 /usr/bin/python3 -m venv .sflow_venv && \
+                 source .sflow_venv/bin/activate && \
+                 pip install uv && \
+                 cd ../.. && \
+                 uv pip install -e '.[dev]'
+             "
+    else
+        echo "Skipping venv creation: $PWD/.sflow_venv already exists"
+    fi
+
+    if [ ! -f "$PWD/.sflow_venv/bin/activate" ]; then
+        echo "ERROR: e2e sflow venv was not created at $PWD/.sflow_venv"
+        exit 1
+    fi
+
+    "$PWD/.sflow_venv/bin/uv" pip install -e "$REPO_DIR" --prerelease=allow
+
+    echo ""
+    echo "===== Bounded Chatty Batch Submit ====="
+    echo ""
+
+    CHATTY_SUBMIT_DIR="$PWD/sflow_output/chatty_bounded_submit_$STAMP"
+    CHATTY_SBATCH_PATH="$CHATTY_SUBMIT_DIR/chatty_bounded_logs.sh"
+    mkdir -p "$CHATTY_SUBMIT_DIR"
+
+    chatty_output=$(sflow batch \
+        -f "$REPO_DIR/examples/local_chatty_bounded_logs.yaml" \
+        --nodes 1 \
+        -p "$E2E_PARTITION" \
+        -A "$E2E_ACCOUNT" \
+        --workspace-dir "$PWD" \
+        --output-dir "$PWD/sflow_output" \
+        --sflow-venv-path "$PWD" \
+        --log-level warn \
+        --task-log-mode bounded \
+        --task-log-keep-lines-per-second 0 \
+        --task-log-keep-first-lines 5 \
+        --task-log-max-bytes 1048576 \
+        --task-log-backup-count 2 \
+        --sbatch-path "$CHATTY_SBATCH_PATH" 2>&1)
+    chatty_status=$?
+    echo "$chatty_output"
+    if [ "$chatty_status" -ne 0 ]; then
+        echo "ERROR: chatty bounded sflow batch script generation failed"
+        exit 1
+    fi
+
+    # This submit-mode regression test must exercise the local checkout because it
+    # often runs before the current branch is pushed. The general e2e matrix below
+    # still uses the normal generated install path.
+    python - "$CHATTY_SBATCH_PATH" "$REPO_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+script = Path(sys.argv[1])
+repo = Path(sys.argv[2])
+text = script.read_text()
+replacement = (
+    '    "$VIRTUAL_ENV/bin/uv" pip install -e '
+    f"'{repo}' --prerelease=allow"
+)
+lines = []
+for line in text.splitlines():
+    if "uv\" pip install 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@" in line:
+        lines.append(replacement)
+    else:
+        lines.append(line)
+script.write_text("\n".join(lines) + "\n")
+PY
+
+    chatty_submit=$(sbatch "$CHATTY_SBATCH_PATH" 2>&1)
+    chatty_submit_status=$?
+    echo "$chatty_submit"
+    if [ "$chatty_submit_status" -ne 0 ]; then
+        echo "ERROR: chatty bounded sbatch submission failed"
+        exit 1
+    fi
+
+    chatty_job_id=$(echo "$chatty_submit" | grep -oP 'Submitted batch job \K[0-9]+' | tail -1)
+    if [ -z "$chatty_job_id" ]; then
+        echo "ERROR: no Slurm job id captured for chatty bounded batch submit"
+        exit 1
+    fi
+
+    echo "Chatty bounded job id: $chatty_job_id"
+    while true; do
+        state=$(sacct -j "$chatty_job_id" --noheader -o State -X 2>/dev/null | head -1 | tr -d ' ')
+        elapsed=$(sacct -j "$chatty_job_id" --noheader -o Elapsed -X 2>/dev/null | head -1 | tr -d ' ')
+        echo "  $chatty_job_id: ${state:-UNKNOWN} elapsed=${elapsed:-N/A}"
+        if [ -n "$state" ] && [[ "$state" != "PENDING" ]] && [[ "$state" != "RUNNING" ]] && [[ "$state" != "CONFIGURING" ]]; then
+            break
+        fi
+        sleep 10
+    done
+
+    if [[ "$state" != "COMPLETED" ]]; then
+        echo "ERROR: chatty bounded batch job did not complete successfully (state=$state)"
+        exit 1
+    fi
+
+    chatty_run_dir=$(find "$PWD/sflow_output" -maxdepth 1 -type d -name "${chatty_job_id}-local_chatty_bounded_logs-*" -print -quit 2>/dev/null)
+    if [ -z "$chatty_run_dir" ]; then
+        echo "ERROR: chatty bounded workflow output directory not found"
+        exit 1
+    fi
+
+    chatty_task_log="$chatty_run_dir/chatty_service/chatty_service.log"
+    if [ ! -f "$chatty_run_dir/bounded_ready_marker" ]; then
+        echo "ERROR: chatty bounded readiness marker missing"
+        exit 1
+    fi
+    if [ ! -f "$chatty_task_log" ]; then
+        echo "ERROR: chatty bounded task log missing"
+        exit 1
+    fi
+    if ! grep -q "sflow: suppressed" "$chatty_task_log"; then
+        echo "ERROR: chatty bounded task log missing suppression summary"
+        exit 1
+    fi
+    if grep -q "BOUNDED_READY" "$chatty_task_log"; then
+        echo "ERROR: chatty readiness line was persisted despite bounded suppression"
+        exit 1
+    fi
+    if grep -q "bounded noisy line 199" "$chatty_task_log"; then
+        echo "ERROR: late chatty output was persisted despite bounded suppression"
+        exit 1
+    fi
+
+    chatty_submit_out="$PWD/sflow_output/${chatty_job_id}-sflow-submit.out"
+    if [ -f "$chatty_submit_out" ] && grep -q "bounded noisy line" "$chatty_submit_out"; then
+        echo "ERROR: chatty task output leaked into sbatch stdout"
+        exit 1
+    fi
+
+    echo "PASS: chatty bounded sflow batch submit completed with bounded per-task logs and clean sbatch stdout"
+
+    echo ""
+    echo "===== Full Batched Sample Matrix Submit ====="
+    echo ""
+    set -x
     ./sample_test.sh -p "$E2E_PARTITION" -A "$E2E_ACCOUNT" -m "$MODEL_PATH" -t "$TEST_TYPE" --submit -- "-e --exclude=gb-nvl-137-compute09,gb-nvl-137-compute16" # 09 has some GPU issues
+    set +x
 elif [ -z "$SUBMIT" ]; then
     echo "Preflight only (no -S flag). To submit jobs, re-run with -S."
 else
