@@ -7,9 +7,10 @@ import os
 import pty
 import shlex
 import subprocess
+import sys
 from typing import Mapping, Optional
 
-from sflow.logging import get_logger
+from sflow.logging import IN_TASK_OUTPUT_ATTR, get_logger
 
 from .command import Command, format_command
 
@@ -27,12 +28,59 @@ def _strip_ansi(text: str) -> str:
 class SubprocessLauncher:
     """A command launcher for launching commands."""
 
+    def __init__(self, *, echo_to_console: bool | None = None) -> None:
+        """
+        Args:
+            echo_to_console: Whether to echo in-task (subprocess) output lines to
+                the interactive console. Defaults to autodetect: echo only when
+                stdout is a real TTY, so live output is shown for ``sflow run`` in a
+                terminal but never written to disk under ``sflow batch`` / Slurm
+                (where stdout is redirected to a file) or when stdout is piped.
+        """
+        if echo_to_console is None:
+            try:
+                echo_to_console = sys.stdout.isatty()
+            except Exception:
+                echo_to_console = False
+        self._echo_to_console = bool(echo_to_console)
+
     def _console_prefix(self, task_name: str | None) -> str:
         """
-        Prefix applied to lines printed to the terminal (console logger) so users can
-        tell which workflow task produced them.
+        Prefix applied to subprocess lines echoed to the interactive console so users
+        can tell which workflow task produced them. The full, unprefixed output is
+        always written to the per-task log via ``output_logger``.
         """
         return f"[{task_name}] " if task_name else ""
+
+    def _emit_subprocess_line(
+        self,
+        line_str: str,
+        *,
+        prefix: str,
+        output_logger: Optional[logging.Logger],
+    ) -> None:
+        """
+        Route one line of subprocess (in-task) output.
+
+        The full output is always written to the per-task log via ``output_logger``
+        (configured non-propagating, so it stays in ``<task>.log``) -- this is the
+        single on-disk home for in-task content.
+
+        It is additionally echoed to the interactive console only when stdout is a
+        real TTY (never under ``sflow batch`` / redirected stdout) and the per-task
+        logger does not itself propagate to the shared logger (which would already
+        surface the line -- as on the Slurm allocation path). The echo carries the
+        ``IN_TASK_OUTPUT_ATTR`` marker so the ``sflow.log`` file handler filters it
+        out: in-task output is never persisted to ``sflow.log`` at any log level.
+        """
+        if not line_str:
+            return
+        if output_logger is not None:
+            output_logger.info(line_str)
+        if self._echo_to_console and (
+            output_logger is None or not output_logger.propagate
+        ):
+            _logger.info(f"{prefix}{line_str}", extra={IN_TASK_OUTPUT_ATTR: True})
 
     async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
         """
@@ -159,10 +207,9 @@ class SubprocessLauncher:
                     for line_str in lines[:-1]:
                         # Strip ANSI escape sequences for cleaner logs
                         line_str = _strip_ansi(line_str).rstrip()
-                        if line_str:
-                            _logger.info(f"{pfx}{line_str}")
-                            if output_logger:
-                                output_logger.info(line_str)
+                        self._emit_subprocess_line(
+                            line_str, prefix=pfx, output_logger=output_logger
+                        )
 
                 if ret is not None and not chunk:
                     # Process exited and no more data
@@ -170,10 +217,9 @@ class SubprocessLauncher:
                         line_str = _strip_ansi(
                             buffer.decode("utf-8", errors="replace")
                         ).rstrip()
-                        if line_str:
-                            _logger.info(f"{pfx}{line_str}")
-                            if output_logger:
-                                output_logger.info(line_str)
+                        self._emit_subprocess_line(
+                            line_str, prefix=pfx, output_logger=output_logger
+                        )
                     break
 
                 if not chunk:

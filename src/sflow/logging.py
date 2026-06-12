@@ -11,6 +11,11 @@ from rich.logging import RichHandler
 # Default width for non-interactive terminals (piping, file output, etc.)
 _DEFAULT_NON_TTY_WIDTH = 200
 
+# LogRecord attribute marking high-volume in-task (subprocess) output. Records
+# carrying this marker are echoed to the interactive console only and are kept
+# out of the persistent sflow.log file (see ``add_log_file``).
+IN_TASK_OUTPUT_ATTR = "sflow_in_task_output"
+
 
 def configure_logging(
     level: str = "INFO", log_file: Optional[str] = None, *, console: bool = True
@@ -82,6 +87,10 @@ def add_log_file(log_file: str) -> None:
     fh.setFormatter(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
+    # Keep high-volume in-task (subprocess) output out of sflow.log; it lives only
+    # in the per-task <task>.log. sflow.log retains banners/orchestration ("hint and
+    # command logs") so it stays small even under sflow batch on a shared filesystem.
+    fh.addFilter(lambda record: not getattr(record, IN_TASK_OUTPUT_ATTR, False))
     logger.addHandler(fh)
 
     # Ensure the logger itself accepts INFO messages even if the console
