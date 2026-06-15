@@ -7,13 +7,48 @@ import os
 import pty
 import shlex
 import subprocess
+import sys
 from typing import Mapping, Optional
 
-from sflow.logging import get_logger
+from sflow.logging import SFLOW_TASK_STREAM_ATTR, get_logger
 
 from .command import Command, format_command
 
 _logger = get_logger(__name__)
+
+
+def _console_streams_task_output() -> bool:
+    """Whether per-task subprocess output should be echoed to the root logger.
+
+    True only for interactive TTY sessions. In batch mode (Slurm redirects
+    stdout/stderr to files) or when output is piped to a file, this returns
+    False so task content never floods sflow.log or the Slurm stdout/err files.
+    Per-task content is always written to the per-task log regardless.
+    """
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _emit_task_output_line(
+    line_str: str,
+    *,
+    pfx: str,
+    output_logger: Optional[logging.Logger],
+    stream_console: bool,
+) -> None:
+    """Route a single line of task (subprocess) output.
+
+    Always writes to the per-task logger (``output_logger`` -> ``<task>.log``).
+    Only additionally echoes to the root ``sflow`` logger (console / Slurm
+    stdout) when ``stream_console`` is True, tagging the record with
+    ``SFLOW_TASK_STREAM_ATTR`` so sflow.log's file handler drops it.
+    """
+    if output_logger:
+        output_logger.info(line_str)
+    if stream_console:
+        _logger.info(f"{pfx}{line_str}", extra={SFLOW_TASK_STREAM_ATTR: True})
 
 
 def _strip_ansi(text: str) -> str:
@@ -76,9 +111,18 @@ class SubprocessLauncher:
         task_name: str | None = None,
     ) -> int:
         pfx = self._console_prefix(task_name)
+        # Orchestration hint: goes to sflow.log + console (and Slurm stdout/err).
+        # Intentionally NOT written to the per-task log: LogWatchProbe scans the
+        # per-task log file and would false-match patterns inside the command text.
         _logger.info(f"{pfx}========== Command ==========")
         _logger.info(f"{pfx}{format_command(command)}")
         _logger.info(f"{pfx}=============================")
+
+        # Decide once whether to echo per-task output to the root logger/console.
+        # Per-task content always goes to the per-task log (output_logger); it is
+        # only additionally streamed to the console for interactive TTY sessions.
+        stream_console = _console_streams_task_output()
+
         if isinstance(command, Command):
             command = command.as_list()
 
@@ -160,9 +204,12 @@ class SubprocessLauncher:
                         # Strip ANSI escape sequences for cleaner logs
                         line_str = _strip_ansi(line_str).rstrip()
                         if line_str:
-                            _logger.info(f"{pfx}{line_str}")
-                            if output_logger:
-                                output_logger.info(line_str)
+                            _emit_task_output_line(
+                                line_str,
+                                pfx=pfx,
+                                output_logger=output_logger,
+                                stream_console=stream_console,
+                            )
 
                 if ret is not None and not chunk:
                     # Process exited and no more data
@@ -171,9 +218,12 @@ class SubprocessLauncher:
                             buffer.decode("utf-8", errors="replace")
                         ).rstrip()
                         if line_str:
-                            _logger.info(f"{pfx}{line_str}")
-                            if output_logger:
-                                output_logger.info(line_str)
+                            _emit_task_output_line(
+                                line_str,
+                                pfx=pfx,
+                                output_logger=output_logger,
+                                stream_console=stream_console,
+                            )
                     break
 
                 if not chunk:
