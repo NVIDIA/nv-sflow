@@ -645,6 +645,10 @@ class SflowApp:
 
                 task_output_sinks: dict[str, TaskOutputSink] = {}
                 task_output_collectors: dict[str, TaskOutputCollector] = {}
+                # Per-task log handlers we add below, tracked so we can close them
+                # (flushing the bounded-mode suppression summary and releasing file
+                # descriptors) and detach them when the run finishes.
+                task_log_handlers: list[tuple[logging.Logger, logging.Handler]] = []
                 for t in tg.get_tasks():
                     task_out_dir = workflow_out_dir / t.name
                     if not dry_run:
@@ -675,6 +679,7 @@ class SflowApp:
                         if not existing:
                             fh = create_task_log_handler(log_path, task_log_policy)
                             t.logger.addHandler(fh)
+                            task_log_handlers.append((t.logger, fh))
                         t.logger.setLevel(logging.INFO)
                         t.logger.propagate = False
                         if task_log_policy.mode == "bounded":
@@ -1184,6 +1189,14 @@ class SflowApp:
                             f"Workflow '{config.workflow.name}' cancelled: {len(cancelled)} task(s) cancelled ({names})"
                         )
                 finally:
+                    # Close per-task log handlers: flush the bounded-mode trailing
+                    # suppression summary, release file descriptors, and detach them
+                    # so loggers don't accumulate handlers across in-process runs.
+                    for _task_logger, _task_handler in task_log_handlers:
+                        with suppress(Exception):
+                            _task_handler.close()
+                        with suppress(Exception):
+                            _task_logger.removeHandler(_task_handler)
                     # Always attempt to release owned backend allocations.
                     try:
                         await release_backends(state)

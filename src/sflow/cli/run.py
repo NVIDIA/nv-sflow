@@ -213,8 +213,10 @@ def run(
         typer.Option(
             "--task-log-keep-first-lines",
             help=(
-                "Bounded mode only: number of initial task output lines to persist "
-                "immediately before the per-second keep rate applies."
+                "Bounded mode only: burst capacity (token bucket) for persisted task "
+                "output lines. The first N lines are kept immediately; thereafter up "
+                "to N lines can burst again after the task goes quiet, refilling at "
+                "the per-second keep rate."
             ),
             min=0,
         ),

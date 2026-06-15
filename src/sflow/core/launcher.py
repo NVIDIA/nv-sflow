@@ -71,6 +71,13 @@ class SubprocessLauncher:
         (configured non-propagating, so it stays in ``<task>.log``) -- this is the
         single on-disk home for in-task content.
 
+        INVARIANT: this method is the only writer of the per-task log, and it always
+        notifies ``on_output_line`` for the same line it persists. So the live stream
+        seen by probes / output parsing is a strict superset of ``<task>.log``. This
+        is what lets ``LogWatchProbe`` stop re-reading the file once it has seen any
+        live line (see ``LogWatchProbe.check``). Do not write to a task's logger from
+        anywhere else, or those lines would be invisible to live probes.
+
         It is additionally echoed to the interactive console only when stdout is a
         real TTY (never under ``sflow batch`` / redirected stdout) and the per-task
         logger does not itself propagate to the shared logger (which would already

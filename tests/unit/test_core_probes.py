@@ -221,6 +221,47 @@ def test_log_watch_probe_disk_fallback_reads_only_new_bytes(tmp_path: Path):
     assert asyncio.run(p.probe(t)) is True
 
 
+def test_log_watch_probe_rebaseline_on_retry_ignores_stale_attempt(tmp_path: Path):
+    """On retry, stale matches from the previous attempt that are still present in
+    the append-mode log must not re-trigger the probe before the new attempt
+    produces its own output. The orchestrator drives this via reset() +
+    rebaseline_on_retry() on re-submission."""
+    wf_out = tmp_path / "wf"
+    (wf_out / "svc").mkdir(parents=True)
+    log_path = wf_out / "svc" / "svc.log"
+    # Attempt 1 already wrote a readiness line that remains on disk after the retry.
+    log_path.write_text("starting...\nREADY\n")
+
+    t = Task(
+        name="svc",
+        logger=_DummyLogger(),  # type: ignore[arg-type]
+        operator=BashOperator(BashOperatorConfig(name="bash")),
+    )
+    t.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
+
+    p = LogWatchProbe(
+        regex_pattern="READY",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=5,
+    )
+
+    # Attempt 1: probe matches the readiness line from disk.
+    assert asyncio.run(p.probe(t)) is True
+
+    # Retry: orchestrator resets and rebaselines. The previous attempt's "READY" is
+    # still in the append-mode log but must NOT be recounted (false readiness).
+    p.reset()
+    p.rebaseline_on_retry()
+    assert asyncio.run(p.probe(t)) is False
+
+    # Only output produced by the new attempt (appended) should count.
+    log_path.write_text(log_path.read_text() + "still warming up\n")
+    assert asyncio.run(p.probe(t)) is False
+    log_path.write_text(log_path.read_text() + "READY\n")
+    assert asyncio.run(p.probe(t)) is True
+
+
 # --- TcpPortProbe on_node tests ---
 
 

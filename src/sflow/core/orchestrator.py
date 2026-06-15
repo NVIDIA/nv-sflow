@@ -115,8 +115,15 @@ class Orchestrator:
                     _logger.info(f"Submitting task: {task.name}")
                     task.status = TaskStatus.RUNNING
                     task.attempts = int(getattr(task, "attempts", 0)) + 1
+                    is_retry = task.attempts > 1
                     for p in getattr(task, "probes", []) or []:
                         p.reset()
+                        if is_retry:
+                            # Don't recount a previous attempt's still-on-disk output
+                            # (append-mode per-task log) in the probe's file fallback.
+                            rebaseline = getattr(p, "rebaseline_on_retry", None)
+                            if rebaseline is not None:
+                                rebaseline()
                     collector = self._task_output_collectors.get(task.name)
                     if collector is not None:
                         collector.reset()

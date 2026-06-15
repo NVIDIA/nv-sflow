@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from sflow.core.probe import Probe, ProbeType
+from sflow.core.probe import Probe, ProbeStatus, ProbeType
 
 
 class LogWatchProbe(Probe):
@@ -50,6 +50,11 @@ class LogWatchProbe(Probe):
         self._offset = 0
         self._matched_count = 0
         self._received_live_lines = False
+        # When True, the next disk read rebaselines ``_offset`` to the current end of
+        # the log, so a retry does not recount the previous attempt's output (the
+        # per-task log is opened in append mode). Set via ``rebaseline_on_retry``,
+        # which the orchestrator calls on re-submission. See ``check``.
+        self._rebaseline_offset = False
 
     def feed_line(self, line: str) -> bool:
         """Feed one live subprocess output line before any persistence policy runs."""
@@ -60,7 +65,10 @@ class LogWatchProbe(Probe):
         return self._matched_count >= self._match_count
 
     def is_live_match_active(self) -> bool:
-        return self.status.name == "INITIATED" and self._matched_count < self._match_count
+        return (
+            self.status == ProbeStatus.INITIATED
+            and self._matched_count < self._match_count
+        )
 
     def _count_matches(self, text: str) -> int:
         if self._literal_pattern is not None:
@@ -73,6 +81,18 @@ class LogWatchProbe(Probe):
         self._offset = 0
         self._matched_count = 0
         self._received_live_lines = False
+        self._rebaseline_offset = False
+
+    def rebaseline_on_retry(self) -> None:
+        """Skip log content from previous attempts on the next disk read.
+
+        The orchestrator calls this on re-submission (retry). Because the per-task
+        log is append-mode, attempt N-1's output is still on disk; without this the
+        file fallback in ``check`` could recount stale matches before attempt N
+        produces output. (When attempt N produces live output, ``check`` short-
+        circuits on ``_received_live_lines`` and never reads the file anyway.)
+        """
+        self._rebaseline_offset = True
 
     def _log_path(self, task) -> Path:  # type: ignore[override]
         wf_out = task.envs.get("SFLOW_WORKFLOW_OUTPUT_DIR")
@@ -91,14 +111,24 @@ class LogWatchProbe(Probe):
     async def check(self, task) -> bool:  # type: ignore[override]
         if self._matched_count >= self._match_count:
             return True
+        # Once any live line has been fed, rely solely on the live stream: it is a
+        # strict superset of what reaches <task>.log (the launcher is the only writer
+        # and feeds every persisted line to us via feed_line -- see
+        # SubprocessLauncher._emit_subprocess_line). Re-reading the file here would
+        # only risk double-counting lines already counted live.
         if self._received_live_lines:
             return False
 
         path = self._log_path(task)
         try:
             size = path.stat().st_size
-            if size < self._offset:
-                self._offset = 0
+            if self._rebaseline_offset:
+                # New attempt (after reset): skip everything written by previous
+                # attempts so we only count matches produced by this attempt.
+                self._offset = size
+                self._rebaseline_offset = False
+            elif size < self._offset:
+                self._offset = 0  # file truncated / rotated
             with path.open("r", errors="ignore") as f:
                 f.seek(self._offset)
                 data = f.read()

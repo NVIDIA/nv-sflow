@@ -829,3 +829,84 @@ def test_readiness_probe_timeout_logs_error():
 
     timeout_msgs = capture.messages(containing="timed out")
     assert any("my_server" in m for m in timeout_msgs)
+
+
+# --- End-to-end live-stream probe wiring (orchestrator feeds probes) ---
+
+
+class _LiveStreamLauncher:
+    """Simulates SubprocessLauncher: streams each output line through
+    ``on_output_line`` (exactly as ``_emit_subprocess_line`` does for real subprocess
+    output), then stays alive until cancelled. Writes nothing to disk, so a probe can
+    only match via the live stream.
+
+    (Real subprocesses are intentionally blocked in unit tests by the pytest_subprocess
+    autouse fixture; the real launcher's on_output_line call is covered separately in
+    test_core_launcher_logging.py, and real end-to-end runs live in the e2e shell tests.)
+    """
+
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+
+    async def run_async(
+        self,
+        command,
+        output_logger=None,
+        env=None,
+        on_output_line=None,
+        task_name=None,
+        task_output_sink=None,
+        **kwargs,
+    ) -> int:
+        for line in self._lines:
+            if on_output_line is not None:
+                on_output_line(task_name, line)
+            await asyncio.sleep(0)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            return -1
+        return 0
+
+
+def test_failure_probe_triggers_from_live_output_stream(tmp_path: Path):
+    """End-to-end: the orchestrator feeds live subprocess output to LogWatchProbe via
+    on_output_line, so the probe matches from the live stream (not the on-disk log)
+    and fail-fast fires. Locks in the launcher -> on_output_line -> _feed_output_line
+    _to_probes -> feed_line -> check wiring that the isolated unit tests cannot cover
+    together. ``_received_live_lines`` proves the match came from the live stream."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    probe = LogWatchProbe(
+        regex_pattern="BOOM_PATTERN",
+        type=ProbeType.FAILURE,
+        interval=0,
+        timeout=30,
+        failure_threshold=1,
+    )
+    svc = Task(
+        name="svc",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.svc_live_stream"),
+        probes=[probe],
+    )
+    # The launcher writes nothing to disk, so a match can only come from the live
+    # stream; point at an empty dir so any accidental file read would find no match.
+    svc.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(tmp_path)
+    tg.dag.add_node("svc", svc)
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_LiveStreamLauncher(["starting up", "BOOM_PATTERN", "more output"]),
+        fail_fast=True,
+    )
+
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=10))
+
+    assert svc.status == TaskStatus.FAILED
+    assert svc.failed_by_probe is True
+    assert probe.status == ProbeStatus.TRIGGERED
+    # The match must have come from the live stream, not from re-reading <task>.log.
+    assert probe._received_live_lines is True
