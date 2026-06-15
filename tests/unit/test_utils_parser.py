@@ -30,6 +30,14 @@ def test_lines_parser_w_star_allows_empty_word_field():
     assert parser.parsed_dict()["partition"] == ""
 
 
+def test_lines_parser_skips_invalid_pattern_without_crashing():
+    # An unparseable pattern is ignored at construction so a typo in one
+    # output spec cannot crash line parsing; valid patterns still match.
+    parser = LinesParser(["{bad:type_that_does_not_exist}", "ok={v:d}"])
+    parser.add_line("ok=5")
+    assert parser.parsed_dict() == {"v": 5}
+
+
 def test_parsing_log_handler_collects_from_log_records():
     logger = logging.getLogger("sflow.tests.parser")
     logger.setLevel(logging.INFO)

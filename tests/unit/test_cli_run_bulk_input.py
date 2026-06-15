@@ -235,7 +235,9 @@ def test_cli_run_bulk_input_dry_run(mock_sflow_app, csv_file):
     override_map = dict(v.split("=", 1) for v in overrides)
     assert override_map.get("MY_VAR") == "10"
     assert call_kwargs.kwargs["task_log_mode"] == "bounded"
-    assert call_kwargs.kwargs["echo_task_output"] is True
+    # Without --suppress-task-output-console, echo is left unset (None) so the
+    # launcher's TTY autodetect decides whether to echo in-task output.
+    assert call_kwargs.kwargs["echo_task_output"] is None
 
 
 def test_cli_run_bulk_input_row2(mock_sflow_app, csv_file):

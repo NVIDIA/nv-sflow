@@ -391,7 +391,7 @@ def run(
                 task_log_keep_first_lines=task_log_keep_first_lines,
                 task_log_max_bytes=task_log_max_bytes,
                 task_log_backup_count=task_log_backup_count,
-                echo_task_output=not suppress_task_output_console,
+                echo_task_output=(False if suppress_task_output_console else None),
             )
         finally:
             if log_handler is not None:

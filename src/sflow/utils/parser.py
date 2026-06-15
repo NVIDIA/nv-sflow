@@ -3,7 +3,9 @@
 
 import logging
 
-from parse import parse, with_pattern
+from parse import compile as parse_compile, with_pattern
+
+_logger = logging.getLogger(__name__)
 
 
 @with_pattern(r"\w*")
@@ -28,6 +30,23 @@ class LinesParser:
                 syntax (e.g., "Value: {value:d}" to extract an integer named 'value').
         """
         self._parse_patterns = parse_patterns
+        # Compile each pattern once. ``parse.parse()`` rebuilds the regex on every
+        # call, which is wasteful when lines are fed one-by-one from a live task
+        # stream; precompiling keeps the per-line cost to a single regex match.
+        self._compiled = []
+        for pattern in parse_patterns:
+            try:
+                self._compiled.append(
+                    parse_compile(
+                        pattern,
+                        extra_types={"w*": parse_nullable_w},
+                        case_sensitive=True,
+                    )
+                )
+            except Exception as e:
+                # Best-effort: skip an unparseable pattern rather than crash the
+                # workflow (task output parsing has always been best-effort).
+                _logger.warning(f"Ignoring invalid parse pattern {pattern!r}: {e}")
         self._parsed_dict = {}
 
     def add_line(self, line: str):
@@ -40,15 +59,8 @@ class LinesParser:
         Args:
             line: The text line to parse.
         """
-        for pattern in self._parse_patterns:
-            result = parse(
-                pattern,
-                line,
-                extra_types={
-                    "w*": parse_nullable_w,
-                },
-                case_sensitive=True,
-            )
+        for parser in self._compiled:
+            result = parser.parse(line)
             if result:
                 for key, value in result.named.items():
                     if key not in self._parsed_dict:

@@ -97,6 +97,19 @@ def test_in_task_output_echoed_to_console_when_tty(shared_logger_capture):
     assert any("[tty_unit] " in r.getMessage() for r in echoed)
 
 
+def test_echo_to_console_none_autodetects_from_tty(monkeypatch):
+    """``echo_to_console=None`` (the SflowApp.run default) must defer to stdout's
+    TTY state -- never silently coerce to False -- so redirected/piped ``sflow run``
+    stays quiet while an interactive terminal still echoes live output."""
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    assert SubprocessLauncher(echo_to_console=None)._echo_to_console is False
+
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert SubprocessLauncher(echo_to_console=None)._echo_to_console is True
+    # No explicit argument behaves the same as an explicit None.
+    assert SubprocessLauncher()._echo_to_console is True
+
+
 def test_no_extra_echo_when_output_logger_propagates(shared_logger_capture):
     """Slurm allocation path: a propagating output_logger already reaches the shared
     logger, so the launcher must not add a second (marked) echo."""

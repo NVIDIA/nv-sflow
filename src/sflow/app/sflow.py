@@ -232,7 +232,7 @@ class SflowApp:
         task_log_keep_first_lines: int = 1000,
         task_log_max_bytes: int = 64 * 1024 * 1024,
         task_log_backup_count: int = 16,
-        echo_task_output: bool = True,
+        echo_task_output: bool | None = None,
     ) -> Path | None:
         """
         Run the workflow and return the workflow output directory path.
@@ -1155,7 +1155,7 @@ class SflowApp:
                         workflow=state.workflow,
                         poll_interval=1,
                         launcher=SubprocessLauncher(
-                            echo_to_console=bool(echo_task_output)
+                            echo_to_console=echo_task_output
                         ),
                         task_output_sinks=task_output_sinks,
                         task_output_collectors=task_output_collectors,
