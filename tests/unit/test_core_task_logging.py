@@ -111,6 +111,35 @@ def test_bounded_task_log_handler_refills_tokens_over_time(tmp_path):
     assert "refilled kept" in contents
 
 
+def test_bounded_task_log_handler_refills_when_keep_first_lines_is_zero(tmp_path):
+    log_path = tmp_path / "task.log"
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    policy = TaskLogPolicy(
+        mode="bounded",
+        keep_lines_per_second=2,
+        keep_first_lines=0,
+        max_bytes=1024 * 1024,
+        backup_count=1,
+    )
+    handler = BoundedRotatingTaskLogHandler(log_path, policy, clock=clock)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = _make_logger("sflow.tests.task_logging.zero_initial_refill", handler)
+
+    logger.info("initial dropped")
+    now = 0.5
+    logger.info("refilled kept")
+    handler.close()
+
+    contents = log_path.read_text()
+    assert "initial dropped" not in contents
+    assert "sflow: suppressed 1 task log lines due to rate limit" in contents
+    assert "refilled kept" in contents
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

@@ -235,6 +235,7 @@ def test_cli_run_bulk_input_dry_run(mock_sflow_app, csv_file):
     override_map = dict(v.split("=", 1) for v in overrides)
     assert override_map.get("MY_VAR") == "10"
     assert call_kwargs.kwargs["task_log_mode"] == "bounded"
+    assert call_kwargs.kwargs["echo_task_output"] is True
 
 
 def test_cli_run_bulk_input_row2(mock_sflow_app, csv_file):
@@ -300,6 +301,24 @@ def test_cli_run_can_opt_out_to_full_task_log_mode(mock_sflow_app, workflow_file
 
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     assert mock_sflow_app.run.call_args.kwargs["task_log_mode"] == "full"
+
+
+def test_cli_run_can_suppress_task_output_console_for_batch(
+    mock_sflow_app, workflow_files
+):
+    base, _variant = workflow_files
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            str(base),
+            "--dry-run",
+            "--suppress-task-output-console",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_sflow_app.run.call_args.kwargs["echo_task_output"] is False
 
 
 def test_cli_run_bulk_input_without_row_fails(mock_sflow_app, csv_file):

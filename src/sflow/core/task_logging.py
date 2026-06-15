@@ -126,7 +126,8 @@ class BoundedRotatingTaskLogHandler(logging.handlers.RotatingFileHandler):
         if rate <= 0:
             return
         burst = float(self._policy.keep_first_lines)
-        self._tokens = min(burst, self._tokens + elapsed * rate)
+        capacity = burst if burst > 0 else max(rate, 1.0)
+        self._tokens = min(capacity, self._tokens + elapsed * rate)
 
     def _emit_suppression_summary(self, record: logging.LogRecord) -> None:
         if self._suppressed <= 0:

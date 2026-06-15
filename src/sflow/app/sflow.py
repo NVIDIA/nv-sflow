@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from sflow.app.assembly import build_state, release_backends
 from sflow.config.loader import ConfigLoader
+from sflow.core.outputs import TaskOutputCollector
 from sflow.core.task_logging import TaskLogPolicy, TaskOutputSink, create_task_log_handler
 from sflow.logging import add_log_file, get_logger
 
@@ -231,6 +232,7 @@ class SflowApp:
         task_log_keep_first_lines: int = 1000,
         task_log_max_bytes: int = 64 * 1024 * 1024,
         task_log_backup_count: int = 16,
+        echo_task_output: bool = True,
     ) -> Path | None:
         """
         Run the workflow and return the workflow output directory path.
@@ -308,6 +310,7 @@ class SflowApp:
             import subprocess
             from contextlib import suppress
 
+            from sflow.core.launcher import SubprocessLauncher
             from sflow.core.orchestrator import Orchestrator
             from sflow.ui.rich_tui import RichTui, RichTuiConfig
 
@@ -641,6 +644,7 @@ class SflowApp:
                     add_log_file(str(workflow_out_dir / "sflow.log"))
 
                 task_output_sinks: dict[str, TaskOutputSink] = {}
+                task_output_collectors: dict[str, TaskOutputCollector] = {}
                 for t in tg.get_tasks():
                     task_out_dir = workflow_out_dir / t.name
                     if not dry_run:
@@ -677,6 +681,10 @@ class SflowApp:
                             task_output_sinks[t.name] = TaskOutputSink(
                                 logger=t.logger,
                                 policy=task_log_policy,
+                            )
+                        if getattr(t, "output_specs", None):
+                            task_output_collectors[t.name] = TaskOutputCollector(
+                                list(t.output_specs)
                             )
 
                 if dry_run:
@@ -1146,7 +1154,11 @@ class SflowApp:
                     orch = Orchestrator(
                         workflow=state.workflow,
                         poll_interval=1,
+                        launcher=SubprocessLauncher(
+                            echo_to_console=bool(echo_task_output)
+                        ),
                         task_output_sinks=task_output_sinks,
+                        task_output_collectors=task_output_collectors,
                     )
                     await orch.run()
 

@@ -276,7 +276,9 @@ def test_batch_can_opt_out_to_full_task_log_mode(
     )
 
     assert result.exit_code == 0, f"CLI failed: {result.output}"
-    assert "--task-log-mode" not in sbatch_path.read_text()
+    script_content = sbatch_path.read_text()
+    assert "--task-log-mode full" in script_content
+    assert "--task-log-keep-lines-per-second" not in script_content
 
 
 def test_batch_script_bootstraps_venv_with_resolved_system_python(
@@ -364,6 +366,7 @@ def test_batch_task_log_options_propagate_to_generated_sflow_run(
     assert "--task-log-keep-first-lines 500" in script_content
     assert "--task-log-max-bytes 1048576" in script_content
     assert "--task-log-backup-count 4" in script_content
+    assert "--suppress-task-output-console" in script_content
 
 
 def test_single_job_without_nodes_fails_when_not_derivable(mock_sflow_app, temp_workflow_file):

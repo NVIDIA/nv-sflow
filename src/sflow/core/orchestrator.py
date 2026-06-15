@@ -9,7 +9,7 @@ from typing import Any
 from sflow.logging import get_logger
 
 from .launcher import SubprocessLauncher
-from .outputs import collect_task_outputs
+from .outputs import TaskOutputCollector, collect_task_outputs, write_task_outputs
 from .probe import Probe, ProbeStatus, ProbeTimeoutError, ProbeType
 from .task import Task, TaskStatus
 from .workflow import Workflow
@@ -29,6 +29,7 @@ class Orchestrator:
         launcher: SubprocessLauncher | None = None,
         fail_fast: bool = True,
         task_output_sinks: dict[str, Any] | None = None,
+        task_output_collectors: dict[str, TaskOutputCollector] | None = None,
     ):
         self.workflow = workflow
         self._poll_interval = poll_interval
@@ -36,6 +37,7 @@ class Orchestrator:
 
         self._subprocess_launcher = launcher or SubprocessLauncher()
         self._task_output_sinks = task_output_sinks or {}
+        self._task_output_collectors = task_output_collectors or {}
         self._live_probe_index: dict[str, list[Probe]] = {}
         self._subprocess_tasks = dict[str, asyncio.Task]()
         self._stop_event = asyncio.Event()
@@ -59,6 +61,9 @@ class Orchestrator:
             feed_line = getattr(probe, "feed_line", None)
             if feed_line is not None:
                 feed_line(line)
+        collector = self._task_output_collectors.get(task_name)
+        if collector is not None:
+            collector.feed_line(line)
 
     def _rebuild_live_probe_index(self) -> None:
         index: dict[str, list[Probe]] = {}
@@ -112,6 +117,9 @@ class Orchestrator:
                     task.attempts = int(getattr(task, "attempts", 0)) + 1
                     for p in getattr(task, "probes", []) or []:
                         p.reset()
+                    collector = self._task_output_collectors.get(task.name)
+                    if collector is not None:
+                        collector.reset()
                     self._rebuild_live_probe_index()
                     self._subprocess_tasks[task.name] = asyncio.create_task(
                         self._launch_task_with_timeout(task)
@@ -135,9 +143,12 @@ class Orchestrator:
                         t.exit_code = exit_code
                         if exit_code == 0:
                             t.status = TaskStatus.COMPLETED
-                            # MVP outputs parsing: parse from task log after completion.
                             if getattr(t, "output_specs", None):
-                                await collect_task_outputs(t)
+                                collector = self._task_output_collectors.get(t.name)
+                                if collector is not None:
+                                    await write_task_outputs(t, collector.parsed())
+                                else:
+                                    await collect_task_outputs(t)
                         else:
                             # Get the exception
                             task_exception = proc_task.exception()

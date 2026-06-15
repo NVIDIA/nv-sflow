@@ -238,6 +238,14 @@ def run(
             min=0,
         ),
     ] = 16,
+    suppress_task_output_console: Annotated[
+        bool,
+        typer.Option(
+            "--suppress-task-output-console",
+            help="Internal: suppress live task output echo on the shared console.",
+            hidden=True,
+        ),
+    ] = False,
     workspace_dir: Annotated[
         Optional[Path],
         typer.Option(
@@ -383,6 +391,7 @@ def run(
                 task_log_keep_first_lines=task_log_keep_first_lines,
                 task_log_max_bytes=task_log_max_bytes,
                 task_log_backup_count=task_log_backup_count,
+                echo_task_output=not suppress_task_output_console,
             )
         finally:
             if log_handler is not None:

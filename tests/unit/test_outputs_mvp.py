@@ -6,6 +6,7 @@ import json
 import logging
 
 from sflow.core.outputs import collect_task_outputs
+from sflow.core.task_logging import TaskLogPolicy, create_task_log_handler
 from sflow.core.task import OutputSpec, Task
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.command import Command
@@ -58,3 +59,50 @@ def test_outputs_mvp_parses_log_and_writes_outputs_json(tmp_path):
     assert payload["task"] == "t1"
     assert payload["outputs"]["ttft"] == 42.5
     assert payload["outputs"]["tps"] == 123.0
+
+
+def test_live_output_collector_parses_line_suppressed_from_bounded_log(tmp_path):
+    from sflow.core.outputs import TaskOutputCollector, write_task_outputs
+
+    task_out = tmp_path / "producer"
+    task_out.mkdir(parents=True)
+
+    t = Task(
+        name="producer",
+        logger=logging.getLogger("sflow.tests.outputs.live"),
+        operator=_NoopOperator(),
+        script=["echo hi"],
+    )
+    t.envs["SFLOW_TASK_OUTPUT_DIR"] = str(task_out)
+    t.output_specs = [OutputSpec(pattern="RESULT value={value:d}")]
+
+    log_path = task_out / "producer.log"
+    handler = create_task_log_handler(
+        log_path,
+        TaskLogPolicy(
+            mode="bounded",
+            keep_lines_per_second=0,
+            keep_first_lines=1,
+            max_bytes=1024 * 1024,
+            backup_count=1,
+        ),
+    )
+    logger = logging.getLogger("sflow.tests.outputs.live.task")
+    logger.handlers = []
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+
+    collector = TaskOutputCollector(t.output_specs)
+    for line in ["noise line kept", "RESULT value=42"]:
+        collector.feed_line(line)
+        logger.info(line)
+    handler.close()
+
+    assert "RESULT value=42" not in log_path.read_text()
+    parsed = collector.parsed()
+    assert parsed["value"] == 42
+
+    asyncio.run(write_task_outputs(t, parsed))
+    payload = json.loads((task_out / "outputs.json").read_text())
+    assert payload["outputs"]["value"] == 42

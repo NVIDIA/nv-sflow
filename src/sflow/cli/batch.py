@@ -327,8 +327,9 @@ def _generate_sbatch_script(
     if log_level != "info":
         sflow_cmd_parts.extend(["--log-level", log_level])
 
-    if task_log_mode != "full":
-        sflow_cmd_parts.extend(["--task-log-mode", shlex.quote(task_log_mode)])
+    sflow_cmd_parts.extend(["--task-log-mode", shlex.quote(task_log_mode)])
+    sflow_cmd_parts.append("--suppress-task-output-console")
+    if task_log_mode == "bounded":
         sflow_cmd_parts.extend(
             [
                 "--task-log-keep-lines-per-second",

@@ -42,6 +42,41 @@ def task_outputs_path(task: Task) -> Path | None:
     return None
 
 
+def _output_patterns(specs: list[OutputSpec]) -> list[str]:
+    return [s.pattern for s in specs if s and s.pattern]
+
+
+def _parse_output_lines(lines: list[str], specs: list[OutputSpec]) -> dict[str, Any]:
+    patterns = _output_patterns(specs)
+    if not patterns:
+        return {}
+    parser = LinesParser(patterns)
+    parser.add_lines(lines)
+    return dict(parser.parsed_dict())
+
+
+class TaskOutputCollector:
+    """Collect task outputs from the unsuppressed live subprocess stream."""
+
+    def __init__(self, specs: list[OutputSpec]) -> None:
+        self._specs = list(specs)
+        self._patterns = _output_patterns(self._specs)
+        self._parser = LinesParser(self._patterns) if self._patterns else None
+
+    def feed_line(self, line: str) -> None:
+        if self._parser is None:
+            return
+        self._parser.add_lines([line])
+
+    def reset(self) -> None:
+        self._parser = LinesParser(self._patterns) if self._patterns else None
+
+    def parsed(self) -> dict[str, Any]:
+        if self._parser is None:
+            return {}
+        return dict(self._parser.parsed_dict())
+
+
 def parse_outputs_from_text(text: str, specs: list[OutputSpec]) -> dict[str, Any]:
     """
     Parse task outputs from log text using parse-style patterns.
@@ -51,10 +86,7 @@ def parse_outputs_from_text(text: str, specs: list[OutputSpec]) -> dict[str, Any
     - Collect named fields across all matches.
     - If a key has a single match -> scalar, otherwise -> list.
     """
-    if not specs:
-        return {}
-    patterns = [s.pattern for s in specs if s and s.pattern]
-    if not patterns:
+    if not specs or not _output_patterns(specs):
         return {}
     # Logs are written via logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"),
     # so the actual user output is the final "message" segment after 3 separators.
@@ -65,9 +97,29 @@ def parse_outputs_from_text(text: str, specs: list[OutputSpec]) -> dict[str, Any
         parts = line.split(" - ", 3)
         lines.append(parts[-1] if parts else line)
 
-    parser = LinesParser(patterns)
-    parser.add_lines(lines)
-    return dict(parser.parsed_dict())
+    return _parse_output_lines(lines, specs)
+
+
+async def write_task_outputs(task: Task, parsed: dict[str, Any]) -> dict[str, Any]:
+    task.outputs = parsed
+
+    out_path = task_outputs_path(task)
+    if out_path is not None:
+        payload = {
+            "task": task.name,
+            "specs": [asdict(s) for s in (task.output_specs or [])],
+            "outputs": parsed,
+        }
+
+        def _write_payload() -> None:
+            out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+        try:
+            await asyncio.to_thread(_write_payload)
+        except Exception as e:
+            _logger.warning(f"Failed to write outputs.json for task {task.name}: {e}")
+
+    return parsed
 
 
 async def collect_task_outputs(task: Task) -> dict[str, Any]:
@@ -107,18 +159,4 @@ async def collect_task_outputs(task: Task) -> dict[str, Any]:
         _logger.warning(f"Failed to parse outputs for task {task.name}: {e}")
         parsed = {}
 
-    task.outputs = parsed
-
-    out_path = task_outputs_path(task)
-    if out_path is not None:
-        payload = {
-            "task": task.name,
-            "specs": [asdict(s) for s in (task.output_specs or [])],
-            "outputs": parsed,
-        }
-        try:
-            out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        except Exception as e:
-            _logger.warning(f"Failed to write outputs.json for task {task.name}: {e}")
-
-    return parsed
+    return await write_task_outputs(task, parsed)
