@@ -3250,3 +3250,50 @@ def test_batch_defaults_sflow_version_from_execution_env(
         "git+https://github.com/NVIDIA/nv-sflow.git@feature/infmax_v3"
         in script_content
     )
+
+
+def test_batch_script_bootstraps_venv_with_resolved_system_python(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """The generated sbatch venv bootstrap must not use a bare ``python3``.
+
+    A bare ``python3`` resolves through PATH, so if the submitting shell has a
+    virtualenv activated, sbatch's default ``--export=ALL`` leaks that venv into
+    the job and ``python3 -m venv`` runs the caller's interpreter -- which fails
+    with "Exec format error" when the login node and compute node differ in
+    architecture (e.g. x86 login vs aarch64 Grace compute).
+
+    The script must instead clear the inherited virtualenv and resolve a real
+    system python3: prefer well-known absolute locations, then fall back to a
+    PATH-resolved interpreter so nodes that install python outside /usr/bin work.
+    """
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    # Venv is created via a resolved interpreter, never a bare python3 from PATH.
+    assert '"$SFLOW_BOOTSTRAP_PYTHON" -m venv .sflow_venv' in script_content
+    assert "    python3 -m venv .sflow_venv" not in script_content
+    # Well-known absolute location is tried first, with a PATH fallback for nodes
+    # that install python elsewhere.
+    assert "/usr/bin/python3" in script_content
+    assert "command -v python3" in script_content
+    # An inherited (possibly wrong-arch) virtualenv must be neutralized.
+    assert "unset VIRTUAL_ENV" in script_content
+    assert 'grep -vxF "$VIRTUAL_ENV/bin"' in script_content

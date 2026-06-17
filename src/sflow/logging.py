@@ -11,6 +11,25 @@ from rich.logging import RichHandler
 # Default width for non-interactive terminals (piping, file output, etc.)
 _DEFAULT_NON_TTY_WIDTH = 200
 
+# Log records carrying this attribute (set to True) are per-task subprocess
+# output. They may be streamed to an interactive console, but must never be
+# written to sflow.log (or the Slurm stdout/err files). Those sinks are reserved
+# for orchestration lines and command/status hints; full per-task content lives
+# in <task>/<task>.log.
+SFLOW_TASK_STREAM_ATTR = "sflow_task_stream"
+
+
+class _DropTaskStreamFilter(logging.Filter):
+    """Drop per-task subprocess output records so they never reach a file handler.
+
+    Records produced by streaming a task's stdout/stderr are tagged with
+    ``SFLOW_TASK_STREAM_ATTR``. This filter keeps them out of sflow.log while
+    still allowing them through to the interactive console handler.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, SFLOW_TASK_STREAM_ATTR, False)
+
 
 def configure_logging(
     level: str = "INFO", log_file: Optional[str] = None, *, console: bool = True
@@ -46,6 +65,8 @@ def configure_logging(
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
+        # Per-task subprocess output must never land in the log file.
+        file_handler.addFilter(_DropTaskStreamFilter())
         handlers.append(file_handler)
 
     # Configure the sflow logger
@@ -82,6 +103,8 @@ def add_log_file(log_file: str) -> None:
     fh.setFormatter(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
+    # Keep per-task subprocess output out of sflow.log (orchestration only).
+    fh.addFilter(_DropTaskStreamFilter())
     logger.addHandler(fh)
 
     # Ensure the logger itself accepts INFO messages even if the console
