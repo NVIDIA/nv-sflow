@@ -7,8 +7,8 @@ from pydantic import ValidationError
 from sflow.plugins.operators.srun import (
     SrunOperator,
     SrunOperatorConfig,
-    _is_valid_container_image,
 )
+from sflow.utils.container import is_valid_container_image
 
 
 def test_srun_operator_supports_pyxis_container_image_flags_and_common_args():
@@ -82,6 +82,28 @@ def test_srun_operator_supports_pyxis_container_name_flags():
         )
     )
     assert "--container-name cname" in s
+
+
+def test_srun_operator_maps_slurm_runtime_envs_to_sflow_aliases():
+    op = SrunOperator(SrunOperatorConfig(name="op_srun"))
+
+    command = op.build_command(
+        task_name="t1",
+        script=["echo aliases"],
+        envs={},
+    )
+    payload = command.as_list()[-1]
+
+    assert 'export SFLOW_BACKEND_JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-}}"' in payload
+    assert 'export SFLOW_BACKEND_NODELIST="${SLURM_JOB_NODELIST:-${SLURM_NODELIST:-}}"' in payload
+    assert 'export SFLOW_BACKEND_NUM_NODES="${SLURM_NNODES:-}"' in payload
+    assert 'export SFLOW_BACKEND_STEP_ID="${SLURM_STEP_ID:-}"' in payload
+    assert 'export SFLOW_TASK_NODE_NAME="${SLURMD_NODENAME:-}"' in payload
+    assert 'export SFLOW_TASK_NODE_INDEX="${SLURM_NODEID:-}"' in payload
+    assert 'export SFLOW_TASK_PROCESS_ID="${SLURM_PROCID:-}"' in payload
+    assert 'export SFLOW_TASK_LOCAL_PROCESS_ID="${SLURM_LOCALID:-}"' in payload
+    assert 'export SFLOW_TASK_NUM_PROCESSES="${SLURM_NTASKS:-}"' in payload
+    assert payload.rstrip().endswith("echo aliases")
 
 
 def test_srun_operator_rejects_container_image_and_name_set_together():
@@ -225,6 +247,38 @@ def test_srun_operator_container_mounts_only_from_extra_args():
     assert s.count("--container-mounts") == 1
 
 
+def test_srun_operator_config_exposes_container_protocol_hooks():
+    cfg = SrunOperatorConfig(
+        name="op_srun",
+        container_image="nvcr.io/example/app:1.0",
+        container_mounts=["/host:/ctr:ro"],
+        extra_args=["--container-mounts", "/extra:/extra:rw,/host:/ctr:rw"],
+    )
+
+    assert cfg.uses_container() is True
+    assert cfg.container_images() == ["nvcr.io/example/app:1.0"]
+    assert cfg.mount_specs() == ["/host:/ctr:ro", "/extra:/extra:rw"]
+
+
+def test_srun_operator_config_warns_when_enroot_credentials_missing(
+    tmp_path, monkeypatch
+):
+    # log_to_file=False isolates the enroot warning from the (now default-on)
+    # offload python3/bash>=5 warning.
+    cfg = SrunOperatorConfig(
+        name="op_srun",
+        container_image="nvcr.io/example/app:1.0",
+        log_to_file=False,
+    )
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    warnings = cfg.runtime_warnings()
+
+    assert len(warnings) == 1
+    assert "enroot credentials" in warnings[0]
+
+
 # ---------------------------------------------------------------------------
 # Container image validation
 # ---------------------------------------------------------------------------
@@ -251,7 +305,7 @@ def test_srun_operator_container_mounts_only_from_extra_args():
     ],
 )
 def test_valid_container_images(image: str):
-    assert _is_valid_container_image(image), f"Expected valid: {image}"
+    assert is_valid_container_image(image), f"Expected valid: {image}"
 
 
 @pytest.mark.parametrize(
@@ -265,7 +319,7 @@ def test_valid_container_images(image: str):
     ],
 )
 def test_invalid_container_images(image: str):
-    assert not _is_valid_container_image(image), f"Expected invalid: {image}"
+    assert not is_valid_container_image(image), f"Expected invalid: {image}"
 
 
 def test_srun_operator_rejects_invalid_container_image():
@@ -319,3 +373,57 @@ def test_srun_operator_accepts_valid_image_in_extra_args():
         extra_args=["--container-image=nvcr.io/nvidia/pytorch:24.01-py3"],
     )
     assert "--container-image=nvcr.io/nvidia/pytorch:24.01-py3" in cfg.extra_args
+
+
+# ---------------------------------------------------------------------------
+# Job / placement targeting
+# ---------------------------------------------------------------------------
+
+
+def test_srun_apply_backend_context_pins_jobid_and_nodelist():
+    """apply_backend_context binds the step to the backend's allocation via
+    --jobid / --nodelist (login-node / single-allocation path)."""
+    from sflow.core.backend import Allocation
+    from sflow.core.compute_node import ComputeNode
+
+    class _FakeBackend:
+        def __init__(self):
+            self.allocation = Allocation(
+                allocation_id="777",
+                nodes=[
+                    ComputeNode(
+                        name="n1", ip_address="10.0.0.1", index=0, num_gpus=0
+                    )
+                ],
+                owned=True,
+            )
+
+    op = SrunOperator(SrunOperatorConfig(name="op", ntasks_per_node=1))
+    op.apply_backend_context(
+        backend=_FakeBackend(),
+        assigned_nodes=["n1"],
+        artifacts=[],
+    )
+
+    assert op.config.job_id == "777"
+    assert op.config.nodelist == ["n1"]
+
+    s = str(op.build_command(task_name="t", script=["echo hi"], envs={}))
+    assert "--jobid 777" in s
+    assert "--nodelist n1" in s
+
+
+def test_srun_step_exports_all_without_overrides():
+    """A step keeps a plain --export ALL: no enroot runtime relocation and no
+    SLURM_JOB_ID override."""
+    op = SrunOperator(
+        SrunOperatorConfig(
+            name="op", job_id="777", nodelist=["n1"], ntasks_per_node=1
+        )
+    )
+
+    s = str(op.build_command(task_name="t", script=["echo hi"], envs={}))
+    assert "--export ALL" in s
+    assert "ENROOT_RUNTIME_PATH=" not in s
+    assert "SLURM_JOB_ID=" not in s
+    assert "--jobid 777" in s

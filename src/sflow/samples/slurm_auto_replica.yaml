@@ -20,18 +20,18 @@ variables:
     value: 4
   SLURM_NODES:
     description: "Number of nodes"
-    value: 6
+    value: 3
   
   # Task Resources
   PREFILL_SERVER_COUNT:
     description: "Number of prefill servers"
-    value: 4
+    value: 2
   PREFILL_GPUS_PER_SERVER:
     description: "GPUs per prefill server"
     value: 2
   DECODE_SERVER_COUNT:
     description: "Number of decode servers"
-    value: 2
+    value: 1
   DECODE_GPUS_PER_SERVER:
     description: "GPUs per decode server"
     value: 8
@@ -91,45 +91,25 @@ workflow:
         # Access each replica by index
         - echo "Prefill 0 IP - ${{ task.prefill_server[0].nodes[0].ip_address }}"
         - echo "Prefill 1 IP - ${{ task.prefill_server[1].nodes[0].ip_address }}"
-        - echo "Prefill 2 IP - ${{ task.prefill_server[2].nodes[0].ip_address }}"
-        - echo "Prefill 3 IP - ${{ task.prefill_server[3].nodes[0].ip_address }}"
         - echo "Prefill 0 Name - ${{ task.prefill_server[0].nodes[0].name }}"
         - echo "Prefill 1 Name - ${{ task.prefill_server[1].nodes[0].name }}"
-        - echo "Prefill 2 Name - ${{ task.prefill_server[2].nodes[0].name }}"
-        - echo "Prefill 3 Name - ${{ task.prefill_server[3].nodes[0].name }}"
         - echo "Prefill 0 GPUs - ${{ task.prefill_server[0].gpus }}"
         - echo "Prefill 1 GPUs - ${{ task.prefill_server[1].gpus }}"
-        - echo "Prefill 2 GPUs - ${{ task.prefill_server[2].gpus }}"
-        - echo "Prefill 3 GPUs - ${{ task.prefill_server[3].gpus }}"
         - echo "Prefill 0 Resources - ${{ task.prefill_server[0].nodes }}"
         - echo "Prefill 1 Resources - ${{ task.prefill_server[1].nodes }}"
-        - echo "Prefill 2 Resources - ${{ task.prefill_server[2].nodes }}"
-        - echo "Prefill 3 Resources - ${{ task.prefill_server[3].nodes }}"
         - echo "Prefill 0 Backend - ${{ task.prefill_server[0].backend }}"
         - echo "Prefill 1 Backend - ${{ task.prefill_server[1].backend }}"
-        - echo "Prefill 2 Backend - ${{ task.prefill_server[2].backend }}"
-        - echo "Prefill 3 Backend - ${{ task.prefill_server[3].backend }}"
         - echo "Prefill 0 Operator - ${{ task.prefill_server[0].operator }}"
         - echo "Prefill 1 Operator - ${{ task.prefill_server[1].operator }}"
-        - echo "Prefill 2 Operator - ${{ task.prefill_server[2].operator }}"
-        - echo "Prefill 3 Operator - ${{ task.prefill_server[3].operator }}"
 
         - echo "Decode 0 Node 0 IP - ${{ task.decode_server[0].nodes[0].ip_address }}"
         - echo "Decode 0 Node 1 IP - ${{ task.decode_server[0].nodes[1].ip_address }}"
-        - echo "Decode 1 Node 0 IP - ${{ task.decode_server[1].nodes[0].ip_address }}"
-        - echo "Decode 1 Node 1 IP - ${{ task.decode_server[1].nodes[1].ip_address }}"
         - echo "Decode 0 Node 0 Name - ${{ task.decode_server[0].nodes[0].name }}"
         - echo "Decode 0 Node 1 Name - ${{ task.decode_server[0].nodes[1].name }}"
-        - echo "Decode 1 Node 0 Name - ${{ task.decode_server[1].nodes[0].name }}"
-        - echo "Decode 1 Node 1 Name - ${{ task.decode_server[1].nodes[1].name }}"
         - echo "Decode 0 GPUs - ${{ task.decode_server[0].gpus }}"
-        - echo "Decode 1 GPUs - ${{ task.decode_server[1].gpus }}"
         - echo "Decode 0 Resources - ${{ task.decode_server[0].nodes }}"
-        - echo "Decode 1 Resources - ${{ task.decode_server[1].nodes }}"
         - echo "Decode 0 Backend - ${{ task.decode_server[0].backend }}"
-        - echo "Decode 1 Backend - ${{ task.decode_server[1].backend }}"
         - echo "Decode 0 Operator - ${{ task.decode_server[0].operator }}"
-        - echo "Decode 1 Operator - ${{ task.decode_server[1].operator }}"
         
         - echo "Client Task Nodes - ${{ task.client.nodes }}"
         - echo "Client Task Nodes[0] IP - ${{ task.client.nodes[0].ip_address }}"

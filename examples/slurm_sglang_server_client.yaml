@@ -125,28 +125,6 @@ workflow:
           timeout: 1200
           interval: 2
     
-    - name: gpu_monitor
-      operator: sglang_runtime
-      script:
-        - echo "Starting gpu monitor"
-        - >
-          nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used 
-          --format=csv,noheader,nounits -lms 2000 | 
-          while IFS= read -r input || [ -n "$input" ] ; 
-          do timestamp=$(date +%s%3N); 
-          printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}" "${input}"; 
-          done 
-          >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
-      probes:
-        readiness:
-          log_watch:
-            match_pattern: "Starting gpu monitor"
-      resources:
-        nodes:
-          indices: [0]
-      depends_on:
-        - load_image
-    
     - name: sglang_server
       operator: sglang_runtime
       replicas:
@@ -214,5 +192,15 @@ workflow:
       resources:
         nodes:
           indices: [0]
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # server's resources (used_by_tasks), not the benchmark client's own node
+      # -- so the report captures the server's GPU/CPU usage over the benchmark
+      # window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - sglang_server
+        report:
+          enabled: true
       depends_on:
         - sglang_server

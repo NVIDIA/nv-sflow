@@ -1,0 +1,473 @@
+version: "0.1"
+
+# Kubernetes port of examples/slurm_dynamo_trtllm_disagg.yaml.
+#
+# Native Kubernetes recipe: a `kubernetes` backend (scheduling: device_plugin)
+# reserves and discovers nodes, then each task runs as its own scheduler-placed
+# pod whose GPUs come from the legacy nvidia.com/gpu device plugin. The operators
+# are `type: k8s` and carry the workload images (DYNAMO_IMAGE / AIPERF_IMAGE).
+#
+# Cluster assumptions: NVIDIA gpu-operator (nvidia.com/gpu device plugin). The
+# backend reserves real nodes with placeholder pods that hold the node GPUs,
+# discovers their node names + InternalIPs, pins each task pod via nodeSelector,
+# and hands the GPUs to the GPU tasks via the create-before-destroy handoff.
+# CPU-only infra (etcd/nats/frontend) overlaps on node 0 without consuming GPUs.
+# Set `scheduling: dra` to use DRA (nvidia-dra-driver-gpu, Kubernetes 1.34+,
+# resource.k8s.io/v1, DeviceClass gpu.nvidia.com) instead of the device plugin.
+
+variables:
+  # --- Kubernetes backend configuration ---
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    value: default
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 4
+  NUM_NODES:
+    description: "Number of nodes"
+    value: 3
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: Qwen3-0-6B-FP8
+  MODEL_NAME:
+    description: "Model path"
+    value: Qwen/Qwen3-0.6B-FP8
+
+  # Prefill Server Configuration
+  NUM_CTX_SERVERS:
+    description: "Number of context/prefill servers"
+    value: 2
+  CTX_TP_SIZE:
+    description: "Context tensor parallel size"
+    type: integer
+    value: 2
+  CTX_DP_SIZE:
+    description: "Context data parallel size"
+    type: integer
+    value: 1
+  CTX_EP_SIZE:
+    description: "Context expert parallel size"
+    type: integer
+    value: 1
+  CTX_MOE_TP_SIZE:
+    description: "Context MOE tensor parallel size"
+    type: integer
+    value: 1
+  CTX_PP_SIZE:
+    description: "Context pipeline parallel size"
+    type: integer
+    value: 1
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+  CTX_BATCH_SIZE:
+    description: "Context batch size"
+    value: 128
+  CTX_MAX_NUM_TOKENS:
+    description: "Context max number of tokens"
+    value: 4096
+  CTX_MAX_SEQ_LEN:
+    description: "Context max sequence length"
+    value: 1280
+  CTX_FREE_GPU_MEMORY_FRACTION:
+    description: "Context free GPU memory fraction"
+    value: 0.9
+  CTX_ENABLE_ATTENTION_DP:
+    description: "Context enable attention DP"
+    value: false
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+
+  # Decode Server Configuration
+  NUM_GEN_SERVERS:
+    description: "Number of generation/decode servers"
+    value: 1
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size"
+    type: integer
+    value: 8
+  GEN_DP_SIZE:
+    description: "Generation data parallel size"
+    type: integer
+    value: 1
+  GEN_EP_SIZE:
+    description: "Generation expert parallel size"
+    type: integer
+    value: 1
+  GEN_MOE_TP_SIZE:
+    description: "Generation MOE tensor parallel size"
+    type: integer
+    value: 1
+  GEN_PP_SIZE:
+    description: "Generation pipeline parallel size"
+    type: integer
+    value: 1
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+  GEN_BATCH_SIZE:
+    description: "Generation batch size"
+    value: 128
+  GEN_MAX_NUM_TOKENS:
+    description: "Generation max number of tokens"
+    value: 4096
+  GEN_MAX_SEQ_LEN:
+    description: "Generation max sequence length"
+    value: 2304
+  GEN_FREE_GPU_MEMORY_FRACTION:
+    description: "Generation free GPU memory fraction"
+    value: 0.9
+  GEN_ENABLE_ATTENTION_DP:
+    description: "Generation enable attention DP"
+    value: false
+
+  # Extra Arguments - You can append any optional arguments to the trtllm-llmapi-launch command
+  EXTRA_FRONTEND_ARGS:
+    description: "Extra frontend arguments"
+    value: ""
+  EXTRA_PREFILL_ARGS:
+    description: "Extra prefill arguments"
+    value: ""
+  EXTRA_DECODE_ARGS:
+    description: "Extra decode arguments"
+    value: ""
+
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 50
+    domain: [50, 100]
+
+  # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+  DYNAMO_IMAGE:
+    description: "Dynamo TRTLLM container image"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.8.0
+
+artifacts:
+  # file type artifacts will be generated by sflow with the content defined in this yaml file, accessible as `${{ artifacts.NAME.path }}` in task scripts
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+  - name: PREFILL_CONFIG
+    uri: file://prefill_config.yaml
+    content: |
+      max_batch_size: ${{ variables.CTX_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.CTX_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.CTX_MAX_SEQ_LEN }}
+      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      enable_attention_dp: ${{ variables.CTX_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: ${{ variables.CTX_PP_SIZE }}
+      cuda_graph_config: null
+      print_iter_log: true
+      disable_overlap_scheduler: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.CTX_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
+        backend: DEFAULT
+  - name: DECODE_CONFIG
+    uri: file://decode_config.yaml
+    content: |
+      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      enable_attention_dp: ${{ variables.GEN_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: ${{ variables.GEN_PP_SIZE }}
+      max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.GEN_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.GEN_MAX_SEQ_LEN }}
+      cuda_graph_config:
+        enable_padding: true
+        max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+      print_iter_log: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.GEN_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
+        backend: DEFAULT
+      stream_interval: 20
+
+backends:
+  # A kubernetes backend with device-plugin scheduling. No `image` field --
+  # workload images come from the operators (DYNAMO_IMAGE / AIPERF_IMAGE) below.
+  - name: k8s_cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so peers can be addressed by the node InternalIPs that
+    # reservation returns (etcd/NATS registration mirrors the Slurm path).
+    host_network: true
+    # Request GPUs via the legacy nvidia.com/gpu device plugin; use 'dra' for
+    # DRA (nvidia-dra-driver-gpu, DeviceClass gpu.nvidia.com).
+    scheduling: device_plugin
+    reservation:
+      timeout: 1200
+
+operators:
+  # Native kubernetes operators carry the workload image. A single-node task
+  # becomes one pod; a multi-node task becomes one pod per node.
+  - name: dynamo_trtllm
+    type: k8s
+    image: ${{ variables.DYNAMO_IMAGE }}
+  - name: aiperf
+    type: k8s
+    image: ${{ variables.AIPERF_IMAGE }}
+
+workflow:
+  name: dynamo_trtllm_disagg
+  timeout: 115m
+
+  variables:
+    # Workflow level variables will overwrite the variables defined in global variables section if using same name
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.k8s_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: load_image
+      operator: dynamo_trtllm
+      # One pod per node pre-pulls the image onto each reserved node's kubelet cache.
+      resources:
+        nodes:
+          count: ${{ variables.NUM_NODES }}
+      script:
+        - echo "Image Loaded"
+        - sleep 3600
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Image Loaded"
+            match_count: ${{ variables.NUM_NODES }}
+          timeout: 1200
+          interval: 2
+
+    - name: nats_server
+      operator: dynamo_trtllm
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 300
+          interval: 2
+      depends_on:
+        - load_image
+
+    - name: etcd_server
+      operator: dynamo_trtllm
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 300
+          interval: 2
+      depends_on:
+        - load_image
+
+    - name: frontend_server
+      operator: dynamo_trtllm
+      script:
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 300
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: prefill_server
+      operator: dynamo_trtllm
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode prefill
+          --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+      retries:
+        count: 3
+        interval: 30
+        backoff: 2
+
+    - name: decode_server
+      operator: dynamo_trtllm
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode decode
+          --extra-engine-args ${{ artifacts.DECODE_CONFIG.path }} ${EXTRA_DECODE_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+      retries:
+        count: 3
+        interval: 30
+        backoff: 2
+
+    - name: benchmark
+      operator: aiperf
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # prefill/decode SERVERS' resources (used_by_tasks), not the benchmark
+      # client's own node -- so the report captures the servers' GPU/CPU usage
+      # over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
+      depends_on:
+        - prefill_server
+        - decode_server
+        - frontend_server

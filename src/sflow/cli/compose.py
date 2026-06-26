@@ -6,59 +6,24 @@ CLI command for composing multiple sflow YAML config files into a single valid c
 with variables resolved inline.
 """
 
-import re
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional
 
 import typer
 import yaml
-from jinja2 import StrictUndefined, UndefinedError
-from jinja2.sandbox import SandboxedEnvironment
 
+from sflow.app.monitor_cli import inject_cli_monitors_into_dict
 from sflow.cli import DOCS_URL, app
-from sflow.config.loader import ConfigLoader, merge_config_dicts
-from sflow.config.resolver import ExpressionResolver
-from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
+from sflow.config.loader import (
+    ConfigLoader,
+    _normalize_script_plain_mappings,
+    merge_config_dicts,
+)
 from sflow.logging import configure_logging, get_logger
+from sflow.resolution import ExpressionResolver, resolve_variables_inline
+from sflow.runtime_info import log_runtime_info
 
 _logger = get_logger(__name__)
-
-_EXPR_RE = re.compile(r"\$\{\{(.+?)\}\}")
-_SHELL_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-# Env vars that are NOT sflow variables — never resolve these.
-_BUILTIN_ENV_VARS = frozenset(
-    {
-        "CUDA_VISIBLE_DEVICES",
-        "SLURM_NODEID",
-        "SLURMD_NODENAME",
-        "SLURM_JOB_ID",
-        "SLURM_JOBID",
-        "SLURM_PROCID",
-        "SLURM_LOCALID",
-        "SLURM_NTASKS",
-        "SLURM_NNODES",
-        "SLURM_STEP_ID",
-        "SLURM_STEP_NODELIST",
-        "SLURM_JOB_NODELIST",
-        "HOME",
-        "USER",
-        "PATH",
-        "PWD",
-        "HOSTNAME",
-        "SHELL",
-        "LANG",
-        "TERM",
-        "SFLOW_WORKSPACE_DIR",
-        "SFLOW_OUTPUT_DIR",
-        "SFLOW_WORKFLOW_OUTPUT_DIR",
-        "SFLOW_TASK_OUTPUT_DIR",
-        "SFLOW_TASK_ASSIGNED_NODE_IPS",
-        "COLUMNS",
-        "IFS",
-    }
-)
 
 
 def _merged_section_to_list(section: Any) -> list:
@@ -101,377 +66,6 @@ def _strip_none_values(obj: Any) -> Any:
     return obj
 
 
-def _extract_variables(merged: Dict[str, Any]) -> dict[str, Any]:
-    """Extract a flat {name: value} dict from the variables list in the merged config."""
-    out: dict[str, Any] = {}
-    for entry in merged.get("variables") or []:
-        if isinstance(entry, dict) and "name" in entry:
-            out[entry["name"]] = entry.get("value")
-    wf = merged.get("workflow")
-    if isinstance(wf, dict):
-        for entry in wf.get("variables") or []:
-            if isinstance(entry, dict) and "name" in entry:
-                out[entry["name"]] = entry.get("value")
-    return out
-
-
-def _classify_resolvable(variables: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
-    """Split variables into resolvable (literal or computable) and unresolvable.
-
-    Returns (resolved_values, unresolvable_names).
-    Iterates until stable to handle chained dependencies (A references B).
-    """
-    env = SandboxedEnvironment(
-        undefined=StrictUndefined,
-        autoescape=False,
-        variable_start_string="${{",
-        variable_end_string="}}",
-    )
-
-    resolved: dict[str, Any] = {}
-    pending: dict[str, Any] = dict(variables)
-
-    changed = True
-    while changed:
-        changed = False
-        still_pending: dict[str, Any] = {}
-        for name, value in pending.items():
-            if not isinstance(value, str) or "${{" not in value:
-                resolved[name] = value
-                changed = True
-                continue
-            ctx = {"variables": resolved, **resolved}
-            try:
-                tpl = env.from_string(str(value))
-                result = tpl.render(**ctx)
-                resolved[name] = _coerce_type(result)
-                changed = True
-            except (UndefinedError, Exception):
-                still_pending[name] = value
-        pending = still_pending
-
-    return resolved, set(pending.keys())
-
-
-def _coerce_type(value: str) -> Any:
-    """Convert a Jinja2 string result back to a native Python type when possible."""
-    if not isinstance(value, str):
-        return value
-    stripped = value.strip()
-    if stripped.lower() in ("true", "false"):
-        return stripped.lower() == "true"
-    try:
-        return int(stripped)
-    except ValueError:
-        pass
-    try:
-        return float(stripped)
-    except ValueError:
-        pass
-    return value
-
-
-def _to_jinja_literal(value: Any) -> str:
-    """Render a Python value as a Jinja-compatible literal."""
-    return repr(value)
-
-
-def _consume_quoted_string(text: str, start: int) -> tuple[str, int]:
-    """Return the quoted substring starting at *start* and the next index."""
-    quote = text[start]
-    end = start + 1
-    while end < len(text):
-        if text[end] == "\\":
-            end += 2
-            continue
-        if text[end] == quote:
-            end += 1
-            break
-        end += 1
-    return text[start:end], end
-
-
-def _inline_resolved_vars_in_expr_body(
-    body: str,
-    resolved: dict[str, Any],
-    domains: dict[str, list[Any]] | None,
-) -> str:
-    """Inline known variable values into a raw Jinja expression body."""
-    if not resolved:
-        return body
-
-    domain_map = domains or {}
-    out: list[str] = []
-    i = 0
-    while i < len(body):
-        ch = body[i]
-        if ch in ("'", '"'):
-            quoted, i = _consume_quoted_string(body, i)
-            out.append(quoted)
-            continue
-
-        if body.startswith("variables.", i):
-            match = _IDENTIFIER_RE.match(body, i + len("variables."))
-            if match:
-                name = match.group(0)
-                end = match.end()
-                if body.startswith(".domain", end) and name in resolved:
-                    out.append(_to_jinja_literal(domain_map.get(name, [])))
-                    i = end + len(".domain")
-                    continue
-                if name in resolved:
-                    out.append(_to_jinja_literal(resolved[name]))
-                    i = end
-                    continue
-
-        match = _IDENTIFIER_RE.match(body, i)
-        if match:
-            name = match.group(0)
-            end = match.end()
-            prev = body[i - 1] if i > 0 else ""
-            if prev != "." and not (prev.isalnum() or prev == "_"):
-                if body.startswith(".domain", end) and name in resolved:
-                    out.append(_to_jinja_literal(domain_map.get(name, [])))
-                    i = end + len(".domain")
-                    continue
-                if name in resolved:
-                    out.append(_to_jinja_literal(resolved[name]))
-                    i = end
-                    continue
-
-        out.append(ch)
-        i += 1
-
-    return "".join(out)
-
-
-def _inline_resolved_vars_in_jinja(
-    text: str,
-    resolved: dict[str, Any],
-    domains: dict[str, list[Any]] | None = None,
-) -> str:
-    """Rewrite deferred Jinja expressions so removed variables become literals."""
-    if "${{" not in text or not resolved:
-        return text
-
-    def _rewrite(match: re.Match) -> str:
-        expr_text = match.group(0)
-        body = expr_text[3:-2]
-        rewritten = _inline_resolved_vars_in_expr_body(body, resolved, domains)
-        if rewritten == body:
-            return expr_text
-        return "${{" + rewritten + "}}"
-
-    return _EXPR_RE.sub(_rewrite, text)
-
-
-def _resolve_expressions(
-    obj: Any,
-    ctx: dict[str, Any],
-    env: SandboxedEnvironment,
-    resolved: dict[str, Any] | None = None,
-    domains: dict[str, list[Any]] | None = None,
-) -> Any:
-    """Walk a data structure, resolving ${{ }} expressions where all refs are available.
-
-    For strings that are a single pure expression, the result is type-coerced
-    (e.g. "2" becomes 2).  For mixed strings (literal text + expressions),
-    each expression is resolved individually so resolvable parts are inlined
-    even when other parts in the same string are not yet resolvable.
-    """
-    if isinstance(obj, str):
-        if "${{" not in obj:
-            return obj
-        stripped = obj.strip()
-        if _EXPR_RE.fullmatch(stripped):
-            try:
-                result = env.from_string(obj).render(**ctx)
-                return _coerce_type(result)
-            except (UndefinedError, Exception):
-                rewritten = _inline_resolved_vars_in_jinja(obj, resolved or {}, domains)
-                if rewritten == obj:
-                    return obj
-                try:
-                    result = env.from_string(rewritten).render(**ctx)
-                    return _coerce_type(result)
-                except (UndefinedError, Exception):
-                    return rewritten
-
-        def _replace_match(m: re.Match) -> str:
-            expr_text = m.group(0)
-            try:
-                return env.from_string(expr_text).render(**ctx)
-            except (UndefinedError, Exception):
-                rewritten = _inline_resolved_vars_in_jinja(
-                    expr_text, resolved or {}, domains
-                )
-                if rewritten == expr_text:
-                    return expr_text
-                try:
-                    return env.from_string(rewritten).render(**ctx)
-                except (UndefinedError, Exception):
-                    return rewritten
-
-        return _EXPR_RE.sub(_replace_match, obj)
-    if isinstance(obj, list):
-        return [
-            _resolve_expressions(item, ctx, env, resolved=resolved, domains=domains)
-            for item in obj
-        ]
-    if isinstance(obj, dict):
-        return {
-            k: _resolve_expressions(v, ctx, env, resolved=resolved, domains=domains)
-            for k, v in obj.items()
-        }
-    return obj
-
-
-def _resolve_shell_vars(obj: Any, resolved: dict[str, Any]) -> Any:
-    """Replace ${NAME} shell variable references in script strings with literal values."""
-    if isinstance(obj, str):
-
-        def _replace(m: re.Match) -> str:
-            name = m.group(1)
-            if name in _BUILTIN_ENV_VARS or name not in resolved:
-                return m.group(0)
-            val = resolved[name]
-            return str(val)
-
-        return _SHELL_VAR_RE.sub(_replace, obj)
-    if isinstance(obj, list):
-        return [_resolve_shell_vars(item, resolved) for item in obj]
-    if isinstance(obj, dict):
-        return {k: _resolve_shell_vars(v, resolved) for k, v in obj.items()}
-    return obj
-
-
-def _remove_resolved_variables(
-    section: list | None,
-    resolved_names: set[str],
-) -> list:
-    """Filter a variables list, keeping only entries whose names are NOT in resolved_names."""
-    if not section:
-        return []
-    return [
-        entry
-        for entry in section
-        if not (isinstance(entry, dict) and entry.get("name") in resolved_names)
-    ]
-
-
-def _collect_replica_variable_names(merged: Dict[str, Any]) -> set[str]:
-    """Find variable names referenced by any replicas config in any task.
-
-    This includes:
-    - ``replicas.variables`` (sweep variables that change per replica)
-    - ``replicas.count`` / ``replicas.policy`` (expressions like
-      ``${{ variables.NUM_CTX_SERVERS }}``)
-
-    These variables must stay in the variables section so replica
-    behaviour remains configurable.
-    """
-    names: set[str] = set()
-    wf = merged.get("workflow")
-    if not isinstance(wf, dict):
-        return names
-    for task in wf.get("tasks") or []:
-        if not isinstance(task, dict):
-            continue
-        replicas = task.get("replicas")
-        if not isinstance(replicas, dict):
-            continue
-        for v in replicas.get("variables") or []:
-            if isinstance(v, str):
-                names.add(v)
-        for field in ("count", "policy"):
-            val = replicas.get(field)
-            if isinstance(val, str):
-                for m in _EXPR_RE.finditer(val):
-                    expr = m.group(1).strip()
-                    if expr.startswith("variables."):
-                        names.add(expr.split(".", 1)[1])
-    return names
-
-
-def _clean_resolved_strings(obj: Any) -> Any:
-    """Strip trailing whitespace from resolved script strings.
-
-    YAML block scalars (``>`` / ``|``) append a trailing newline that becomes
-    a literal ``\\n`` after Jinja2 rendering.  Cleaning it here keeps the
-    composed output readable.
-    """
-    if isinstance(obj, str):
-        return obj.rstrip(" \t\n")
-    if isinstance(obj, list):
-        return [_clean_resolved_strings(item) for item in obj]
-    if isinstance(obj, dict):
-        return {k: _clean_resolved_strings(v) for k, v in obj.items()}
-    return obj
-
-
-def _resolve_variables_inline(merged: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve all resolvable variables inline throughout the config.
-
-    - Resolves ${{ variables.X }} expressions to literal values
-    - Resolves ${X} shell references in scripts to literal values
-    - Removes resolved variables from the variables sections
-    - Keeps variables referenced by replicas.variables (needed for sweeps)
-    - Keeps expressions that depend on backends/artifacts/task (post-allocation)
-    """
-    replica_vars = _collect_replica_variable_names(merged)
-
-    variables = _extract_variables(merged)
-    domains = extract_domains_from_raw_config(merged)
-    resolved, unresolvable = _classify_resolvable(variables)
-
-    # Replica sweep variables must stay as declarations (their value changes
-    # per replica), but they should still be accessible in the Jinja context
-    # so that static metadata like ${{ variables.X.domain }} can resolve.
-    for rv in replica_vars:
-        resolved.pop(rv, None)
-
-    if not resolved and not replica_vars:
-        return merged
-
-    env = SandboxedEnvironment(
-        undefined=StrictUndefined,
-        autoescape=False,
-        variable_start_string="${{",
-        variable_end_string="}}",
-    )
-    wrapped = build_variables_ctx_from_raw(resolved, domains)
-    # Add replica vars to the "variables" namespace only (not top-level) so
-    # that ${{ variables.X.domain }} resolves, but ${{ variables.X }} and
-    # ${{ X }} stay unresolved (VariableValue.__str__ re-emits the expression).
-    from sflow.core.variable import VariableValue
-
-    for rv in replica_vars:
-        if rv not in wrapped and rv in variables:
-            wrapped[rv] = VariableValue(
-                f"${{{{ variables.{rv} }}}}", domain=domains.get(rv)
-            )
-    ctx: dict[str, Any] = {"variables": wrapped, **wrapped}
-
-    merged = _resolve_expressions(merged, ctx, env, resolved=resolved, domains=domains)
-    merged = _resolve_shell_vars(merged, resolved)
-    merged = _clean_resolved_strings(merged)
-
-    removable = set(resolved.keys())
-
-    if "variables" in merged and merged["variables"]:
-        merged["variables"] = _remove_resolved_variables(merged["variables"], removable)
-        if not merged["variables"]:
-            del merged["variables"]
-
-    wf = merged.get("workflow")
-    if isinstance(wf, dict) and "variables" in wf and wf["variables"]:
-        wf["variables"] = _remove_resolved_variables(wf["variables"], removable)
-        if not wf["variables"]:
-            del wf["variables"]
-
-    return merged
-
-
 def _compose_files(
     files: List[Path],
     set_var: List[str] | None,
@@ -480,6 +74,8 @@ def _compose_files(
     resolve: bool = False,
     missable_tasks: List[str] | None = None,
     quiet_missable: bool = False,
+    enable_workflow_monitor: bool = False,
+    enable_task_monitors: List[str] | None = None,
 ) -> str:
     """Compose multiple YAML files into a single YAML string.
 
@@ -492,6 +88,7 @@ def _compose_files(
             data = yaml.safe_load(f)
         if data is None:
             raise ValueError(f"Configuration file is empty: {path}")
+        _normalize_script_plain_mappings(data)
         syntax = resolver.validate_syntax(data, location=str(path))
         if not syntax.valid:
             details = "\n".join(str(e) for e in syntax.errors)
@@ -526,6 +123,13 @@ def _compose_files(
             for _ms in missable_stripped:
                 _logger.warning(f"  ⚠ {_ms}")
 
+    # Inject CLI-enabled monitors so the composed snapshot reflects them.
+    inject_cli_monitors_into_dict(
+        merged,
+        enable_workflow_monitor=enable_workflow_monitor,
+        enable_task_monitors=enable_task_monitors,
+    )
+
     from pydantic import ValidationError
 
     from sflow.config.schema import SflowConfig, validate_node_exclude_indices
@@ -538,7 +142,7 @@ def _compose_files(
     validate_node_exclude_indices(config)
 
     if resolve:
-        merged = _resolve_variables_inline(merged)
+        merged = resolve_variables_inline(merged)
 
     if override_warnings:
         for w in override_warnings:
@@ -718,7 +322,6 @@ def _run_bulk_compose(
                 SflowApp().run(
                     file=config_files,
                     dry_run=True,
-                    quiet=True,
                     variable_overrides=list(set_var) if set_var else None,
                     artifact_overrides=list(artifacts) if artifacts else None,
                     missable_tasks=effective_missable,
@@ -913,6 +516,7 @@ def compose(
         configure_logging(
             level=log_level, console=output is not None or bulk_input is not None
         )
+        log_runtime_info()
 
         if row and bulk_input is None:
             typer.echo("Error: --row requires --bulk-input.", err=True)
@@ -977,7 +581,6 @@ def compose(
                 SflowApp().run(
                     file=files,
                     dry_run=True,
-                    quiet=True,
                     variable_overrides=set_var,
                     artifact_overrides=artifact,
                     missable_tasks=missable_tasks,

@@ -66,6 +66,7 @@ where = ["src"]
 "sflow.samples.inference_x_v2.sglang" = ["*.yaml"]
 "sflow.samples.inference_x_v2.composed_recipes" = ["*.yaml"]
 "sflow.skills" = ["*.md", "**/*.md", "**/*.py"]
+"sflow.monitoring" = ["*.py"]
 
 [dependency-groups]
 dev = [

@@ -1,0 +1,23 @@
+# sflow
+
+> Declarative workflow descriptor (YAML) with swappable backends. Describe a workflow once
+> — tasks, dependencies, resources, and launch methods — and run it on Slurm or locally
+> (Docker and Kubernetes planned). sflow ships AI agent skills for writing and debugging
+> sflow YAML, installable with `sflow skill`.
+
+## Agent skills
+
+- [Agent skills overview](https://nvidia.github.io/nv-sflow/docs/agents/intro): what ships and how agents use it
+- [Setup](https://nvidia.github.io/nv-sflow/docs/agents/setup): `sflow skill` install and per-tool wiring
+- [Writing sflow YAML](https://nvidia.github.io/nv-sflow/docs/agents/writing-sflow-yaml/): authoring skill
+- [Error analysis](https://nvidia.github.io/nv-sflow/docs/agents/sflow-error-analysis/): debugging skill
+- [AGENTS.md guidelines](https://nvidia.github.io/nv-sflow/docs/agents/agents-guidelines): authoring workflow and rules
+
+## Docs
+
+- [Introduction](https://nvidia.github.io/nv-sflow/docs/user/intro)
+- [Quickstart](https://nvidia.github.io/nv-sflow/docs/user/quickstart)
+- [Quick reference](https://nvidia.github.io/nv-sflow/docs/user/quick-reference)
+- [Configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration)
+- [CLI reference](https://nvidia.github.io/nv-sflow/docs/user/cli)
+- [Feature map](https://nvidia.github.io/nv-sflow/feature-map)

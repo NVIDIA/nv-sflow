@@ -538,3 +538,50 @@ Key CSV columns:
 - Variable columns: override variable values per row
 - `missable_tasks`: comma-separated task names to mark as missable
 - Empty cells keep the default value from the YAML
+
+## Example 7: Hardware Monitoring
+
+Add a workflow-level monitor (whole pool, full run) and a task-level monitor that
+tracks the resources used by the inference servers during the benchmark. Collectors
+run on the bare node host; reports are generated once after the run.
+
+```yaml
+version: "0.1"
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    nodes: 2
+    gpus_per_node: 8
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+workflow:
+  name: serve_and_bench
+  monitor:                       # whole pool, full workflow lifetime
+    interval: 5000
+    report:
+      enabled: true              # format defaults to [csv, svg]
+  tasks:
+    - name: server
+      operator: my_container
+      script:
+        - python -m my.server
+      probes:
+        readiness:
+          tcp_port: { port: 8000 }
+    - name: aiperf
+      operator: my_container
+      depends_on: [server]
+      script:
+        - aiperf profile ...
+      monitor:                   # bound to aiperf; monitors the server's GPUs
+        resources:
+          used_by_tasks: [server]
+        scopes:
+          gpu: {}
+        report:
+          enabled: true
+```
+
+After the run, see `<output_dir>/<run_id>/sflow_monitor.log` for the terminal
+overview and `<output_dir>/<run_id>/sflow_monitor/` for detailed CSVs.

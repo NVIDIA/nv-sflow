@@ -3,6 +3,7 @@
 
 import logging
 import sys
+import time
 from typing import Optional
 
 from rich.console import Console
@@ -29,6 +30,89 @@ class _DropTaskStreamFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         return not getattr(record, SFLOW_TASK_STREAM_ATTR, False)
+
+
+class CoalescingFileHandler(logging.FileHandler):
+    """A ``FileHandler`` that coalesces flushes to cut per-line syscalls.
+
+    The stock ``FileHandler`` flushes after every record, so a chatty task
+    becomes one ``write()``+``flush()`` per line. This handler writes every
+    record immediately but flushes at most once per ``flush_interval`` seconds
+    (and always on ``flush``/``close``). The interval is short enough that
+    ``LogWatchProbe`` (which polls the file) still observes lines promptly.
+    """
+
+    def __init__(self, *args, flush_interval: float = 0.2, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._flush_interval = max(float(flush_interval), 0.0)
+        self._last_flush = 0.0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Mirror logging.StreamHandler.emit but defer the flush to an interval.
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            stream.write(msg + self.terminator)
+            now = time.monotonic()
+            if now - self._last_flush >= self._flush_interval:
+                self.flush()
+                self._last_flush = now
+        except RecursionError:  # pragma: no cover - matches stdlib behavior
+            raise
+        except Exception:
+            self.handleError(record)
+
+
+class DeferredTaskLogHandler(logging.Handler):
+    """Buffer task-logger records and append them to ``<task>.log`` only after
+    the task's own writer has released the file.
+
+    In offload mode the operator writes ``<task>.log`` itself (srun ``--output``
+    or a host-side shell redirect), so sflow must not write the same file
+    concurrently (single-writer invariant). Any driver-side diagnostics the
+    launcher captures for the task (e.g. ``srun: error: ... Exited with exit
+    code 1``) are buffered here and *appended* to ``<task>.log`` on
+    :meth:`flush`, which the launcher calls in its ``finally`` block once the
+    subprocess has exited -- so they land in the per-task log itself instead of
+    a scattered ``<task>.orchestration.log`` sidecar. If the task produced no
+    driver-side diagnostics, nothing is written and the file is left untouched.
+    """
+
+    def __init__(self, target: str) -> None:
+        super().__init__()
+        # Mirror logging.FileHandler's attribute so dedup-by-path checks (and any
+        # tooling that inspects handler targets) recognize this handler too.
+        self.baseFilename = str(target)
+        self._buffer: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._buffer.append(self.format(record) + "\n")
+        except Exception:
+            self.handleError(record)
+
+    def flush(self) -> None:
+        # Append (never truncate) so the operator-written content is preserved.
+        # Called post-exit (single writer), so this does not race the operator.
+        self.acquire()
+        try:
+            if not self._buffer:
+                return
+            try:
+                with open(self.baseFilename, "a", encoding="utf-8") as fh:
+                    fh.write("".join(self._buffer))
+                self._buffer.clear()
+            except Exception:
+                # Diagnostics are best-effort; never break the run over them.
+                pass
+        finally:
+            self.release()
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            super().close()
 
 
 def configure_logging(
@@ -81,6 +165,33 @@ def configure_logging(
 
     # Ensure propagation is handled correctly (usually True, but we are setting handlers)
     logger.propagate = False
+
+
+def enable_console_logging(level: Optional[str] = None) -> None:
+    """Attach a Rich console handler to the ``sflow`` logger if none is present.
+
+    Idempotent. Used to *resume* console logging after an interactive TUI tears
+    down -- the TUI runs with the console handler disabled (``console=False``), so
+    deferred work such as hardware-monitor post-processing would otherwise emit
+    nothing to the terminal. Existing handlers (e.g. the sflow.log file handler or
+    the TUI buffer handler) are left untouched.
+    """
+    logger = logging.getLogger("sflow")
+    for handler in logger.handlers:
+        if isinstance(handler, RichHandler):
+            return  # console logging already active
+    numeric_level = (
+        getattr(logging, level.upper(), logging.INFO)
+        if level
+        else (logger.level or logging.INFO)
+    )
+    if sys.stdout.isatty():
+        rich_console = Console()
+    else:
+        rich_console = Console(width=_DEFAULT_NON_TTY_WIDTH, force_terminal=False)
+    console_handler = RichHandler(console=rich_console, rich_tracebacks=True)
+    console_handler.setLevel(numeric_level if isinstance(numeric_level, int) else logging.INFO)
+    logger.addHandler(console_handler)
 
 
 def add_log_file(log_file: str) -> None:

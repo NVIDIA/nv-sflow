@@ -17,7 +17,10 @@
   [resources](https://nvidia.github.io/nv-sflow/docs/user/resources),
   [replicas](https://nvidia.github.io/nv-sflow/docs/user/replicas),
   [probes](https://nvidia.github.io/nv-sflow/docs/user/probes),
+  [monitor](https://nvidia.github.io/nv-sflow/docs/user/monitor),
+  [uploads](https://nvidia.github.io/nv-sflow/docs/user/uploads),
   [outputs](https://nvidia.github.io/nv-sflow/docs/user/outputs),
+  [results](https://nvidia.github.io/nv-sflow/docs/user/results),
   [modular-workflows](https://nvidia.github.io/nv-sflow/docs/user/modular-workflows),
   [cli](https://nvidia.github.io/nv-sflow/docs/user/cli),
   [samples](https://nvidia.github.io/nv-sflow/docs/user/samples),
@@ -85,4 +88,5 @@ Ask about variance needs. Split into modular files if needed:
 - Use `container_name` + `--container-image` in `extra_args` for container reuse
 - Add `probes.failure.log_watch` for `"Traceback (most recent call last)"` on server tasks
 - Add `probes.readiness` on long-running server tasks
+- For post-execution uploads to S3, declare a `storage:` block with `type: s3` and per-task `uploads:` specs; credentials come from the boto3 default chain — never in YAML. Use `on_error: fail` only when the upload IS the deliverable.
 - Run validation and `--dry-run` before every actual run

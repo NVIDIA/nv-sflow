@@ -120,6 +120,98 @@ sflow run -f local_dag.yaml            # Execute
 
 ---
 
+### Result Parsing
+
+Demonstrates the consolidated [`task.result`](./results.md) entry: parsing
+metrics from a task log with a regex map, writing JSON directly to
+`$SFLOW_TASK_RESULT_FILE`, and a downstream task reading the per-task `result.json`
+and workflow-level `results.json` index.
+
+```yaml
+version: "0.1"
+
+backends:
+  - name: local
+    type: local
+    default: true
+    nodes: 1
+
+workflow:
+  name: local_result_parsing
+  tasks:
+    - name: benchmark_log
+      script:
+        - |
+          echo "TTFT: 40.0 ms"
+          echo "TTFT: 42.5 ms"
+          echo "tok/s: 123.0"
+          echo "p99 latency: 88 ms"
+      result:
+        ttft: 'TTFT:\s*([0-9.]+)\s*ms'      # last match wins -> 42.5
+        tps: 'tok/s:\s*([0-9.]+)'
+        latency_p99: 'p99 latency:\s*([0-9.]+)\s*ms'
+
+    - name: benchmark_file
+      script:
+        - |
+          echo '{"throughput": 999.5, "errors": 0}' > "$SFLOW_TASK_RESULT_FILE"
+      result:
+        file: result.json
+
+    - name: verify
+      depends_on: [benchmark_log, benchmark_file]
+      script:
+        - test -f "$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_log/result.json"
+        - test -f "$SFLOW_WORKFLOW_RESULT_FILE"
+```
+
+**Run it:**
+
+```bash
+sflow sample local_result_parsing
+sflow run -f local_result_parsing.yaml
+```
+
+---
+
+## Docker Samples
+
+These samples use the local **Docker backend** to run containerized workloads on
+your workstation. They require Docker on PATH (and, for GPU samples, an NVIDIA GPU
+plus the NVIDIA Container Toolkit so `--gpus all` works).
+
+### SGLang Serving Qwen3-0.6B (Local Container)
+
+`docker_sglang_qwen3` is the local-container counterpart of
+`slurm_sglang_server_client`: it stands up SGLang serving **Qwen3-0.6B** in a
+container, runs a tiny stdlib client against the OpenAI-compatible API, then runs
+an **AIPerf benchmark** at concurrency 8 — no Slurm required.
+
+Highlights:
+
+- **Local Docker backend** (`type: docker`) with one GPU; the `docker_run`
+  operator launches the SGLang image with `--gpus all --network host`.
+- A **readiness** `log_watch` probe releases downstream tasks only after SGLang
+  prints its "ready to roll" banner, plus a **failure** probe for `Traceback`.
+- The client is a `file://` artifact (stdlib `urllib`), so no extra packages are
+  installed; it reads the model name / prompt / port from sflow-injected env vars.
+- An **AIPerf** task (CPU-only `python:3.12-slim` container) `pip install`s aiperf
+  and benchmarks the server (`--concurrency 8`), mirroring the benchmark task in
+  `slurm_dynamo_trtllm_agg`. Results land under the task's output dir.
+
+```bash
+sflow sample docker_sglang_qwen3
+sflow run -f docker_sglang_qwen3.yaml
+
+# Validate only
+sflow run -f docker_sglang_qwen3.yaml --dry-run
+
+# Add hardware monitoring without editing the recipe
+sflow run -f docker_sglang_qwen3.yaml --enable-workflow-monitor
+```
+
+---
+
 ## Slurm Samples
 
 These samples require a Slurm cluster with GPU resources.
@@ -130,7 +222,7 @@ Deploys an SGLang inference server with AIPerf benchmarking on Slurm.
 
 **Features:**
 - SGLang server with FP8 inference
-- GPU monitoring
+- Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - AIPerf benchmarking client
 - Readiness probes for service orchestration
 
@@ -265,29 +357,6 @@ workflow:
           timeout: 1200
           interval: 2
 
-    - name: gpu_monitor
-      operator: sglang_runtime
-      script:
-        - echo "Starting gpu monitor"
-        - >
-          nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used 
-          --format=csv,noheader,nounits -lms 2000 | 
-          while IFS= read -r input || [ -n "$input" ] ; 
-          do timestamp=$(date +%s%3N); 
-          printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}" "${input}"; 
-          done 
-          >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "Starting gpu monitor"
-      resources:
-        nodes:
-          indices: [0]
-      depends_on:
-        - load_image
-        - install_aiperf
-    
     - name: sglang_server
       operator: sglang_runtime
       replicas:
@@ -349,6 +418,15 @@ workflow:
       resources:
         nodes:
           indices: [0]
+      # Sample the SERVER's resources from this benchmark task (used_by_tasks),
+      # not the benchmark client's own node, so the report captures the server's
+      # GPU/CPU usage over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - sglang_server
+        report:
+          enabled: true
       depends_on:
         - sglang_server
         - install_aiperf
@@ -613,7 +691,7 @@ Deploys a disaggregated inference setup with separate prefill and decode servers
 - Disaggregated prefill/decode architecture with `trtllm-serve`
 - Dynamic configuration using file-type artifacts with backend node IP resolution
 - Configurable tensor parallelism for prefill and decode servers
-- GPU monitoring task
+- Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - Sequential benchmark sweeps with variable domains
 - Failure probes for error detection
 
@@ -844,6 +922,16 @@ workflow:
         policy: sequential
       script:
         - aiperf profile --concurrency ${CONCURRENCY} --url http://${HEAD_NODE_IP}:8000 ...
+      # Sample the prefill/decode SERVERS' resources from this benchmark task
+      # (used_by_tasks), not the benchmark client's own node, so the report
+      # captures the servers' GPU/CPU usage over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
       depends_on:
         - prefill_server
         - decode_server
@@ -877,7 +965,7 @@ A production-ready multi-node disaggregated inference setup optimized for large 
 - Multi-node deployment (default 3 nodes with 4 GPUs each)
 - Disaggregated prefill/decode architecture with configurable parallelism
 - NATS and etcd for service discovery
-- GPU monitoring across all nodes
+- Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - MoE (Mixture of Experts) optimization parameters
 - Sequential benchmark sweeps with variable domains
 - File-type artifacts for dynamic server configuration
@@ -1005,18 +1093,6 @@ workflow:
             regex_pattern: "Image Loaded"
           timeout: 1200
 
-    - name: gpu_monitor
-      operator:
-        name: dynamo_trtllm
-        ntasks_per_node: 1
-      resources:
-        nodes:
-          count: ${{ variables.SLURM_NODES }}
-      script:
-        - nvidia-smi monitoring...
-      depends_on:
-        - load_image
-
     - name: nats_server
       operator: dynamo_trtllm
       script:
@@ -1116,6 +1192,16 @@ workflow:
         policy: sequential
       script:
         - aiperf profile --concurrency ${CONCURRENCY} ...
+      # Sample the prefill/decode SERVERS' resources from this benchmark task
+      # (used_by_tasks), not the benchmark client's own node, so the report
+      # captures the servers' GPU/CPU usage over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
       depends_on:
         - prefill_server
         - decode_server
@@ -1147,6 +1233,7 @@ sflow batch -f slurm_infmax_v1_ds_r1.yaml \
 |--------|----------|
 | `local_hello_world` | Variables, basic task execution |
 | `local_dag` | Task dependencies, parallel execution, built-in env vars |
+| `docker_sglang_qwen3` | Local Docker backend, containerized LLM serving (SGLang + Qwen3-0.6B), readiness/failure probes, file:// client script |
 | `slurm_sglang_server_client` | Slurm backend, operators, probes, replicas, GPU resources |
 | `slurm_dynamo_trtllm_disagg` | Service discovery (NATS/etcd), retry policies, multi-process tasks |
 | `slurm_trtllm_serve_disagg` | Artifacts with backend IP resolution, failure probes, variable sweeps |

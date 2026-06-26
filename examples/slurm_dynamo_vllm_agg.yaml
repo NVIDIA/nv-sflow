@@ -183,33 +183,6 @@ workflow:
           timeout: 1200
           interval: 2
     
-    - name: gpu_monitor
-      operator: 
-        name: dynamo_vllm
-        ntasks: ${{ variables.SLURM_NODES }}
-        ntasks_per_node: 1
-      resources:
-        nodes:
-          count: ${{ variables.SLURM_NODES }}
-      script:
-        - echo "Starting gpu monitor"
-        - >
-          nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used 
-          --format=csv,noheader,nounits -lms 2000 | 
-          while IFS= read -r input || [ -n "$input" ] ; 
-          do timestamp=$(date +%s%3N); 
-          printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}" "${input}"; 
-          done 
-          >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
-      probes:
-        readiness:
-          log_watch:
-            match_pattern: "Starting gpu monitor"
-          timeout: 300
-          interval: 2
-      depends_on:
-        - load_image
-
     - name: nats_server
       operator: dynamo_vllm
       script:
@@ -384,6 +357,16 @@ workflow:
         variables:
           - CONCURRENCY
         policy: sequential
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # aggregated server's resources (used_by_tasks), not the benchmark client's
+      # own node -- so the report captures the server's GPU/CPU usage over the
+      # benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - agg_server
+        report:
+          enabled: true
       depends_on:
         - agg_server
         - frontend_server

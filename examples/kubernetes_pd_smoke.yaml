@@ -1,0 +1,145 @@
+version: "0.1"
+
+# Smoke test for cross-task IP resolution in a PD-separation layout (reservation
+# + pinned task pods model).
+#
+# What this validates:
+#   1. reservation reserves real nodes and the planner pins tasks via
+#      resources.nodes.indices (leader on node 0, worker on node 1, decode on node 2)
+#   2. ${{ backends.k8s.nodes[0].ip_address }} resolves to the real node-0 InternalIP
+#   3. Cross-node connectivity: prefill worker (node 1) -> prefill leader (node 0)
+#   4. Cross-task connectivity: decode (node 2) -> prefill leader (node 0)
+#
+# Each role is a single-node k8s pod pinned to a specific reserved node, so the
+# leader is deterministically on node 0 and reachable at nodes[0].ip_address. The
+# image lives on the operator (the backend has no image); host_network makes the
+# pod IP equal the node IP. No GPUs, no Dynamo, no CRDs required.
+
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    namespace: default
+    nodes: 3          # node 0 = prefill leader, node 1 = prefill worker, node 2 = decode
+    gpus_per_node: 0
+    host_network: true
+
+operators:
+  - name: py
+    type: k8s
+    image: python:3.11-slim
+
+workflow:
+  name: k8s_pd_smoke
+  variables:
+    PREFILL_LEADER_IP:
+      description: "Prefill leader (node 0) InternalIP -- resolved after reservation"
+      value: "${{ backends.k8s.nodes[0].ip_address }}"
+
+  tasks:
+    - name: prefill_leader
+      operator: py
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - |
+          cat > /tmp/leader.py << 'PYEOF'
+          import socket, json, os
+
+          port     = int(os.environ.get("SMOKE_PORT", "17173"))
+          expected = 2  # 1 prefill worker + 1 decode node
+
+          srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          srv.bind(("0.0.0.0", port))
+          srv.listen(expected + 1)
+          srv.settimeout(180)
+          print(f"[prefill-leader] listening on :{port}, expecting {expected} check-in(s)", flush=True)
+
+          seen = []
+          for _ in range(expected):
+              conn, addr = srv.accept()
+              msg = json.loads(conn.recv(256).decode())
+              conn.send(b"ACK")
+              conn.close()
+              seen.append(msg)
+              print(f"[prefill-leader] check-in: role={msg['role']} @ {addr[0]}", flush=True)
+
+          srv.close()
+          roles = {m["role"] for m in seen}
+          assert "prefill" in roles, f"no prefill worker checked in: {seen}"
+          assert "decode" in roles, f"no decode node checked in: {seen}"
+          print(f"[prefill-leader] all check-in(s) received (roles: {sorted(roles)}) — PD SMOKE TEST PASSED", flush=True)
+          PYEOF
+          python3 /tmp/leader.py
+
+    - name: prefill_worker
+      operator: py
+      resources:
+        nodes:
+          indices: [1]
+      depends_on:
+        - prefill_leader
+      script:
+        - |
+          export PREFILL_LEADER_IP="${{ variables.PREFILL_LEADER_IP }}"
+          cat > /tmp/worker.py << 'PYEOF'
+          import socket, json, os, time
+
+          leader_ip = os.environ["PREFILL_LEADER_IP"]
+          port      = int(os.environ.get("SMOKE_PORT", "17173"))
+          print(f"[prefill-worker] connecting to leader {leader_ip}:{port}", flush=True)
+
+          for attempt in range(90):
+              try:
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.settimeout(5)
+                  s.connect((leader_ip, port))
+                  s.send(json.dumps({"role": "prefill"}).encode())
+                  ack = s.recv(16)
+                  s.close()
+                  print(f"[prefill-worker] checked in with leader — ack={ack}", flush=True)
+                  break
+              except (ConnectionRefusedError, OSError):
+                  if attempt == 89:
+                      raise RuntimeError(f"[prefill-worker] leader {leader_ip}:{port} unreachable")
+                  time.sleep(1)
+          PYEOF
+          python3 /tmp/worker.py
+
+    - name: decode_client
+      operator: py
+      resources:
+        nodes:
+          indices: [2]
+      depends_on:
+        - prefill_leader
+      script:
+        - |
+          # ${{ variables.PREFILL_LEADER_IP }} is resolved by sflow after reservation
+          # and becomes a literal IP in the pod env -- no runtime variable lookup needed.
+          export PREFILL_LEADER_IP="${{ variables.PREFILL_LEADER_IP }}"
+          cat > /tmp/decode.py << 'PYEOF'
+          import socket, json, os, time, sys
+
+          leader_ip = os.environ["PREFILL_LEADER_IP"]
+          port      = int(os.environ.get("SMOKE_PORT", "17173"))
+          print(f"[decode] connecting to prefill leader {leader_ip}:{port}", flush=True)
+
+          for attempt in range(90):
+              try:
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.settimeout(5)
+                  s.connect((leader_ip, port))
+                  s.send(json.dumps({"role": "decode"}).encode())
+                  ack = s.recv(16)
+                  s.close()
+                  print(f"[decode] cross-task check-in OK — ack={ack}", flush=True)
+                  sys.exit(0)
+              except (ConnectionRefusedError, OSError):
+                  if attempt == 89:
+                      raise RuntimeError(f"[decode] prefill leader {leader_ip}:{port} unreachable")
+                  time.sleep(1)
+          PYEOF
+          python3 /tmp/decode.py

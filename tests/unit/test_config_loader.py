@@ -39,6 +39,48 @@ workflow:
     assert config.workflow.tasks[0].name == "t1"
 
 
+def test_load_config_preserves_plain_script_command_with_colon(tmp_path):
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+version: "0.1"
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo "My GPUs: $CUDA_VISIBLE_DEVICES"
+""".lstrip()
+    )
+
+    config = ConfigLoader().load_config(p)
+
+    assert config.workflow.tasks[0].script == [
+        'echo "My GPUs: $CUDA_VISIBLE_DEVICES"'
+    ]
+
+
+def test_load_config_preserves_plain_script_command_with_colon_in_task_map(tmp_path):
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+version: "0.1"
+workflow:
+  name: wf
+  tasks:
+    t1:
+      script:
+        - echo "My GPUs: $CUDA_VISIBLE_DEVICES"
+""".lstrip()
+    )
+
+    config = ConfigLoader().load_config(p)
+
+    assert config.workflow.tasks[0].script == [
+        'echo "My GPUs: $CUDA_VISIBLE_DEVICES"'
+    ]
+
+
 def test_load_config_applies_variable_overrides(tmp_path):
     p = tmp_path / "sflow.yaml"
     p.write_text(

@@ -1,0 +1,23 @@
+version: "0.1"
+
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    namespace: default
+    nodes: 1
+    gpus_per_node: 0
+
+operators:
+  - name: k8s_op
+    type: k8s
+    # The kubernetes backend has no image; the workload image lives on the operator.
+    image: ubuntu:22.04
+
+workflow:
+  name: kubernetes_hello_world
+  tasks:
+    - name: hello
+      operator: k8s_op
+      script:
+        - echo "Hello from Kubernetes"

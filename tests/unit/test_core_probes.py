@@ -131,6 +131,99 @@ def test_log_watch_probe_match_count(tmp_path: Path):
     assert triggered is True
 
 
+def _make_log_task(tmp_path: Path, content: str = ""):
+    wf_out = tmp_path / "wf"
+    (wf_out / "svc").mkdir(parents=True)
+    log_path = wf_out / "svc" / "svc.log"
+    log_path.write_text(content)
+    t = Task(
+        name="svc",
+        logger=_DummyLogger(),  # type: ignore[arg-type]
+        operator=BashOperator(BashOperatorConfig(name="bash")),
+    )
+    t.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
+    return t, log_path
+
+
+def test_log_watch_probe_scans_incrementally_without_recounting(tmp_path: Path):
+    """check() reads only the appended tail and accumulates matches across calls.
+
+    Regression guard for the old behavior that re-read the whole file and
+    re-counted every match on each tick (the previously-unused ``_offset``).
+    """
+    t, log_path = _make_log_task(tmp_path, "booting...\n")
+    p = LogWatchProbe(
+        regex_pattern="READY",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=10,
+        match_count=2,
+    )
+
+    # First check consumes the existing complete line; no match yet.
+    assert asyncio.run(p.check(t)) is False
+    assert p._offset == len(b"booting...\n")
+    assert p._match_total == 0
+
+    # A half-written line (no trailing newline) is NOT counted or consumed yet.
+    log_path.write_text(log_path.read_text() + "READY")
+    assert asyncio.run(p.check(t)) is False
+    assert p._offset == len(b"booting...\n")
+    assert p._match_total == 0
+
+    # Completing the line makes it count exactly once.
+    log_path.write_text(log_path.read_text() + "\n")
+    assert asyncio.run(p.check(t)) is False  # 1 of 2
+    assert p._match_total == 1
+
+    # A second match reaches the threshold.
+    log_path.write_text(log_path.read_text() + "READY\n")
+    assert asyncio.run(p.check(t)) is True
+    assert p._match_total == 2
+
+    # Repeated checks with no new data must not re-count.
+    assert asyncio.run(p.check(t)) is True
+    assert p._match_total == 2
+
+
+def test_log_watch_probe_rescans_after_truncation(tmp_path: Path):
+    """If the watched log is truncated/rotated (shrinks), the scan restarts."""
+    t, log_path = _make_log_task(tmp_path, "first line READY\n")
+    p = LogWatchProbe(
+        regex_pattern="READY", type=ProbeType.READINESS, interval=0, timeout=10
+    )
+    assert asyncio.run(p.check(t)) is True
+    assert p._offset == len(b"first line READY\n")
+    assert p._match_total == 1
+
+    # Rotate: replace with shorter content (size < offset) holding a fresh match.
+    log_path.write_text("READY\n")
+    assert asyncio.run(p.check(t)) is True
+    # Re-scanned from the start rather than seeking past the new (shorter) EOF.
+    assert p._offset == len(b"READY\n")
+    assert p._match_total == 1
+
+
+def test_log_watch_probe_reset_restarts_incremental_scan(tmp_path: Path):
+    """reset() (called on retry) clears the offset and accumulated match count."""
+    t, log_path = _make_log_task(tmp_path, "READY\n")
+    p = LogWatchProbe(
+        regex_pattern="READY", type=ProbeType.READINESS, interval=0, timeout=10
+    )
+    assert asyncio.run(p.check(t)) is True
+    assert p._offset == len(b"READY\n")
+    assert p._match_total == 1
+
+    p.reset()
+    assert p._offset == 0
+    assert p._match_total == 0
+    assert p.status == ProbeStatus.INITIATED
+
+    # After reset the same content is scanned again from the beginning.
+    assert asyncio.run(p.check(t)) is True
+    assert p._match_total == 1
+
+
 # --- TcpPortProbe on_node tests ---
 
 

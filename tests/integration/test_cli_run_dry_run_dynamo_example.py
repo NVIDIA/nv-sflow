@@ -78,8 +78,11 @@ def test_cli_run_dry_run_dynamo_example_exits_zero_and_does_not_create_output_di
     )
 
     assert result.exit_code == 0, result.output
-    assert "Allocation map (finalized node/GPU assignment):" in result.output
+    assert "── Allocation map" in result.output
     assert "backend 'slurm_cluster'" in result.output
+    # Default dry-run shows the compact per-task summary, not the full detail.
+    assert "(use --verbose for full per-task details)" in result.output
+    assert "operator config" not in result.output
 
     # Dry-run should not create any output dirs/files.
     assert not out_dir.exists()

@@ -1,0 +1,81 @@
+version: "0.1"
+
+# This example demonstrates the consolidated `result` task entry.
+#
+# It covers two common ways to produce small structured task results:
+#   1. Parse metrics from the task log with regex patterns.
+#   2. Write JSON directly to $SFLOW_TASK_RESULT_FILE and let sflow normalize it.
+#
+# Run it locally:
+#   sflow run examples/local_result_parsing.yaml
+#
+# Key output files:
+#   <run_dir>/benchmark_log/result.json
+#   <run_dir>/benchmark_file/result.json
+#   <run_dir>/results.json
+
+backends:
+  - name: local
+    type: local
+    default: true
+    nodes: 1
+
+workflow:
+  name: local_result_parsing
+
+  tasks:
+    - name: benchmark_log
+      script:
+        # Block scalar keeps `: ` in echoed benchmark lines from being parsed
+        # as YAML mapping syntax.
+        - |
+          echo "warming up"
+          echo "TTFT: 40.0 ms"
+          echo "TTFT: 42.5 ms"
+          echo "tok/s: 123.0"
+          echo "p99 latency: 88 ms"
+      result:
+        # Simple regex map: each regex is matched against the merged task log.
+        # The first capture group becomes the result value; the default
+        # aggregate is `last`, so ttft resolves to 42.5.
+        ttft: 'TTFT:\s*([0-9.]+)\s*ms'
+        tps: 'tok/s:\s*([0-9.]+)'
+        latency_p99: 'p99 latency:\s*([0-9.]+)\s*ms'
+
+    - name: benchmark_file
+      script:
+        # Tasks that already produce structured output can write a plain JSON
+        # object directly to $SFLOW_TASK_RESULT_FILE.
+        - |
+          echo '{"throughput": 999.5, "errors": 0}' > "$SFLOW_TASK_RESULT_FILE"
+      result:
+        file: result.json
+
+    - name: verify
+      depends_on: [benchmark_log, benchmark_file]
+      script:
+        - |
+          set -euo pipefail
+
+          log_result="$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_log/result.json"
+          file_result="$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_file/result.json"
+          index="$SFLOW_WORKFLOW_RESULT_FILE"
+
+          test -f "$log_result"
+          test -f "$file_result"
+          test -f "$index"
+
+          grep -q '"schema_version": "sflow.result.v1"' "$log_result"
+          grep -q '"ttft": 42.5' "$log_result"
+          grep -q '"tps": 123.0' "$log_result"
+          grep -q '"latency_p99": 88' "$log_result"
+
+          grep -q '"schema_version": "sflow.result.v1"' "$file_result"
+          grep -q '"throughput": 999.5' "$file_result"
+          grep -q '"errors": 0' "$file_result"
+
+          grep -q '"schema_version": "sflow.results.v1"' "$index"
+          grep -q '"benchmark_log"' "$index"
+          grep -q '"benchmark_file"' "$index"
+
+          printf 'RESULT_PARSING_SAMPLE_PASS\n' > "$SFLOW_TASK_OUTPUT_DIR/verify.txt"

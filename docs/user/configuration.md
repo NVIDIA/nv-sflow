@@ -125,9 +125,14 @@ backends:
     partition: ${{ variables.SLURM_PARTITION }}
     time: 00:30:00
     nodes: 2
+    gpus_per_node: 8        # sflow planning only
     extra_args:
-      - "--gpus-per-node=8"
+      - "--gpus-per-node=8" # passed to salloc
 ```
+
+`gpus_per_node` tells sflow how many GPU indices each node has for planning and
+packing. It does not add `--gpus-per-node` to `salloc`; include that flag in
+`extra_args` when your cluster requires it.
 
 If you are already inside a Slurm allocation (e.g. via `salloc` or `sbatch`), you can use:
 
@@ -210,6 +215,28 @@ workflow:
       exclude: [0]
       count: 2
 ```
+
+`resources.nodes.release_after` and `resources.gpus.release_after` control when that resource kind can be reused by later tasks in the DAG. Node reservations are only exclusive when `resources.nodes.release_after` is explicitly set; when omitted, both `resources.nodes.indices` and `resources.nodes.count` are placement constraints and may overlap with other planned tasks. GPU reservations infer the safe behavior when omitted: tasks without readiness probes release GPUs after task completion for downstream dependents, while tasks with readiness probes keep GPUs until workflow completion because they may still be running after they become ready. Use `task_ready` when a task can release a resource after its readiness probe succeeds, `task_completion` when the resource can be reused after the task reaches any terminal status (`COMPLETED`, `FAILED`, `TIMEOUT`, or `CANCELLED`), or `workflow_completion` to explicitly reserve it for the whole workflow:
+
+```yaml
+- name: check_entire_env
+  resources:
+    gpus:
+      count: 8
+  script:
+    - nvidia-smi
+
+- name: worker
+  depends_on: [check_entire_env]
+  replicas:
+    count: 4
+    policy: parallel
+  resources:
+    gpus:
+      count: 2
+```
+
+Policies are independent per resource kind, so a task can release GPUs at readiness while keeping a node reservation until workflow completion. Dry-run performs a scheduler rehearsal for these lifetimes; it validates temporal resource usage rather than only summing all declared resources.
 
 ### replicas
 

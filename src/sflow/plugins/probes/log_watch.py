@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -45,7 +46,19 @@ class LogWatchProbe(Probe):
             self._regex = re.compile(re.escape(p))
         self._logger_task_name = logger_task_name
         self._match_count = max(int(match_count), 1)
+        # Incremental scan state: byte offset of the log already consumed (always
+        # at a newline boundary) and the running count of matches found so far.
+        # This avoids re-reading and re-scanning the whole file on every check.
         self._offset = 0
+        self._match_total = 0
+
+    def reset(self) -> None:
+        # The orchestrator calls reset() when a task is (re)submitted/retried. A
+        # retry may recreate or truncate the log, so the incremental scan (offset
+        # and accumulated match count) must restart from scratch.
+        super().reset()
+        self._offset = 0
+        self._match_total = 0
 
     def _log_path(self, task) -> Path:  # type: ignore[override]
         wf_out = task.envs.get("SFLOW_WORKFLOW_OUTPUT_DIR")
@@ -64,14 +77,35 @@ class LogWatchProbe(Probe):
     async def check(self, task) -> bool:  # type: ignore[override]
         path = self._log_path(task)
         try:
-            data = path.read_text(errors="ignore")
+            with path.open("rb") as f:
+                # Detect truncation/rotation: if the file shrank below where we
+                # last stopped, re-scan it from the beginning.
+                f.seek(0, os.SEEK_END)
+                if f.tell() < self._offset:
+                    self._offset = 0
+                    self._match_total = 0
+                # Read only the bytes appended since the previous check.
+                f.seek(self._offset)
+                chunk = f.read()
         except FileNotFoundError:
             return False
         except Exception:
             return False
 
-        self._offset = len(data)
+        # Only consume up to the last newline so a match is never split across
+        # reads, and a half-written trailing line isn't counted early. The per-task
+        # <task>.log is newline-delimited whether sflow's launcher writes it (stream
+        # mode) or srun --output plus the aligned prefixer writes it (offload mode):
+        # both emit one record per line ending in "\n". In offload mode the rank
+        # label is folded into the message (srun --label is disabled), so the file
+        # matches stream mode and patterns behave identically.
+        newline = chunk.rfind(b"\n")
+        if newline != -1:
+            consumed = chunk[: newline + 1]
+            self._match_total += len(
+                self._regex.findall(consumed.decode("utf-8", errors="ignore"))
+            )
+            self._offset += len(consumed)
 
-        # Count total matches in the entire log so far; require at least match_count.
-        matches = self._regex.findall(data)
-        return len(matches) >= self._match_count
+        # Matches accumulate across checks; require at least match_count in total.
+        return self._match_total >= self._match_count

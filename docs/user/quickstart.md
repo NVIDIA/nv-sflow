@@ -319,6 +319,7 @@ Notes:
 
 - Update `account/partition/time/nodes` to match your cluster.
 - If you're already inside a Slurm allocation, `sflow` will reuse it; otherwise it will call `salloc` first.
+- `gpus_per_node` is used for sflow resource planning and GPU index assignment; it does not add a Slurm allocation flag.
 - The backend also supports `extra_args` to pass arbitrary flags to `salloc`:
 
 ```yaml
@@ -330,6 +331,7 @@ backends:
     partition: "your_slurm_partition"
     time: "01:00:00"
     nodes: 2
+    gpus_per_node: 8
     extra_args:
       - "--exclusive"
       - "--gpus-per-node=8"
@@ -422,7 +424,7 @@ Before running, make sure you have updated the workflow YAML for your environmen
 - **Slurm settings**: set `account` and `partition` to values valid on your cluster
 - **Model paths**: update any model or data paths to locations accessible from your compute nodes
 - **Container images**: if the workflow uses a container operator, update the image tag to the version you need
-- **Extra args**: Some of the cluster need to add --gpus-per-node flag when requesting GPU partition, remember to add this in backend.extra_args which accepts a list of extra args 
+- **Extra args**: Some clusters require `--gpus-per-node` when requesting GPU partitions. Add it explicitly in backend `extra_args`; sflow does not infer or add that Slurm flag from `gpus_per_node`.
 
 **Validate first with a dry-run** to catch config errors without allocating nodes:
 

@@ -51,6 +51,9 @@ graph TB
       hf_art["hf://"]
       docker_art["docker://"]
     end
+    subgraph Storage
+      s3_st["s3"]
+    end
   end
 
   subgraph Core["Core Engine"]
@@ -73,6 +76,7 @@ graph TB
   assembly --> Backends
   assembly --> Operators
   assembly --> Artifacts
+  assembly --> Storage
   assembly --> state
   state --> taskgraph
   taskgraph --> orchestrator
@@ -109,7 +113,7 @@ flowchart TD
   subgraph Phase3["3. Orchestration"]
     poll["Poll loop\n(async, configurable interval)"]
     submit["Submit ready tasks\n(all deps COMPLETED/READY)"]
-    launch["Launch via operator\n(srun/bash/docker/ssh/python)"]
+    launch["Launch via operator\n(srun/bash/docker_run/kubernetes/ssh/python)"]
     probes["Run probes on\nRUNNING/READY tasks"]
     check_exit["Check subprocess exits\n(exit code, retries)"]
     failfast["Fail-fast check\n(cancel all on failure)"]
@@ -204,7 +208,7 @@ stateDiagram-v2
 
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
-| **`sflow run`** | Execute a workflow | `--dry-run`, `--tui`, `--bulk-input/--row`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M`, `--extra-args`, `--output-dir`, `--log-level` |
+| **`sflow run`** | Execute a workflow | `--dry-run`, `--tui`, `--bulk-input/--row`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M`, `--extra-args/-e`, `--output-dir`, `--log-level` |
 | **`sflow batch`** | Generate Slurm sbatch scripts | `--submit`, `--bulk-input` (CSV sweeps), `--bulk-submit` (YAML folders), `--row`, `--nodes`, `--partition`, `--account`, `--time`, `--resolve`, `--sflow-version` |
 | **`sflow compose`** | Merge multiple YAMLs into one | `--resolve`, `--validate`, `--bulk-input`, `--row`, `--missable-tasks/-M`, `-o/--output` |
 | **`sflow visualize`** | Render DAG as image/mermaid | `--format` (png/svg/pdf/mermaid/dot), `--show-variables`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M` |
@@ -286,6 +290,16 @@ Artifacts are named external resources resolved by URI scheme. They are register
 | `docker://` | Docker | Not yet implemented | Container image reference |
 
 Artifacts are referenced in expressions as `${{ artifacts.NAME.path }}` (resolved local path) or `${{ artifacts.NAME.uri }}` (original URI).
+
+### Storage (post-execution uploads)
+
+Storage targets define **where** to upload task outputs after each task completes. Targets are registered via `@register_storage()` and selected by `type` in the YAML config.
+
+| Storage | Type | Backend | Key Config |
+|---------|------|---------|------------|
+| **S3** | `s3` | boto3 default credential chain | `bucket`, `region`, `prefix`, `endpoint_url`, `storage_class` |
+
+Each task declares per-spec uploads under `uploads:` (see [Uploads](./uploads.md)). Uploads fire when the task reaches `COMPLETED` — *before* fail-fast cancels remaining work, so partial results are preserved. Failure handling is per-spec via `on_error: warn | fail`.
 
 ## Replicas & Sweeps
 

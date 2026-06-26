@@ -5,6 +5,10 @@ sidebar_position: 1
 
 `sflow` is a **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_.
 
+:::tip Find the right feature
+Not sure where to start? Open the [Feature Map](/feature-map) to choose a goal, see which sflow features apply, and jump to the relevant docs. Building with an AI coding agent? See [Agent Skills](/docs/agents/intro).
+:::
+
 An application's deployment steps are usually logically the same regardless of the underlying infrastructure. Take [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) as an example: you start etcd and NATS, launch a frontend server, spin up workers that register to the frontend, and the service is up. That logical flow never changes — but making it actually run on Slurm, Docker Compose, or Kubernetes requires a different set of infrastructure-specific scripts, resource management, and networking tweaks each time, and the effort must be repeated for every new platform.
 
 `sflow` is trying to eliminate this duplication. You describe the workflow once in a portable YAML format — tasks, dependencies, resources, and launch methods — and `sflow` delegates execution to the target infrastructure through swappable backends, leveraging each platform's native ecosystem rather than reimplementing it (e.g. Kubernetes, Helm charts, Argo Workflows).
@@ -57,12 +61,10 @@ graph TD
     benchmark_0 -- Completed --> benchmark_1
   end
 
-  gpu_monitor["gpu_monitor"]
   nats_server["nats_server"]
   etcd_server["etcd_server"]
   frontend_server["frontend_server"]
 
-  start --> gpu_monitor
   start --> nats_server
   start --> etcd_server
 
@@ -78,7 +80,6 @@ graph TD
   decode_server_0 -- Ready --> benchmark_0
   decode_server_1 -- Ready --> benchmark_0
 
-  gpu_monitor -- Completed --> stop
   benchmark_1 -- Completed --> stop
 
 ```
@@ -102,10 +103,12 @@ Use the `local` backend with the `bash` operator to validate your DAG and script
 | **Workflow** | A set of tasks wired into a DAG via `depends_on`. |
 | **Task** | An executable unit. The key field is `script` — a list of lines joined into a bash script. |
 | **Backend** | Where compute comes from. Built-ins: `slurm` (allocates via `salloc`) and `local` (simulates nodes on the local machine). |
-| **Operator** | How a task is launched. Built-ins: `bash`, `srun`, `docker`, `ssh`, `python`. Named operators let you preset flags and reuse them across tasks. |
+| **Operator** | How a task is launched. Built-ins: `bash`, `srun`, `docker_run`, `kubernetes`, `ssh`, `python`. Named operators let you preset flags and reuse them across tasks. |
 | **Variable** | A named value referenced as `${{ variables.NAME }}` in YAML or `${NAME}` in scripts. Override from the CLI with `--set`. |
 | **Expression** | Jinja2-based `${{ ... }}` syntax inside YAML to reference variables, backend info, task metadata, and more (e.g. `${{ backends.slurm.nodes[0].ip_address }}`). Supports filters (`${{ [a, b] \| min }}`), conditionals, and list indexing. |
 | **Artifact** | A named external resource (model, config, dataset) referenced by URI and resolved to a local path at runtime. |
+| **Storage** | A named post-execution upload target (e.g. S3). Per-task `uploads:` specs ship logs and result files to the target when a task completes. |
+| **Result** | A task's small structured outputs (metrics, scores). A `result:` entry parses them from the task log or a JSON file into a canonical `result.json` plus a workflow-level `results.json` index. |
 | **Probe** | A health-check gate. Readiness probes block dependents until a service is live; failure probes terminate the workflow when a fatal condition is detected. |
 | **Replica** | A task can be replicated N times (parallel or sequential) with per-replica variable overrides for sweeps. |
 
@@ -210,7 +213,9 @@ This user guide reflects actual code behavior. Not all planned features may be a
 | Parallel/sequential replicas, sweeps | [Replicas](./replicas.md) |
 | Composable configs, sweeps, missable tasks | [Modular Workflows](./modular-workflows.md) |
 | Readiness/failure gates for services | [Probes](./probes.md) |
+| Post-execution uploads to S3 | [Uploads](./uploads.md) |
 | Log and output directory structure | [Outputs & Logs](./outputs.md) |
+| Capture task metrics & structured results | [Results](./results.md) |
 | Full sflow.yaml schema | [Configuration](./configuration.md) |
 | CLI options | [CLI Reference](./cli.md) |
 | Frequently asked questions | [FAQ](./faq.md) |

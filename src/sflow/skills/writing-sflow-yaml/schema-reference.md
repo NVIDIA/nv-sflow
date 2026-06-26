@@ -12,7 +12,8 @@ Complete field-by-field reference for sflow v0.1 YAML configuration.
 > [replicas](https://nvidia.github.io/nv-sflow/docs/user/replicas),
 > [resources](https://nvidia.github.io/nv-sflow/docs/user/resources),
 > [modular-workflows](https://nvidia.github.io/nv-sflow/docs/user/modular-workflows),
-> [outputs](https://nvidia.github.io/nv-sflow/docs/user/outputs).
+> [outputs](https://nvidia.github.io/nv-sflow/docs/user/outputs),
+> [results](https://nvidia.github.io/nv-sflow/docs/user/results).
 
 ## Top-Level Fields
 
@@ -108,9 +109,20 @@ For replicated tasks, use `task.<name>_0` or `task.<name>[0]`.
 | `SFLOW_OUTPUT_DIR`              | Output root directory                   |
 | `SFLOW_WORKFLOW_OUTPUT_DIR`     | Workflow-specific output directory      |
 | `SFLOW_TASK_OUTPUT_DIR`         | Task-specific output directory          |
+| `SFLOW_TASK_RESULT_FILE`             | Per-task result file (`${SFLOW_TASK_OUTPUT_DIR}/result.json`) |
+| `SFLOW_WORKFLOW_RESULT_FILE`   | Workflow results index (`${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json`) |
 | `SFLOW_REPLICA_INDEX`           | Replica index (0-based)                 |
 | `SFLOW_TASK_ASSIGNED_NODE_NAMES`| Comma-separated node hostnames          |
 | `SFLOW_TASK_ASSIGNED_NODE_IPS`  | Comma-separated node IP addresses       |
+| `SFLOW_BACKEND_JOB_ID`          | Backend allocation/job id (Slurm job id when using Slurm) |
+| `SFLOW_BACKEND_NODELIST`        | Backend allocation nodelist             |
+| `SFLOW_BACKEND_NUM_NODES`       | Number of nodes in the backend allocation |
+| `SFLOW_BACKEND_STEP_ID`         | Backend step id (Slurm step id when using `srun`) |
+| `SFLOW_TASK_NODE_NAME`          | Runtime node hostname for this task process |
+| `SFLOW_TASK_NODE_INDEX`         | Runtime node index for this task process |
+| `SFLOW_TASK_PROCESS_ID`         | Runtime process/rank id for this task process |
+| `SFLOW_TASK_LOCAL_PROCESS_ID`   | Runtime local process/rank id on the node |
+| `SFLOW_TASK_NUM_PROCESSES`      | Runtime task/process count for this launch |
 
 ---
 
@@ -287,6 +299,7 @@ workflow:
 | `timeout`   | string | No       | Timeout (e.g. `"120m"`, `"2h"`)               |
 | `variables` | dict   | No       | Workflow-scoped variables (override global)    |
 | `tasks`     | list   | Yes      | Non-empty list of task definitions             |
+| `monitor`   | dict   | No       | Hardware monitor over the whole pool, run for the full workflow lifetime (see Monitor) |
 
 ---
 
@@ -304,7 +317,8 @@ workflow:
   replicas: {}                  # optional
   probes: {}                    # optional
   retries: {}                   # optional
-  outputs: []                   # optional
+  outputs: []                   # optional (legacy MVP)
+  result: {}                    # optional (consolidated result parsing)
 ```
 
 ### Task Field Reference
@@ -319,7 +333,9 @@ workflow:
 | `replicas`   | dict        | No       | Replica count, policy, sweep variables     |
 | `probes`     | dict        | No       | Readiness and failure probes               |
 | `retries`    | dict        | No       | Retry policy                               |
-| `outputs`    | list        | No       | Output parsing patterns                    |
+| `outputs`    | list        | No       | Output parsing patterns (legacy MVP)       |
+| `result`     | map/dict    | No       | Consolidated result parsing (regex map, `patterns`, or `file`) |
+| `monitor`    | dict        | No       | Hardware monitor bound to this task's lifetime (see Monitor) |
 
 ### Resources
 
@@ -396,6 +412,115 @@ outputs:
 ```
 
 Parsed values written to `outputs.json` after task success.
+
+### Result
+
+Consolidated, regex-first result parsing. Successor to `outputs`. Three shapes:
+
+```yaml
+# 1. Simple regex map (first capture group; type=auto, aggregate=last)
+result:
+  ttft: 'TTFT:\s*([0-9.]+)\s*ms'
+  tps: 'tok/s:\s*([0-9.]+)'
+
+# 2. Advanced patterns (type cast, aggregation, units, required)
+result:
+  patterns:
+    - name: ttft
+      regex: 'TTFT:\s*(?P<value>[0-9.]+)\s*ms'
+      type: float
+      unit: ms
+      aggregate: last        # first|last|list|count|min|max|avg|sum
+      required: true
+
+# 3. File source (task writes JSON; sflow normalizes it)
+result:
+  file: result.json          # relative to SFLOW_TASK_OUTPUT_DIR; or write $SFLOW_TASK_RESULT_FILE
+```
+
+- `patterns` and `file` are mutually exclusive.
+- `result.file` must end in `.json`; use `patterns:` for a metric literally
+  named `file`.
+- Runs after task success; a task is not `COMPLETED` until parsing finishes, so
+  dependents can read the files below.
+- Writes `${SFLOW_TASK_OUTPUT_DIR}/result.json` and updates
+  `${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json`. Env vars `SFLOW_TASK_RESULT_FILE` and
+  `SFLOW_WORKFLOW_RESULT_FILE` point at these.
+- Best-effort: a missing `required` match sets `ok: false` but does not fail the
+  workflow in this release.
+
+---
+
+## Monitor
+
+Hardware resource monitoring. Supported at two scopes:
+
+- `workflow.monitor` — covers the whole pool by default; runs for the full
+  workflow lifetime.
+- `tasks[*].monitor` — bound to a task; starts when the task starts and stops
+  when the task's process exits (a long-running `READY` service is monitored
+  until workflow teardown).
+
+```yaml
+workflow:
+  monitor:                       # workflow-level: whole pool, full run
+    interval: 5000               # default sample interval (ms)
+    scopes:                      # optional; omit to collect ALL built-ins
+      gpu: { interval: 1000 }    # cpu | gpu | memory | disk | network
+      cpu: {}
+      custom:                    # extra user commands run on the node
+        script:
+          - my_probe.sh >> ${SFLOW_TASK_OUTPUT_DIR}/custom.log
+    report:                      # optional detailed per-consumer report
+      enabled: true
+      format: [csv, svg]         # default; both pure-stdlib. add `png` for raster
+                                 # (needs the optional `sflow[monitor]` / matplotlib extra)
+  tasks:
+    - name: aiperf
+      script: [ ... ]
+      depends_on: [prefill_server, decode_server]
+      monitor:
+        resources:               # default: the task's own assigned nodes/GPUs
+          used_by_tasks: [prefill_server, decode_server]  # monitor THESE instead
+          gpus: { count: 8 }     # reporting filter (GPUs to include)
+        scopes:
+          gpu: {}
+        report: { enabled: true }
+```
+
+### How it works
+
+- **Bare host, passive:** collectors run directly on the node host (no container)
+  via `nvidia-smi` + `/proc`, overlapping the workload (`srun --overlap`) without
+  reserving GPUs.
+- **Singleton per node:** at most one collector runs per physical node; overlapping
+  monitors (workflow + tasks, overlapping `used_by_tasks`) reuse it and collect the
+  union of requested scopes. GPU/scope/time-window subsets are applied at report time.
+- **Zero workload overhead:** only lightweight sampling happens during the run; all
+  aggregation/plots run once AFTER the workflow finishes.
+
+### Field Reference
+
+| Field       | Type        | Description                                             |
+|-------------|-------------|---------------------------------------------------------|
+| `interval`  | int         | Default sample interval in ms (default `5000`, min `100`) |
+| `scopes`    | dict        | Active scopes; omit to enable all built-ins             |
+| `resources` | dict        | `nodes` / `gpus` (like `tasks.resources`) + `used_by_tasks` |
+| `report`    | dict        | `enabled` (bool) + `format` (default `[csv, svg]`; `png` is optional) |
+
+Scopes: `cpu`, `gpu` (accepts `fields:` to override the `nvidia-smi` query),
+`memory`, `disk`, `network` (each accepts `enabled`/`interval`), and `custom`
+(`script: [...]`). When `scopes` is omitted entirely, all built-ins are enabled.
+
+### Outputs
+
+- `<run>/sflow_monitor.log` — terminal-friendly overview (min/avg/max tables +
+  ASCII sparkline timelines), sibling to `sflow_summary.log`.
+- `<run>/sflow_monitor/raw/` — raw per-node CSV samples.
+- `<run>/sflow_monitor/<consumer>/` — detailed timeline + summary CSVs and an SVG
+  timeline for each monitor with `report.enabled` (`format` defaults to
+  `[csv, svg]`, both pure-stdlib). Add `png` for a raster chart (needs the
+  optional `sflow[monitor]` / matplotlib extra; skipped gracefully if absent).
 
 ---
 

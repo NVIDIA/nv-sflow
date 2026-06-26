@@ -6,7 +6,8 @@ Operator plugin implementations for sflow.
 """
 
 from .bash import BashOperator, BashOperatorConfig
-from .docker import DockerOperator, DockerOperatorConfig
+from .docker_run import DockerRunOperator, DockerRunOperatorConfig
+from .k8s import K8sOperator, K8sOperatorConfig
 from .python import PythonOperator, PythonOperatorConfig
 from .srun import SrunOperator, SrunOperatorConfig
 from .ssh import SshOperator, SshOperatorConfig
@@ -14,8 +15,10 @@ from .ssh import SshOperator, SshOperatorConfig
 __all__ = [
     "BashOperator",
     "BashOperatorConfig",
-    "DockerOperator",
-    "DockerOperatorConfig",
+    "DockerRunOperator",
+    "DockerRunOperatorConfig",
+    "K8sOperator",
+    "K8sOperatorConfig",
     "PythonOperator",
     "PythonOperatorConfig",
     "SshOperator",

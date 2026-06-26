@@ -1,0 +1,51 @@
+version: "0.1"
+
+# This example demonstrates the `storage` plugin: declare a named S3 target
+# at the top level, then attach per-task `uploads:` specs that fire when a
+# task reaches COMPLETED.
+#
+# Credentials come from the boto3 default chain (AWS_* env vars,
+# ~/.aws/credentials, or an IAM role). Do NOT put secrets in YAML.
+#
+# Validate locally with `--dry-run`:
+#   sflow run examples/local_storage_upload.yaml --dry-run
+#
+# To run for real you need an S3 bucket you can write to. Override the
+# bucket name on the CLI:
+#   sflow run examples/local_storage_upload.yaml \
+#     --set BUCKET=my-bucket --set RUN_ID=my-test-run
+
+variables:
+  - name: BUCKET
+    description: "S3 bucket to upload results into"
+    value: my-bucket
+  - name: RUN_ID
+    description: "Per-run prefix to namespace uploaded objects"
+    value: run-001
+
+storage:
+  - name: results_bucket
+    type: s3
+    bucket: ${{ variables.BUCKET }}
+    region: us-west-2
+    prefix: "sflow-demo/${{ variables.RUN_ID }}/"
+
+workflow:
+  name: local_storage_upload
+  tasks:
+    - name: produce_results
+      script:
+        - mkdir -p "${SFLOW_TASK_OUTPUT_DIR}"
+        - echo "metric,value" > "${SFLOW_TASK_OUTPUT_DIR}/results.csv"
+        - echo "throughput,42" >> "${SFLOW_TASK_OUTPUT_DIR}/results.csv"
+        - printf '{"run":"%s","ok":true}\n' "${RUN_ID}" > "${SFLOW_TASK_OUTPUT_DIR}/summary.json"
+      uploads:
+        # Explicit destination: ends up at s3://<bucket>/sflow-demo/<run_id>/main/results.csv
+        - target: results_bucket
+          from: "${{ task.output_dir }}/results.csv"
+          to: "main/results.csv"
+        # Glob; each match keeps its basename under the target prefix.
+        # on_error: warn means an upload failure is logged but does not fail the task.
+        - target: results_bucket
+          from: "${{ task.output_dir }}/*.json"
+          on_error: warn

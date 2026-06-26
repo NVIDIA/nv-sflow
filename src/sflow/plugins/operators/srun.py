@@ -3,32 +3,66 @@
 
 from __future__ import annotations
 
-import re
+import os
 from collections.abc import Mapping, Sequence
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
+from sflow.core import log_offload
 from sflow.core.command import Command
+from sflow.core.command_log import register_command_family
+from sflow.core.log_offload import (
+    OFFLOAD_TASK_LOGS_ENV,
+    offload_enabled,
+    offload_env_override,
+    wrap_with_prefixer,
+)
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.operator_registry import register_operator
+from sflow.utils.container import (
+    append_runtime_mounts as append_runtime_mount_specs,
+    extract_container_images_from_extra_args,
+    is_valid_container_image,
+    local_artifact_mounts,
+    merge_container_mounts_from_extra_args,
+    validate_container_image_reference,
+)
 
-# Matches remote registry references: [registry[:port]/][org/]name[:tag][@digest]
-_REGISTRY_IMAGE_RE = re.compile(
-    r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*(@[a-zA-Z][a-zA-Z0-9]*:[a-fA-F0-9]+)?$"
+register_command_family("slurm", {"srun"}, filename="slurm_cmds.log")
+
+# Back-compat re-exports of the (now shared) offload helpers, kept so existing
+# imports in tests and scripts/bench_offload_logging.py keep working.
+# OFFLOAD_TASK_LOGS_ENV is imported above (now the backend-neutral canonical name).
+_offload_env_override = offload_env_override
+_stdout_is_tty = log_offload.stdout_is_tty
+_LOG_PREFIX_HELPER_SRC = log_offload.LOG_PREFIX_HELPER_SRC
+
+
+_SLURM_TO_SFLOW_RUNTIME_ENV: tuple[tuple[str, str], ...] = (
+    ("SFLOW_BACKEND_JOB_ID", "${SLURM_JOB_ID:-${SLURM_JOBID:-}}"),
+    ("SFLOW_BACKEND_NODELIST", "${SLURM_JOB_NODELIST:-${SLURM_NODELIST:-}}"),
+    ("SFLOW_BACKEND_NUM_NODES", "${SLURM_NNODES:-}"),
+    ("SFLOW_BACKEND_STEP_ID", "${SLURM_STEP_ID:-}"),
+    ("SFLOW_TASK_NODE_NAME", "${SLURMD_NODENAME:-}"),
+    ("SFLOW_TASK_NODE_INDEX", "${SLURM_NODEID:-}"),
+    ("SFLOW_TASK_PROCESS_ID", "${SLURM_PROCID:-}"),
+    ("SFLOW_TASK_LOCAL_PROCESS_ID", "${SLURM_LOCALID:-}"),
+    ("SFLOW_TASK_NUM_PROCESSES", "${SLURM_NTASKS:-}"),
 )
 
 
+def _slurm_runtime_env_prelude() -> list[str]:
+    return [
+        f'if [ -n "{source_expr}" ]; then export {target}="{source_expr}"; fi'
+        for target, source_expr in _SLURM_TO_SFLOW_RUNTIME_ENV
+    ]
+
+
 def _is_valid_container_image(image: str) -> bool:
-    """Return True if *image* looks like a remote registry reference or a local .sqsh file."""
-    if not image or not image.strip():
-        return False
-    image = image.strip()
-    if "${{" in image or "${" in image:
-        return True
-    if image.endswith(".sqsh"):
-        return True
-    return bool(_REGISTRY_IMAGE_RE.match(image))
+    """Backward-compatible alias for the public container image validator."""
+    return is_valid_container_image(image)
 
 
 class SrunOperatorConfig(OperatorConfig):
@@ -68,6 +102,13 @@ class SrunOperatorConfig(OperatorConfig):
     kill_on_bad_exit: bool = False
     overlap: bool = True
     wait: int | str | None = None
+    # Per-task log offload, ON by default. When enabled, srun writes the per-task
+    # log itself via --output (offload) and a compute-side prefixer reproduces
+    # sflow's log format, so the driver no longer pumps task content line-by-line.
+    # The env channel OFFLOAD_TASK_LOGS_ENV takes precedence over this field (see
+    # SrunOperator._offload_enabled). Auto-falls back to streaming on an
+    # interactive TTY / --tui session.
+    log_to_file: bool = True
 
     # --- Pyxis / container (srun plugin flags) ---
     container_image: str | None = None
@@ -82,6 +123,56 @@ class SrunOperatorConfig(OperatorConfig):
 
     extra_args: list[str] = Field(default_factory=list)
 
+    def container_images(self) -> list[str]:
+        images: list[str] = []
+        if self.container_image:
+            images.append(self.container_image)
+        images.extend(extract_container_images_from_extra_args(list(self.extra_args)))
+        return images
+
+    def mount_specs(self) -> list[str]:
+        mounts, _filtered_extra_args = merge_container_mounts_from_extra_args(
+            self.container_mounts or [],
+            list(self.extra_args or []),
+        )
+        return append_runtime_mount_specs([], mounts)
+
+    def uses_container(self) -> bool:
+        return bool(self.container_image or self.container_name or self.container_images())
+
+    def append_runtime_mounts(self, mounts: Sequence[str]) -> None:
+        if not (self.container_image or self.container_name):
+            return
+        self.container_mounts = append_runtime_mount_specs(
+            list(self.container_mounts or []),
+            list(mounts),
+        )
+
+    def runtime_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        if self.uses_container():
+            creds_path = Path.home() / ".config" / "enroot" / ".credentials"
+            if not creds_path.exists():
+                warnings.append(
+                    f"srun operator uses container images but enroot credentials "
+                    f"file not found at {creds_path}. "
+                    f"Container pulls from authenticated registries (e.g. nvcr.io) "
+                    f"may fail. See: https://github.com/NVIDIA/enroot/blob/master/doc/cmd/import.md"
+                )
+        # Mirror offload_enabled() exactly so the warning reflects what actually
+        # happens: it applies the env override > config precedence AND the
+        # interactive-TTY fallback (offload auto-streams on a TTY/--tui). The
+        # earlier inline check omitted the TTY case and falsely warned that
+        # offload was enabled while output was actually being streamed.
+        if offload_enabled(self.log_to_file):
+            warnings.append(
+                "srun per-task log offload is enabled: the task container needs "
+                "python3 (preferred) or bash >= 5 to reproduce sflow's "
+                "millisecond log timestamps; otherwise offloaded logs fall back "
+                "to second-resolution timestamps."
+            )
+        return warnings
+
     @model_validator(mode="after")
     def validate_and_coerce_types(self) -> "SrunOperatorConfig":
         """
@@ -94,27 +185,16 @@ class SrunOperatorConfig(OperatorConfig):
                 "srun operator config: 'container_image' and 'container_name' cannot both be set"
             )
 
-        _invalid_img_hint = (
-            "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag') "
-            "or a local .sqsh file path (e.g. '/path/to/image.sqsh')"
-        )
-        if self.container_image and not _is_valid_container_image(self.container_image):
-            raise ValueError(
-                f"srun operator config: 'container_image' does not look like a valid "
-                f"container image. {_invalid_img_hint}, got: '{self.container_image}'"
+        if self.container_image:
+            validate_container_image_reference(
+                self.container_image,
+                source="srun operator config: 'container_image'",
             )
-        for _i, _arg in enumerate(self.extra_args):
-            _img_val: str | None = None
-            if _arg.startswith("--container-image="):
-                _img_val = _arg.split("=", 1)[1]
-            elif _arg == "--container-image" and _i + 1 < len(self.extra_args):
-                _img_val = self.extra_args[_i + 1]
-            if _img_val is not None and not _is_valid_container_image(_img_val):
-                raise ValueError(
-                    f"srun operator config: '--container-image' in extra_args does not "
-                    f"look like a valid container image. {_invalid_img_hint}, "
-                    f"got: '{_img_val}'"
-                )
+        for _img_val in extract_container_images_from_extra_args(list(self.extra_args)):
+            validate_container_image_reference(
+                _img_val,
+                source="srun operator config: '--container-image' in extra_args",
+            )
 
         # Coerce string values to int for numeric fields
         def _to_int(val: int | str | None) -> int | None:
@@ -165,6 +245,44 @@ class SrunOperator(Operator):
         super().__init__(config)
         self.config: SrunOperatorConfig
 
+    def _offload_enabled(self) -> bool:
+        """Whether this task offloads its log to srun --output (aligned mode)."""
+        return offload_enabled(self.config.log_to_file)
+
+    def writes_own_task_log(self) -> bool:
+        # In offload mode slurmstepd owns <task>.log, so sflow must not also
+        # attach a FileHandler to that path (single-writer invariant).
+        return self._offload_enabled()
+
+    def apply_backend_context(
+        self,
+        *,
+        backend: Any,
+        assigned_nodes: Sequence[str],
+        artifacts: Sequence[Any],
+        cuda_visible_devices: str | None = None,
+        gpu_count: int | None = None,
+    ) -> None:
+        # gpu_count unused: Slurm GPU comes from --gpus flags + backend CUDA_VISIBLE_DEVICES.
+        job_id = "0"
+        full_nodelist: list[str] = []
+        if getattr(backend, "allocation", None):
+            allocation = backend.allocation
+            job_id = str(getattr(allocation, "allocation_id", None) or "0")
+            full_nodelist = [n.name for n in getattr(allocation, "nodes", [])]
+
+        effective_nodelist = list(assigned_nodes or full_nodelist)
+        if self.config.job_id in (None, "", "0"):
+            self.config.job_id = job_id
+        if not self.config.nodelist:
+            self.config.nodelist = effective_nodelist
+        if self.config.nodes in (None, 0):
+            self.config.nodes = len(effective_nodelist)
+
+        auto_mounts = local_artifact_mounts(artifacts)
+        if auto_mounts:
+            self.config.append_runtime_mounts(auto_mounts)
+
     def build_command(
         self,
         *,
@@ -174,6 +292,8 @@ class SrunOperator(Operator):
     ) -> Command:
         c = self.config
         command = Command(exec="srun")
+        # Offload only engages when we know where slurmstepd should write the log.
+        offload = self._offload_enabled() and bool(envs.get("SFLOW_TASK_OUTPUT_DIR"))
         if c.job_id is not None:
             command.add_opt("--jobid", c.job_id)
 
@@ -225,11 +345,21 @@ class SrunOperator(Operator):
 
         # Behavior / logging
         command.add_opt("--job-name", task_name)
+        if offload:
+            # slurmstepd writes the per-task log directly, taking the sflow driver
+            # out of the per-line byte path. stderr merges into stdout because
+            # --error is omitted, keeping a single output file / single writer.
+            command.add_opt(
+                "--output",
+                os.path.join(str(envs["SFLOW_TASK_OUTPUT_DIR"]), f"{task_name}.log"),
+            )
         if c.unbuffered:
             command.add_opt("--unbuffered")
         if c.export:
             command.add_opt("--export", c.export)
-        if c.label:
+        # In offload mode the rank label is folded into the prefixer instead, so
+        # the file matches stream mode exactly; --label would otherwise double it.
+        if c.label and not offload:
             command.add_opt("--label")
         if c.kill_on_bad_exit:
             command.add_opt("--kill-on-bad-exit")
@@ -265,23 +395,11 @@ class SrunOperator(Operator):
             if c.container_remap_root:
                 command.add_opt("--container-remap-root")
 
-        # Merge container_mounts from config with any --container-mounts in extra_args
-        all_mounts: list[str] = list(c.container_mounts) if c.container_mounts else []
-        filtered_extra_args: list[str] = []
-        i = 0
-        while i < len(c.extra_args):
-            arg = c.extra_args[i]
-            if arg == "--container-mounts" and i + 1 < len(c.extra_args):
-                extra_mounts = c.extra_args[i + 1].split(",")
-                all_mounts.extend(extra_mounts)
-                i += 2
-            elif arg.startswith("--container-mounts="):
-                extra_mounts = arg.split("=", 1)[1].split(",")
-                all_mounts.extend(extra_mounts)
-                i += 1
-            else:
-                filtered_extra_args.append(arg)
-                i += 1
+        # Merge container_mounts from config with any --container-mounts in extra_args.
+        all_mounts, filtered_extra_args = merge_container_mounts_from_extra_args(
+            c.container_mounts or [],
+            list(c.extra_args),
+        )
 
         if _has_container and all_mounts:
             command.add_opt("--container-mounts", ",".join(all_mounts))
@@ -292,6 +410,28 @@ class SrunOperator(Operator):
         command.add_arg("bash")
         command.add_arg("-c")
         # Env is injected by SubprocessLauncher(env=...) and srun --export=ALL will propagate it
-        # to remote tasks. Avoid embedding env exports into the script to prevent leaking values.
-        command.add_arg("\n".join(list(script)))
+        # to remote tasks. The prelude uses only Slurm-provided variable names, so values are
+        # resolved inside the step rather than embedded in the logged command.
+        script_body = "\n".join([*_slurm_runtime_env_prelude(), *list(script)])
+        if offload:
+            command.add_arg(
+                self._wrap_script_with_prefixer(script_body, envs, task_name)
+            )
+        else:
+            command.add_arg(script_body)
         return command
+
+    def _wrap_script_with_prefixer(
+        self, script_body: str, envs: Mapping[str, str], task_name: str
+    ) -> str:
+        """Wrap the task script so its merged stdout/stderr flows through the
+        prefixer. srun captures the pipeline via ``--output`` (no shell redirect),
+        and ``${PIPESTATUS[0]}`` makes the task's exit status (not the prefixer's)
+        propagate to srun and the orchestrator.
+        """
+        return wrap_with_prefixer(
+            script_body,
+            workflow_out_dir=envs.get("SFLOW_WORKFLOW_OUTPUT_DIR"),
+            task_name=task_name,
+            redirect_to=None,
+        )

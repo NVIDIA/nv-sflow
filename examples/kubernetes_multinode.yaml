@@ -1,0 +1,54 @@
+version: "0.1"
+
+# Multi-node distributed training on Kubernetes via the non-DRA device-plugin
+# fallback (scheduling: device_plugin -> nvidia.com/gpu limits).
+#
+# The reservation reserves 4 GPU nodes; the single task is split into 4 pods (one
+# per reserved node, leader = index 0) each requesting 8 GPUs via the legacy
+# device-plugin limit. sflow injects SFLOW_TASK_NODE_INDEX and SFLOW_LEADER_ADDRESS
+# per pod (plus the shared SFLOW_TASK_ASSIGNED_NODE_IPS) so torchrun can rendezvous.
+#
+# Swap `scheduling: device_plugin` for `scheduling: dra` (the default) on a cluster
+# with nvidia-dra-driver-gpu to request GPUs via DRA ResourceClaims instead.
+
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    namespace: default
+    nodes: 4
+    gpus_per_node: 8
+    host_network: true
+    scheduling: device_plugin
+
+operators:
+  - name: trainer
+    type: k8s
+    image: nvcr.io/nvidia/pytorch:24.12-py3
+
+workflow:
+  name: k8s_multinode
+  tasks:
+    - name: distributed_train
+      operator: trainer
+      resources:
+        nodes:
+          count: 4
+        gpus:
+          count: 32   # 8 GPUs per pod across 4 nodes
+      script:
+        # SFLOW_LEADER_ADDRESS is the leader (node 0) IP; SFLOW_TASK_NODE_INDEX is
+        # 0 on the leader and 1..N-1 on workers. Keep NNODES in sync with nodes.count.
+        - export MASTER_ADDR="$SFLOW_LEADER_ADDRESS"
+        - export MASTER_PORT=12345
+        - export NNODES=4
+        - export NPROC_PER_NODE=8
+        - export NODE_RANK="$SFLOW_TASK_NODE_INDEX"
+        - >
+          torchrun
+          --nnodes=$NNODES
+          --nproc_per_node=$NPROC_PER_NODE
+          --node_rank=$NODE_RANK
+          --master_addr=$MASTER_ADDR
+          --master_port=$MASTER_PORT
+          train.py

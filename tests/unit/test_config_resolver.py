@@ -3,7 +3,7 @@
 
 import pytest
 
-from sflow.config.resolver import ExpressionResolver
+from sflow.resolution import ExpressionResolver
 from sflow.core.variable import VariableValue
 
 
@@ -45,6 +45,42 @@ def test_extract_references_returns_undeclared_names(resolver: ExpressionResolve
         }
     )
     assert refs == {"foo", "bar", "variables"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "${{ task.name }}/r.csv",
+        "${{task.name}}/r.csv",
+        "${{ task.name}}/r.csv",
+        "${{task.name }}/r.csv",
+        "${{   task.name   }}/r.csv",
+        "results_${{ task.name }}.csv",
+        "${{ 'p_' + task.name }}/r.csv",
+        "${{ task['name'] }}/r.csv",
+    ],
+)
+def test_references_attribute_detects_all_spellings(
+    resolver: ExpressionResolver, value: str
+):
+    assert resolver.references_attribute(value, "task", "name") is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        123,
+        "main/r.csv",
+        "task.name/r.csv",  # not an expression
+        "${{ task.output_dir }}/r.csv",  # different attribute
+        "${{ taskname }}/r.csv",  # different name
+        "${{ variables.name }}/r.csv",  # different root
+        '${{ "task.name" }}/r.csv',  # inside a string literal, not a real ref
+    ],
+)
+def test_references_attribute_negatives(resolver: ExpressionResolver, value):
+    assert resolver.references_attribute(value, "task", "name") is False
 
 
 def test_resolve_string_strict_undefined_raises_value_error(

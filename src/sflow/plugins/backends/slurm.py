@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
+import shutil
+import subprocess
 from collections.abc import Sequence
 from typing import Any, Literal
 
@@ -9,15 +12,24 @@ from sflow.config.schema import BackendConfig, Resolvable
 from sflow.core.backend import Allocation, Backend
 from sflow.core.backend_registry import register_backend
 from sflow.core.command import Command
+from sflow.core.command_log import register_command_family
 from sflow.core.compute_node import ComputeNode
 from sflow.core.launcher import SubprocessLauncher
 from sflow.core.operator import Operator
 from sflow.logging import get_logger
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
-from sflow.utils.logging import temporary_handler
+from sflow.utils.logging import isolated_logger, temporary_handler
 from sflow.utils.parser import ParseLogHandler
+from sflow.utils.slurm import emit_gpus_per_node_semantics_warning_once
 
 _logger = get_logger(__name__)
+# Commands launched by this backend. The `srun` executable is owned by the srun
+# operator module (registration merges into a union when both are imported).
+register_command_family(
+    "slurm",
+    {"salloc", "scontrol", "scancel", "sbatch"},
+    filename="slurm_cmds.log",
+)
 
 
 class SlurmBackendConfig(BackendConfig):
@@ -26,11 +38,20 @@ class SlurmBackendConfig(BackendConfig):
     partition: Resolvable[str]
     time: Resolvable[str | int]
     nodes: Resolvable[int]
-    # Slurm backend requires GPUs-per-node to be specified so we can correctly
-    # populate ComputeNode.num_gpus for scheduling/packing/validation.
+    # Required. Set to 0 for CPU-only partitions; in that case tasks must not
+    # declare `resources.gpus` (sflow will reject GPU requests against a
+    # zero-capacity node with a clear error).
     gpus_per_node: Resolvable[int]
     extra_args: list[Resolvable[str]] | None = None
     job_name: str | None = None
+    # Per-task log offload is ON by default. The CLI flag / SFLOW_OFFLOAD_TASK_LOGS
+    # env override takes precedence (resolved in SrunOperator). When enabled, srun
+    # writes <task>.log via --output and a compute-side prefixer reproduces sflow's
+    # log format. Auto-falls back to streaming on an interactive TTY / --tui session.
+    offload_task_logs: bool = True
+
+    def planning_node_count(self) -> Resolvable[int] | None:
+        return self.nodes
 
 
 @register_backend("slurm", SlurmBackendConfig)
@@ -55,6 +76,64 @@ class SlurmBackend(Backend):
                 f"Backend '{config.name}' gpus_per_node must be an int after resolution, got {config.gpus_per_node!r}"
             ) from e
         self._subprocess_launcher = SubprocessLauncher()
+        self._warned_gpus_per_node_semantics = False
+
+    def preflight_validate(self) -> None:
+        required = ["salloc", "srun", "scontrol", "scancel"]
+        missing = [c for c in required if shutil.which(c) is None]
+        if missing:
+            raise ValueError(
+                "Pre-flight validation failed for Slurm backend "
+                f"'{self.name}'. Missing required commands: {', '.join(missing)}. "
+                "Ensure Slurm client tools are installed and available on PATH (e.g., load the Slurm module)."
+            )
+
+    def planning_capacity(self) -> tuple[int, int | None]:
+        return (self._nodes, self._gpu_per_node)
+
+    def dry_run_details(self) -> list[tuple[str, str]]:
+        details: list[tuple[str, str]] = [
+            ("account", self._account),
+            ("partition", self._partition),
+            ("nodes", str(self._nodes)),
+            ("gpus_per_node", str(self._gpu_per_node)),
+            ("time", self._time),
+            ("job_name", self._job_name),
+        ]
+        if self._extra_args:
+            details.append(("extra_args", str(list(self._extra_args))))
+        return details
+
+    def resource_env(self, *, cuda_visible_devices: str | None = None) -> dict[str, str]:
+        env = super().resource_env(cuda_visible_devices=cuda_visible_devices)
+        env.update(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if key.startswith("SLURM_") or key.startswith("SLURMD_")
+            }
+        )
+
+        allocation = self.allocation
+        job_id: str | None = env.get("SLURM_JOB_ID") or env.get("SLURM_JOBID")
+        if not job_id and allocation is not None:
+            job_id = allocation.allocation_id
+        if job_id:
+            env["SFLOW_BACKEND_JOB_ID"] = str(job_id)
+
+        nodelist = env.get("SLURM_JOB_NODELIST") or env.get("SLURM_NODELIST")
+        if not nodelist and self.allocation is not None:
+            nodelist = ",".join(node.name for node in self.allocation.nodes)
+        if nodelist:
+            env["SFLOW_BACKEND_NODELIST"] = str(nodelist)
+
+        num_nodes = env.get("SLURM_NNODES")
+        if not num_nodes and self.allocation is not None:
+            num_nodes = str(len(self.allocation.nodes))
+        if num_nodes:
+            env["SFLOW_BACKEND_NUM_NODES"] = str(num_nodes)
+
+        return env
 
     async def _resolve_nodes_via_scontrol(
         self, *, nodelist: str
@@ -64,9 +143,12 @@ class SlurmBackend(Backend):
         Returns None if scontrol getaddrs is not available or fails.
         """
         parser = ParseLogHandler(patterns=["{hostname}: {ip_address}:{port}"])
-        with temporary_handler(_logger, parser):
+        # Use a per-call isolated logger so concurrent backend allocations don't
+        # capture each other's output (see isolated_logger docstring).
+        capture_logger = isolated_logger("slurm.getaddrs")
+        with temporary_handler(capture_logger, parser):
             exit_code = await self._subprocess_launcher.run_async(
-                ["scontrol", "getaddrs", nodelist], output_logger=_logger
+                ["scontrol", "getaddrs", nodelist], output_logger=capture_logger
             )
             if exit_code != 0:
                 _logger.warning(
@@ -135,9 +217,12 @@ class SlurmBackend(Backend):
                 output_lines.append(record.getMessage())
 
         capture_handler = OutputCaptureHandler()
-        with temporary_handler(_logger, capture_handler):
+        # Use a per-call isolated logger so concurrent backend allocations don't
+        # capture each other's output (see isolated_logger docstring).
+        capture_logger = isolated_logger("slurm.srun_resolve")
+        with temporary_handler(capture_logger, capture_handler):
             exit_code = await self._subprocess_launcher.run_async(
-                cmd, output_logger=_logger
+                cmd, output_logger=capture_logger
             )
             if exit_code != 0:
                 raise RuntimeError(
@@ -209,15 +294,38 @@ class SlurmBackend(Backend):
         _logger.info("Falling back to srun method for resolving node addresses")
         return await self._resolve_nodes_via_srun(nodelist=nodelist, job_id=job_id)
 
+    def _should_reuse_env_allocation(self) -> bool:
+        """Whether this backend may reuse an existing ``$SLURM_JOB_ID`` allocation.
+
+        Multi-backend ``sflow batch`` runs every backend from a single driver
+        sbatch but needs each backend on its own Slurm job id (so pyxis/enroot's
+        per-job runtime dir matches the node that provisioned it). In that mode
+        (``SFLOW_SLURM_MULTI_BACKEND_SALLOC=1``) only the wrapper backend
+        (``SFLOW_SLURM_WRAPPER_BACKEND``) reuses the driver allocation; every
+        other backend falls through to its own ``salloc``. Outside that mode the
+        normal single-allocation reuse applies.
+        """
+        if os.environ.get("SFLOW_SLURM_MULTI_BACKEND_SALLOC") == "1":
+            return os.environ.get("SFLOW_SLURM_WRAPPER_BACKEND") == self.name
+        return True
+
     async def allocate(self) -> Allocation:
         import os
+
+        self._warned_gpus_per_node_semantics = (
+            emit_gpus_per_node_semantics_warning_once(
+                self._gpu_per_node,
+                _logger.warning,
+                already_warned=self._warned_gpus_per_node_semantics,
+            )
+        )
 
         # If we're already inside a Slurm allocation, reuse it instead of creating a new one.
         job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID")
         nodelist = os.environ.get("SLURM_JOB_NODELIST") or os.environ.get(
             "SLURM_NODELIST"
         )
-        if job_id and nodelist:
+        if job_id and nodelist and self._should_reuse_env_allocation():
             _logger.info(
                 "Detected existing Slurm allocation in env; skipping salloc "
                 f"(SLURM_JOB_ID={job_id!r}, SLURM_JOB_NODELIST={nodelist!r})"
@@ -244,6 +352,7 @@ class SlurmBackend(Backend):
             .add_opt("--job-name", self._job_name)
             .add_opt("--no-shell")
         )
+
         for arg in self._extra_args:
             command.add_opt(arg)
 
@@ -261,12 +370,18 @@ class SlurmBackend(Backend):
                 output_lines.append(record.getMessage())
 
         capture_handler = OutputCaptureHandler()
+        # Use a per-call isolated logger so concurrent backend allocations don't
+        # capture each other's salloc output. Routing through the shared module
+        # logger caused parsers from sibling allocations to see each other's
+        # "Granted job allocation"/"Nodes ... ready" lines, turning job_id and
+        # nodelist into lists (see isolated_logger docstring).
+        capture_logger = isolated_logger("slurm.salloc")
         with (
-            temporary_handler(_logger, parser),
-            temporary_handler(_logger, capture_handler),
+            temporary_handler(capture_logger, parser),
+            temporary_handler(capture_logger, capture_handler),
         ):
             exit_code = await self._subprocess_launcher.run_async(
-                command, output_logger=_logger
+                command, output_logger=capture_logger
             )
             if exit_code != 0:
                 output_log = "\n".join(output_lines) if output_lines else "(no output)"
@@ -276,17 +391,45 @@ class SlurmBackend(Backend):
                 raise RuntimeError(
                     f"Failed to allocate nodes (exit code {exit_code}). "
                     f"salloc output:\n{output_log}\n"
-                    f"Please check if you are using the correct Slurm account / partition / nodes in the yaml file, or --gpus-per-node=N is correctly set/removed according to your cluster's documentation"
+                    f"Please check if you are using the correct Slurm account / partition / nodes in the yaml file, "
+                    f"or add --gpus-per-node=N to extra_args if required by your cluster's documentation"
                 )
 
         parsed_result = parser.get_parsed_dict()
 
         allocation_id = parsed_result["job_id"]
-        slurm_nodelist = parsed_result["nodelist"]
 
-        nodes = await self._resolve_nodes_from_nodelist(
-            nodelist=slurm_nodelist, job_id=allocation_id
-        )
+        # salloc has now irrevocably granted a job. Everything below (node
+        # address resolution, etc.) runs *after* the grant, so if it fails the
+        # job would leak until --time expires: the Allocation is never returned,
+        # so `allocate_resources` never sets `self.allocation`, and neither the
+        # `allocate_backends` failure cleanup nor the atexit fallback (both keyed
+        # off `backend.allocation`) can see it. Cancel the orphaned job on any
+        # failure before propagating the error.
+        try:
+            slurm_nodelist = parsed_result["nodelist"]
+            nodes = await self._resolve_nodes_from_nodelist(
+                nodelist=slurm_nodelist, job_id=allocation_id
+            )
+        except Exception:
+            _logger.error(
+                f"Backend '{self.name}' failed after salloc granted job "
+                f"{allocation_id}; cancelling the orphaned allocation to avoid "
+                "leaking it until --time expires."
+            )
+            try:
+                await self.release(
+                    Allocation(allocation_id=str(allocation_id), nodes=[])
+                )
+            except Exception as cleanup_exc:
+                _logger.warning(
+                    "Failed to cancel orphaned Slurm allocation "
+                    f"{allocation_id}: {cleanup_exc}. It may leak until --time "
+                    "expires; cancel it manually with "
+                    f"'scancel {allocation_id}'."
+                )
+            raise
+
         return Allocation(
             allocation_id=allocation_id,
             nodes=nodes,
@@ -298,27 +441,39 @@ class SlurmBackend(Backend):
             ["scancel", allocation.allocation_id], output_logger=_logger
         )
 
+    def emergency_release(self, allocation: Allocation) -> None:
+        if not allocation.allocation_id:
+            return
+        scancel_bin = shutil.which("scancel")
+        if not scancel_bin:
+            return
+        try:
+            subprocess.run(
+                [scancel_bin, str(allocation.allocation_id)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            return
+
     def default_operator(
         self,
         *,
         name: str,
         assigned_nodes: Sequence[str] | None = None,
     ) -> Operator:
-        # Slurm execution defaults to srun operator. If allocated, surface job_id/nodelist.
-        job_id = "0"
-        nodelist: list[str] = []
-        if self.allocation and self.allocation.allocation_id:
-            job_id = str(self.allocation.allocation_id)
-            nodelist = [n.name for n in (self.allocation.nodes or [])]
-
-        # Prefer assembly-assigned nodes if present.
-        if assigned_nodes:
-            nodelist = list(assigned_nodes)
+        self._warned_gpus_per_node_semantics = (
+            emit_gpus_per_node_semantics_warning_once(
+                self._gpu_per_node,
+                _logger.warning,
+                already_warned=self._warned_gpus_per_node_semantics,
+            )
+        )
 
         cfg = SrunOperatorConfig(
             name=name,
-            job_id=job_id,
-            nodelist=nodelist,
+            log_to_file=bool(self.config.offload_task_logs),
         )
         return SrunOperator(cfg)
 
@@ -358,9 +513,11 @@ class SlurmBackend(Backend):
             raise ValueError(
                 f"Backend '{conf.name}' gpus_per_node must resolve to int, got {resolved!r}"
             ) from e
-        if gpus_per_node <= 0:
+        # 0 is valid: it explicitly declares a CPU-only partition. Negative
+        # values remain a user error.
+        if gpus_per_node < 0:
             raise ValueError(
-                f"Backend '{conf.name}' gpus_per_node must be > 0, got {gpus_per_node}"
+                f"Backend '{conf.name}' gpus_per_node must be >= 0, got {gpus_per_node}"
             )
 
         return SlurmBackendConfig(
@@ -374,4 +531,5 @@ class SlurmBackend(Backend):
             extra_args=extra_args,
             job_name=str(workflow_name),
             gpus_per_node=gpus_per_node,
+            offload_task_logs=bool(getattr(conf, "offload_task_logs", True)),
         )

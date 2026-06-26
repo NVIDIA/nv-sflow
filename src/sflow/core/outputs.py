@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from sflow.logging import get_logger
-from sflow.utils.parser import LinesParser
+from sflow.utils.parser import LinesParser, strip_sflow_log_prefix
 
 from .task import OutputSpec, Task
 
@@ -56,14 +56,11 @@ def parse_outputs_from_text(text: str, specs: list[OutputSpec]) -> dict[str, Any
     patterns = [s.pattern for s in specs if s and s.pattern]
     if not patterns:
         return {}
-    # Logs are written via logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"),
-    # so the actual user output is the final "message" segment after 3 separators.
-    # Parse against the extracted message to keep patterns simple (SRD-style).
-    lines = []
-    for line in text.splitlines():
-        # Split at most 3 times: ts - logger - level - message
-        parts = line.split(" - ", 3)
-        lines.append(parts[-1] if parts else line)
+    # Logs are written via logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    # (and reproduced byte-for-byte by the srun offload prefixer), so the actual
+    # user output is the message after the prefix. Strip the prefix only when it is
+    # actually present so raw lines (or messages containing " - ") aren't mangled.
+    lines = [strip_sflow_log_prefix(line) for line in text.splitlines()]
 
     parser = LinesParser(patterns)
     parser.add_lines(lines)

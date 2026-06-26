@@ -74,6 +74,7 @@ For full docs: [configuration](https://nvidia.github.io/nv-sflow/docs/user/confi
 [backends](https://nvidia.github.io/nv-sflow/docs/user/backends),
 [operators](https://nvidia.github.io/nv-sflow/docs/user/operators),
 [probes](https://nvidia.github.io/nv-sflow/docs/user/probes),
+[monitor](https://nvidia.github.io/nv-sflow/docs/user/monitor),
 [replicas](https://nvidia.github.io/nv-sflow/docs/user/replicas),
 [resources](https://nvidia.github.io/nv-sflow/docs/user/resources),
 [modular-workflows](https://nvidia.github.io/nv-sflow/docs/user/modular-workflows).

@@ -10,8 +10,13 @@ sidebar_position: 11
 - `sflow batch` – Generate sbatch script for Slurm batch mode
 - `sflow visualize` – Visualize workflow DAG
 - `sflow sample` – List and copy sample workflows
+- `sflow skill` – Copy bundled AI-agent skills for writing and debugging sflow YAML
 
 > Note: `--resume` / `--task` are currently marked as not implemented in code and will error immediately.
+
+Global option:
+
+- `sflow --version` / `sflow -V`: print executable/runtime details, including package version, binary path, Python path, install mode, source label, repo path when known, and git branch/commit when available
 
 ## sflow run
 
@@ -27,23 +32,34 @@ Common options:
 - `--set, -s KEY=VALUE`: override variables (repeatable); variable must already exist in `variables`
 - `--artifact, -a NAME=URI`: override artifacts (repeatable); artifact must already exist in `artifacts`
 - `--missable-tasks, -M <pattern>`: task names or glob patterns (e.g. `prefill_*`) that may be absent when composing multiple files. Missing missable tasks are removed from `depends_on` and probes with a warning. Only valid with multiple input files. Repeatable.
-- `--extra-args, -e <arg>`: extra args passed to the Slurm backend; values are merged with backend config `extra_args` and deduplicated
+- `--extra-args, -e <arg>`: generic, backend-agnostic extra args. They are forwarded to whichever backend the recipe uses — merged into each **Slurm** backend's `salloc`, each **docker** backend's `docker run`, and every **kubectl** call's global flags. Deduplicated by option (CLI wins over the recipe; a more specific `--extra-salloc-args` / `--extra-docker-args` / `--extra-kubectl-args` wins over `--extra-args` on a conflicting option). Repeatable
+- `--extra-salloc-args <arg>`: like `--extra-args` but **Slurm only** — merged into each Slurm backend's `salloc` (e.g. `--gpus-per-node=4`). In a multi-backend recipe it applies to every Slurm backend's `salloc`
+- `--extra-docker-args <arg>`: like `--extra-args` but **docker only** — merged into each docker backend's `docker run` (e.g. `--shm-size=16g`)
 - `--bulk-input, -b <csv>`: resolve workflow files and overrides from one CSV row
 - `--row <selector>`: required with `--bulk-input`; `sflow run` accepts exactly one row selector
 - `--workspace-dir <dir>`: workspace root directory (default: current directory)
 - `--output-dir <dir>`: output root directory (default: `<workspace-dir>/sflow_output`)
+- `--kubeconfig <path>`: kubeconfig file for kubernetes backends (also exported as `KUBECONFIG`; default: `$KUBECONFIG` or `~/.kube/config`)
+- `--kube-context <name>`: kubeconfig context for kubernetes backends (default: current-context)
+- `--kube-namespace <name>`: override the namespace for all kubernetes backends
+- `--extra-kubectl-args <flag>`: extra global kubectl flag applied to every kubectl call (e.g. `--extra-kubectl-args=--insecure-skip-tls-verify`); repeatable
+- `--tui-refresh <fps>`: TUI refresh rate in frames per second (default: `2`, minimum: `1`)
 - `--log-level <level>`: `debug|info|warning|error|critical` (default: `info`)
+- `--verbose, -v`: enable verbose output
 
 Notes:
 
 - `--tui` is ignored in `--dry-run` mode.
 - In `--tui` mode, logs are captured and rendered in the right pane (to avoid interleaving console logs with the live UI).
+- Each run logs the same executable/runtime details shown by `sflow --version`, which helps identify whether a local editable checkout, branch build, or release package is running.
 - CSV paths in `sflow_config_file` are resolved relative to the CSV file. CLI `-f` files are prepended to the row's files and deduplicated by resolved path.
 - `--row=-1` selects the last CSV row, `--row=-2` the second-to-last, etc. Use the `--row=N` form for negative rows so Typer does not treat the value as a flag.
 
 Output structure (non dry-run):
 
 - `<output-dir>/<run_id>/sflow.log`: global log
+- `<output-dir>/<run_id>/sflow_summary.log`: live execution summary, updated during the run and finalized on completion or failure
+- `<output-dir>/<run_id>/*_cmds.log`: command-only launch logs, grouped by command family when commands are executed
 - `<output-dir>/<run_id>/<task>/<task>.log`: per-task log
 
 ## sflow visualize
@@ -146,13 +162,15 @@ Common options:
 - `--account, -A <name>`: Slurm account (auto-detected if not specified)
 - `--time <limit>`: time limit (e.g., `02:00:00`)
 - `--nodes, -N <count>`: number of nodes. If omitted, single-job and bulk-submit modes derive it from the config's Slurm backend `nodes` field. Bulk-input mode requires either this flag or a CSV node-count column (`SLURM_NODES`, `NUM_SLURM_NODES`, or `NUM_NODES`).
-- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation, not as a sbatch directive. Use `-e '--gpus-per-node=N'` if your cluster requires the sbatch directive.
+- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation and planning only, not as a Slurm directive. Use `-e '--gpus-per-node=N'` for `sflow batch`, or backend `extra_args` for `sflow run`, if your cluster requires the Slurm allocation flag.
 - `--job-name, -J <name>`: Slurm job name (default: `sflow`)
 - `--set, -s KEY=VALUE`: override variables (repeatable)
 - `--artifact, -a NAME=URI`: override artifacts (repeatable)
 - `--missable-tasks, -M <pattern>`: task names or glob patterns that may be absent when composing modular configs (repeatable). Missing references are removed with a warning. Only valid with multiple input files or `--bulk-input`/`--bulk-submit`.
-- `--sflow-venv-path <path>`: path to existing Python venv for compute nodes
-- `--sflow-version <ref>`: Git branch, tag, or ref to install in generated batch scripts. If omitted, scripts try to reuse the currently installed sflow git ref/version before falling back to `main`.
+- `--sflow-venv-path <path>`: parent directory under which **each Slurm job creates its own fresh, disposable per-job venv** (`.sflow_venv-<job id>/`) and installs sflow into it, then removes it when the job exits. This is the venv *parent* dir, not an existing venv to reuse. The venv is built on the compute node with a resolved system `python3`, so it always matches the node architecture (x86/arm). Defaults to compute-node-local scratch resolved at run time (`${TMPDIR:-/tmp}/sflow_compute_node_venv`); pass a shared-filesystem path to override. The per-job dirs are auto-removed on normal exit and on Slurm cancel/timeout, but a hard `SIGKILL`/node crash can leave `.sflow_venv-<job id>`/`.sflow_src-<job id>` behind under a shared path (node-local scratch is reclaimed by the cluster).
+- `--sflow-version <ref>`: Git branch, tag, or ref to install in generated batch scripts. If omitted, scripts try to reuse the currently installed sflow git ref/version before falling back to `main`. Mutually exclusive with `--sflow-source-path`. When `--sflow-index-url` is set, this is instead interpreted as a **PyPI version specifier** (see below).
+- `--sflow-index-url <url>`: install sflow from a **private PyPI index** (e.g. an Artifactory registry such as `https://<host>/artifactory/api/pypi/<repo>/simple`) instead of from git. When set, `--sflow-version` becomes a PyPI version specifier: a bare version is pinned (`0.2.1` → `sflow==0.2.1`), an operator spec is passed through (`>=0.2,<0.3`), and omitting it installs the latest available. The index is added with uv's `--extra-index-url`, so sflow's dependencies still resolve from the default index. Credentials must be available on the compute node via `~/.netrc` or a credential helper; URLs containing embedded credentials are rejected. Mutually exclusive with `--sflow-source-path`.
+- `--sflow-source-path <path>`: local sflow source checkout to install **editable** (`uv pip install -e ".[dev]"`) into each job's per-job venv instead of from a git ref. Each job first copies the checkout into its own per-job source dir (via `rsync`, or `tar` when `rsync` is absent) so concurrent editable builds never race on setuptools-scm build artifacts. The path must be readable from the compute node. Mutually exclusive with `--sflow-version`.
 - `--sbatch-extra-args, -e <arg>`: additional `#SBATCH` directives (repeatable). Supports `${{ variables.X }}` and shorthand `${{ X }}` expressions resolved from config defaults, `--set`, and CSV row values.
 - `--sbatch-output, -O <pattern>`: Slurm stdout pattern (default: `sflow_output/%j-sflow-submit.out`)
 - `--sbatch-error, -E <pattern>`: Slurm stderr pattern (default: `sflow_output/%j-sflow-submit.err`)
@@ -178,7 +196,7 @@ Common options:
 
 ### Notes
 
-- A dry-run validation is performed before generating each sbatch script. CLI `--nodes` and `--gpus-per-node` are applied directly to the slurm backend during validation.
+- A dry-run validation is performed before generating each sbatch script. CLI `--nodes` and `--gpus-per-node` are applied directly to the slurm backend during validation; `--gpus-per-node` still only describes topology unless also passed as an explicit sbatch extra arg.
 - Sbatch stdout/stderr logs are automatically copied into the sflow workflow output directory at the end of each generated script.
 - Without `--submit`, a hint is shown to remind you to add `--submit` for actual submission.
 
@@ -229,3 +247,27 @@ Common options:
 - `--output, -o <path>`: output path (default: `./<sample_name>`)
 - `--force, -f`: overwrite existing file/folder if it exists
 - `--list, -l`: list all available samples
+
+## sflow skill
+
+Copy bundled AI-agent skills into a project. These skills help coding agents write sflow YAML and diagnose workflow errors.
+
+```bash
+# List available skills
+sflow skill --list
+
+# Copy skills to ./skills
+sflow skill
+
+# Copy to a custom skills directory
+sflow skill --output .cursor/skills
+
+# Overwrite existing bundled skill files
+sflow skill --force
+```
+
+Common options:
+
+- `--output, -o <dir>`: output directory (default: `./skills`)
+- `--force, -f`: overwrite existing files when merging into an existing directory
+- `--list, -l`: list available bundled skills
