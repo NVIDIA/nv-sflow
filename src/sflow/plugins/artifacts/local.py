@@ -64,14 +64,27 @@ class _FileArtifactResolver:
             if not Path(raw).is_absolute():
                 path = output_dir / raw
 
-            _logger.info(
-                f"Artifact '{name}' (file://) with inline content will be written to: {path}"
-            )
-            if materialize:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
+            if remote_filesystem:
+                # The backend executes off the controller host (e.g. Kubernetes), so a
+                # controller-written file is invisible to the remote pods/nodes. Don't
+                # write it here; the off-host operator injects the content natively
+                # (e.g. a ConfigMap mounted at this path) from Artifact.content below.
+                _logger.info(
+                    f"Artifact '{name}' (file://) inline content will be injected "
+                    "natively by the off-host backend (not written to the controller); "
+                    f"in-task path: {path}"
+                )
+            else:
+                _logger.info(
+                    f"Artifact '{name}' (file://) with inline content will be written to: {path}"
+                )
+                if materialize:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
 
-        return Artifact(name=name, uri=uri, description=description, path=path)
+        return Artifact(
+            name=name, uri=uri, description=description, path=path, content=content
+        )
 
 
 # Register file-like resolvers.

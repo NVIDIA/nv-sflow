@@ -143,6 +143,39 @@ def test_resolve_artifacts_inline_file_content_materializes_only_when_enabled(
     assert p2.read_text() == "different"
 
 
+def test_resolve_artifacts_inline_file_content_remote_filesystem_not_written(
+    tmp_path: Path,
+):
+    # Off-host backends (e.g. Kubernetes) can't see a controller-written file, so
+    # inline file:// content must NOT be materialized on the controller; the content
+    # is carried on the Artifact for the operator to inject natively (ConfigMap).
+    state = _empty_state()
+    cfg = SflowConfig(
+        version="0.1",
+        artifacts=[{"name": "INLINE", "uri": "file://inline.txt", "content": "hello"}],
+        workflow=WorkflowConfig(
+            name="wf", tasks=[TaskConfig(name="t1", script=["echo hi"])]
+        ),
+    )
+
+    out_dir = tmp_path / "output"
+    state = resolve_artifacts(
+        cfg,
+        state,
+        workspace_dir=tmp_path,
+        output_dir=out_dir,
+        materialize=True,
+        remote_filesystem=True,
+    )
+    art = state.artifacts["INLINE"]
+    # Path is still resolved (scripts reference it; the pod mounts the file there),
+    # but nothing is written to the controller's filesystem.
+    assert art.path == out_dir / "inline.txt"
+    assert not (out_dir / "inline.txt").exists()
+    # Inline content is carried for K8s-native injection.
+    assert art.content == "hello"
+
+
 def test_resolve_artifacts_http_downloads_into_workspace_cache(
     tmp_path: Path, monkeypatch
 ):

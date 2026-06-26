@@ -165,9 +165,16 @@ artifacts:
   # On Kubernetes, artifacts are injected into the task pods the native way (not via
   # the controller's filesystem), accessible as `${{ artifacts.NAME.path }}`:
   #   * file:// + inline `content` -> mounted into the pod from a ConfigMap.
-  #   * fs:// -> hostPath-mounted at the same path, so it must be a NODE-accessible
-  #     location (e.g. an NFS / shared filesystem mounted on every node).
+  #   * fs:// -> made visible inside the pod, two ways:
+  #       1. PVC-backed (recommended for models/large data): declare a PVC under the
+  #          backend's `volumes:` and point the fs:// path at a location under its
+  #          `mount_path` (see the commented `volumes:` on the k8s_cluster backend).
+  #       2. hostPath: if no PVC covers the path, fs:// is hostPath-mounted at the
+  #          same path, so it must be NODE-accessible (e.g. an NFS/shared filesystem
+  #          mounted on every node). A missing node path fails the pod loudly.
   - name: LOCAL_MODEL_PATH
+    # PVC example: with the `model-store` volume mounted at /models, point this at
+    # the model dir inside that PVC, e.g. fs:///models/Qwen3-0.6B-FP8
     uri: fs:///path/to/your/model
   - name: PREFILL_CONFIG
     uri: file://prefill_config.yaml
@@ -229,6 +236,18 @@ backends:
     # Request GPUs via the legacy nvidia.com/gpu device plugin; use 'dra' for
     # DRA (nvidia-dra-driver-gpu, DeviceClass gpu.nvidia.com).
     scheduling: device_plugin
+    # Pre-existing PersistentVolumeClaims to mount into task pods. Use this to make
+    # cluster-resident data (e.g. a model staged on shared storage) available to
+    # pods without a node-local hostPath. The PVC + its data must already exist in
+    # the namespace; sflow only references it. A PVC is mounted into a task's pod(s)
+    # only when the task references a path under its mount_path (so e.g. the model
+    # is not mounted into the etcd/nats pods). Use read_only + an ROX/RWX PVC to
+    # share one model across prefill/decode pods on multiple nodes.
+    # volumes:
+    #   - name: model-store
+    #     claim: qwen-model-pvc        # an existing PVC holding the model
+    #     mount_path: /models
+    #     read_only: true
     reservation:
       timeout: 1200
 

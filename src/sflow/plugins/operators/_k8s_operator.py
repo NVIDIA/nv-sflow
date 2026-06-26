@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import ConfigDict, field_validator
 
@@ -33,6 +35,7 @@ from sflow.plugins.operators._k8s_render import (
 )
 from sflow.plugins.operators._k8s_shell import (
     build_k8s_task_command,
+    configmap_data_key,
     namespace_segment,
     sanitize_name,
 )
@@ -132,6 +135,13 @@ class K8sContainerOperator(Operator):
         # Backend allocation id, stamped onto every task object as the allocation
         # label so the backend's label-selector sweep can delete them all.
         self._allocation_id: str | None = None
+        # Resolved workflow artifacts (injected via apply_backend_context). Used to
+        # mount file:// inline content (ConfigMap) and fs:// paths (hostPath) into
+        # each task's pod(s) the K8s-native way.
+        self._artifacts: list[Any] = []
+        # Pre-existing PVC mounts declared on the backend (shared storage that fs://
+        # artifacts can live on); injected via apply_backend_context.
+        self._pvc_volumes: list[dict[str, Any]] = []
 
     def apply_backend_context(
         self,
@@ -145,6 +155,8 @@ class K8sContainerOperator(Operator):
         self._namespace = getattr(backend, "namespace", None)
         self._node_count = max(len(assigned_nodes), 1)
         self._assigned_node_names = list(assigned_nodes or [])
+        self._artifacts = list(artifacts or [])
+        self._pvc_volumes = list(getattr(backend, "volumes", None) or [])
         self._scheduling = str(getattr(backend, "scheduling", "dra"))
         self._gpu_device_class = self.config.device_class or str(
             getattr(backend, "gpu_device_class", "gpu.nvidia.com")
@@ -235,6 +247,100 @@ class K8sContainerOperator(Operator):
             return self._assigned_node_names[index]
         return None
 
+    def _covering_pvc(self, path_str: str) -> dict[str, Any] | None:
+        """The configured PVC whose mount_path is ``path_str`` or a parent of it."""
+        p = Path(path_str)
+        for vol in self._pvc_volumes:
+            mount_path = vol.get("mount_path")
+            if not mount_path:
+                continue
+            mp = Path(str(mount_path))
+            if p == mp or mp in p.parents:
+                return vol
+        return None
+
+    @staticmethod
+    def _host_path_type(path_str: str) -> str:
+        """Best-effort hostPath ``type`` for an fs:// path, via a controller stat.
+
+        If the controller can see the path (typical when it lives on a shared
+        filesystem mounted on both controller and nodes), pin the type so the
+        kubelet rejects the pod with a clear error when a node lacks it -- instead
+        of silently creating an empty dir. When the controller can't see it (a
+        node-only path, or an output dir created at runtime), return "" so the
+        kubelet stays lenient.
+        """
+        try:
+            p = Path(path_str)
+            if p.is_dir():
+                return "Directory"
+            if p.is_file():
+                return "File"
+        except OSError:
+            pass
+        return ""
+
+    def _artifact_injection(
+        self, script: Sequence[str]
+    ) -> tuple[
+        dict[str, str],
+        list[tuple[str, str]],
+        list[tuple[str, str]],
+        list[dict[str, Any]],
+    ]:
+        """K8s-native artifact wiring for a task's pod(s), from resolved artifacts.
+
+        Returns ``(configmap_data, file_mounts, host_path_mounts, pvc_mounts)``:
+
+        * ``configmap_data`` -- ``{key: inline_content}`` for ``file://`` artifacts
+          declared with inline content; these become one ConfigMap mounted into the
+          pod (so the content lives in the cluster, not on the controller's disk).
+        * ``file_mounts`` -- ``[(in_pod_path, key)]`` subPath mounts for the above,
+          placing each file at its resolved ``${{ artifacts.NAME.path }}`` location.
+        * ``host_path_mounts`` -- ``[(node_path, hostpath_type)]`` for ``fs://``
+          (and non-inline ``file://``) artifacts NOT served by a PVC, hostPath-
+          mounted at the same path so a shared / node-local location is visible.
+        * ``pvc_mounts`` -- pre-existing PVC volumes (deduped) to mount because a
+          referenced ``fs://`` artifact path lives under their ``mount_path``.
+
+        Only artifacts the task's (already-resolved) script references are injected,
+        so e.g. the model ``fs://`` path is not mounted into CPU-only infra pods.
+        """
+        joined = "\n".join(script)
+        cm_data: dict[str, str] = {}
+        file_mounts: list[tuple[str, str]] = []
+        host_path_mounts: list[tuple[str, str]] = []
+        pvc_by_name: dict[str, dict[str, Any]] = {}
+        seen_paths: set[str] = set()
+        for art in self._artifacts:
+            uri = str(getattr(art, "uri", "") or "")
+            scheme = urlparse(uri).scheme.lower()
+            if scheme not in ("file", "fs"):
+                continue
+            path = getattr(art, "path", None)
+            if path is None:
+                continue
+            path_str = str(path)
+            name = str(getattr(art, "name", "") or "")
+            # Inject only what the task uses: its resolved path or ${NAME} env ref.
+            if path_str not in joined and not (name and name in joined):
+                continue
+            content = getattr(art, "content", None)
+            if scheme == "file" and content is not None:
+                key = configmap_data_key(name)
+                cm_data[key] = content
+                file_mounts.append((path_str, key))
+                continue
+            # A path served by a declared PVC: mount the PVC (once), not a hostPath.
+            pvc = self._covering_pvc(path_str)
+            if pvc is not None:
+                vol_name = sanitize_name(str(pvc["name"]))
+                pvc_by_name.setdefault(vol_name, {**pvc, "name": vol_name})
+            elif path_str not in seen_paths:
+                seen_paths.add(path_str)
+                host_path_mounts.append((path_str, self._host_path_type(path_str)))
+        return cm_data, file_mounts, host_path_mounts, list(pvc_by_name.values())
+
     def build_command(
         self,
         *,
@@ -261,6 +367,12 @@ class K8sContainerOperator(Operator):
         )
         tolerations = self._effective_tolerations()
 
+        # K8s-native artifact injection (file:// -> ConfigMap, fs:// -> PVC/hostPath).
+        cm_data, file_mounts, host_path_mounts, pvc_mounts = self._artifact_injection(
+            script
+        )
+        artifacts_cm_name = sanitize_name(f"{base}-artifacts") if cm_data else None
+
         items: list[dict[str, Any]] = [
             render_configmap(
                 name=configmap_name,
@@ -270,6 +382,16 @@ class K8sContainerOperator(Operator):
                 allocation_id=self._allocation_id,
             )
         ]
+        if artifacts_cm_name is not None:
+            items.append(
+                render_configmap(
+                    name=artifacts_cm_name,
+                    namespace=self._namespace,
+                    data=cm_data,
+                    task_label=base,
+                    allocation_id=self._allocation_id,
+                )
+            )
         if rct_name is not None:
             items.append(
                 render_resource_claim_template(
@@ -308,6 +430,10 @@ class K8sContainerOperator(Operator):
                     compute_domain_channel=self._compute_domain_channel,
                     task_label=base,
                     allocation_id=self._allocation_id,
+                    artifacts_configmap_name=artifacts_cm_name,
+                    file_artifact_mounts=file_mounts,
+                    host_path_mounts=host_path_mounts,
+                    pvc_mounts=pvc_mounts,
                 )
             )
 
@@ -324,4 +450,5 @@ class K8sContainerOperator(Operator):
             parallel_logs=n > 1,
             kubectl_global_args=self._kubectl_global_args,
             allocation_id=self._allocation_id,
+            artifacts_configmap_name=artifacts_cm_name,
         )

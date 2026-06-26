@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from sflow.config.schema import BackendConfig, Resolvable
 from sflow.core.backend import (
@@ -61,6 +61,40 @@ class KubernetesDraConfig(BaseModel):
     compute_domain: bool = False
 
 
+class KubernetesVolumeConfig(BaseModel):
+    """A pre-existing PersistentVolumeClaim (PVC) to mount into task pods.
+
+    This is how cluster-resident data (e.g. a model staged on shared storage)
+    reaches pods without a node-local hostPath: declare the PVC + where it mounts,
+    then point an ``fs://`` artifact at a path under ``mount_path``. The operator
+    mounts the PVC into the pod(s) of any task whose script references a path under
+    ``mount_path`` (and skips the hostPath fallback for those paths).
+
+    The PVC itself (and its data) must already exist in the backend namespace --
+    sflow does not create or populate it.
+    """
+
+    # Pod volume name (DNS-1123); also the key linking volume <-> volumeMount.
+    name: str
+    # Name of the existing PersistentVolumeClaim (spec.volumes[].pvc.claimName).
+    claim: Resolvable[str]
+    # Absolute path the PVC is mounted at inside each task pod.
+    mount_path: Resolvable[str]
+    # Optional path within the PVC to mount (volumeMount.subPath).
+    sub_path: Resolvable[str] | None = None
+    # Mount read-only (default: True -- model/data PVCs are typically read-only and
+    # this is required to share a single PVC across pods on multiple nodes).
+    read_only: bool = True
+
+    @field_validator("mount_path")
+    @classmethod
+    def _mount_path_absolute(cls, v: Resolvable[str]) -> Resolvable[str]:
+        # Skip template expressions; they are validated after resolution.
+        if isinstance(v, str) and "${{" not in v and not v.startswith("/"):
+            raise ValueError(f"volume mount_path must be absolute, got: {v!r}")
+        return v
+
+
 class KubernetesReservationConfig(BaseModel):
     """Tuning for the Kubernetes backend's node reservation."""
 
@@ -89,6 +123,9 @@ class KubernetesBackendConfig(BackendConfig):
     # Pod tolerations applied to placeholder + task pods. None -> tolerate
     # nvidia.com/gpu so pods can land on gpu-operator-tainted GPU nodes.
     tolerations: list[dict[str, Any]] | None = None
+    # Pre-existing PersistentVolumeClaims to mount into task pods (e.g. shared model
+    # storage that fs:// artifacts point into). See KubernetesVolumeConfig.
+    volumes: list[KubernetesVolumeConfig] | None = None
     # Optional tuning for the (always-on) reserve+discover+pin behavior.
     reservation: KubernetesReservationConfig | None = None
 
@@ -153,6 +190,7 @@ class KubernetesBackend(Backend):
         )
         self._compute_domain: bool = bool(dra.compute_domain) if dra is not None else False
         self._tolerations: list[dict[str, Any]] | None = config.tolerations
+        self._volumes = list(config.volumes or [])
         # CLI-level kube access (set via apply_kubectl_config from `sflow run`
         # flags); prefixed onto every kubectl call sflow makes for this backend.
         self._kubeconfig: str | None = None
@@ -219,6 +257,22 @@ class KubernetesBackend(Backend):
         if self._tolerations is not None:
             return [dict(t) for t in self._tolerations]
         return [dict(DEFAULT_GPU_TOLERATION)]
+
+    @property
+    def volumes(self) -> list[dict[str, Any]]:
+        """PVC mounts (resolved) injected into task pods by the operator."""
+        out: list[dict[str, Any]] = []
+        for v in self._volumes:
+            out.append(
+                {
+                    "name": str(v.name),
+                    "claim": str(v.claim),
+                    "mount_path": str(v.mount_path),
+                    "sub_path": str(v.sub_path) if v.sub_path is not None else None,
+                    "read_only": bool(v.read_only),
+                }
+            )
+        return out
 
     @property
     def compute_domain_channel(self) -> str | None:

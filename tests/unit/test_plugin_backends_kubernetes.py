@@ -40,6 +40,34 @@ def test_placeholder_allocation_returns_synthetic_nodes():
 
 
 # ---------------------------------------------------------------------------
+# PVC volume config
+# ---------------------------------------------------------------------------
+
+
+def test_volumes_property_normalizes_pvc_config():
+    backend = KubernetesBackend(_cfg(volumes=[
+        {"name": "model-store", "claim": "model-pvc", "mount_path": "/models"},
+        {"name": "scratch", "claim": "scratch-pvc", "mount_path": "/scratch",
+         "sub_path": "out", "read_only": False},
+    ]))
+    vols = backend.volumes
+    assert vols[0] == {"name": "model-store", "claim": "model-pvc",
+                       "mount_path": "/models", "sub_path": None, "read_only": True}
+    assert vols[1]["sub_path"] == "out" and vols[1]["read_only"] is False
+
+
+def test_volumes_property_empty_when_unset():
+    assert KubernetesBackend(_cfg()).volumes == []
+
+
+def test_volume_mount_path_must_be_absolute():
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(volumes=[{"name": "v", "claim": "c", "mount_path": "relative/path"}])
+
+
+# ---------------------------------------------------------------------------
 # capabilities
 # ---------------------------------------------------------------------------
 

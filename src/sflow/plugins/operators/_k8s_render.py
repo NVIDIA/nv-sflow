@@ -29,6 +29,14 @@ SFLOW_ALLOC_LABEL = "sflow.ai/allocation"
 # ResourceClaimTemplate) so the operator can clean them up as a group.
 SFLOW_TASK_LABEL = "sflow.ai/task"
 
+# Label distinguishing reservation/placeholder pods from real task pods. The
+# placeholder anti-affinity targets this label (not the broad allocation label)
+# so reservations still spread one-per-node WITHOUT repelling the task pods,
+# which share the allocation label and must be free to co-locate (e.g. CPU-only
+# etcd/nats/frontend overlapping on the head node alongside its placeholder).
+SFLOW_ROLE_LABEL = "sflow.ai/role"
+RESERVATION_ROLE = "reservation"
+
 # Standard node label carrying the node's hostname; the placement primitive for
 # pinning pods onto reserved nodes (nodeSelector / nodeAffinity / anti-affinity).
 HOSTNAME_LABEL = "kubernetes.io/hostname"
@@ -56,6 +64,10 @@ SFLOW_SCRIPT_DIR = "/sflow"
 SFLOW_ENTRYPOINT_FILE = "entrypoint.sh"
 SFLOW_ENTRYPOINT_PATH = f"{SFLOW_SCRIPT_DIR}/{SFLOW_ENTRYPOINT_FILE}"
 _SCRIPT_VOLUME_NAME = "sflow-scripts"
+# Volume name for inline file:// artifacts injected as a ConfigMap. Each artifact
+# is mounted (read-only, via subPath) at its resolved in-task path so task scripts
+# referencing ``${{ artifacts.NAME.path }}`` find the file inside the pod.
+_ARTIFACT_VOLUME_NAME = "sflow-artifacts"
 
 # gpu-operator typically taints GPU nodes; tolerate it by default so both the
 # GPU workloads and the CPU-only infra pods (etcd/nats/frontend) can land there.
@@ -263,12 +275,19 @@ def render_reservation_pod_manifest(
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": _RESERVATION_TERMINATION_GRACE_SECONDS,
         "containers": [container],
+        # Spread one reservation pod per node. Match only OTHER reservation pods
+        # (role label) -- matching the broad allocation label would also repel the
+        # allocation's task pods (anti-affinity is symmetric), permanently blocking
+        # CPU-only tasks pinned to a still-reserved node.
         "affinity": {
             "podAntiAffinity": {
                 "requiredDuringSchedulingIgnoredDuringExecution": [
                     {
                         "labelSelector": {
-                            "matchLabels": {SFLOW_ALLOC_LABEL: allocation_id}
+                            "matchLabels": {
+                                SFLOW_ALLOC_LABEL: allocation_id,
+                                SFLOW_ROLE_LABEL: RESERVATION_ROLE,
+                            }
                         },
                         "topologyKey": HOSTNAME_LABEL,
                     }
@@ -288,7 +307,7 @@ def render_reservation_pod_manifest(
     metadata = _manifest_metadata(
         pod_name,
         namespace,
-        labels={SFLOW_ALLOC_LABEL: allocation_id, "sflow.ai/role": "reservation"},
+        labels={SFLOW_ALLOC_LABEL: allocation_id, SFLOW_ROLE_LABEL: RESERVATION_ROLE},
     )
     return {"apiVersion": "v1", "kind": "Pod", "metadata": metadata, "spec": pod_spec}
 
@@ -313,6 +332,10 @@ def render_task_pod(
     compute_domain_channel: str | None = None,
     task_label: str | None = None,
     allocation_id: str | None = None,
+    artifacts_configmap_name: str | None = None,
+    file_artifact_mounts: Sequence[tuple[str, str]] = (),
+    host_path_mounts: Sequence[tuple[str, str]] = (),
+    pvc_mounts: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Render one task Pod manifest (dict) for ``kubectl apply``.
 
@@ -321,14 +344,82 @@ def render_task_pod(
     limit (see ``scheduling``). ``assigned_node`` pins the pod via a
     ``kubernetes.io/hostname`` nodeSelector; ``extra_env`` carries per-pod literals
     (e.g. ``SFLOW_TASK_NODE_INDEX`` / ``SFLOW_LEADER_ADDRESS`` for multi-node).
+
+    Artifacts are injected K8s-natively so remote pods can see them:
+    ``file_artifact_mounts`` is ``[(in_pod_path, configmap_key)]`` for inline
+    ``file://`` artifacts (mounted read-only via subPath from
+    ``artifacts_configmap_name``); ``host_path_mounts`` is ``[(node_path, type)]``
+    for ``fs://`` artifacts (hostPath-mounted at the same path). A non-empty
+    ``type`` (e.g. ``Directory``/``File``) makes the kubelet fail the pod loudly
+    when the node lacks the path, instead of silently mounting an empty dir.
+    ``pvc_mounts`` are pre-existing PersistentVolumeClaims to mount (each a mapping
+    with ``name``/``claim``/``mount_path``/``sub_path``/``read_only``), e.g. shared
+    model storage that ``fs://`` artifacts point into.
     """
+    volume_mounts: list[dict[str, Any]] = [
+        {"name": _SCRIPT_VOLUME_NAME, "mountPath": SFLOW_SCRIPT_DIR}
+    ]
+    volumes: list[dict[str, Any]] = [
+        {"name": _SCRIPT_VOLUME_NAME, "configMap": {"name": configmap_name}}
+    ]
+    # Inline file:// artifacts: one ConfigMap volume, each entry mounted read-only
+    # at its resolved path via subPath (key == ConfigMap data key).
+    if file_artifact_mounts and artifacts_configmap_name:
+        volumes.append(
+            {
+                "name": _ARTIFACT_VOLUME_NAME,
+                "configMap": {"name": artifacts_configmap_name},
+            }
+        )
+        for mount_path, key in file_artifact_mounts:
+            volume_mounts.append(
+                {
+                    "name": _ARTIFACT_VOLUME_NAME,
+                    "mountPath": mount_path,
+                    "subPath": key,
+                    "readOnly": True,
+                }
+            )
+    # fs:// artifacts: hostPath-mount each node-accessible path at the same path so
+    # scripts referencing the resolved path find it unchanged inside the pod. A
+    # known ``type`` (Directory/File) is set so the kubelet rejects the pod with a
+    # clear error when the node is missing the path, rather than auto-creating an
+    # empty dir that yields a confusing downstream failure.
+    for idx, (host_path, host_type) in enumerate(host_path_mounts):
+        vol_name = f"sflow-fs-{idx}"
+        host_path_spec: dict[str, str] = {"path": host_path}
+        if host_type:
+            host_path_spec["type"] = host_type
+        volumes.append({"name": vol_name, "hostPath": host_path_spec})
+        volume_mounts.append({"name": vol_name, "mountPath": host_path})
+    # Pre-existing PVCs (e.g. shared model storage). The claim + data must already
+    # exist in the namespace; sflow only references it.
+    for pvc in pvc_mounts:
+        vol_name = str(pvc["name"])
+        read_only = bool(pvc.get("read_only", True))
+        volumes.append(
+            {
+                "name": vol_name,
+                "persistentVolumeClaim": {
+                    "claimName": str(pvc["claim"]),
+                    "readOnly": read_only,
+                },
+            }
+        )
+        mount: dict[str, Any] = {
+            "name": vol_name,
+            "mountPath": str(pvc["mount_path"]),
+            "readOnly": read_only,
+        }
+        if pvc.get("sub_path"):
+            mount["subPath"] = str(pvc["sub_path"])
+        volume_mounts.append(mount)
+
     container: dict[str, Any] = {
         "name": pod_name,
         "image": image,
         "command": ["bash", "-l", SFLOW_ENTRYPOINT_PATH],
-        "volumeMounts": [
-            {"name": _SCRIPT_VOLUME_NAME, "mountPath": SFLOW_SCRIPT_DIR}
-        ],
+        "volumeMounts": volume_mounts,
     }
     if image_pull_policy:
         container["imagePullPolicy"] = image_pull_policy
@@ -358,9 +449,7 @@ def render_task_pod(
     pod_spec: dict[str, Any] = {
         "restartPolicy": restart_policy,
         "containers": [container],
-        "volumes": [
-            {"name": _SCRIPT_VOLUME_NAME, "configMap": {"name": configmap_name}}
-        ],
+        "volumes": volumes,
     }
     if pod_claims:
         pod_spec["resourceClaims"] = pod_claims

@@ -7,9 +7,11 @@ the create-before-destroy handoff gating (GPU tasks only)."""
 
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
+from sflow.core.artifact import Artifact
 from sflow.core.backend import Allocation
 from sflow.core.compute_node import ComputeNode
 from sflow.plugins.backends.kubernetes import KubernetesBackend, KubernetesBackendConfig
@@ -18,7 +20,8 @@ from sflow.plugins.operators.k8s import K8sOperator, K8sOperatorConfig
 _MARK = "SFLOW_K8S_MANIFEST"
 
 
-def _backend(scheduling="dra", gpus_per_node=8, nodes=2, namespace="default"):
+def _backend(scheduling="dra", gpus_per_node=8, nodes=2, namespace="default",
+             volumes=None):
     backend = KubernetesBackend(
         KubernetesBackendConfig(
             name="k8s",
@@ -27,6 +30,7 @@ def _backend(scheduling="dra", gpus_per_node=8, nodes=2, namespace="default"):
             nodes=nodes,
             gpus_per_node=gpus_per_node,
             scheduling=scheduling,
+            volumes=volumes,
         )
     )
     backend.allocation = Allocation(
@@ -42,11 +46,14 @@ def _backend(scheduling="dra", gpus_per_node=8, nodes=2, namespace="default"):
     return backend
 
 
-def _build(backend, assigned_nodes, *, gpu_count, task="t", script=("run",), envs=None):
+def _build(
+    backend, assigned_nodes, *, gpu_count, task="t", script=("run",), envs=None,
+    artifacts=(),
+):
     op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
     op.apply_backend_context(
-        backend=backend, assigned_nodes=list(assigned_nodes), artifacts=[],
-        gpu_count=gpu_count,
+        backend=backend, assigned_nodes=list(assigned_nodes),
+        artifacts=list(artifacts), gpu_count=gpu_count,
     )
     cmd = op.build_command(task_name=task, script=list(script), envs=dict(envs or {}))
     shell = cmd.as_list()[-1]
@@ -354,3 +361,168 @@ def test_wrapper_traps_int_term_exit():
     assert "trap cleanup INT TERM EXIT" in shell
     # cleanup disarms itself to avoid re-entry when it exits.
     assert "trap - INT TERM EXIT" in shell
+
+
+# ---------------------------------------------------------------------------
+# K8s-native artifact injection (file:// -> ConfigMap, fs:// -> hostPath)
+# ---------------------------------------------------------------------------
+
+
+def test_inline_file_artifact_injected_as_configmap_and_mounted():
+    # file:// + inline content -> a ConfigMap carries the content (in-cluster, not on
+    # the controller disk) and is mounted at the resolved path inside the pod.
+    art = Artifact(
+        name="PREFILL_CONFIG",
+        uri="file://prefill_config.yaml",
+        path=Path("/out/run/prefill_config.yaml"),
+        content="max_batch_size: 128\n",
+    )
+    manifest, shell = _build(
+        _backend("device_plugin", 8), ["node-0"], gpu_count=0,
+        script=["run --cfg /out/run/prefill_config.yaml"],
+        artifacts=[art],
+    )
+    art_cms = [
+        i for i in manifest["items"]
+        if i["kind"] == "ConfigMap" and i["metadata"]["name"].endswith("-artifacts")
+    ]
+    assert len(art_cms) == 1
+    assert art_cms[0]["data"] == {"PREFILL_CONFIG": "max_batch_size: 128\n"}
+    assert art_cms[0]["metadata"]["labels"]["sflow.ai/allocation"] == "abc"
+
+    mounts = _pods(manifest)[0]["spec"]["containers"][0]["volumeMounts"]
+    assert any(
+        m.get("subPath") == "PREFILL_CONFIG"
+        and m["mountPath"] == "/out/run/prefill_config.yaml"
+        and m.get("readOnly")
+        for m in mounts
+    )
+    # The artifacts ConfigMap is torn down with the rest of the task objects.
+    assert "-artifacts" in shell
+
+
+def test_fs_artifact_injected_as_hostpath_when_referenced():
+    art = Artifact(
+        name="MODEL", uri="fs:///shared/models/qwen", path=Path("/shared/models/qwen")
+    )
+    manifest, _ = _build(
+        _backend("device_plugin", 8), ["node-0"], gpu_count=0,
+        script=["run --model /shared/models/qwen"],
+        artifacts=[art],
+    )
+    vols = _pods(manifest)[0]["spec"]["volumes"]
+    assert any(v.get("hostPath", {}).get("path") == "/shared/models/qwen" for v in vols)
+
+
+def test_artifact_not_mounted_when_not_referenced_by_script():
+    # CPU-only infra pods (e.g. etcd) shouldn't get the model hostPath mounted.
+    art = Artifact(
+        name="MODEL", uri="fs:///shared/models/qwen", path=Path("/shared/models/qwen")
+    )
+    manifest, _ = _build(
+        _backend("device_plugin", 8), ["node-0"], gpu_count=0,
+        script=["etcd --data-dir /tmp/etcd"],
+        artifacts=[art],
+    )
+    vols = _pods(manifest)[0]["spec"]["volumes"]
+    assert all("hostPath" not in v for v in vols)
+    assert not [
+        i for i in manifest["items"]
+        if i["kind"] == "ConfigMap" and i["metadata"]["name"].endswith("-artifacts")
+    ]
+
+
+def test_artifact_referenced_by_env_name_is_injected():
+    # Scripts may use the ${NAME} env convenience instead of the resolved path.
+    art = Artifact(
+        name="MODEL", uri="fs:///shared/models/qwen", path=Path("/shared/models/qwen")
+    )
+    manifest, _ = _build(
+        _backend("device_plugin", 8), ["node-0"], gpu_count=0,
+        script=["run --model ${MODEL}"],
+        artifacts=[art],
+    )
+    vols = _pods(manifest)[0]["spec"]["volumes"]
+    assert any(v.get("hostPath", {}).get("path") == "/shared/models/qwen" for v in vols)
+
+
+def test_fs_artifact_hostpath_type_pins_directory_when_path_exists(tmp_path):
+    # When the controller can see the fs:// path (e.g. a shared filesystem mounted
+    # on both controller and nodes), pin hostPath type=Directory so the kubelet
+    # fails loudly on nodes that lack it instead of mounting an empty dir.
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    art = Artifact(name="MODEL", uri=f"fs://{model_dir}", path=model_dir)
+    manifest, _ = _build(
+        _backend("device_plugin", 8), ["node-0"], gpu_count=0,
+        script=[f"run --model {model_dir}"],
+        artifacts=[art],
+    )
+    hp = [v for v in _pods(manifest)[0]["spec"]["volumes"] if v.get("hostPath")][0]
+    assert hp["hostPath"] == {"path": str(model_dir), "type": "Directory"}
+
+
+# ---------------------------------------------------------------------------
+# PVC mounts (pre-existing PersistentVolumeClaims backing fs:// paths)
+# ---------------------------------------------------------------------------
+
+
+def test_fs_artifact_under_pvc_mounts_pvc_not_hostpath():
+    # fs:// path living under a declared PVC mount -> mount the PVC, skip hostPath.
+    be = _backend(
+        "device_plugin", 8,
+        volumes=[{"name": "model-store", "claim": "model-pvc", "mount_path": "/models"}],
+    )
+    art = Artifact(
+        name="MODEL", uri="fs:///models/Qwen3-8B-NVFP4",
+        path=Path("/models/Qwen3-8B-NVFP4"),
+    )
+    manifest, _ = _build(
+        be, ["node-0"], gpu_count=0,
+        script=["run --model /models/Qwen3-8B-NVFP4"], artifacts=[art],
+    )
+    pod = _pods(manifest)[0]
+    vols = pod["spec"]["volumes"]
+    pvc = [v for v in vols if v.get("persistentVolumeClaim")]
+    assert len(pvc) == 1
+    assert pvc[0]["persistentVolumeClaim"] == {"claimName": "model-pvc", "readOnly": True}
+    # The covered fs:// path is served by the PVC, not a hostPath.
+    assert all("hostPath" not in v for v in vols)
+    mt = [
+        x for x in pod["spec"]["containers"][0]["volumeMounts"]
+        if x["name"] == pvc[0]["name"]
+    ][0]
+    assert mt == {"name": pvc[0]["name"], "mountPath": "/models", "readOnly": True}
+
+
+def test_pvc_not_mounted_when_task_does_not_reference_it():
+    # Infra pods (etcd) that don't reference a path under the PVC don't get it.
+    be = _backend(
+        "device_plugin", 8,
+        volumes=[{"name": "model-store", "claim": "model-pvc", "mount_path": "/models"}],
+    )
+    art = Artifact(
+        name="MODEL", uri="fs:///models/Qwen3-8B-NVFP4",
+        path=Path("/models/Qwen3-8B-NVFP4"),
+    )
+    manifest, _ = _build(
+        be, ["node-0"], gpu_count=0, script=["etcd --data-dir /tmp/etcd"],
+        artifacts=[art],
+    )
+    vols = _pods(manifest)[0]["spec"]["volumes"]
+    assert all("persistentVolumeClaim" not in v for v in vols)
+
+
+def test_multiple_fs_artifacts_under_same_pvc_dedup_to_one_volume():
+    be = _backend(
+        "device_plugin", 8,
+        volumes=[{"name": "store", "claim": "pvc", "mount_path": "/data"}],
+    )
+    a1 = Artifact(name="A", uri="fs:///data/a", path=Path("/data/a"))
+    a2 = Artifact(name="B", uri="fs:///data/b", path=Path("/data/b"))
+    manifest, _ = _build(
+        be, ["node-0"], gpu_count=0, script=["run /data/a /data/b"],
+        artifacts=[a1, a2],
+    )
+    pvc = [v for v in _pods(manifest)[0]["spec"]["volumes"] if v.get("persistentVolumeClaim")]
+    assert len(pvc) == 1

@@ -233,6 +233,11 @@ def test_format_runtime_info_omits_parent_repo_git_for_regular_install(
         "_git_info_for_repo",
         lambda repo: "(main abc123, dirty)" if repo is not None else "",
     )
+    # Pin the version so the source label is deterministic regardless of how the
+    # test environment's sflow is versioned (a `.dev` build -> "remote pypi
+    # package"; a clean release -> "remote pypi release"). The label is incidental
+    # here -- this test targets the parent-repo git omission below.
+    monkeypatch.setattr(runtime_info, "__version__", "0.2.3.dev1")
 
     info = runtime_info.format_runtime_info()
 

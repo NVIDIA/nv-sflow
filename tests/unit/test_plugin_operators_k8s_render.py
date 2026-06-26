@@ -134,14 +134,21 @@ def test_reservation_pod_host_network_and_node_selector_and_tolerations():
     assert spec["tolerations"] == [{"key": "nvidia.com/gpu", "operator": "Exists"}]
 
 
-def test_reservation_pod_labels_and_anti_affinity_scoped_to_allocation():
+def test_reservation_pod_labels_and_anti_affinity_scoped_to_reservations():
     m = render_reservation_pod_manifest(pod_name="pod-0", allocation_id="abc")
     assert m["metadata"]["labels"][SFLOW_ALLOC_LABEL] == "abc"
     assert m["metadata"]["labels"]["sflow.ai/role"] == "reservation"
     anti = m["spec"]["affinity"]["podAntiAffinity"][
         "requiredDuringSchedulingIgnoredDuringExecution"
     ][0]
-    assert anti["labelSelector"]["matchLabels"] == {SFLOW_ALLOC_LABEL: "abc"}
+    # Anti-affinity targets only other reservation pods (role label), not the
+    # broad allocation label -- otherwise it would also repel the allocation's
+    # task pods (anti-affinity is symmetric) and block CPU-only tasks pinned to a
+    # still-reserved node.
+    assert anti["labelSelector"]["matchLabels"] == {
+        SFLOW_ALLOC_LABEL: "abc",
+        "sflow.ai/role": "reservation",
+    }
     assert anti["topologyKey"] == "kubernetes.io/hostname"
 
 
@@ -172,3 +179,87 @@ def test_task_pod_device_plugin_limit():
     )
     assert m["spec"]["containers"][0]["resources"]["limits"] == {"nvidia.com/gpu": "4"}
     assert "resourceClaims" not in m["spec"]
+
+
+def test_task_pod_inline_file_artifact_mounted_from_configmap():
+    # file:// inline artifacts: one ConfigMap volume, each mounted read-only at its
+    # resolved in-pod path via subPath (so remote pods see the content).
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        artifacts_configmap_name="t-artifacts",
+        file_artifact_mounts=[("/out/run/prefill_config.yaml", "PREFILL_CONFIG")],
+    )
+    spec = m["spec"]
+    art_vol = [v for v in spec["volumes"] if v["name"] == "sflow-artifacts"]
+    assert art_vol and art_vol[0]["configMap"]["name"] == "t-artifacts"
+    mounts = spec["containers"][0]["volumeMounts"]
+    art_mount = [m for m in mounts if m["name"] == "sflow-artifacts"][0]
+    assert art_mount == {
+        "name": "sflow-artifacts",
+        "mountPath": "/out/run/prefill_config.yaml",
+        "subPath": "PREFILL_CONFIG",
+        "readOnly": True,
+    }
+    # Script ConfigMap mount is preserved.
+    assert any(mt["mountPath"] == "/sflow" for mt in mounts)
+
+
+def test_task_pod_fs_artifact_mounted_as_hostpath():
+    # fs:// artifacts: hostPath-mounted at the same node path so the pod sees it.
+    # A known type makes the kubelet reject a missing node path loudly.
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        host_path_mounts=[("/shared/models/qwen", "Directory")],
+    )
+    spec = m["spec"]
+    hp = [v for v in spec["volumes"] if v.get("hostPath")]
+    assert hp and hp[0]["hostPath"] == {"path": "/shared/models/qwen", "type": "Directory"}
+    mount = [
+        mt for mt in spec["containers"][0]["volumeMounts"]
+        if mt["mountPath"] == "/shared/models/qwen"
+    ][0]
+    assert mount["name"] == hp[0]["name"]
+
+
+def test_task_pod_fs_artifact_hostpath_omits_type_when_unknown():
+    # When the type is unknown (controller can't stat it), no type is set so the
+    # kubelet stays lenient (e.g. node-only paths / runtime-created output dirs).
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        host_path_mounts=[("/mnt/out", "")],
+    )
+    hp = [v for v in m["spec"]["volumes"] if v.get("hostPath")][0]
+    assert hp["hostPath"] == {"path": "/mnt/out"}
+
+
+def test_task_pod_without_artifacts_has_only_script_volume():
+    m = render_task_pod(pod_name="t", image="img:1", configmap_name="t-cfg")
+    spec = m["spec"]
+    assert [v["name"] for v in spec["volumes"]] == ["sflow-scripts"]
+    assert [mt["mountPath"] for mt in spec["containers"][0]["volumeMounts"]] == ["/sflow"]
+
+
+def test_task_pod_pvc_mounted():
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        pvc_mounts=[{"name": "model-store", "claim": "model-pvc",
+                     "mount_path": "/models", "sub_path": None, "read_only": True}],
+    )
+    spec = m["spec"]
+    pv = [v for v in spec["volumes"] if v.get("persistentVolumeClaim")][0]
+    assert pv["name"] == "model-store"
+    assert pv["persistentVolumeClaim"] == {"claimName": "model-pvc", "readOnly": True}
+    mt = [x for x in spec["containers"][0]["volumeMounts"] if x["name"] == "model-store"][0]
+    assert mt == {"name": "model-store", "mountPath": "/models", "readOnly": True}
+
+
+def test_task_pod_pvc_subpath_and_read_write():
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        pvc_mounts=[{"name": "v", "claim": "c", "mount_path": "/data",
+                     "sub_path": "models", "read_only": False}],
+    )
+    pv = [v for v in m["spec"]["volumes"] if v["name"] == "v"][0]
+    assert pv["persistentVolumeClaim"] == {"claimName": "c", "readOnly": False}
+    mt = [x for x in m["spec"]["containers"][0]["volumeMounts"] if x["name"] == "v"][0]
+    assert mt == {"name": "v", "mountPath": "/data", "readOnly": False, "subPath": "models"}
