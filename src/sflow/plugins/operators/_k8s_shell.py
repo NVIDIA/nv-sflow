@@ -24,6 +24,10 @@ from sflow.plugins.operators._k8s_render import SFLOW_ALLOC_LABEL
 # poll that too. 300 * 2s readiness budget, 30 * 1s exit-code budget.
 READY_RETRIES = 300
 EXIT_CODE_RETRIES = 30
+# Seconds between pod-phase polls while the live log stream is following. The
+# moment the pod is terminal we stop draining the (possibly minutes-behind) log
+# backlog, so this bounds how long after pod exit the wrapper keeps waiting.
+PHASE_POLL_INTERVAL = 2
 
 _MANIFEST_HEREDOC = "SFLOW_K8S_MANIFEST"
 
@@ -140,10 +144,77 @@ def wait_for_pod_ready_lines(pod_ref: str, ns_seg: str, *, label: str) -> list[s
     ]
 
 
-def stream_logs_line(pod_ref: str, ns_seg: str, *, background: bool) -> str:
-    """A ``kubectl logs -f`` line; backgrounded (``&``) for parallel multi-pod streaming."""
-    suffix = "&" if background else "|| true"
-    return f"kubectl logs -f {pod_ref}{ns_seg} --all-containers --prefix {suffix}"
+def stream_pod_logs_lines(
+    pod_ref: str,
+    ns_seg: str,
+    *,
+    label: str,
+    complete_log_path: str | None,
+    background: bool,
+) -> list[str]:
+    """Follow ``pod_ref``'s logs live, but stop the moment the pod is terminal.
+
+    Kubernetes prioritizes pod execution over log delivery, so ``kubectl logs -f``
+    can lag minutes behind a finished pod while it drains a backlog. Blocking on
+    that backlog delays the wrapper's exit -- and therefore the sflow driver's
+    view of the task's status, which is derived from the wrapper exit code -- by
+    the whole drain time. So follow the logs in the *background* (the live stream
+    still reaches the console + ``<task>.log`` through the driver) and poll the
+    pod phase; as soon as it is terminal (``Succeeded``/``Failed``) write the
+    COMPLETE container log straight to ``complete_log_path`` (a temp file written
+    by a direct ``kubectl logs`` that bypasses the slow per-line driver pipeline,
+    so nothing is lost), stop the live stream, and emit a hint. Once the task is
+    done the driver swaps that temp file in as the final ``<task>.log`` and
+    deletes it (see ``K8sContainerOperator.finalize_task_log``), so there is a
+    single complete log and no duplicate. When the live stream instead ends on
+    its own (small/quiet pod) the loop just falls through -- no kill, no temp
+    file -- preserving the prior fast path.
+
+    Returns the shell lines. For multi-pod tasks (``background``) the whole block
+    is wrapped in a backgrounded subshell so per-pod streams run concurrently
+    (the caller ``wait``s afterwards); each subshell owns its own ``$!``/``$dest``.
+    """
+    follow = f"kubectl logs -f {pod_ref}{ns_seg} --all-containers --prefix"
+    phase = (
+        f"kubectl get {pod_ref}{ns_seg} -o jsonpath='{{.status.phase}}' "
+        "2>/dev/null || true"
+    )
+    hint_prefix = (
+        f"[sflow] {label}: pod finished (phase=$ph); stopped live log stream "
+        "early (K8s log flush lags pod exit)"
+    )
+    terminal: list[str] = []
+    if complete_log_path is not None:
+        terminal.append(f"      __sflow_dest={shlex.quote(complete_log_path)};")
+        terminal.append(
+            f"      kubectl logs {pod_ref}{ns_seg} --all-containers --prefix "
+            '> "$__sflow_dest" 2>/dev/null || true;'
+        )
+        terminal.append('      kill "$__sflow_log_pid" 2>/dev/null || true;')
+        terminal.append(
+            f'      echo "{hint_prefix} -- complete container log captured '
+            'for the per-task log";'
+        )
+    else:
+        terminal.append('      kill "$__sflow_log_pid" 2>/dev/null || true;')
+        terminal.append(f'      echo "{hint_prefix}";')
+    body = [
+        f"{follow} &",
+        "__sflow_log_pid=$!",
+        'while kill -0 "$__sflow_log_pid" 2>/dev/null; do',
+        f"  ph=$({phase});",
+        '  case "${ph:-}" in',
+        "    Succeeded|Failed)",
+        *terminal,
+        "      break;;",
+        "  esac;",
+        f"  sleep {PHASE_POLL_INTERVAL};",
+        "done",
+        'wait "$__sflow_log_pid" 2>/dev/null || true',
+    ]
+    if background:
+        return ["(", *[f"  {line}" for line in body], ") &"]
+    return body
 
 
 def exit_code_poll_lines(pod_ref: str, ns_seg: str) -> list[str]:
@@ -213,6 +284,7 @@ def build_k8s_task_command(
     kubectl_global_args: Sequence[str] = (),
     allocation_id: str | None = None,
     artifacts_configmap_name: str | None = None,
+    complete_log_paths: Sequence[str | None] = (),
 ) -> Command:
     """Build the ``kubectl`` wrapper for a (possibly multi-pod) task.
 
@@ -223,6 +295,11 @@ def build_k8s_task_command(
     task pod(s) bind), waits for each pod to start before streaming its logs (in
     parallel when ``parallel_logs``), then propagates the exit code from the
     leader pod (``pod_names[0]``).
+
+    Log streaming stops as soon as a pod is terminal rather than blocking on the
+    log backlog (see ``stream_pod_logs_lines``); ``complete_log_paths`` gives the
+    per-pod file (aligned with ``pod_names``) the complete container log is dumped
+    to in that case (``None`` -> no dump, e.g. when the task output dir is unknown).
     """
     use_secret = secret_name is not None
     pod_refs = [f"pod/{shlex.quote(p)}" for p in pod_names]
@@ -275,12 +352,25 @@ def build_k8s_task_command(
     lines.extend(handoff_delete_lines(handoff_delete_pods, ns_seg))
 
     # Wait for each pod to leave Pending/ContainerCreating before streaming it,
-    # echoing phase/reason while it starts up.
-    for pod_ref, pod_name in zip(pod_refs, pod_names, strict=True):
+    # echoing phase/reason while it starts up. Then follow its logs but stop the
+    # moment the pod is terminal (so the wrapper -- and the sflow driver's task
+    # status -- isn't held back by the K8s log-delivery backlog).
+    for idx, (pod_ref, pod_name) in enumerate(zip(pod_refs, pod_names, strict=True)):
         lines.extend(wait_for_pod_ready_lines(pod_ref, ns_seg, label=pod_name))
-        lines.append(stream_logs_line(pod_ref, ns_seg, background=parallel_logs))
+        complete_log_path = (
+            complete_log_paths[idx] if idx < len(complete_log_paths) else None
+        )
+        lines.extend(
+            stream_pod_logs_lines(
+                pod_ref,
+                ns_seg,
+                label=pod_name,
+                complete_log_path=complete_log_path,
+                background=parallel_logs,
+            )
+        )
     if parallel_logs:
-        # `wait` blocks until all backgrounded log streams close.
+        # `wait` blocks until all backgrounded per-pod stream watchers close.
         lines.append("wait")
 
     lines.extend(exit_code_poll_lines(pod_refs[0], ns_seg))

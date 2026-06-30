@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import BaseModel
 
@@ -102,3 +102,27 @@ class Operator(ABC):
         task's process ends (and before a relaunch) so nothing outlives the run.
         """
         return []
+
+    def finalize_task_log(
+        self,
+        *,
+        task_name: str,
+        task_output_dir: str | None,
+        release_handler: Callable[[], None],
+    ) -> None:
+        """Optionally rewrite ``<task>.log`` in place once a task is terminal.
+
+        Called by the orchestrator when a task reaches a terminal state (never on
+        a pending retry). Default: no-op. Operators that captured a more complete
+        copy of the log out-of-band override this to swap that copy into
+        ``<task>.log`` so it is the single, complete source of truth -- e.g. the
+        kubernetes operator dumps each pod's full container log to a temp
+        ``<pod>.pod.log`` when it stops the live stream early (the K8s log backlog
+        lags pod exit), then swaps it in here.
+
+        ``release_handler`` makes the driver flush + close its ``<task>.log`` file
+        handler so there is a single writer; it MUST be called before writing the
+        file, and only when actually rewriting it (so unaffected tasks keep their
+        handler untouched).
+        """
+        return None

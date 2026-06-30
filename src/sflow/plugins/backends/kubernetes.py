@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -38,6 +39,17 @@ from sflow.plugins.operators._k8s_render import (
 from sflow.plugins.operators._k8s_shell import sanitize_name
 
 _RESERVE_POLL_INTERVAL = 2
+
+# GKE GPUDirect-RDMA (gIB) layout installed by the nccl-rdma-installer DaemonSet:
+# the NVIDIA driver libs + NCCL gIB plugin live on the node and are hostPath-mounted
+# into task pods so multi-node NCCL collectives run over RoCE. Sourcing
+# set_nccl_env.sh applies GKE's NCCL tuning. Used only for multi-node GPU pods
+# (single-node TP stays on NVLink and needs neither).
+_GKE_RDMA_LIB_MOUNTS: tuple[tuple[str, str], ...] = (
+    ("/home/kubernetes/bin/nvidia", "/usr/local/nvidia"),
+    ("/home/kubernetes/bin/gib", "/usr/local/gib"),
+)
+_GKE_NCCL_ENV_SCRIPT = "/usr/local/gib/scripts/set_nccl_env.sh"
 # How often (seconds) to emit a "still waiting" heartbeat while a reservation pod
 # is unscheduled, in addition to logging immediately whenever the phase changes.
 # Overridable at runtime via $SFLOW_K8S_WAIT_HEARTBEAT_SECS.
@@ -126,8 +138,36 @@ class KubernetesBackendConfig(BackendConfig):
     # Pre-existing PersistentVolumeClaims to mount into task pods (e.g. shared model
     # storage that fs:// artifacts point into). See KubernetesVolumeConfig.
     volumes: list[KubernetesVolumeConfig] | None = None
+    # Network device tuning for IB/NCCL/UCX/NIXL/gloo (disaggregated KV transfer):
+    #   "auto" (default) -> at reservation, detect RDMA. On GKE multi-NIC RDMA
+    #                       nodes (networking.gke.io.networks/rdma-N resources +
+    #                       HCAs), grant task GPU pods SCOPED RDMA device access:
+    #                       each pod requests a per-pod slice of the node's RDMA
+    #                       NICs (sized to its GPU count) plus CAP_IPC_LOCK, and
+    #                       gets a matching UCX_NET_DEVICES + NCCL_IB_HCA, so
+    #                       NIXL/UCX (and NCCL) run over RDMA -- no privileged. When
+    #                       no RDMA is present, falls back to pinning the routable
+    #                       TCP NIC (UCX_NET_DEVICES + NCCL/GLOO_SOCKET_IFNAME).
+    #   "off"            -> inject nothing (recipe/cluster handles it).
+    #   [list]           -> force these as UCX_NET_DEVICES + NCCL_IB_HCA for every
+    #                       pod (env only; assumes the pods already have RDMA access).
+    # Detection is best-effort: if nothing is found, nothing is injected.
+    rdma: str | list[str] = "auto"
     # Optional tuning for the (always-on) reserve+discover+pin behavior.
     reservation: KubernetesReservationConfig | None = None
+
+    @field_validator("rdma")
+    @classmethod
+    def _validate_rdma(cls, v: str | list[str]) -> str | list[str]:
+        if (
+            isinstance(v, str)
+            and "${{" not in v
+            and v.lower() not in ("auto", "off")
+        ):
+            raise ValueError(
+                f"rdma must be 'auto', 'off', or a list of UCX device specs, got: {v!r}"
+            )
+        return v
 
     def planning_node_count(self) -> Resolvable[int] | None:
         return self.nodes
@@ -191,11 +231,38 @@ class KubernetesBackend(Backend):
         self._compute_domain: bool = bool(dra.compute_domain) if dra is not None else False
         self._tolerations: list[dict[str, Any]] | None = config.tolerations
         self._volumes = list(config.volumes or [])
+        # RDMA network tuning (see `rdma` config). _rdma_mode is auto|off|explicit;
+        # _rdma_env is the env dict (UCX/NCCL/gloo device+interface vars) injected
+        # into task pods -- set from an explicit list now, or by detection in
+        # allocate() ("auto").
+        rdma_conf = config.rdma
+        self._rdma_env: dict[str, str] = {}
+        # RDMA fast-path state (populated by auto-detection in allocate()):
+        # whether task GPU pods should get scoped RDMA device access, and the
+        # per-node (rdma_resource_name, hca_name) NIC specs the operator assigns
+        # a per-pod slice from.
+        self._rdma_enabled: bool = False
+        self._rdma_nic_specs: list[tuple[str, str]] = []
+        if isinstance(rdma_conf, list):
+            self._rdma_mode = "explicit"
+            ucx_devices = [str(d) for d in rdma_conf]
+            self._rdma_env = self._build_network_env(
+                ucx_net_devices=",".join(ucx_devices),
+                nccl_ib_hca=",".join(d.split(":", 1)[0] for d in ucx_devices),
+                rdma_hcas=",".join(d.split(":", 1)[0] for d in ucx_devices),
+            )
+        elif str(rdma_conf).lower() == "off":
+            self._rdma_mode = "off"
+        else:
+            self._rdma_mode = "auto"
         # CLI-level kube access (set via apply_kubectl_config from `sflow run`
         # flags); prefixed onto every kubectl call sflow makes for this backend.
         self._kubeconfig: str | None = None
         self._kube_context: str | None = None
         self._kubectl_extra_args: list[str] = []
+        # Node hostnames to steer all pods away from (from `--kube-exclude-node`); applied
+        # as a hostname NotIn nodeAffinity on the reservation pods.
+        self._exclude_nodes: list[str] = []
         self._pending_alloc_id: str | None = None
 
     def apply_kubectl_config(self, cfg: Any) -> None:
@@ -208,6 +275,9 @@ class KubernetesBackend(Backend):
         self._kubeconfig = cfg.kubeconfig or None
         self._kube_context = cfg.context or None
         self._kubectl_extra_args = [str(a) for a in (cfg.extra_args or [])]
+        self._exclude_nodes = [
+            str(n) for n in (getattr(cfg, "exclude_nodes", None) or [])
+        ]
         if cfg.namespace:
             self._namespace = str(cfg.namespace)
 
@@ -238,6 +308,87 @@ class KubernetesBackend(Backend):
     @property
     def node_selector(self) -> dict[str, str] | None:
         return self._node_selector
+
+    @property
+    def exclude_nodes(self) -> list[str]:
+        """Node hostnames all pods are steered away from (from ``--kube-exclude-node``)."""
+        return list(self._exclude_nodes)
+
+    @property
+    def network_env(self) -> dict[str, str]:
+        """Network env vars (UCX/NCCL/gloo device+interface) to inject into task pods.
+
+        Empty unless RDMA was detected (auto) or an explicit device list was given.
+        """
+        return dict(self._rdma_env)
+
+    @property
+    def rdma_net_devices(self) -> str:
+        """UCX_NET_DEVICES value injected into task pods (RDMA fast path), or ""."""
+        return self._rdma_env.get("UCX_NET_DEVICES", "")
+
+    @property
+    def rdma_enabled(self) -> bool:
+        """True when task GPU pods should get scoped RDMA device access (auto mode)."""
+        return self._rdma_enabled
+
+    @property
+    def rdma_nic_specs(self) -> list[tuple[str, str]]:
+        """Per-node RDMA NICs as ``(resource_name, hca_name)``, ordered by index.
+
+        The operator requests a per-pod slice of these (sized to the pod's GPU
+        count) as scoped device resources and sets a matching
+        ``UCX_NET_DEVICES`` / ``NCCL_IB_HCA``.
+        """
+        return list(self._rdma_nic_specs)
+
+    @property
+    def rdma_lib_mounts(self) -> list[tuple[str, str]]:
+        """GKE gIB hostPath lib mounts ``(host_path, mount_path)`` for multi-node NCCL.
+
+        Empty unless the RDMA fast path is active. The operator mounts these only
+        on multi-node GPU pods (where NCCL collectives cross nodes); single-node TP
+        stays on NVLink and needs neither the libs nor the gIB plugin.
+        """
+        return list(_GKE_RDMA_LIB_MOUNTS) if self._rdma_enabled else []
+
+    @property
+    def rdma_nccl_env_script(self) -> str:
+        """Path to GKE's NCCL tuning script (sourced for multi-node pods), or ""."""
+        return _GKE_NCCL_ENV_SCRIPT if self._rdma_enabled else ""
+
+    @staticmethod
+    def _build_network_env(
+        *,
+        ucx_net_devices: str = "",
+        nccl_ib_hca: str = "",
+        socket_iface: str = "",
+        rdma_hcas: str = "",
+    ) -> dict[str, str]:
+        """Assemble device/interface env for IB/NCCL/UCX/NIXL/gloo.
+
+        * ``ucx_net_devices`` -> ``UCX_NET_DEVICES`` (UCX/NIXL): the NIC(s) UCX may
+          use -- a routable netdev like ``eth0`` (TCP) for ``auto``, or explicit RDMA
+          specs like ``mlx5_0:1`` when the pods have RDMA verbs access.
+        * ``nccl_ib_hca`` -> ``NCCL_IB_HCA`` (explicit RDMA only).
+        * ``socket_iface`` -> ``NCCL_SOCKET_IFNAME`` + ``GLOO_SOCKET_IFNAME`` (the
+          control/bootstrap NIC; pins it so the libs don't pick a link-local one).
+        * ``rdma_hcas`` -> ``SFLOW_RDMA_HCAS`` (informational: RDMA devices present on
+          the node, to help opt into RDMA via ``rdma: [...]``).
+        """
+        env: dict[str, str] = {}
+        if ucx_net_devices:
+            env["UCX_NET_DEVICES"] = ucx_net_devices
+            env["SFLOW_UCX_NET_DEVICES"] = ucx_net_devices
+        if nccl_ib_hca:
+            env["NCCL_IB_HCA"] = nccl_ib_hca
+        if socket_iface:
+            env["NCCL_SOCKET_IFNAME"] = socket_iface
+            env["GLOO_SOCKET_IFNAME"] = socket_iface
+            env["SFLOW_PRIMARY_IFACE"] = socket_iface
+        if rdma_hcas:
+            env["SFLOW_RDMA_HCAS"] = rdma_hcas
+        return env
 
     @property
     def scheduling(self) -> str:
@@ -711,6 +862,7 @@ class KubernetesBackend(Backend):
                 host_network=self._host_network,
                 node_selector=self._node_selector,
                 tolerations=self._effective_tolerations(),
+                exclude_nodes=self._exclude_nodes,
             )
             for i in range(count)
         ]
@@ -727,13 +879,145 @@ class KubernetesBackend(Backend):
                         allocation_id=alloc_id,
                     )
                 )
-            return await self._allocate_reserved(alloc_id, pod_names, manifests)
+            allocation = await self._allocate_reserved(alloc_id, pod_names, manifests)
+            if self._rdma_mode == "auto":
+                await self._detect_network_env(pod_names)
+            return allocation
         except BaseException:
             # BaseException (not just Exception) so a cancel (Ctrl+C) mid-allocation
             # still releases the reservation pods instead of leaking them.
             await self._release_alloc(alloc_id)
             self._pending_alloc_id = None
             raise
+
+    async def _detect_network_env(self, pod_names: list[str]) -> None:
+        """Best-effort: detect RDMA HCAs + control NIC, build IB/NCCL/UCX/NIXL env.
+
+        The reservation pods run with ``host_network`` (when configured), so they
+        see the host NICs. We read each RDMA netdev's InfiniBand device under
+        ``/sys/class/net/<dev>/device/infiniband`` (e.g. ``mlx5_0``) and the routable
+        control interface from the default route (``/proc/net/route``). From those we
+        build ``UCX_NET_DEVICES`` (UCX/NIXL), ``NCCL_IB_HCA`` + ``NCCL_SOCKET_IFNAME``
+        (NCCL), ``GLOO_SOCKET_IFNAME``, and ``SFLOW_*`` mirrors, and inject them into
+        task pods. Any failure (no RDMA, exec denied, pod not ready) leaves it unset
+        -- never fatal.
+        """
+        if not pod_names:
+            return
+        detect = (
+            'for d in /sys/class/net/*/device/infiniband; do '
+            'for ib in $(ls "$d" 2>/dev/null); do echo "HCA $ib"; done; done; '
+            "awk '$2==\"00000000\"{print \"IFACE \"$1; exit}' /proc/net/route 2>/dev/null"
+        )
+        out = ""
+        try:
+            # The reservation sleeper may still be ContainerCreating right after
+            # scheduling; retry a few times before giving up (best-effort).
+            for _ in range(5):
+                rc, out, _err = await self._kubectl(
+                    ["exec", pod_names[0], *self._ns_args(), "--", "sh", "-c", detect]
+                )
+                if rc == 0:
+                    break
+                await asyncio.sleep(3)
+            else:
+                _logger.info(
+                    "Kubernetes backend '%s': RDMA autodetect skipped (could not exec "
+                    "reservation pod); device/interface selection left to the libs.",
+                    self.name,
+                )
+                return
+        except Exception as e:  # never let best-effort detection break allocation
+            _logger.info(
+                "Kubernetes backend '%s': RDMA autodetect errored (%s); skipping.",
+                self.name,
+                e,
+            )
+            return
+        hcas = sorted(
+            {ln.split(None, 1)[1].strip() for ln in out.splitlines() if ln.startswith("HCA ")}
+        )
+        ifaces = [
+            ln.split(None, 1)[1].strip() for ln in out.splitlines() if ln.startswith("IFACE ")
+        ]
+        primary_iface = ifaces[0] if ifaces else ""
+
+        # RDMA fast path: when the scheduling node exposes GKE multi-NIC RDMA
+        # resources (networking.gke.io.networks/rdma-N) and we detected HCAs,
+        # enable scoped RDMA. Task GPU pods then request a per-pod slice of these
+        # NICs (the device resource + IPC_LOCK gives verbs access without
+        # privileged) and the operator sets a matching UCX_NET_DEVICES /
+        # NCCL_IB_HCA. Here we only pin the control NIC (NCCL/GLOO bootstrap);
+        # the per-pod RDMA device env is assigned by the operator.
+        nic_specs = await self._detect_rdma_nic_specs(pod_names[0]) if hcas else []
+        if nic_specs:
+            self._rdma_enabled = True
+            self._rdma_nic_specs = nic_specs
+            self._rdma_env = self._build_network_env(
+                socket_iface=primary_iface,
+                rdma_hcas=",".join(hcas),
+            )
+            _logger.info(
+                "Kubernetes backend '%s': RDMA fast path enabled "
+                "(%d NIC(s)/node: %s; control iface '%s').",
+                self.name,
+                len(nic_specs),
+                ",".join(h for _r, h in nic_specs),
+                primary_iface or "(none)",
+            )
+            return
+
+        if not primary_iface:
+            _logger.info(
+                "Kubernetes backend '%s': no routable interface detected; leaving "
+                "UCX/NCCL device selection to the libs.",
+                self.name,
+            )
+            return
+        # No RDMA device access available: pin UCX/NCCL/gloo to the routable
+        # primary NIC (TCP) so they don't pick a link-local/unreachable interface.
+        # The detected HCAs are exposed via SFLOW_RDMA_HCAS for opt-in.
+        self._rdma_env = self._build_network_env(
+            ucx_net_devices=primary_iface,
+            socket_iface=primary_iface,
+            rdma_hcas=",".join(hcas),
+        )
+        _logger.info(
+            "Kubernetes backend '%s': pinned UCX/NCCL to interface '%s'%s.",
+            self.name,
+            primary_iface,
+            f" (RDMA HCAs present: {','.join(hcas)})" if hcas else "",
+        )
+
+    async def _detect_rdma_nic_specs(self, pod_name: str) -> list[tuple[str, str]]:
+        """Discover the node's GKE RDMA NICs as ``(resource_name, hca_name)`` specs.
+
+        Reads the scheduling node's allocatable for GKE multi-NIC RDMA resources
+        (``networking.gke.io.networks/rdma-<N>``); each NIC ``N`` maps 1:1 to IB
+        device ``mlx5_<N>`` (``gpuNrdma0``). Returns ``[]`` when the node exposes
+        no such resources (non-GKE / non-RDMA cluster), so the caller falls back
+        to the TCP path. Best-effort: any failure yields ``[]``.
+        """
+        rc, node, _err = await self._kubectl(
+            ["get", "pod", pod_name, *self._ns_args(), "-o", "jsonpath={.spec.nodeName}"]
+        )
+        node = (node or "").strip()
+        if rc != 0 or not node:
+            return []
+        rc, out, _err = await self._kubectl(["get", "node", node, "-o", "json"])
+        if rc != 0 or not out:
+            return []
+        try:
+            allocatable = json.loads(out).get("status", {}).get("allocatable", {})
+        except (ValueError, AttributeError):
+            return []
+        indexed: list[tuple[int, str]] = []
+        for key in allocatable:
+            m = re.fullmatch(r"networking\.gke\.io\.networks/rdma-(\d+)", str(key))
+            if m:
+                indexed.append((int(m.group(1)), str(key)))
+        indexed.sort()
+        return [(resource, f"mlx5_{idx}") for idx, resource in indexed]
 
     async def _allocate_reserved(
         self,
@@ -854,6 +1138,12 @@ class KubernetesBackend(Backend):
             details.append(("context", self._kube_context))
         if self._kubectl_extra_args:
             details.append(("kubectl_args", str(list(self._kubectl_extra_args))))
+        if self._exclude_nodes:
+            details.append(("exclude_nodes", str(list(self._exclude_nodes))))
+        if self._rdma_env:
+            details.append(("rdma", str(dict(sorted(self._rdma_env.items())))))
+        elif self._rdma_mode == "off":
+            details.append(("rdma", "off"))
         if self._extra_args:
             details.append(("extra_args", str(list(self._extra_args))))
         return details
@@ -967,6 +1257,23 @@ class KubernetesBackend(Backend):
                 ) from e
             reservation = KubernetesReservationConfig(timeout=timeout_i)
 
+        volumes = None
+        if conf.volumes:
+            volumes = [
+                KubernetesVolumeConfig(
+                    name=v.name,
+                    claim=str(resolver.resolve(v.claim, ctx)),
+                    mount_path=str(resolver.resolve(v.mount_path, ctx)),
+                    sub_path=(
+                        str(resolver.resolve(v.sub_path, ctx))
+                        if v.sub_path is not None
+                        else None
+                    ),
+                    read_only=bool(v.read_only),
+                )
+                for v in conf.volumes
+            ]
+
         return KubernetesBackendConfig(
             name=conf.name,
             type="kubernetes",
@@ -981,5 +1288,7 @@ class KubernetesBackend(Backend):
             scheduling=conf.scheduling,
             dra=dra,
             tolerations=conf.tolerations,
+            volumes=volumes,
+            rdma=conf.rdma,
             reservation=reservation,
         )

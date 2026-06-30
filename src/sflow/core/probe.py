@@ -80,6 +80,18 @@ class Probe(ABC):
         self._success_streak = 0
         self._failure_streak = 0
 
+    @property
+    def effective_check_timeout(self) -> int:
+        """Per-attempt timeout (seconds), never exceeding the check interval.
+
+        Checks run sequentially: the next one can't start until the current one
+        returns, so letting a single attempt run longer than the interval is
+        meaningless. When an interval is set, fall back to it.
+        """
+        if self.interval > 0 and self.each_check_timeout > self.interval:
+            return self.interval
+        return self.each_check_timeout
+
     @abstractmethod
     async def check(self, task: Task) -> bool:
         """
@@ -121,7 +133,7 @@ class Probe(ABC):
 
         try:
             ok = await asyncio.wait_for(
-                self.check(task), timeout=max(self.each_check_timeout, 1)
+                self.check(task), timeout=max(self.effective_check_timeout, 1)
             )
         except asyncio.TimeoutError:
             ok = False

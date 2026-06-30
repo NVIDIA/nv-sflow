@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import os
 import subprocess
 import time
 from datetime import timedelta
@@ -245,13 +246,21 @@ class Orchestrator:
                         raise
 
                 for name in finished:
+                    ft = self.workflow.get_task(name)
+                    # Once a task is terminal (not a pending retry), let its
+                    # operator finalize <task>.log -- e.g. the k8s operator swaps
+                    # in the complete container log it captured on early stop.
+                    # Success was already finalized in _finalize_successful_task
+                    # (before result parsing), so only handle failed/cancelled here.
+                    if ft.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                        self._finalize_task_log(ft)
                     del self._subprocess_tasks[name]
                     # The task's process exited (completed/failed/retry); release
                     # its monitor. A node still referenced by the workflow monitor
                     # or another task stays up (singleton reuse). NOTE: tasks that
                     # reached READY are not in `finished` (their process is still
                     # alive), so their monitor keeps running until teardown.
-                    await self._release_task_monitor(self.workflow.get_task(name))
+                    await self._release_task_monitor(ft)
 
                 # Surface buffered per-task log lines to disk before evaluating
                 # probes. LogWatchProbe reads <task>.log from disk, but the
@@ -363,6 +372,57 @@ class Orchestrator:
                 "workflow_finished", status=summary_status, detail=summary_detail
             )
 
+    def _task_log_dir(self, t: Task) -> str | None:
+        """Directory holding the task's ``<task>.log`` (from its file handler)."""
+        logger = getattr(t, "logger", None)
+        for handler in getattr(logger, "handlers", []) or []:
+            if isinstance(handler, CoalescingFileHandler):
+                base = getattr(handler, "baseFilename", None)
+                if base:
+                    return os.path.dirname(base)
+        return None
+
+    def _release_task_log_handler(self, t: Task) -> None:
+        """Flush, close, and detach the per-task stream file handler.
+
+        Lets a single writer replace ``<task>.log`` afterwards (e.g. the k8s
+        complete-log swap). Only safe once the task is terminal (no retry), since
+        a re-submission would otherwise have no handler to write through.
+        """
+        logger = getattr(t, "logger", None)
+        if logger is None:
+            return
+        for handler in list(getattr(logger, "handlers", []) or []):
+            if isinstance(handler, CoalescingFileHandler):
+                try:
+                    handler.flush()
+                    handler.close()
+                except Exception:
+                    pass
+                logger.removeHandler(handler)
+
+    def _finalize_task_log(self, t: Task) -> None:
+        """Let a terminal task's operator rewrite ``<task>.log`` in place.
+
+        The k8s operator uses this to swap in the complete container log it
+        captured when it stopped the live stream early. Best-effort: a no-op for
+        operators that don't override the hook, and never raises. The operator
+        calls ``release_handler`` itself, but only when it actually rewrites the
+        file, so unaffected tasks keep their handler.
+        """
+        op = getattr(t, "operator", None)
+        finalize = getattr(op, "finalize_task_log", None)
+        if not callable(finalize):
+            return
+        try:
+            finalize(
+                task_name=t.name,
+                task_output_dir=self._task_log_dir(t),
+                release_handler=lambda: self._release_task_log_handler(t),
+            )
+        except Exception as exc:
+            _logger.debug(f"finalize_task_log failed for '{t.name}': {exc}")
+
     async def _finalize_successful_task(self, t: Task) -> None:
         """
         Run post-process work that must finish before DAG dependents can submit.
@@ -372,6 +432,11 @@ class Orchestrator:
         have finished.
         """
         t.status = TaskStatus.FINALIZING
+
+        # Swap the complete log into <task>.log BEFORE parsing, so result/output
+        # parsing (which reads <task>.log) sees the full log even if the live
+        # stream was stopped early (k8s). No-op for other operators / no early stop.
+        self._finalize_task_log(t)
 
         # MVP outputs parsing: parse from task log after process success.
         if getattr(t, "output_specs", None):

@@ -67,6 +67,109 @@ def test_volume_mount_path_must_be_absolute():
         _cfg(volumes=[{"name": "v", "claim": "c", "mount_path": "relative/path"}])
 
 
+def test_rdma_config_modes():
+    # auto (default): nothing injected until detection runs.
+    assert KubernetesBackend(_cfg()).network_env == {}
+    # off: never inject.
+    assert KubernetesBackend(_cfg(rdma="off")).network_env == {}
+    # explicit list: UCX + NCCL HCA env built from the given device specs.
+    be = KubernetesBackend(_cfg(rdma=["mlx5_0:1", "mlx5_1:1"]))
+    env = be.network_env
+    assert env["UCX_NET_DEVICES"] == "mlx5_0:1,mlx5_1:1"
+    assert env["NCCL_IB_HCA"] == "mlx5_0,mlx5_1"  # ports stripped for NCCL HCA names
+    assert be.rdma_net_devices == "mlx5_0:1,mlx5_1:1"  # back-compat accessor
+
+
+def test_rdma_invalid_string_rejected():
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(rdma="bogus")
+
+
+def test_detect_network_env_pins_routable_iface_not_rdma(monkeypatch):
+    # auto pins UCX/NCCL/gloo to the routable NIC (UCX can only use TCP NICs in the
+    # pod); it must NOT force the RDMA HCAs (that breaks UCX), only expose them.
+    be = KubernetesBackend(_cfg())  # auto
+
+    async def fake_kubectl(args):
+        return 0, "HCA mlx5_0\nHCA mlx5_1\nHCA mlx5_2\nIFACE eth0\n", ""
+
+    monkeypatch.setattr(be, "_kubectl", fake_kubectl)
+    asyncio.run(be._detect_network_env(["res-0"]))
+    env = be.network_env
+    assert env["UCX_NET_DEVICES"] == "eth0"  # routable NIC, not mlx5
+    assert env["NCCL_SOCKET_IFNAME"] == "eth0"
+    assert env["GLOO_SOCKET_IFNAME"] == "eth0"
+    assert env["SFLOW_PRIMARY_IFACE"] == "eth0"
+    assert env["SFLOW_RDMA_HCAS"] == "mlx5_0,mlx5_1,mlx5_2"  # informational only
+    assert "NCCL_IB_HCA" not in env  # not forced (pods lack RDMA verbs access)
+    assert "mlx5" not in env["UCX_NET_DEVICES"]
+
+
+def test_detect_network_env_pins_iface_even_without_rdma(monkeypatch):
+    be = KubernetesBackend(_cfg())
+
+    async def fake_kubectl(args):
+        return 0, "IFACE eth0\n", ""  # routable NIC, no RDMA HCAs
+
+    monkeypatch.setattr(be, "_kubectl", fake_kubectl)
+    asyncio.run(be._detect_network_env(["res-0"]))
+    env = be.network_env
+    assert env["UCX_NET_DEVICES"] == "eth0"
+    assert env["NCCL_SOCKET_IFNAME"] == "eth0"
+    assert "SFLOW_RDMA_HCAS" not in env
+
+
+def test_detect_network_env_nothing_when_no_iface(monkeypatch):
+    be = KubernetesBackend(_cfg())
+
+    async def fake_kubectl(args):
+        return 0, "", ""  # no default route, no HCAs
+
+    monkeypatch.setattr(be, "_kubectl", fake_kubectl)
+    asyncio.run(be._detect_network_env(["res-0"]))
+    assert be.network_env == {}
+
+
+def test_resolve_config_preserves_rdma():
+    class _Id:
+        def resolve(self, v, ctx):
+            return v
+
+    conf = _cfg(rdma=["mlx5_0:1"])
+    resolved = KubernetesBackend.resolve_config(
+        conf, resolver=_Id(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.rdma == ["mlx5_0:1"]
+    assert KubernetesBackend(resolved).rdma_net_devices == "mlx5_0:1"
+
+
+def test_resolve_config_preserves_and_resolves_pvc_volumes():
+    # Regression: resolve_config() rebuilds the backend config field-by-field, so it
+    # must carry `volumes` through (and resolve each entry's Resolvable fields),
+    # otherwise the PVC is silently dropped and fs:// falls back to a hostPath.
+    class _Resolver:
+        def resolve(self, value, ctx):
+            if isinstance(value, str):
+                return value.replace("PVCNAME", "real-pvc")
+            return value
+
+    conf = _cfg(volumes=[
+        {"name": "model-store", "claim": "PVCNAME", "mount_path": "/models",
+         "read_only": True},
+    ])
+    resolved = KubernetesBackend.resolve_config(
+        conf, resolver=_Resolver(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.volumes is not None and len(resolved.volumes) == 1
+    v = resolved.volumes[0]
+    assert v.claim == "real-pvc"  # Resolvable field was resolved
+    assert v.mount_path == "/models" and v.read_only is True
+    # And the live backend object exposes it for the operator.
+    assert KubernetesBackend(resolved).volumes[0]["claim"] == "real-pvc"
+
+
 # ---------------------------------------------------------------------------
 # capabilities
 # ---------------------------------------------------------------------------
@@ -413,6 +516,42 @@ def test_apply_kubectl_config_global_args_and_namespace_override():
     assert details["kubectl_args"] == "['--insecure-skip-tls-verify']"
 
 
+def test_apply_kubectl_config_sets_exclude_nodes():
+    from sflow.core.kubectl_config import KubectlConfig
+
+    backend = KubernetesBackend(_cfg())
+    backend.apply_kubectl_config(KubectlConfig(exclude_nodes=["bad-1", "bad-2"]))
+    assert backend.exclude_nodes == ["bad-1", "bad-2"]
+
+
+def test_exclude_nodes_threaded_into_reservation_manifests(monkeypatch):
+    # Regression guard: --kube-exclude-node must reach the reservation pod render (the
+    # place that decides node placement), not just sit on the backend.
+    from sflow.core.kubectl_config import KubectlConfig
+
+    backend = KubernetesBackend(_cfg(nodes=1, gpus_per_node=0))
+    backend.apply_kubectl_config(KubectlConfig(exclude_nodes=["bad-1"]))
+
+    captured: dict = {}
+
+    def fake_render(**kwargs):
+        captured.update(kwargs)
+        return {"kind": "Pod", "metadata": {"name": kwargs["pod_name"]}, "spec": {}}
+
+    monkeypatch.setattr(k8s_mod, "render_reservation_pod_manifest", fake_render)
+
+    async def fake_alloc(alloc_id, pod_names, manifests):
+        return Allocation(allocation_id=alloc_id, nodes=[], owned=True)
+
+    async def fake_detect(pod_names):
+        return None
+
+    monkeypatch.setattr(backend, "_allocate_reserved", fake_alloc)
+    monkeypatch.setattr(backend, "_detect_network_env", fake_detect)
+    asyncio.run(backend.allocate())
+    assert captured.get("exclude_nodes") == ["bad-1"]
+
+
 def test_kubectl_global_args_prefixed_on_sync_kubectl_calls():
     from sflow.core.kubectl_config import KubectlConfig
 
@@ -481,10 +620,14 @@ def _reserve(backend: KubernetesBackend) -> tuple[Allocation, list[dict]]:
     async def fake_internal(node_name, *, fallback=""):
         return {"gpu-node-a": "10.1.0.1", "gpu-node-b": "10.1.0.2"}[node_name]
 
+    async def fake_detect(pod_names):
+        return None
+
     with (
         mock.patch.object(backend, "_apply_manifest", side_effect=fake_apply),
         mock.patch.object(backend, "_wait_for_pod_scheduled", side_effect=fake_wait),
         mock.patch.object(backend, "_node_internal_ip", side_effect=fake_internal),
+        mock.patch.object(backend, "_detect_network_env", side_effect=fake_detect),
     ):
         allocation = asyncio.run(backend.allocate())
     return allocation, applied

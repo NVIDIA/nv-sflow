@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 
 import pytest
+import yaml
 
 from sflow.core.artifact import Artifact
 from sflow.core.backend import Allocation
@@ -290,6 +291,134 @@ def test_wrapper_echoes_phase_and_reason_while_waiting():
     assert "kubectl describe pod" in shell
 
 
+# ---------------------------------------------------------------------------
+# log streaming: stop on pod terminal so the driver status syncs with the pod,
+# dumping the complete container log straight to a sibling file (K8s log
+# delivery lags pod exit, so blocking on the backlog would stall the wrapper).
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_stops_stream_on_terminal_phase_and_dumps_complete_log(tmp_path):
+    _, shell = _build(
+        _backend("dra", 8), ["node-0"], gpu_count=2,
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+    )
+    # The live follow is backgrounded so the driver/console keep getting output
+    # in real time while the wrapper independently watches the pod phase.
+    assert "kubectl logs -f pod/t" in shell
+    assert "--all-containers --prefix &" in shell
+    assert 'while kill -0 "$__sflow_log_pid" 2>/dev/null; do' in shell
+    assert 'case "${ph:-}" in' in shell
+    assert "Succeeded|Failed)" in shell
+    # On terminal: dump the COMPLETE container log straight to the sibling file
+    # (a no-`-f` `kubectl logs` that bypasses the slow driver pipeline), then
+    # stop the live stream, hint, and fall through to the exit-code poll.
+    assert f"{tmp_path}/t.pod.log" in shell
+    assert '--all-containers --prefix > "$__sflow_dest" 2>/dev/null || true' in shell
+    assert "stopped live log stream early" in shell
+    assert "complete container log captured for the per-task log" in shell
+    assert 'wait "$__sflow_log_pid" 2>/dev/null || true' in shell
+
+
+def test_wrapper_multinode_stops_each_stream_and_dumps_per_pod(tmp_path):
+    _, shell = _build(
+        _backend("dra", 8, nodes=2), ["node-0", "node-1"], gpu_count=16,
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+    )
+    # Each pod is followed + phase-watched in its own backgrounded subshell and
+    # gets its own complete-log sibling file; one bare `wait` joins them before
+    # the leader's exit-code poll.
+    assert shell.count("kubectl logs -f pod/t-0") == 1
+    assert shell.count("kubectl logs -f pod/t-1") == 1
+    assert f"{tmp_path}/t-0.pod.log" in shell
+    assert f"{tmp_path}/t-1.pod.log" in shell
+    assert shell.count(") &") == 2
+    assert shell.count("stopped live log stream early") == 2
+    assert "\nwait\n" in shell
+
+
+def test_wrapper_stops_stream_without_output_dir_skips_complete_dump():
+    # No SFLOW_TASK_OUTPUT_DIR (dry-run-like): still background + phase-watch +
+    # stop early, but with no known destination there is no complete-log dump.
+    _, shell = _build(_backend("dra", 8), ["node-0"], gpu_count=2)
+    assert "--all-containers --prefix &" in shell
+    assert 'while kill -0 "$__sflow_log_pid" 2>/dev/null; do' in shell
+    assert "stopped live log stream early" in shell
+    assert "__sflow_dest" not in shell
+    assert ".pod.log" not in shell
+    assert "complete container log captured" not in shell
+
+
+# ---------------------------------------------------------------------------
+# finalize_task_log: after the task is done, swap the complete <pod>.pod.log the
+# wrapper captured on early-stop into <task>.log (single complete source of
+# truth, aligned with other backends) and delete the temp; no-op otherwise.
+# ---------------------------------------------------------------------------
+
+
+def _operator():
+    return K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+
+
+def test_finalize_task_log_swaps_single_pod_log_into_task_log(tmp_path):
+    # Live stream wrote a truncated <task>.log; the wrapper captured the complete
+    # log to <pod>.pod.log. finalize swaps it in (atomic rename) and drops the temp.
+    (tmp_path / "decode_server_0.log").write_text("live-truncated\n")
+    (tmp_path / "decode-server-0.pod.log").write_text("complete-1\ncomplete-2\n")
+    released = []
+    _operator().finalize_task_log(
+        task_name="decode_server_0",
+        task_output_dir=str(tmp_path),
+        release_handler=lambda: released.append(True),
+    )
+    # The driver was asked to release <task>.log before the swap.
+    assert released == [True]
+    assert (tmp_path / "decode_server_0.log").read_text() == "complete-1\ncomplete-2\n"
+    # The temp pod log is gone -> no duplicate.
+    assert not (tmp_path / "decode-server-0.pod.log").exists()
+
+
+def test_finalize_task_log_concatenates_multi_pod_logs(tmp_path):
+    (tmp_path / "t.log").write_text("live\n")
+    (tmp_path / "t-0.pod.log").write_text("pod0-line\n")
+    (tmp_path / "t-1.pod.log").write_text("pod1-line\n")
+    released = []
+    _operator().finalize_task_log(
+        task_name="t",
+        task_output_dir=str(tmp_path),
+        release_handler=lambda: released.append(True),
+    )
+    assert released == [True]
+    assert (tmp_path / "t.log").read_text() == "pod0-line\npod1-line\n"
+    assert not (tmp_path / "t-0.pod.log").exists()
+    assert not (tmp_path / "t-1.pod.log").exists()
+
+
+def test_finalize_task_log_noop_without_pod_log_keeps_live_log(tmp_path):
+    # Stream finished on its own: no <pod>.pod.log -> <task>.log is already
+    # complete, so finalize leaves it untouched and never releases the handler.
+    (tmp_path / "t.log").write_text("live-complete\n")
+    released = []
+    _operator().finalize_task_log(
+        task_name="t",
+        task_output_dir=str(tmp_path),
+        release_handler=lambda: released.append(True),
+    )
+    assert released == []
+    assert (tmp_path / "t.log").read_text() == "live-complete\n"
+
+
+def test_finalize_task_log_noop_without_output_dir():
+    released = []
+    # No output dir (dry-run-like): nothing to do, handler left alone.
+    _operator().finalize_task_log(
+        task_name="t",
+        task_output_dir=None,
+        release_handler=lambda: released.append(True),
+    )
+    assert released == []
+
+
 def test_gpu_oversubscription_detected_at_plan_time():
     # Planning is uniform across backends: the planner reserves GPU intervals for
     # k8s too, so over-requesting GPUs on a node is caught at plan time (rather
@@ -495,8 +624,11 @@ def test_fs_artifact_under_pvc_mounts_pvc_not_hostpath():
     assert mt == {"name": pvc[0]["name"], "mountPath": "/models", "readOnly": True}
 
 
-def test_pvc_not_mounted_when_task_does_not_reference_it():
-    # Infra pods (etcd) that don't reference a path under the PVC don't get it.
+def test_declared_pvc_mounted_into_pod_even_without_script_reference():
+    # Backend volumes are workflow-wide storage: mounted into every task pod even
+    # when the script never names the path -- e.g. the dynamo frontend loads the
+    # model card via discovery, so it needs /models mounted despite its script
+    # being just `python3 -m dynamo.frontend`.
     be = _backend(
         "device_plugin", 8,
         volumes=[{"name": "model-store", "claim": "model-pvc", "mount_path": "/models"}],
@@ -506,11 +638,89 @@ def test_pvc_not_mounted_when_task_does_not_reference_it():
         path=Path("/models/Qwen3-8B-NVFP4"),
     )
     manifest, _ = _build(
-        be, ["node-0"], gpu_count=0, script=["etcd --data-dir /tmp/etcd"],
+        be, ["node-0"], gpu_count=0,
+        script=["python3 -m dynamo.frontend --http-port 8000"], artifacts=[art],
+    )
+    pod = _pods(manifest)[0]
+    pvc = [v for v in pod["spec"]["volumes"] if v.get("persistentVolumeClaim")]
+    assert len(pvc) == 1
+    assert pvc[0]["persistentVolumeClaim"]["claimName"] == "model-pvc"
+    mt = [
+        x for x in pod["spec"]["containers"][0]["volumeMounts"]
+        if x["name"] == pvc[0]["name"]
+    ][0]
+    assert mt["mountPath"] == "/models"
+
+
+def test_no_pvc_mounted_when_backend_has_no_volumes():
+    # Without declared backend volumes, an fs:// path falls back to a hostPath
+    # (no PVC), even if referenced.
+    be = _backend("device_plugin", 8)
+    art = Artifact(
+        name="MODEL", uri="fs:///models/Qwen3-8B-NVFP4",
+        path=Path("/models/Qwen3-8B-NVFP4"),
+    )
+    manifest, _ = _build(
+        be, ["node-0"], gpu_count=0, script=["run --model /models/Qwen3-8B-NVFP4"],
         artifacts=[art],
     )
     vols = _pods(manifest)[0]["spec"]["volumes"]
     assert all("persistentVolumeClaim" not in v for v in vols)
+
+
+def test_network_env_injected_into_pod_env():
+    # When the backend detected RDMA, every task pod gets the IB/NCCL/UCX/gloo env
+    # so all libs use the fast NICs + the routable control interface.
+    be = _backend("device_plugin", 8)
+    be._rdma_env = {  # simulate reservation-time detection
+        "UCX_NET_DEVICES": "mlx5_0:1,mlx5_1:1",
+        "NCCL_IB_HCA": "mlx5_0,mlx5_1",
+        "NCCL_SOCKET_IFNAME": "eth0",
+        "GLOO_SOCKET_IFNAME": "eth0",
+    }
+    manifest, _ = _build(be, ["node-0"], gpu_count=2)
+    env = {
+        e["name"]: e["value"]
+        for e in _pods(manifest)[0]["spec"]["containers"][0].get("env", [])
+    }
+    assert env.get("UCX_NET_DEVICES") == "mlx5_0:1,mlx5_1:1"
+    assert env.get("NCCL_IB_HCA") == "mlx5_0,mlx5_1"
+    assert env.get("NCCL_SOCKET_IFNAME") == "eth0"
+    assert env.get("GLOO_SOCKET_IFNAME") == "eth0"
+
+
+def test_no_network_env_when_no_rdma_detected():
+    manifest, _ = _build(_backend("device_plugin", 8), ["node-0"], gpu_count=2)
+    env = {
+        e["name"]: e["value"]
+        for e in _pods(manifest)[0]["spec"]["containers"][0].get("env", [])
+    }
+    assert "UCX_NET_DEVICES" not in env and "NCCL_IB_HCA" not in env
+
+
+def test_pods_get_ram_backed_dev_shm_by_default():
+    # K8s' 64Mi /dev/shm segfaults MPI/NCCL; task pods get a RAM-backed tmpfs.
+    manifest, _ = _build(_backend("device_plugin", 8), ["node-0"], gpu_count=2)
+    pod = _pods(manifest)[0]
+    dshm = [v for v in pod["spec"]["volumes"] if v["name"] == "dshm"][0]
+    assert dshm["emptyDir"] == {"medium": "Memory"}
+    assert any(
+        mt["mountPath"] == "/dev/shm"
+        for mt in pod["spec"]["containers"][0]["volumeMounts"]
+    )
+
+
+def test_shm_size_config_caps_dev_shm():
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1", shm_size="16Gi"))
+    op.apply_backend_context(
+        backend=_backend("device_plugin", 8), assigned_nodes=["node-0"],
+        artifacts=[], gpu_count=0,
+    )
+    shell = op.build_command(task_name="t", script=["run"], envs={}).as_list()[-1]
+    body = shell.split(_MARK, 1)[1].split("\n" + _MARK, 1)[0]
+    pod = _pods(json.loads(body.split("\n", 1)[1]))[0]
+    dshm = [v for v in pod["spec"]["volumes"] if v["name"] == "dshm"][0]
+    assert dshm["emptyDir"] == {"medium": "Memory", "sizeLimit": "16Gi"}
 
 
 def test_multiple_fs_artifacts_under_same_pvc_dedup_to_one_volume():
@@ -526,3 +736,42 @@ def test_multiple_fs_artifacts_under_same_pvc_dedup_to_one_volume():
     )
     pvc = [v for v in _pods(manifest)[0]["spec"]["volumes"] if v.get("persistentVolumeClaim")]
     assert len(pvc) == 1
+
+
+# ---------------------------------------------------------------------------
+# Manifest persistence: the rendered List manifest is saved to the task output
+# dir as readable YAML (auditability), actual-run-only and best-effort.
+# ---------------------------------------------------------------------------
+
+
+def test_build_command_persists_manifest_yaml_when_output_dir_exists(tmp_path):
+    # On an actual run SFLOW_TASK_OUTPUT_DIR exists; the rendered List manifest is
+    # also written next to <task>.log as readable YAML for auditability.
+    manifest, _ = _build(
+        _backend("dra", 8), ["node-0"], gpu_count=2,
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+    )
+    saved = tmp_path / "t.k8s.yaml"
+    assert saved.exists()
+    text = saved.read_text()
+    assert text.startswith("# Auto-generated by sflow")
+    # The file round-trips to exactly the manifest applied via `kubectl apply -f -`.
+    loaded = yaml.safe_load(text)
+    assert loaded == manifest
+    kinds = [i["kind"] for i in loaded["items"]]
+    assert "ConfigMap" in kinds and "Pod" in kinds
+
+
+def test_build_command_does_not_persist_manifest_without_output_dir(tmp_path):
+    # Dry-run-like: SFLOW_TASK_OUTPUT_DIR points at a dir that does not exist, so
+    # nothing is written (and the command is still built without error).
+    missing = tmp_path / "does-not-exist"
+    manifest, shell = _build(
+        _backend("dra", 8), ["node-0"], gpu_count=2,
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(missing)},
+    )
+    assert not missing.exists()
+    assert not (missing / "t.k8s.yaml").exists()
+    # The command was still rendered normally.
+    assert manifest["kind"] == "List"
+    assert _MARK in shell

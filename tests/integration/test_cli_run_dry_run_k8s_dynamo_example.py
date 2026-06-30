@@ -49,6 +49,7 @@ def test_k8s_dynamo_dry_run_single_node_uses_k8s_operator(tmp_path: Path):
             "GPUS_PER_NODE=4",
             "NUM_CTX_SERVERS=1",
             "CTX_TP_SIZE=2",
+            "NUM_GEN_SERVERS=1",
             "GEN_TP_SIZE=2",
         ],
     )
@@ -72,6 +73,7 @@ def test_k8s_dynamo_dry_run_multinode_worker_spans_nodes(tmp_path: Path):
         [
             "NUM_NODES=5",
             "GPUS_PER_NODE=2",
+            "NUM_CTX_SERVERS=1",  # this test exercises one worker spanning nodes
             "CTX_TP_SIZE=4",
             "GEN_TP_SIZE=2",
         ],

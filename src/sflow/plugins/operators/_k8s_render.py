@@ -68,6 +68,11 @@ _SCRIPT_VOLUME_NAME = "sflow-scripts"
 # is mounted (read-only, via subPath) at its resolved in-task path so task scripts
 # referencing ``${{ artifacts.NAME.path }}`` find the file inside the pod.
 _ARTIFACT_VOLUME_NAME = "sflow-artifacts"
+# RAM-backed /dev/shm volume. Kubernetes' default /dev/shm is only 64Mi, which is
+# far too small for MPI/NCCL/UCX shared memory (multi-GPU and multi-node), causing
+# crashes/segfaults; task pods get a sized tmpfs instead (cf. docker --shm-size).
+_DSHM_VOLUME_NAME = "dshm"
+SFLOW_SHM_DIR = "/dev/shm"
 
 # gpu-operator typically taints GPU nodes; tolerate it by default so both the
 # GPU workloads and the CPU-only infra pods (etcd/nats/frontend) can land there.
@@ -248,6 +253,7 @@ def render_reservation_pod_manifest(
     host_network: bool = False,
     node_selector: Mapping[str, str] | None = None,
     tolerations: Sequence[Mapping[str, Any]] | None = None,
+    exclude_nodes: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Render a placeholder Pod that reserves a node (one per node via anti-affinity).
 
@@ -255,6 +261,10 @@ def render_reservation_pod_manifest(
     via the same GPU path as tasks (a DRA claim or an ``nvidia.com/gpu`` limit),
     until a GPU task is pinned to the node and the operator deletes it on the
     create-before-destroy handoff (or release() tears the allocation down).
+
+    ``exclude_nodes`` adds a ``kubernetes.io/hostname NotIn`` nodeAffinity so the
+    reservation (and thus every task pinned to a reserved node) avoids those nodes
+    -- e.g. a node with a broken driver, passed via ``sflow run --kube-exclude-node``.
     """
     container: dict[str, Any] = {
         "name": "reserve",
@@ -295,6 +305,23 @@ def render_reservation_pod_manifest(
             }
         },
     }
+    # Steer the reservation (and thus the pinned tasks) away from excluded nodes.
+    if exclude_nodes:
+        pod_spec["affinity"]["nodeAffinity"] = {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            {
+                                "key": HOSTNAME_LABEL,
+                                "operator": "NotIn",
+                                "values": [str(n) for n in exclude_nodes],
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
     if pod_claims:
         pod_spec["resourceClaims"] = pod_claims
     if host_network:
@@ -336,6 +363,10 @@ def render_task_pod(
     file_artifact_mounts: Sequence[tuple[str, str]] = (),
     host_path_mounts: Sequence[tuple[str, str]] = (),
     pvc_mounts: Sequence[Mapping[str, Any]] = (),
+    shm_size: str | None = None,
+    rdma_nic_resources: Sequence[str] = (),
+    rdma_ipc_lock: bool = False,
+    rdma_lib_mounts: Sequence[tuple[str, str]] = (),
 ) -> dict[str, Any]:
     """Render one task Pod manifest (dict) for ``kubectl apply``.
 
@@ -354,7 +385,13 @@ def render_task_pod(
     when the node lacks the path, instead of silently mounting an empty dir.
     ``pvc_mounts`` are pre-existing PersistentVolumeClaims to mount (each a mapping
     with ``name``/``claim``/``mount_path``/``sub_path``/``read_only``), e.g. shared
-    model storage that ``fs://`` artifacts point into.
+    model storage that ``fs://`` artifacts point into.     ``shm_size`` optionally caps
+    the RAM-backed ``/dev/shm`` (always mounted; the K8s 64Mi default is too small
+    for MPI/NCCL). ``rdma_nic_resources`` requests scoped GKE RDMA NIC device
+    resources (e.g. ``networking.gke.io.networks/rdma-0``) as container limits;
+    paired with ``rdma_ipc_lock`` (adds ``CAP_IPC_LOCK``) this gives the pod RDMA
+    verbs access for UCX/NIXL/NCCL without running privileged. ``rdma_lib_mounts``
+    hostPath-mounts the GKE gIB libs (read-only) for multi-node NCCL.
     """
     volume_mounts: list[dict[str, Any]] = [
         {"name": _SCRIPT_VOLUME_NAME, "mountPath": SFLOW_SCRIPT_DIR}
@@ -362,6 +399,14 @@ def render_task_pod(
     volumes: list[dict[str, Any]] = [
         {"name": _SCRIPT_VOLUME_NAME, "configMap": {"name": configmap_name}}
     ]
+    # RAM-backed /dev/shm (tmpfs) so MPI/NCCL/UCX have enough shared memory; the
+    # 64Mi K8s default segfaults multi-GPU/multi-node jobs. Optional ``shm_size``
+    # caps it (else it is bounded by node memory).
+    shm_emptydir: dict[str, Any] = {"medium": "Memory"}
+    if shm_size:
+        shm_emptydir["sizeLimit"] = shm_size
+    volumes.append({"name": _DSHM_VOLUME_NAME, "emptyDir": shm_emptydir})
+    volume_mounts.append({"name": _DSHM_VOLUME_NAME, "mountPath": SFLOW_SHM_DIR})
     # Inline file:// artifacts: one ConfigMap volume, each entry mounted read-only
     # at its resolved path via subPath (key == ConfigMap data key).
     if file_artifact_mounts and artifacts_configmap_name:
@@ -392,6 +437,14 @@ def render_task_pod(
             host_path_spec["type"] = host_type
         volumes.append({"name": vol_name, "hostPath": host_path_spec})
         volume_mounts.append({"name": vol_name, "mountPath": host_path})
+    # GKE gIB libs (NVIDIA driver + NCCL plugin) for multi-node RDMA NCCL: hostPath
+    # mounts of the node-installed dirs, read-only at their canonical container paths.
+    for idx, (host_path, mount_path) in enumerate(rdma_lib_mounts):
+        vol_name = f"sflow-rdma-lib-{idx}"
+        volumes.append({"name": vol_name, "hostPath": {"path": host_path}})
+        volume_mounts.append(
+            {"name": vol_name, "mountPath": mount_path, "readOnly": True}
+        )
     # Pre-existing PVCs (e.g. shared model storage). The claim + data must already
     # exist in the namespace; sflow only references it.
     for pvc in pvc_mounts:
@@ -421,6 +474,11 @@ def render_task_pod(
         "command": ["bash", "-l", SFLOW_ENTRYPOINT_PATH],
         "volumeMounts": volume_mounts,
     }
+    # Scoped RDMA verbs access (no privileged): CAP_IPC_LOCK lets the libs pin
+    # memory for RDMA; the device nodes themselves are granted by the GKE RDMA
+    # device plugin via the rdma NIC resource requests below.
+    if rdma_ipc_lock:
+        container["securityContext"] = {"capabilities": {"add": ["IPC_LOCK"]}}
     if image_pull_policy:
         container["imagePullPolicy"] = image_pull_policy
     if env_secret_name:
@@ -443,6 +501,12 @@ def render_task_pod(
                 "resourceClaimTemplateName": compute_domain_channel,
             }
         )
+    # Scoped GKE RDMA NIC device resources (extended resources; setting limits
+    # implies an equal request). Each grants verbs access to its IB device.
+    if rdma_nic_resources:
+        limits = resources.setdefault("limits", {})
+        for res in rdma_nic_resources:
+            limits[str(res)] = "1"
     if resources:
         container["resources"] = resources
 

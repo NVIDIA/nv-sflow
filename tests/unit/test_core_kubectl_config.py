@@ -33,3 +33,12 @@ def test_namespace_excluded_from_global_args():
     cfg = KubectlConfig(namespace="team-ns")
     assert cfg.global_args() == []
     assert cfg.is_empty() is False
+
+
+def test_exclude_nodes_is_not_a_kubectl_flag_but_marks_config_non_empty():
+    # exclude_nodes is a pod scheduling constraint (nodeAffinity), not a kubectl
+    # client flag, so it stays out of global_args() but still makes the config
+    # non-empty (so it is applied to backends).
+    cfg = KubectlConfig(exclude_nodes=["node-a", "node-b"])
+    assert cfg.global_args() == []
+    assert cfg.is_empty() is False

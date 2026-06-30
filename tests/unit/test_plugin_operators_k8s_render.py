@@ -150,6 +150,24 @@ def test_reservation_pod_labels_and_anti_affinity_scoped_to_reservations():
         "sflow.ai/role": "reservation",
     }
     assert anti["topologyKey"] == "kubernetes.io/hostname"
+    # No exclude_nodes -> no nodeAffinity.
+    assert "nodeAffinity" not in m["spec"]["affinity"]
+
+
+def test_reservation_pod_exclude_nodes_adds_hostname_not_in_node_affinity():
+    m = render_reservation_pod_manifest(
+        pod_name="pod-0", allocation_id="abc", exclude_nodes=["bad-1", "bad-2"]
+    )
+    term = m["spec"]["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"][0]["matchExpressions"][0]
+    assert term == {
+        "key": "kubernetes.io/hostname",
+        "operator": "NotIn",
+        "values": ["bad-1", "bad-2"],
+    }
+    # The one-per-node spread anti-affinity is preserved alongside it.
+    assert "podAntiAffinity" in m["spec"]["affinity"]
 
 
 # ---------------------------------------------------------------------------
@@ -232,11 +250,25 @@ def test_task_pod_fs_artifact_hostpath_omits_type_when_unknown():
     assert hp["hostPath"] == {"path": "/mnt/out"}
 
 
-def test_task_pod_without_artifacts_has_only_script_volume():
+def test_task_pod_without_artifacts_has_script_and_shm_volumes():
+    # Even with no artifacts, task pods get the script ConfigMap and a RAM-backed
+    # /dev/shm (the 64Mi K8s default segfaults MPI/NCCL).
     m = render_task_pod(pod_name="t", image="img:1", configmap_name="t-cfg")
     spec = m["spec"]
-    assert [v["name"] for v in spec["volumes"]] == ["sflow-scripts"]
-    assert [mt["mountPath"] for mt in spec["containers"][0]["volumeMounts"]] == ["/sflow"]
+    assert [v["name"] for v in spec["volumes"]] == ["sflow-scripts", "dshm"]
+    assert [mt["mountPath"] for mt in spec["containers"][0]["volumeMounts"]] == [
+        "/sflow", "/dev/shm",
+    ]
+    dshm = [v for v in spec["volumes"] if v["name"] == "dshm"][0]
+    assert dshm["emptyDir"] == {"medium": "Memory"}
+
+
+def test_task_pod_shm_size_caps_tmpfs():
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg", shm_size="16Gi"
+    )
+    dshm = [v for v in m["spec"]["volumes"] if v["name"] == "dshm"][0]
+    assert dshm["emptyDir"] == {"medium": "Memory", "sizeLimit": "16Gi"}
 
 
 def test_task_pod_pvc_mounted():

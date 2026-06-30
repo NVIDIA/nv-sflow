@@ -48,7 +48,7 @@ class HttpGetProbe(Probe):
     async def check(self, task) -> bool:  # type: ignore[override]
         def _do() -> _HttpResponse:
             req = request.Request(self._url, headers=self._headers, method="GET")
-            with request.urlopen(req, timeout=max(self.timeout, 1)) as resp:  # nosec B310
+            with request.urlopen(req, timeout=max(self.effective_check_timeout, 1)) as resp:  # nosec B310
                 return _HttpResponse(status=int(resp.status), body=resp.read())
 
         try:
@@ -80,7 +80,7 @@ class HttpPostProbe(Probe):
             headers = dict(self._headers)
             headers.setdefault("Content-Type", "text/plain; charset=utf-8")
             req = request.Request(self._url, data=data, headers=headers, method="POST")
-            with request.urlopen(req, timeout=max(self.timeout, 1)) as resp:  # nosec B310
+            with request.urlopen(req, timeout=max(self.effective_check_timeout, 1)) as resp:  # nosec B310
                 return _HttpResponse(status=int(resp.status), body=resp.read())
 
         try:

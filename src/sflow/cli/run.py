@@ -257,6 +257,16 @@ def run(
             "(e.g. --extra-kubectl-args=--insecure-skip-tls-verify). Repeatable.",
         ),
     ] = None,
+    kube_exclude_node: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--kube-exclude-node",
+            help="Node hostname to keep all kubernetes pods off (e.g. a node with a "
+            "broken driver). Applied as a kubernetes.io/hostname NotIn nodeAffinity "
+            "on the reservation pods, so the run avoids it without a cluster-wide "
+            "cordon. Repeatable; keeps volatile node info out of the recipe.",
+        ),
+    ] = None,
     enable_workflow_monitor: EnableWorkflowMonitorOption = False,
     enable_task_monitor: EnableTaskMonitorOption = None,
     bulk_input: Annotated[
@@ -468,6 +478,7 @@ def run(
             context=kube_context,
             namespace=kube_namespace,
             extra_args=kubectl_args,
+            exclude_nodes=list(kube_exclude_node or []),
         )
 
         # Route the resolved per-type args to their backend type: slurm -> salloc,

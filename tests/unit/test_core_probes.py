@@ -495,3 +495,25 @@ def test_probe_default_values():
     assert p.interval == 5
     assert p.success_threshold == 1
     assert p.failure_threshold == 3
+
+
+def test_effective_check_timeout_falls_back_to_interval():
+    """each_check_timeout is capped to the interval when it would exceed it."""
+    # Larger than interval -> falls back to interval (configured value preserved).
+    p = _AlwaysPassProbe(
+        type=ProbeType.READINESS, each_check_timeout=30, interval=20
+    )
+    assert p.each_check_timeout == 30
+    assert p.effective_check_timeout == 20
+
+    # Within interval -> used as-is.
+    p2 = _AlwaysPassProbe(
+        type=ProbeType.READINESS, each_check_timeout=10, interval=20
+    )
+    assert p2.effective_check_timeout == 10
+
+    # No interval gating (interval=0) -> no cap.
+    p3 = _AlwaysPassProbe(
+        type=ProbeType.READINESS, each_check_timeout=30, interval=0
+    )
+    assert p3.effective_check_timeout == 30
