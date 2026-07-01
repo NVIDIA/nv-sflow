@@ -70,6 +70,13 @@ class BackendCapabilities:
     # hard-enforces one pod per physical GPU, so it sets this False and the
     # planner coerces GPU ``release_after: task_ready`` -> ``task_completion``.
     supports_gpu_sharing: bool = True
+    # Whether sflow can run the bare-host hardware monitor (hardware_monitor.py)
+    # directly on the backend's reserved nodes. Slurm/local/Docker run on the
+    # physical host, so True. Kubernetes has no node-level collector mechanism yet
+    # (a privileged DCGM/nvidia-smi DaemonSet would be the proper path) -- running
+    # it on the sflow driver host would only sample the driver, not the reserved
+    # GPU nodes -- so it sets this False and the monitor planner skips it.
+    supports_host_monitoring: bool = True
 
 
 class Backend(ABC):

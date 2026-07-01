@@ -4,6 +4,7 @@
 """Plan-time monitor resolution + dedup (via build_state, no real allocation)."""
 
 import asyncio
+import logging
 
 from sflow.app.assembly import build_state
 from sflow.config.schema import SflowConfig
@@ -29,6 +30,31 @@ def _build(workflow: dict, tmp_path, *, nodes: int = 2):
         }
     )
     # allocate=False -> placeholder allocation with N nodes: slurm-node0..N-1.
+    return asyncio.run(build_state(config, allocate=False, output_dir=tmp_path))
+
+
+def _build_k8s(workflow: dict, tmp_path, *, nodes: int = 2):
+    # k8s tasks require an explicit `k8s` operator carrying a workload image;
+    # inject one onto every task so the test workflows stay terse.
+    wf = dict(workflow)
+    wf["tasks"] = [{**t, "operator": t.get("operator", "work")} for t in wf.get("tasks", [])]
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "k8s",
+                    "type": "kubernetes",
+                    "default": True,
+                    "namespace": "ns",
+                    "nodes": nodes,
+                    "gpus_per_node": 8,
+                }
+            ],
+            "operators": [{"name": "work", "type": "k8s", "image": "img:1"}],
+            "workflow": wf,
+        }
+    )
     return asyncio.run(build_state(config, allocate=False, output_dir=tmp_path))
 
 
@@ -144,6 +170,83 @@ def test_no_monitor_means_no_registry(tmp_path):
     )
     assert state.monitor_registry is None
     assert state.workflow_monitor is None
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def test_kubernetes_backend_skips_hardware_monitor(tmp_path):
+    # Node-level monitoring is not implemented on k8s (the collector would run on
+    # the driver host, not the reserved GPU nodes), so the planner skips it
+    # entirely instead of producing misleading driver-host samples.
+    state = _build_k8s(
+        {
+            "name": "wf",
+            "monitor": {"interval": 1000, "report": {"enabled": True}},
+            "tasks": [{"name": "a", "script": ["echo a"]}],
+        },
+        tmp_path,
+    )
+    assert state.monitor_registry is None
+    assert state.workflow_monitor is None
+
+
+def test_kubernetes_backend_used_by_tasks_monitor_skipped(tmp_path):
+    state = _build_k8s(
+        {
+            "name": "wf",
+            "tasks": [
+                {
+                    "name": "server",
+                    "script": ["sleep 1"],
+                    "resources": {"nodes": {"indices": [1]}, "gpus": {"count": 4}},
+                },
+                {
+                    "name": "bench",
+                    "script": ["echo bench"],
+                    "depends_on": ["server"],
+                    "monitor": {
+                        "report": {"enabled": True},
+                        "resources": {"used_by_tasks": ["server"]},
+                    },
+                },
+            ],
+        },
+        tmp_path,
+    )
+    assert state.monitor_registry is None
+    bench = state.workflow.get_task("bench")
+    assert bench.monitor is None
+
+
+def test_kubernetes_backend_monitor_logs_skip_hint(tmp_path):
+    logger = logging.getLogger("sflow.app.monitor_planner")
+    handler = _ListHandler()
+    handler.setLevel(logging.INFO)
+    prev_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        _build_k8s(
+            {
+                "name": "wf",
+                "monitor": {"interval": 1000},
+                "tasks": [{"name": "a", "script": ["echo a"]}],
+            },
+            tmp_path,
+        )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+    joined = "\n".join(handler.messages).lower()
+    assert "monitor" in joined
+    assert "not implemented" in joined or "kubernetes" in joined or "skip" in joined
 
 
 def test_used_by_tasks_merges_across_replicas(tmp_path):

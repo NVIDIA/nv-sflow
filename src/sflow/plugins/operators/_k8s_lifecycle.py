@@ -28,7 +28,7 @@ import os
 import shlex
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 
 from sflow.core.command import Command
 from sflow.core.launcher import _strip_ansi
@@ -79,6 +79,44 @@ async def get_pod_phase(
         global_args=global_args,
     )
     return out if rc == 0 else ""
+
+
+async def format_pod_start_note(
+    pod_ref: str, *, global_args: Sequence[str], ns_args: Sequence[str]
+) -> str | None:
+    """A short ``"<phase>[: <reason>]"`` for a pod that has not started yet.
+
+    Returns ``None`` once the pod is ``Running``/``Succeeded`` (nothing to
+    annotate) or is gone/unreadable. ``<reason>`` is the container
+    ``waiting.reason`` if present (e.g. ``ImagePullBackOff``), else the
+    ``PodScheduled`` condition reason (e.g. ``Unschedulable``). Used to surface a
+    live task sub-status (``RUNNING (Pending: Unschedulable)``) while the task
+    shows RUNNING but its pod is still scheduling / pulling its image.
+    """
+    phase = await get_pod_phase(pod_ref, global_args=global_args, ns_args=ns_args)
+    if not phase or phase in ("Running", "Succeeded"):
+        return None
+    reason = ""
+    rc, out, _ = await run_kubectl(
+        [
+            "get", pod_ref, *ns_args, "-o",
+            "jsonpath={.status.containerStatuses[*].state.waiting.reason}",
+        ],
+        global_args=global_args,
+    )
+    if rc == 0 and out:
+        reason = out.split()[0]
+    if not reason:
+        rc, out, _ = await run_kubectl(
+            [
+                "get", pod_ref, *ns_args, "-o",
+                'jsonpath={.status.conditions[?(@.type=="PodScheduled")].reason}',
+            ],
+            global_args=global_args,
+        )
+        if rc == 0 and out:
+            reason = out.strip()
+    return f"{phase}: {reason}" if reason else phase
 
 
 async def watch_until_terminal(
@@ -139,6 +177,76 @@ async def pod_exit_code(
                 break
         await asyncio.sleep(1)
     return 0 if phase == "Succeeded" else 1
+
+
+async def gather_pods_fail_fast(
+    watchers: Sequence[Awaitable[tuple[int, str]]],
+) -> list[tuple[int, str] | None]:
+    """Await one ``(exit_code, phase)`` watcher per pod, failing fast on any death.
+
+    A multi-node task is one logical unit split into one pod per node (leader =
+    index 0). If ANY pod reaches a non-zero exit / ``Failed`` phase (or its watcher
+    raises), the remaining watchers are cancelled and the partial result list is
+    returned at once -- otherwise a still-running peer (e.g. a worker pod idling on
+    ``sleep 3600`` after the leader's engine has already crashed) would keep the
+    whole task blocked until it is force-killed. When no pod fails, every watcher is
+    awaited: a run-to-completion multi-node task needs all pods to finish, and a
+    healthy long-lived service -- whose watchers never return -- blocks until the
+    caller is cancelled at workflow teardown.
+
+    Returns a per-pod ``(exit_code, phase)`` list aligned to ``watchers``; slots for
+    pods still running when a peer failed (hence cancelled) are ``None``.
+    """
+    tasks = [asyncio.ensure_future(w) for w in watchers]
+    results: list[tuple[int, str] | None] = [None] * len(tasks)
+    try:
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            failed = False
+            for finished in done:
+                idx = tasks.index(finished)
+                if finished.cancelled():
+                    continue
+                if finished.exception() is not None:
+                    # A watcher blew up (e.g. kubectl error) -> treat as a failed pod.
+                    results[idx] = (1, "Failed")
+                    failed = True
+                    continue
+                rc, phase = finished.result()
+                results[idx] = (rc, phase)
+                if rc != 0 or phase == "Failed":
+                    failed = True
+            if failed:
+                break
+        return results
+    finally:
+        # A peer failed (or we're being torn down): cancel the still-running pod
+        # watchers so we never block on them; their own `finally` cuts the streams.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def task_exit_code(results: Sequence[tuple[int, str] | None]) -> int:
+    """Collapse per-pod ``(exit_code, phase)`` results into the task's exit code.
+
+    A multi-node task is one unit: if ANY pod failed (non-zero exit or ``Failed``
+    phase) the task fails with that code (``1`` when the phase is ``Failed`` but the
+    numeric code is 0/unknown). Otherwise the leader pod (index 0) carries the
+    task's exit code -- unchanged single-pod / all-succeeded behaviour.
+    """
+    if not results:
+        return 0
+    for r in results:
+        if r is not None and (r[0] != 0 or r[1] == "Failed"):
+            return r[0] or 1
+    leader = results[0]
+    return leader[0] if leader is not None else 0
 
 
 async def start_pod_log_file_stream(

@@ -194,6 +194,10 @@ class KubernetesBackend(Backend):
             supports_host_path_mounts=False,
             has_runtime_node_addresses=True,
             supports_gpu_sharing=False,
+            # Node-level hardware monitoring is not implemented on k8s yet (needs a
+            # DCGM/DaemonSet collector); the monitor planner skips it rather than
+            # sampling the sflow driver host and reporting misleading metrics.
+            supports_host_monitoring=False,
         )
         # Populated in allocate(): maps a real k8s node name -> the placeholder
         # pod holding it (used for the create-before-destroy GPU handoff).
@@ -1168,18 +1172,21 @@ class KubernetesBackend(Backend):
         name: str,
         assigned_nodes: Sequence[str] | None = None,
     ) -> Operator:
-        # Hardware monitoring must observe the physical node, but sflow has no
-        # node-level collector mechanism on Kubernetes yet (a privileged DCGM /
-        # nvidia-smi DaemonSet would be the proper path). As an interim, run the
-        # collector on the sflow driver host via bash and warn that the metrics
-        # reflect the driver, not the reserved k8s node(s).
+        # Node-level hardware monitoring is NOT implemented for Kubernetes yet (a
+        # privileged DCGM / nvidia-smi DaemonSet would be the proper path). The
+        # backend advertises this via ``capabilities.supports_host_monitoring =
+        # False``, and the monitor planner (``_MonitorPlanner._monitorable``) skips
+        # k8s monitor targets entirely -- so this method is normally never reached.
+        # It remains only as a defensive fallback: run the collector on the sflow
+        # driver host and warn loudly that the metrics reflect the driver, not the
+        # reserved k8s node(s).
         from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
 
         _logger.warning(
-            "Monitor '%s': backend '%s' is Kubernetes; hardware metrics are "
-            "collected on the sflow driver host, not the reserved node(s). "
-            "Node-level GPU monitoring on k8s (DCGM/DaemonSet) is not yet "
-            "implemented.",
+            "Monitor '%s': backend '%s' is Kubernetes; node-level hardware "
+            "monitoring is not implemented yet, so it is normally skipped. This "
+            "fallback collects on the sflow driver host, NOT the reserved "
+            "node(s) -- the metrics do not reflect the GPU nodes.",
             name,
             self.name,
         )

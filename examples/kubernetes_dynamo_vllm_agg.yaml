@@ -1,6 +1,11 @@
 version: "0.1"
 
-# Kubernetes port of examples/slurm_dynamo_vllm_disagg.yaml.
+# Aggregated (non-disaggregated) companion to
+# examples/kubernetes_dynamo_vllm_disagg.yaml. Instead of splitting prefill and
+# decode into separate workers with a NIXL KV-cache transfer between them, a
+# single aggregated worker serves both phases. This recipe is sized to run ONE
+# aggregated worker with tensor-parallel size 16 spanning 2 nodes (AGG_TP_SIZE=16
+# GPUs > GPUS_PER_NODE=8), so the worker forms a Ray cluster across both nodes.
 #
 # Native Kubernetes recipe: a `kubernetes` backend (scheduling: device_plugin)
 # reserves and discovers nodes, then each task runs as its own scheduler-placed
@@ -15,19 +20,17 @@ version: "0.1"
 # Set `scheduling: dra` to use DRA (nvidia-dra-driver-gpu, Kubernetes 1.34+,
 # resource.k8s.io/v1, DeviceClass gpu.nvidia.com) instead of the device plugin.
 #
-# vLLM-specific notes (these are what differ from the trtllm port):
-#   * Disaggregation moves the KV cache over NIXL. With host_network: true, pods
-#     co-located on a node share the host's network namespace, so each worker
-#     needs a unique VLLM_NIXL_SIDE_CHANNEL_PORT. The Slurm trick of offsetting
-#     the port by the first CUDA_VISIBLE_DEVICES index does NOT work here: every
-#     pod gets its own exclusive GPUs (device plugin / DRA) and sees them as
-#     0,1,..., so that index is always 0. Instead each worker derives the port
-#     from SFLOW_REPLICA_INDEX, and prefill/decode use different bases so a
-#     prefill and a decode replica packed onto the same node never collide.
-#   * Multi-node workers (GPUS_PER_WORKER > GPUS_PER_NODE) use a Ray cluster.
+# vLLM aggregated notes (what differs from the disagg port):
+#   * No disaggregation: one worker runs prefill+decode, so there is no NIXL
+#     KV-cache transfer and no --kv-transfer-config / --disaggregation-mode.
+#     VLLM_NIXL_SIDE_CHANNEL_PORT is not used by an aggregated worker; it is
+#     still exported (unique per replica) purely for parity with the disagg
+#     recipe and to stay collision-free under host_network if you ever pack
+#     multiple agg replicas onto one node.
+#   * Multi-node worker (AGG_GPUS_PER_WORKER > GPUS_PER_NODE) uses a Ray cluster.
 #     resources.gpus.count auto-expands the task to one pod per node; the leader
 #     pod (SFLOW_TASK_NODE_INDEX == 0) runs `ray start --head` and launches vLLM,
-#     the other pods join Ray at SFLOW_TASK_ASSIGNED_NODE_IPS[0] and idle.
+#     the other pod joins Ray at SFLOW_TASK_ASSIGNED_NODE_IPS[0] and idles.
 #     SFLOW_TASK_NODE_INDEX is the portable replacement for SLURM_NODEID.
 
 variables:
@@ -43,7 +46,9 @@ variables:
     value: 8
   NUM_NODES:
     description: "Number of nodes"
-    value: 1
+    # One agg worker of AGG_TP_SIZE=16 GPUs spans 2 nodes (16 / GPUS_PER_NODE=8);
+    # the CPU-only etcd/nats/frontend infra overlaps on node 0 without using GPUs.
+    value: 2
 
   # --- Persistent kernel/JIT cache (reused across runs) ---
   # DeepGEMM / DeepEP / Triton / torch.compile JIT-compile kernels on first use,
@@ -66,135 +71,77 @@ variables:
     description: "Model path"
     value: Qwen/Qwen3-8B-FP8
 
-  # Prefill Server Configuration
-  NUM_CTX_SERVERS:
-    description: "Number of context/prefill servers"
+  # Aggregated Server Configuration
+  NUM_AGG_SERVERS:
+    description: "Number of aggregated servers"
     type: integer
-    value: 3
-  CTX_TP_SIZE:
-    description: "Context tensor parallel size"
-    type: integer
-    value: 1
-  CTX_DP_SIZE:
-    description: "Context data parallel size"
+    value: 16
+  AGG_TP_SIZE:
+    description: "Aggregated tensor parallel size"
     type: integer
     value: 1
-  CTX_EP_SIZE:
-    description: "Context expert parallel size"
+  AGG_DP_SIZE:
+    description: "Aggregated data parallel size"
     type: integer
     value: 1
-  CTX_MOE_TP_SIZE:
-    description: "Context MOE tensor parallel size"
+  AGG_EP_SIZE:
+    description: "Aggregated expert parallel size"
     type: integer
     value: 1
-  CTX_PP_SIZE:
-    description: "Context pipeline parallel size"
+  AGG_MOE_TP_SIZE:
+    description: "Aggregated MOE tensor parallel size"
     type: integer
     value: 1
-  CTX_GPUS_PER_WORKER:
-    description: "GPUs per prefill worker"
+  AGG_PP_SIZE:
+    description: "Aggregated pipeline parallel size"
     type: integer
-    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
-  CTX_NODES_PER_WORKER:
-    description: "Nodes per prefill worker"
+    value: 1
+  AGG_GPUS_PER_WORKER:
+    description: "GPUs per aggregated worker"
     type: integer
-    value: ${{ [variables.CTX_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
-  CTX_BATCH_SIZE:
-    description: "Context batch size"
+    value: ${{ variables.AGG_TP_SIZE * variables.AGG_DP_SIZE * variables.AGG_PP_SIZE }}
+  AGG_NODES_PER_WORKER:
+    description: "Nodes per aggregated worker"
     type: integer
-    value: ${{ (variables.CONCURRENCY.domain | max) // variables.NUM_CTX_SERVERS }}
-  CTX_MAX_NUM_TOKENS:
-    description: "Context max number of tokens"
+    value: ${{ [variables.AGG_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
+  AGG_BATCH_SIZE:
+    description: "Aggregated batch size"
+    type: integer
+    value: ${{ (variables.CONCURRENCY.domain | max) // variables.NUM_AGG_SERVERS }}
+  AGG_MAX_NUM_TOKENS:
+    description: "Aggregated max number of tokens"
     type: integer
     value: 4096
-  CTX_MAX_SEQ_LEN:
-    description: "Context max sequence length"
-    type: integer
-    value: 1280
-  CTX_FREE_GPU_MEMORY_FRACTION:
-    description: "Context free GPU memory fraction"
-    value: 0.9
-  CTX_ENABLE_ATTENTION_DP:
-    description: "Context enable attention DP"
-    value: ""
-  KV_CACHE_DTYPE:
-    # Must be bf16 (auto) for NIXL disaggregation: --kv-cache-dtype fp8 makes vLLM's
-    # FlashInfer backend quantize the query to fp8, but P/D disaggregation disables the
-    # only fp8-query kernel (TRTLLM) -> "Query dtype mismatch" crash on Blackwell/vLLM
-    # 0.16.0. Weights stay fp8 (from the model); only the KV cache is bf16.
-    description: "KV cache dtype"
-    value: auto
-
-  # Decode Server Configuration
-  NUM_GEN_SERVERS:
-    description: "Number of generation/decode servers"
-    type: integer
-    value: 5
-  GEN_TP_SIZE:
-    description: "Generation tensor parallel size"
-    type: integer
-    value: 1
-  GEN_DP_SIZE:
-    description: "Generation data parallel size"
-    type: integer
-    value: 1
-  GEN_EP_SIZE:
-    description: "Generation expert parallel size"
-    type: integer
-    value: 1
-  GEN_MOE_TP_SIZE:
-    description: "Generation MOE tensor parallel size"
-    type: integer
-    value: 1
-  GEN_PP_SIZE:
-    description: "Generation pipeline parallel size"
-    type: integer
-    value: 1
-  GEN_GPUS_PER_WORKER:
-    description: "GPUs per decode worker"
-    type: integer
-    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
-  GEN_NODES_PER_WORKER:
-    description: "Nodes per decode worker"
-    type: integer
-    value: ${{ [variables.GEN_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
-  GEN_BATCH_SIZE:
-    description: "Generation batch size"
-    type: integer
-    value: ${{ (variables.CONCURRENCY.domain | max) // variables.NUM_GEN_SERVERS }}
-  GEN_MAX_NUM_TOKENS:
-    description: "Generation max number of tokens"
-    type: integer
-    value: 4096
-  GEN_MAX_SEQ_LEN:
-    description: "Generation max sequence length"
+  AGG_MAX_SEQ_LEN:
+    description: "Aggregated max sequence length"
     type: integer
     value: 2304
-  GEN_FREE_GPU_MEMORY_FRACTION:
-    description: "Generation free GPU memory fraction"
+  AGG_FREE_GPU_MEMORY_FRACTION:
+    description: "Aggregated free GPU memory fraction"
     value: 0.9
-  GEN_ENABLE_ATTENTION_DP:
-    description: "Generation enable attention DP"
+  AGG_ENABLE_ATTENTION_DP:
+    description: "Aggregated enable attention DP"
     value: ""
+  KV_CACHE_DTYPE:
+    # Aggregated serving does NOT disaggregate, so the fp8-query kernel
+    # restriction that forces the disagg recipe to bf16 does not apply here --
+    # `fp8` is safe for an agg worker. `auto` (bf16 KV cache) is the default so
+    # the recipe runs out of the box; set KV_CACHE_DTYPE=fp8 for a denser KV cache.
+    description: "KV cache dtype"
+    value: auto
 
   # Extra Arguments - You can append any optional arguments to the dynamo.vllm command
   EXTRA_FRONTEND_ARGS:
     description: "Extra frontend arguments"
     value: ""
-  EXTRA_PREFILL_ARGS:
-    description: "Extra prefill arguments"
+  EXTRA_AGG_ARGS:
+    description: "Extra aggregated server arguments"
     value: ""
-  EXTRA_DECODE_ARGS:
-    description: "Extra decode arguments"
-    value: ""
-  DYN_REQUEST_PLANE:
-    description: "Dynamo request plane"
-    value: "nats"
 
   # Network transport debugging. NET_DEBUG=1 makes each GPU worker log the
-  # transport NCCL and UCX/NIXL actually pick, so you can confirm the collective
-  # (NCCL) and KV-transfer (NIXL/UCX) traffic uses RDMA and not a TCP/Ethernet
-  # fallback. Grep the prefill/decode logs for:
+  # transport NCCL and UCX/NIXL actually pick, so you can confirm the multi-node
+  # tensor-parallel (NCCL) traffic uses RDMA and not a TCP/Ethernet fallback.
+  # Grep the agg_server logs for:
   #   * NCCL: "NET/IB" (RDMA/RoCE) vs "NET/Socket" (TCP)
   #   * UCX/NIXL: "rc_mlx5"/"rc_verbs" (RDMA) vs "tcp"
   # Set NET_DEBUG=0 to silence the extra logging.
@@ -237,8 +184,8 @@ artifacts:
   #          same path, so it must be NODE-accessible (e.g. an NFS/shared filesystem
   #          mounted on every node). A missing node path fails the pod loudly.
   #
-  # vLLM passes everything on the command line, so unlike the trtllm port there are
-  # no PREFILL_CONFIG / DECODE_CONFIG engine-config artifacts -- only the model.
+  # vLLM passes everything on the command line, so there are no engine-config
+  # artifacts -- only the model.
   - name: LOCAL_MODEL_PATH
     # Lives inside the `model-store` PVC (mounted at /models); see backend volumes.
     # Point this at wherever the model is staged inside the PVC.
@@ -255,7 +202,7 @@ backends:
     gpus_per_node: ${{ variables.GPUS_PER_NODE }}
     # pod IP == node IP, so peers can be addressed by the node InternalIPs that
     # reservation returns (etcd/NATS registration mirrors the Slurm path). It also
-    # lets vLLM advertise a reachable NIXL side-channel host for KV transfer.
+    # lets the multi-node Ray cluster address its head by a reachable node IP.
     host_network: true
     # Request GPUs via the legacy nvidia.com/gpu device plugin; use 'dra' for
     # DRA (nvidia-dra-driver-gpu, DeviceClass gpu.nvidia.com).
@@ -264,7 +211,7 @@ backends:
     # get scoped RDMA device access -- a per-pod slice of the node's
     # networking.gke.io.networks/rdma-N NICs (sized to the pod's GPU count) plus
     # CAP_IPC_LOCK -- and a matching UCX_NET_DEVICES/NCCL_IB_HCA, so the
-    # disaggregated KV transfer (NIXL/UCX) and NCCL run over RoCE instead of TCP.
+    # cross-node tensor-parallel NCCL traffic runs over RoCE instead of TCP.
     # Use 'off' to disable, or a list (e.g. [mlx5_0:1, mlx5_1:1]) to force devices.
     rdma: auto
     # Pre-existing PersistentVolumeClaims to mount into task pods. Use this to make
@@ -273,7 +220,7 @@ backends:
     # the namespace; sflow only references it. A PVC is mounted into a task's pod(s)
     # only when the task references a path under its mount_path (so e.g. the model
     # is not mounted into the etcd/nats pods). Use read_only + an ROX/RWX PVC to
-    # share one model across prefill/decode pods on multiple nodes.
+    # share one model across the aggregated worker's pods on multiple nodes.
     #
     # `deepseek-r1-model-lustre` is a dedicated RWX Lustre PVC (in the mlperf-sflow
     # namespace); stage the Qwen model under it and point LOCAL_MODEL_PATH at it.
@@ -305,7 +252,7 @@ operators:
     image: ${{ variables.AIPERF_IMAGE }}
 
 workflow:
-  name: dynamo_vllm_disagg
+  name: dynamo_vllm_agg
   timeout: 115m
 
   variables:
@@ -370,10 +317,10 @@ workflow:
         - nats_server
         - etcd_server
 
-    - name: prefill_server
+    - name: agg_server
       operator: dynamo_vllm
       replicas:
-        count: ${{ variables.NUM_CTX_SERVERS }}
+        count: ${{ variables.NUM_AGG_SERVERS }}
         policy: "parallel"
       script:
         - set -x
@@ -388,8 +335,9 @@ workflow:
             export UCX_LOG_LEVEL=info
           fi
         # Unique NIXL side-channel port per replica (host_network shares node
-        # ports). Prefill uses base 5557; decode uses 6557 so a prefill and a
-        # decode replica packed onto the same node never collide. The stride is
+        # ports). An aggregated worker does not use NIXL, but exporting a unique
+        # port keeps parity with the disagg recipe and stays collision-free if
+        # multiple agg replicas ever land on the same node. The stride is
         # GPUS_PER_NODE so a worker's per-rank ports stay within its own slot.
         - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * ${{ variables.GPUS_PER_NODE }}))
         # --- Persistent JIT/kernel cache on the mounted kernel-cache PVC ---
@@ -409,7 +357,7 @@ workflow:
         - export NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}
         - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
         - >
-          if [ "${CTX_NODES_PER_WORKER}" -gt 1 ]; then
+          if [ "${AGG_NODES_PER_WORKER}" -gt 1 ]; then
             if [[ "${NODE_RANK}" == "0" ]]; then
               unset CUDA_VISIBLE_DEVICES
               ray start --head --port=6379
@@ -419,7 +367,7 @@ workflow:
             fi
             # wait until GPU string appears in ray status output
             while true; do
-              if ray status | grep "${CTX_GPUS_PER_WORKER}.0 GPU"; then
+              if ray status | grep "${AGG_GPUS_PER_WORKER}.0 GPU"; then
                 break
               else
                 echo "Waiting for Ray cluster GPUs to be available in ray status..."
@@ -428,132 +376,31 @@ workflow:
             done
             echo "Ray cluster GPUs are now available."
           else
-            echo "Do not need to setup ray cluster because worker only needs ${CTX_GPUS_PER_WORKER} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
+            echo "Do not need to setup ray cluster because worker only needs ${AGG_GPUS_PER_WORKER} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
           fi
         - >
           if [[ "${NODE_RANK}" == "0" ]]; then
             EXTRA_RAY_ARGS=""
-            if [ "${CTX_NODES_PER_WORKER}" -gt 1 ]; then
+            if [ "${AGG_NODES_PER_WORKER}" -gt 1 ]; then
               EXTRA_RAY_ARGS="--distributed-executor-backend ray"
             fi
             python3 -m dynamo.vllm --model ${{ artifacts.LOCAL_MODEL_PATH.path }} \
             --served-model-name ${{ variables.SERVED_MODEL_NAME }} \
-            --tensor-parallel-size ${CTX_TP_SIZE} \
-            --pipeline-parallel-size ${CTX_PP_SIZE} \
-            --data-parallel-size ${CTX_DP_SIZE} \
+            --tensor-parallel-size ${AGG_TP_SIZE} \
+            --pipeline-parallel-size ${AGG_PP_SIZE} \
+            --data-parallel-size ${AGG_DP_SIZE} \
             --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }} \
-            --disaggregation-mode prefill \
-            --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
             --no-enable-prefix-caching \
             --block-size 128 \
-            --max-num-seqs ${CTX_BATCH_SIZE} \
-            --max-num-batched-tokens ${CTX_MAX_NUM_TOKENS} ${EXTRA_RAY_ARGS} ${EXTRA_PREFILL_ARGS}
+            --max-num-seqs ${AGG_BATCH_SIZE} \
+            --max-num-batched-tokens ${AGG_MAX_NUM_TOKENS} ${EXTRA_RAY_ARGS} ${EXTRA_AGG_ARGS}
           else
             echo "This is a worker node, do not need to run vllm launch cmd, but remember to setup ray cluster and launch in the master node"
             sleep 3600
           fi
       resources:
         gpus:
-          count: ${{ variables.CTX_GPUS_PER_WORKER }}
-      depends_on:
-        - frontend_server
-      probes:
-        readiness:
-          http_post:
-            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
-            headers:
-              Content-Type: "application/json"
-            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
-          timeout: 1200
-          each_check_timeout: 20
-          interval: 20
-        failure:
-          log_watch:
-            match_pattern: "Traceback (most recent call last)"
-            match_count: 5
-          interval: 30
-
-    - name: decode_server
-      operator: dynamo_vllm
-      replicas:
-        count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: "parallel"
-      script:
-        - set -x
-        - echo ${CUDA_VISIBLE_DEVICES}
-        # Network transport logging (NET_DEBUG=1): make NCCL and UCX/NIXL print
-        # the transport they pick so you can confirm RDMA vs a TCP fallback --
-        # NCCL "NET/IB" vs "NET/Socket", UCX "rc_mlx5"/"rc_verbs" vs "tcp".
-        - >
-          if [ "${NET_DEBUG}" == "1" ]; then
-            export NCCL_DEBUG=INFO
-            export NCCL_DEBUG_SUBSYS=NET
-            export UCX_LOG_LEVEL=info
-          fi
-        # Decode uses base 6557 (prefill uses 5557) so co-located prefill/decode
-        # replicas under host_network never share a NIXL side-channel port.
-        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((6557 + ${SFLOW_REPLICA_INDEX:-0} * ${{ variables.GPUS_PER_NODE }}))
-        # --- Persistent JIT/kernel cache on the mounted kernel-cache PVC ---
-        # Point DeepGEMM/DeepEP/Triton/torch.compile (+ flashinfer via XDG) caches
-        # at the PVC so kernels compile ONCE and future runs reuse them. Exported
-        # before `ray start` so ray workers on the other node(s) inherit them too.
-        - export SFLOW_KERNEL_CACHE=${{ variables.KERNEL_CACHE_DIR }}
-        - export XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg
-        - export VLLM_CACHE_ROOT=${SFLOW_KERNEL_CACHE}/vllm
-        - export TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton
-        - export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor
-        - export DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm
-        - export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep
-        - mkdir -p "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$DG_JIT_CACHE_DIR" "$EP_JIT_CACHE_DIR"
-        - export NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}
-        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
-        - >
-          if [ "${GEN_NODES_PER_WORKER}" -gt 1 ]; then
-            if [[ "${NODE_RANK}" == "0" ]]; then
-              unset CUDA_VISIBLE_DEVICES
-              ray start --head --port=6379
-            else
-              export RAY_worker_register_timeout_seconds=1200 # This to avoid master node load image slower than worker node
-              ray start --address ${FIRST_NODE_IP}:6379
-            fi
-            # wait until GPU string appears in ray status output
-            while true; do
-              if ray status | grep "${GEN_GPUS_PER_WORKER}.0 GPU"; then
-                break
-              else
-                echo "Waiting for Ray cluster GPUs to be available in ray status..."
-                sleep 5
-              fi
-            done
-            echo "Ray cluster GPUs are now available."
-          else
-            echo "Do not need to setup ray cluster because worker only needs ${GEN_GPUS_PER_WORKER} GPUs, and GPUS_PER_NODE is ${{ variables.GPUS_PER_NODE }}"
-          fi
-        - >
-          if [[ "${NODE_RANK}" == "0" ]]; then
-            EXTRA_RAY_ARGS=""
-            if [ "${GEN_NODES_PER_WORKER}" -gt 1 ]; then
-              EXTRA_RAY_ARGS="--distributed-executor-backend ray"
-            fi
-            python3 -m dynamo.vllm --model ${{ artifacts.LOCAL_MODEL_PATH.path }} \
-            --served-model-name ${{ variables.SERVED_MODEL_NAME }} \
-            --tensor-parallel-size ${GEN_TP_SIZE} \
-            --pipeline-parallel-size ${GEN_PP_SIZE} \
-            --data-parallel-size ${GEN_DP_SIZE} \
-            --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }} \
-            --disaggregation-mode decode \
-            --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
-            --no-enable-prefix-caching \
-            --block-size 128 \
-            --max-num-seqs ${GEN_BATCH_SIZE} \
-            --max-num-batched-tokens ${GEN_MAX_NUM_TOKENS} ${EXTRA_RAY_ARGS} ${EXTRA_DECODE_ARGS}
-          else
-            echo "This is a worker node, do not need to run vllm launch cmd, but remember to setup ray cluster and launch in the master node"
-            sleep 3600
-          fi
-      resources:
-        gpus:
-          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+          count: ${{ variables.AGG_GPUS_PER_WORKER }}
       depends_on:
         - frontend_server
       probes:
@@ -614,17 +461,15 @@ workflow:
           - CONCURRENCY
         policy: sequential
       # Trigger a hardware monitor from this benchmark task but sample the
-      # prefill/decode SERVERS' resources (used_by_tasks), not the benchmark
-      # client's own node -- so the report captures the servers' GPU/CPU usage
-      # over the benchmark window.
+      # aggregated SERVER's resources (used_by_tasks), not the benchmark client's
+      # own node -- so the report captures the server's GPU/CPU usage over the
+      # benchmark window.
       monitor:
         resources:
           used_by_tasks:
-            - prefill_server
-            - decode_server
+            - agg_server
         report:
           enabled: true
       depends_on:
-        - prefill_server
-        - decode_server
+        - agg_server
         - frontend_server

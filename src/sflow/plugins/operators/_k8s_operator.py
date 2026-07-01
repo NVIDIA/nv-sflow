@@ -45,6 +45,7 @@ from sflow.plugins.operators._k8s_shell import (
     sanitize_name,
 )
 from sflow.utils.container import validate_container_image_reference
+from sflow.utils.gpu import parse_cuda_visible_devices
 
 _logger = get_logger(__name__)
 
@@ -150,6 +151,11 @@ class K8sContainerOperator(Operator):
         self._device_selectors: list[str] | None = config.device_selectors
         # Per-pod GPU count (resources.gpus.count // node_count); 0 == no GPUs.
         self._per_pod_gpus: int = 0
+        # Planner-reserved node-local GPU slot for this pod, encoded as a
+        # CUDA_VISIBLE_DEVICES string (e.g. "4,5,6,7"). k8s never injects it as
+        # env (the device plugin/DRA picks the physical GPUs), but its first index
+        # is the pod's node-local slot start -- used to align the RDMA NIC window.
+        self._cuda_visible_devices: str | None = None
         self._host_network: bool = (
             bool(config.host_network) if config.host_network is not None else False
         )
@@ -257,6 +263,7 @@ class K8sContainerOperator(Operator):
                 "gets count/nodes GPUs, bounded by the backend's gpus_per_node)."
             )
         self._per_pod_gpus = (total_gpus // self._node_count) if total_gpus else 0
+        self._cuda_visible_devices = cuda_visible_devices
 
         # Real node IPs (for multi-node leader/peer env wiring), discovered at
         # allocation time and carried on the backend allocation.
@@ -305,14 +312,33 @@ class K8sContainerOperator(Operator):
             return self._assigned_node_names[index]
         return None
 
-    def _rdma_pod_nics(self, replica_index: int) -> tuple[list[str], list[str]]:
+    def _node_local_gpu_slot_start(self, replica_index: int) -> int:
+        """First GPU index of this pod's node-local slot.
+
+        The planner reserves each pod a contiguous GPU interval on its node and
+        encodes it in ``cuda_visible_devices`` (e.g. ``"4,5,6,7"``) -- even on
+        k8s, where the device plugin/DRA picks the physical GPUs, the interval is
+        still computed for packing correctness. Its first index is the pod's
+        node-local slot start (what disjoint packing is built on). Falls back to
+        ``replica_index * per_pod_gpus`` when no slot was reserved (e.g. a dry-run
+        without an allocation), preserving same-task replica separation.
+        """
+        slots = parse_cuda_visible_devices(self._cuda_visible_devices)
+        if slots:
+            return min(slots)
+        return replica_index * self._per_pod_gpus
+
+    def _rdma_pod_nics(self, gpu_slot_start: int) -> tuple[list[str], list[str]]:
         """Per-pod RDMA NIC slice as ``(resource_names, hca_names)``.
 
-        Assigns ``per_pod_gpus`` of the node's RDMA NICs by replica index, so
-        replicas co-located on a node (bounded to ``nics_per_node / gpus`` by GPU
-        capacity) get disjoint NICs. The matching ``hca_names`` drive
-        ``UCX_NET_DEVICES`` / ``NCCL_IB_HCA``. Returns ``([], [])`` when the RDMA
-        fast path is off or the task requests no GPUs.
+        Assigns ``per_pod_gpus`` of the node's RDMA NICs starting at this pod's
+        node-local GPU slot (``gpu_slot_start``), so the NIC window lines up with
+        the GPUs the pod occupies. Because the planner packs co-located pods onto
+        disjoint GPU slots (e.g. prefill 0-1 / 2-3, decode 4-7), their NIC windows
+        come out disjoint too -- and each NIC sits next to its GPU (mlx5_N next to
+        GPU N). The matching ``hca_names`` drive ``UCX_NET_DEVICES`` /
+        ``NCCL_IB_HCA``. Returns ``([], [])`` when the RDMA fast path is off or the
+        task requests no GPUs.
         """
         nics = len(self._rdma_nic_specs)
         gpus = self._per_pod_gpus
@@ -321,7 +347,7 @@ class K8sContainerOperator(Operator):
         if gpus >= nics:
             chosen = list(range(nics))
         else:
-            offset = (replica_index * gpus) % nics
+            offset = gpu_slot_start % nics
             chosen = [(offset + k) % nics for k in range(gpus)]
         specs = [self._rdma_nic_specs[j] for j in chosen]
         return [res for res, _hca in specs], [hca for _res, hca in specs]
@@ -501,13 +527,15 @@ class K8sContainerOperator(Operator):
         tolerations = self._effective_tolerations()
 
         # Per-pod RDMA NIC slice (scoped device resources + matching UCX/NCCL env),
-        # sized to the pod's GPU count and offset by replica so co-located replicas
-        # don't collide on the node's NICs. Empty unless the backend enabled RDMA.
+        # sized to the pod's GPU count and aligned to its node-local GPU slot so
+        # co-located pods (e.g. prefill + decode packed onto one node) never
+        # collide on the node's NICs. Empty unless the backend enabled RDMA.
         try:
             replica_index = int(envs.get("SFLOW_REPLICA_INDEX", "0") or 0)
         except (TypeError, ValueError):
             replica_index = 0
-        rdma_nic_resources, rdma_hcas = self._rdma_pod_nics(replica_index)
+        gpu_slot_start = self._node_local_gpu_slot_start(replica_index)
+        rdma_nic_resources, rdma_hcas = self._rdma_pod_nics(gpu_slot_start)
         # gIB (multi-node NCCL over RDMA) is enabled only when the task spans more
         # than one node: with gpus_per_node GPUs per node, a GPU claim that needs
         # node_count > 1 has cross-node NCCL collectives. Single-node TP stays on
@@ -674,6 +702,55 @@ class K8sContainerOperator(Operator):
     def manages_own_execution(self) -> bool:
         return True
 
+    async def _status_note_for_pods(
+        self, pod_refs: Sequence[str], *, global_args: Sequence[str], ns_args: Sequence[str]
+    ) -> str | None:
+        """Aggregate the not-yet-started pods' phase/reason into one sub-status.
+
+        ``None`` when every pod is running (nothing to annotate). For a multi-pod
+        (multi-node) task each still-starting pod is labelled by its pod name.
+        """
+        notes: list[str] = []
+        for ref in pod_refs:
+            note = await k8s_lifecycle.format_pod_start_note(
+                ref, global_args=global_args, ns_args=ns_args
+            )
+            if note:
+                label = ref.split("/", 1)[-1]
+                notes.append(f"{label}: {note}" if len(pod_refs) > 1 else note)
+        return "; ".join(notes) if notes else None
+
+    async def _poll_status_note(
+        self,
+        pod_refs: Sequence[str],
+        *,
+        global_args: Sequence[str],
+        ns_args: Sequence[str],
+        status_note: Callable[[str | None], None],
+        interval: float = 3.0,
+    ) -> None:
+        """Push the pods' live start phase/reason to ``status_note`` until cancelled.
+
+        Display-only and best-effort: any polling error is swallowed so the sub-
+        status watcher can never fail the task. The caller cancels it once the
+        startup wait is over.
+        """
+        try:
+            while True:
+                try:
+                    status_note(
+                        await self._status_note_for_pods(
+                            pod_refs, global_args=global_args, ns_args=ns_args
+                        )
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # never let a display poll break the task
+                    pass
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
     async def execute(
         self,
         *,
@@ -682,6 +759,7 @@ class K8sContainerOperator(Operator):
         env: Mapping[str, str],
         task_name: str,
         script: Sequence[str],
+        status_note: Callable[[str | None], None] | None = None,
     ) -> int:
         """Driver-managed run: apply the pod(s), then stream + watch each pod.
 
@@ -692,10 +770,12 @@ class K8sContainerOperator(Operator):
         console (TTY). The pod STATUS is the authoritative completion signal
         (``watch_until_terminal``); the log stream is a side channel that is
         interrupted the instant the pod is terminal (or the workflow ends and this
-        coroutine is cancelled). The leader pod's exit code is the task's.
+        coroutine is cancelled). Any failed pod fails the whole task (a multi-node
+        task is one unit); otherwise the leader pod's exit code is the task's.
 
-        Once the DAG status check has finished for every pod (the ``gather``
-        returns) and their live streams are interrupted, the on-disk ``<task>.log``
+        Once the pod watches have resolved (every pod terminal, or one pod failed
+        and its still-running peers were cancelled) and their live streams are
+        interrupted, the on-disk ``<task>.log``
         is REBUILT from a one-shot re-fetch of each pod's COMPLETE container log
         (see ``finalize_complete_log``) -- a double-confirm that the saved file is
         complete before the orchestrator runs probes + output/result parsing on it.
@@ -707,6 +787,19 @@ class K8sContainerOperator(Operator):
             task_name=task_name, script=list(script), envs=dict(env)
         )
         tailer: asyncio.Future | None = None
+        # Live sub-status: while the apply step waits for the pod(s) to start, poll
+        # their phase/reason and surface it (e.g. "Pending: Unschedulable") next to
+        # the RUNNING task status. Cancelled once startup is over (below).
+        note_poller: asyncio.Future | None = None
+        if status_note is not None:
+            note_poller = asyncio.ensure_future(
+                self._poll_status_note(
+                    plan.pod_refs,
+                    global_args=plan.global_args,
+                    ns_args=plan.ns_args,
+                    status_note=status_note,
+                )
+            )
         try:
             rc = await launcher.run_async(
                 plan.apply_command,
@@ -714,6 +807,14 @@ class K8sContainerOperator(Operator):
                 env=env,
                 task_name=task_name,
             )
+            # Startup wait is over (pod running, or apply failed fast): stop
+            # annotating and clear the sub-status so RUNNING shows clean.
+            if note_poller is not None:
+                note_poller.cancel()
+                await asyncio.gather(note_poller, return_exceptions=True)
+                note_poller = None
+            if status_note is not None:
+                status_note(None)
             if rc != 0:
                 return rc
             # Bytes already in <task>.log after apply == the driver/apply
@@ -733,14 +834,18 @@ class K8sContainerOperator(Operator):
                         plan.task_log_path, task_name=task_name
                     )
                 )
-            results = await asyncio.gather(
-                *[
+            # Watch every pod, but fail the task as a whole the instant any pod
+            # dies: a multi-node task is one logical unit (one pod per node), so a
+            # dead sub-pod must not leave the task blocked on a still-running peer
+            # (e.g. a worker idling on `sleep 3600` after the leader crashed).
+            results = await k8s_lifecycle.gather_pods_fail_fast(
+                [
                     self._run_pod_stream(plan=plan, index=i)
                     for i in range(len(plan.pod_refs))
                 ]
             )
-            exit_codes = [rc for rc, _ in results]
-            phases = [phase for _, phase in results]
+            # Cancelled peers have no result -> "" phase (skips their log re-fetch).
+            phases = [r[1] if r is not None else "" for r in results]
             # All pods are terminal and their live streams are cut. Stop the
             # console tailer, then re-fetch every pod's COMPLETE log and rename it
             # into <task>.log -- so the on-disk log is complete (ground truth) for
@@ -758,9 +863,12 @@ class K8sContainerOperator(Operator):
                     global_args=plan.global_args,
                     ns_args=plan.ns_args,
                 )
-            # The leader pod (index 0) carries the task's exit code.
-            return exit_codes[0] if exit_codes else 0
+            # Any failed pod fails the whole task; otherwise the leader's code.
+            return k8s_lifecycle.task_exit_code(results)
         finally:
+            if note_poller is not None:
+                note_poller.cancel()
+                await asyncio.gather(note_poller, return_exceptions=True)
             if tailer is not None and not tailer.done():
                 tailer.cancel()
             if tailer is not None:

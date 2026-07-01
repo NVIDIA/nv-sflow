@@ -25,8 +25,10 @@ class K8sOperator(K8sContainerOperator):
     from a DRA ResourceClaimTemplate (``scheduling: dra``) or an ``nvidia.com/gpu``
     limit (``scheduling: device_plugin``). Multi-node pods receive
     ``SFLOW_TASK_NODE_INDEX`` and ``SFLOW_LEADER_ADDRESS`` (plus the shared
-    ``SFLOW_TASK_ASSIGNED_NODE_IPS``) so peers can rendezvous. The leader pod
-    (index 0) determines the task exit code.
+    ``SFLOW_TASK_ASSIGNED_NODE_IPS``) so peers can rendezvous. Any failed pod
+    fails the whole task (a dead sub-pod must not leave the task hanging on a
+    still-running peer); otherwise the leader pod (index 0) determines the exit
+    code.
     """
 
     config: K8sOperatorConfig

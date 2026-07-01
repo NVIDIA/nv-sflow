@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import BaseModel
 
@@ -122,6 +122,7 @@ class Operator(ABC):
         env: Mapping[str, str],
         task_name: str,
         script: Sequence[str],
+        status_note: Callable[[str | None], None] | None = None,
     ) -> int:
         """Run the task as a driver-managed flow and return its exit code.
 
@@ -129,8 +130,12 @@ class Operator(ABC):
         shared ``launcher`` (so sub-steps stream through the same per-task log),
         the task's ``output_logger`` / ``env`` / ``name`` / ``script``. Must return
         an int exit code (0 == success) just like a subprocess, and propagate
-        ``asyncio.CancelledError`` on teardown after cleaning up. Default: not
-        implemented.
+        ``asyncio.CancelledError`` on teardown after cleaning up.
+
+        ``status_note`` is an optional callback the operator may call with a short
+        live sub-status string (or ``None`` to clear it) -- e.g. a k8s pod's
+        ``"Pending: Unschedulable"`` while the task is RUNNING but not yet started;
+        it is surfaced next to the task status in the UI. Default: not implemented.
         """
         raise NotImplementedError(
             f"operator '{getattr(self.config, 'type', '?')}' does not implement execute()"

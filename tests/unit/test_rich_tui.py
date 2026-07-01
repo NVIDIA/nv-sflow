@@ -109,9 +109,32 @@ def test_rich_tui_task_rows_display_full_node_list():
     task.assigned_nodes = ["node-1", "node-2", "node-3"]
     tui = RichTui(None, attach_log_handler=False)
 
+    # Rows carry (name, status_value, status_display, exit, nodes); with no
+    # sub-status the display equals the raw status value.
     assert tui._app._task_rows([task]) == (
-        ("task_a", "INITIATED", "", "node-1,node-2,node-3"),
+        ("task_a", "INITIATED", "INITIATED", "", "node-1,node-2,node-3"),
     )
+
+
+def test_rich_tui_task_rows_append_substatus_for_running_task():
+    task = _task("decode")
+    task.status = TaskStatus.RUNNING
+    task.status_detail = "Pending: Unschedulable"
+    tui = RichTui(None, attach_log_handler=False)
+
+    assert tui._app._task_rows([task]) == (
+        ("decode", "RUNNING", "RUNNING (Pending: Unschedulable)", "", ""),
+    )
+
+
+def test_rich_tui_task_rows_ignore_substatus_when_not_running():
+    task = _task("decode")
+    task.status = TaskStatus.COMPLETED
+    task.status_detail = "Pending: Unschedulable"  # stale; only shown while RUNNING
+    tui = RichTui(None, attach_log_handler=False)
+
+    rows = tui._app._task_rows([task])
+    assert rows[0][2] == "COMPLETED"
 
 
 def test_rich_tui_default_refresh_matches_cli_default():
@@ -256,6 +279,31 @@ def test_rich_tui_task_status_cells_use_status_colors():
             assert isinstance(status_cell, Text)
             assert status_cell.plain == "FAILED"
             assert status_cell.style == "red"
+
+    asyncio.run(_run_app())
+
+
+def test_rich_tui_task_status_cell_shows_pod_substatus_while_running():
+    task = _task("decode")
+    task.status = TaskStatus.RUNNING
+    task.status_detail = "Pending: Unschedulable"
+    tg = TaskGraph()
+    tg.dag.add_node(task.name, task)
+    tui = RichTui(
+        Workflow(name="wf", task_graph=tg),
+        console=Console(width=120, height=20),
+        attach_log_handler=False,
+    )
+
+    async def _run_app():
+        async with tui._app.run_test() as _pilot:
+            tui._app.refresh_from_owner(force=True)
+            table = tui._app.query_one("#tasks")
+            status_cell = table.get_cell_at(Coordinate(0, 1))
+            assert isinstance(status_cell, Text)
+            assert status_cell.plain == "RUNNING (Pending: Unschedulable)"
+            # Still styled by the underlying RUNNING status.
+            assert status_cell.style == "yellow"
 
     asyncio.run(_run_app())
 

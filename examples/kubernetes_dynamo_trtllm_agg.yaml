@@ -1,6 +1,10 @@
 version: "0.1"
 
-# Kubernetes port of examples/slurm_dynamo_trtllm_disagg.yaml.
+# Kubernetes port of examples/slurm_dynamo_trtllm_agg.yaml.
+#
+# Aggregated (non-disaggregated) TensorRT-LLM companion to
+# examples/kubernetes_dynamo_trtllm_disagg.yaml: instead of splitting prefill and
+# decode into separate workers, a single aggregated worker serves both phases.
 #
 # Native Kubernetes recipe: a `kubernetes` backend (scheduling: device_plugin)
 # reserves and discovers nodes, then each task runs as its own scheduler-placed
@@ -14,6 +18,15 @@ version: "0.1"
 # CPU-only infra (etcd/nats/frontend) overlaps on node 0 without consuming GPUs.
 # Set `scheduling: dra` to use DRA (nvidia-dra-driver-gpu, Kubernetes 1.34+,
 # resource.k8s.io/v1, DeviceClass gpu.nvidia.com) instead of the device plugin.
+#
+# TensorRT-LLM aggregated notes (what differs from the vllm ports):
+#   * The engine is configured by a YAML file (AGG_CONFIG), injected into the pod
+#     from a ConfigMap (file:// + inline content), and passed via
+#     --extra-engine-args -- there is no long argv like vLLM.
+#   * The worker is SINGLE-NODE: dynamo.trtllm handles intra-node tensor
+#     parallelism itself (no Ray/MPI launcher wiring), matching the trtllm disagg
+#     port. Keep AGG_GPUS_PER_WORKER <= GPUS_PER_NODE; multi-node trtllm on k8s
+#     (cross-node MPI) is not wired here yet.
 
 variables:
   # --- Kubernetes backend configuration ---
@@ -28,7 +41,7 @@ variables:
     value: 8
   NUM_NODES:
     description: "Number of nodes"
-    value: 3
+    value: 1
 
   # Model Configuration
   SERVED_MODEL_NAME:
@@ -38,109 +51,63 @@ variables:
     description: "Model path"
     value: Qwen/Qwen3-8B-FP8
 
-  # Prefill Server Configuration
-  NUM_CTX_SERVERS:
-    description: "Number of context/prefill servers"
+  # Aggregated Server Configuration
+  NUM_AGG_SERVERS:
+    description: "Number of aggregated servers"
+    type: integer
+    value: 1
+  AGG_TP_SIZE:
+    description: "Aggregated tensor parallel size"
+    type: integer
     value: 4
-  CTX_TP_SIZE:
-    description: "Context tensor parallel size"
-    type: integer
-    value: 2
-  CTX_DP_SIZE:
-    description: "Context data parallel size"
+  AGG_DP_SIZE:
+    description: "Aggregated data parallel size"
     type: integer
     value: 1
-  CTX_EP_SIZE:
-    description: "Context expert parallel size"
+  AGG_EP_SIZE:
+    description: "Aggregated expert parallel size"
     type: integer
     value: 1
-  CTX_MOE_TP_SIZE:
-    description: "Context MOE tensor parallel size"
+  AGG_MOE_TP_SIZE:
+    description: "Aggregated MOE tensor parallel size"
     type: integer
     value: 1
-  CTX_PP_SIZE:
-    description: "Context pipeline parallel size"
+  AGG_PP_SIZE:
+    description: "Aggregated pipeline parallel size"
     type: integer
     value: 1
-  CTX_GPUS_PER_WORKER:
-    description: "GPUs per prefill worker"
+  AGG_GPUS_PER_WORKER:
+    description: "GPUs per aggregated worker (keep <= GPUS_PER_NODE: single-node)"
     type: integer
-    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
-  CTX_BATCH_SIZE:
-    description: "Context batch size"
-    value: 128
-  CTX_MAX_NUM_TOKENS:
-    description: "Context max number of tokens"
+    value: ${{ variables.AGG_TP_SIZE * variables.AGG_DP_SIZE * variables.AGG_PP_SIZE }}
+  AGG_BATCH_SIZE:
+    description: "Aggregated batch size"
+    type: integer
+    value: ${{ (variables.CONCURRENCY.domain | max) // variables.NUM_AGG_SERVERS }}
+  AGG_MAX_NUM_TOKENS:
+    description: "Aggregated max number of tokens"
+    type: integer
     value: 4096
-  CTX_MAX_SEQ_LEN:
-    description: "Context max sequence length"
-    value: 1280
-  CTX_FREE_GPU_MEMORY_FRACTION:
-    description: "Context free GPU memory fraction"
+  AGG_MAX_SEQ_LEN:
+    description: "Aggregated max sequence length"
+    type: integer
+    value: 2304
+  AGG_FREE_GPU_MEMORY_FRACTION:
+    description: "Aggregated free GPU memory fraction"
     value: 0.9
-  CTX_ENABLE_ATTENTION_DP:
-    description: "Context enable attention DP"
+  AGG_ENABLE_ATTENTION_DP:
+    description: "Aggregated enable attention DP"
     value: false
   KV_CACHE_DTYPE:
     description: "KV cache dtype"
     value: fp8
 
-  # Decode Server Configuration
-  NUM_GEN_SERVERS:
-    description: "Number of generation/decode servers"
-    value: 4
-  GEN_TP_SIZE:
-    description: "Generation tensor parallel size"
-    type: integer
-    value: 4
-  GEN_DP_SIZE:
-    description: "Generation data parallel size"
-    type: integer
-    value: 1
-  GEN_EP_SIZE:
-    description: "Generation expert parallel size"
-    type: integer
-    value: 1
-  GEN_MOE_TP_SIZE:
-    description: "Generation MOE tensor parallel size"
-    type: integer
-    value: 1
-  GEN_PP_SIZE:
-    description: "Generation pipeline parallel size"
-    type: integer
-    value: 1
-  GEN_GPUS_PER_WORKER:
-    description: "GPUs per decode worker"
-    type: integer
-    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
-  GEN_BATCH_SIZE:
-    description: "Generation batch size"
-    value: 128
-  GEN_MAX_NUM_TOKENS:
-    description: "Generation max number of tokens"
-    value: 4096
-  GEN_MAX_SEQ_LEN:
-    description: "Generation max sequence length"
-    value: 2304
-  GEN_FREE_GPU_MEMORY_FRACTION:
-    description: "Generation free GPU memory fraction"
-    value: 0.9
-  GEN_ENABLE_ATTENTION_DP:
-    description: "Generation enable attention DP"
-    value: false
-
-  # Extra Arguments - You can append any optional arguments to the command
-  DYN_REQUEST_PLANE:
-    description: "Dynamo request plane"
-    value: "nats"
+  # Extra Arguments - You can append any optional arguments to the dynamo.trtllm command
   EXTRA_FRONTEND_ARGS:
     description: "Extra frontend arguments"
     value: ""
-  EXTRA_PREFILL_ARGS:
-    description: "Extra prefill arguments"
-    value: ""
-  EXTRA_DECODE_ARGS:
-    description: "Extra decode arguments"
+  EXTRA_AGG_ARGS:
+    description: "Extra aggregated server arguments"
     value: ""
 
   # Benchmark Configuration
@@ -166,7 +133,6 @@ variables:
     description: "Dynamo TRTLLM container image"
     value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
 
-
 artifacts:
   # On Kubernetes, artifacts are injected into the task pods the native way (not via
   # the controller's filesystem), accessible as `${{ artifacts.NAME.path }}`:
@@ -174,61 +140,32 @@ artifacts:
   #   * fs:// -> made visible inside the pod, two ways:
   #       1. PVC-backed (recommended for models/large data): declare a PVC under the
   #          backend's `volumes:` and point the fs:// path at a location under its
-  #          `mount_path` (see the commented `volumes:` on the k8s_cluster backend).
+  #          `mount_path` (see the `volumes:` on the k8s_cluster backend).
   #       2. hostPath: if no PVC covers the path, fs:// is hostPath-mounted at the
   #          same path, so it must be NODE-accessible (e.g. an NFS/shared filesystem
   #          mounted on every node). A missing node path fails the pod loudly.
   - name: LOCAL_MODEL_PATH
     # Lives inside the `model-store` PVC (mounted at /models); see backend volumes.
     uri: fs:///models/Qwen3-8B-FP8
-  - name: PREFILL_CONFIG
-    uri: file://prefill_config.yaml
+  - name: AGG_CONFIG
+    uri: file://agg_config.yaml
     content: |
-      max_batch_size: ${{ variables.CTX_BATCH_SIZE }}
-      max_num_tokens: ${{ variables.CTX_MAX_NUM_TOKENS }}
-      max_seq_len: ${{ variables.CTX_MAX_SEQ_LEN }}
-      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
-      moe_expert_parallel_size: ${{ variables.CTX_TP_SIZE }}
-      enable_attention_dp: ${{ variables.CTX_ENABLE_ATTENTION_DP }}
-      pipeline_parallel_size: ${{ variables.CTX_PP_SIZE }}
-      # WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).
-      # allreduce_strategy: NCCL
-      cuda_graph_config: null
-      print_iter_log: true
-      disable_overlap_scheduler: true
-      enable_chunked_prefill: false
-      kv_cache_config:
-        enable_block_reuse: false
-        free_gpu_memory_fraction: ${{ variables.CTX_FREE_GPU_MEMORY_FRACTION }}
-        dtype: ${{ variables.KV_CACHE_DTYPE }}
-      cache_transceiver_config:
-        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
-        backend: DEFAULT
-  - name: DECODE_CONFIG
-    uri: file://decode_config.yaml
-    content: |
-      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
-      moe_expert_parallel_size: ${{ variables.GEN_TP_SIZE }}
-      enable_attention_dp: ${{ variables.GEN_ENABLE_ATTENTION_DP }}
-      pipeline_parallel_size: ${{ variables.GEN_PP_SIZE }}
-      # WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).
-      # allreduce_strategy: NCCL
-      max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
-      max_num_tokens: ${{ variables.GEN_MAX_NUM_TOKENS }}
-      max_seq_len: ${{ variables.GEN_MAX_SEQ_LEN }}
+      max_batch_size: ${{ variables.AGG_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.AGG_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.AGG_MAX_SEQ_LEN }}
+      tensor_parallel_size: ${{ variables.AGG_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.AGG_TP_SIZE }}
+      enable_attention_dp: ${{ variables.AGG_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: ${{ variables.AGG_PP_SIZE }}
       cuda_graph_config:
         enable_padding: true
-        max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+        max_batch_size: ${{ variables.AGG_BATCH_SIZE }}
       print_iter_log: true
       enable_chunked_prefill: false
       kv_cache_config:
         enable_block_reuse: false
-        free_gpu_memory_fraction: ${{ variables.GEN_FREE_GPU_MEMORY_FRACTION }}
+        free_gpu_memory_fraction: ${{ variables.AGG_FREE_GPU_MEMORY_FRACTION }}
         dtype: ${{ variables.KV_CACHE_DTYPE }}
-      cache_transceiver_config:
-        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
-        backend: DEFAULT
-      stream_interval: 20
 
 backends:
   # A kubernetes backend with device-plugin scheduling. No `image` field --
@@ -248,8 +185,8 @@ backends:
     # RDMA fast path (default 'auto'): on GKE multi-NIC RDMA nodes, task GPU pods
     # get scoped RDMA device access -- a per-pod slice of the node's
     # networking.gke.io.networks/rdma-N NICs (sized to the pod's GPU count) plus
-    # CAP_IPC_LOCK -- and a matching UCX_NET_DEVICES/NCCL_IB_HCA, so the
-    # disaggregated KV transfer (NIXL/UCX) and NCCL run over RoCE instead of TCP.
+    # CAP_IPC_LOCK -- and a matching UCX_NET_DEVICES/NCCL_IB_HCA, so intra-worker
+    # NCCL/UCX runs over RoCE instead of TCP.
     # Use 'off' to disable, or a list (e.g. [mlx5_0:1, mlx5_1:1]) to force devices.
     rdma: auto
     # Pre-existing PersistentVolumeClaims to mount into task pods. Use this to make
@@ -257,8 +194,7 @@ backends:
     # pods without a node-local hostPath. The PVC + its data must already exist in
     # the namespace; sflow only references it. A PVC is mounted into a task's pod(s)
     # only when the task references a path under its mount_path (so e.g. the model
-    # is not mounted into the etcd/nats pods). Use read_only + an ROX/RWX PVC to
-    # share one model across prefill/decode pods on multiple nodes.
+    # is not mounted into the etcd/nats pods).
     #
     # `deepseek-r1-model-lustre` is a dedicated RWX Lustre PVC (in the mlperf-sflow
     # namespace); the Qwen model is staged at its root, so LOCAL_MODEL_PATH points
@@ -282,7 +218,7 @@ operators:
     image: ${{ variables.AIPERF_IMAGE }}
 
 workflow:
-  name: dynamo_trtllm_disagg
+  name: dynamo_trtllm_agg
   timeout: 115m
 
   variables:
@@ -347,10 +283,10 @@ workflow:
         - nats_server
         - etcd_server
 
-    - name: prefill_server
+    - name: agg_server
       operator: dynamo_trtllm
       replicas:
-        count: ${{ variables.NUM_CTX_SERVERS }}
+        count: ${{ variables.NUM_AGG_SERVERS }}
         policy: "parallel"
       script:
         - set -x
@@ -358,87 +294,27 @@ workflow:
         - export TLLM_LOG_LEVEL=INFO
         - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
         - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        # Pin UCX to the reservation-detected primary NIC (falls back to eth0).
         - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
         - env | grep TLLM
         - env | grep UCX
         - unset UCX_TLS
-        # WIP_WAR (cross-node TP): the all-reduce autotuner probes NCCL_SYMMETRIC, whose
-        # symmetric-memory window buffers need NVLink P2P and crash across nodes
-        # ("NCCL invalid usage"); disable it. See TRT-LLM #12715 / PR #12709.
-        # - export NCCL_SYMMETRIC_ENABLE=0
-        # - export NCCL_GIN_ENABLE=0
-        # - export NCCL_IB_MERGE_NICS=0
-        # - export LD_LIBRARY_PATH=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
-        
-        # DEBUG (temporary): log the KV-transfer/NCCL transport to confirm RDMA vs TCP.
-        # Look for UCX rc_mlx5/dc_mlx5 (RDMA) vs tcp, and NCCL NET/IB vs NET/Socket. Remove after.
+        # DEBUG (temporary): log the NCCL/UCX transport to confirm RDMA vs TCP.
+        # Look for UCX rc_mlx5/dc_mlx5 (RDMA) vs tcp, and NCCL NET/IB vs NET/Socket.
         # - export UCX_LOG_LEVEL=info
         # - export NCCL_DEBUG=INFO
         # - export NCCL_DEBUG_SUBSYS=NET
+        # Single-node aggregated worker: dynamo.trtllm handles intra-node tensor
+        # parallelism itself (no Ray/MPI launcher). The engine is configured by the
+        # ConfigMap-injected AGG_CONFIG passed via --extra-engine-args.
         - >
           python3 -m dynamo.trtllm
           --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${SERVED_MODEL_NAME}
-          --disaggregation-mode prefill
-          --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
+          --extra-engine-args ${{ artifacts.AGG_CONFIG.path }} ${EXTRA_AGG_ARGS}
       resources:
         gpus:
-          count: ${{ variables.CTX_GPUS_PER_WORKER }}
-      depends_on:
-        - frontend_server
-      probes:
-        readiness:
-          http_post:
-            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
-            headers:
-              Content-Type: "application/json"
-            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
-          timeout: 1200
-          each_check_timeout: 20
-          interval: 20
-        failure:
-          log_watch:
-            match_pattern: "Traceback (most recent call last)"
-            match_count: 5
-          interval: 30
-
-    - name: decode_server
-      operator: dynamo_trtllm
-      replicas:
-        count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: "parallel"
-      script:
-        - set -x
-        - echo ${CUDA_VISIBLE_DEVICES}
-        - export TLLM_LOG_LEVEL=INFO
-        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
-        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
-        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
-        - env | grep TLLM
-        - env | grep UCX
-        - unset UCX_TLS
-        # WIP_WAR (cross-node TP): the all-reduce autotuner probes NCCL_SYMMETRIC, whose
-        # symmetric-memory window buffers need NVLink P2P and crash across nodes
-        # ("NCCL invalid usage"); disable it. See TRT-LLM #12715 / PR #12709.
-        # - export NCCL_SYMMETRIC_ENABLE=0
-        # - export NCCL_GIN_ENABLE=0
-        # - export NCCL_IB_MERGE_NICS=0
-        # - export LD_LIBRARY_PATH=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
-
-        # DEBUG (temporary): log the KV-transfer/NCCL transport to confirm RDMA vs TCP.
-        # Look for UCX rc_mlx5/dc_mlx5 (RDMA) vs tcp, and NCCL NET/IB vs NET/Socket. Remove after.
-        # - export UCX_LOG_LEVEL=info
-        # - export NCCL_DEBUG=INFO
-        # - export NCCL_DEBUG_SUBSYS=NET
-        - >
-          python3 -m dynamo.trtllm
-          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
-          --served-model-name ${SERVED_MODEL_NAME}
-          --disaggregation-mode decode
-          --extra-engine-args ${{ artifacts.DECODE_CONFIG.path }} ${EXTRA_DECODE_ARGS}
-      resources:
-        gpus:
-          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+          count: ${{ variables.AGG_GPUS_PER_WORKER }}
       depends_on:
         - frontend_server
       probes:
@@ -499,17 +375,17 @@ workflow:
           - CONCURRENCY
         policy: sequential
       # Trigger a hardware monitor from this benchmark task but sample the
-      # prefill/decode SERVERS' resources (used_by_tasks), not the benchmark
-      # client's own node -- so the report captures the servers' GPU/CPU usage
-      # over the benchmark window.
+      # aggregated SERVER's resources (used_by_tasks), not the benchmark client's
+      # own node. NOTE: node-level hardware monitoring is not implemented on the
+      # kubernetes backend yet, so sflow skips it (with a log hint) -- this block
+      # stays for parity with the Slurm recipe and takes effect on backends that
+      # support host monitoring.
       monitor:
         resources:
           used_by_tasks:
-            - prefill_server
-            - decode_server
+            - agg_server
         report:
           enabled: true
       depends_on:
-        - prefill_server
-        - decode_server
+        - agg_server
         - frontend_server

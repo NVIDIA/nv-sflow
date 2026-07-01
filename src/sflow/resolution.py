@@ -1088,7 +1088,16 @@ def resolve_and_update_variables(
             for key, value in resolved_values.items()
             if not resolver.has_expression(value)
         }
-        ctx: dict[str, Any] = {"variables": ctx_values, **ctx_values}
+        # Wrap in VariableValue so expressions can read `.domain`/`.value`
+        # metadata (e.g. `variables.CONCURRENCY.domain | max`), matching the
+        # compose (`build_variables_ctx_from_raw`) and workflow/task-script
+        # (`build_variables_ctx`) paths. Arithmetic and string rendering
+        # transparently delegate to the underlying value.
+        wrapped_values = {
+            key: VariableValue(value, domain=variables[key].domain)
+            for key, value in ctx_values.items()
+        }
+        ctx: dict[str, Any] = {"variables": wrapped_values, **wrapped_values}
         if extra_ctx:
             ctx.update(extra_ctx)
 

@@ -162,7 +162,24 @@ workflow:
         - echo "max=${{ variables.CONCURRENCY.domain | max }}"
 ```
 
-This also works in places that resolve expressions before execution, including `sflow compose --resolve` and `sflow batch -e/--sbatch-extra-args`.
+Domain metadata is also available when computing other variables, so you can size one variable off another's sweep. For example, size the decode batch to the largest concurrency spread across the decode servers:
+
+```yaml
+variables:
+  CONCURRENCY:
+    value: 512
+    type: integer
+    domain: [128, 256, 512]
+  NUM_GEN_SERVERS:
+    value: 4
+    type: integer
+  GEN_BATCH_SIZE:
+    type: integer
+    # max([128, 256, 512]) // 4 = 128
+    value: ${{ (variables.CONCURRENCY.domain | max) // variables.NUM_GEN_SERVERS }}
+```
+
+This works everywhere expressions are resolved: the top-level and `workflow` `variables:` sections (resolved by `sflow run`), task scripts, `sflow compose --resolve`, and `sflow batch -e/--sbatch-extra-args`.
 
 For replica sweeps, `${{ variables.CONCURRENCY }}` resolves to each replica's row value while `${{ variables.CONCURRENCY.domain }}` stays the full domain list for every replica.
 

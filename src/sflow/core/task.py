@@ -169,6 +169,10 @@ class Task:
     operator: Operator
 
     status: TaskStatus = TaskStatus.INITIATED
+    # Optional live sub-status shown next to `status` (e.g. a k8s pod's
+    # "Pending: Unschedulable" while the task is RUNNING but not yet started).
+    # Backend-agnostic: operators set it via the execute() status_note callback.
+    status_detail: str | None = None
     type: TaskType = TaskType.BATCH
     envs: dict[str, str] = field(default_factory=dict)
     script: list[str] = field(default_factory=list)

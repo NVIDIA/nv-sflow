@@ -221,6 +221,19 @@ class RichTui(AbstractContextManager["RichTui"]):
             TaskStatus.CANCELLED: "magenta",
         }.get(status, "white")
 
+    @staticmethod
+    def _status_display(task: Task) -> str:
+        """Status text with the live sub-status appended while RUNNING.
+
+        e.g. ``RUNNING (Pending: Unschedulable)`` for a k8s task whose pod is still
+        scheduling. Only shown while RUNNING so a stale note never lingers on a
+        terminal status.
+        """
+        detail = getattr(task, "status_detail", None)
+        if detail and task.status == TaskStatus.RUNNING:
+            return f"{task.status} ({detail})"
+        return str(task.status)
+
     def _build_task_table(self, tasks: Iterable[Task]) -> Table:
         t = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
         t.add_column("Task", overflow="fold", no_wrap=False)
@@ -230,7 +243,9 @@ class RichTui(AbstractContextManager["RichTui"]):
 
         for task in tasks:
             status = task.status
-            status_text = Text(str(status), style=self._status_style(status))
+            status_text = Text(
+                self._status_display(task), style=self._status_style(status)
+            )
 
             exit_code = getattr(task, "exit_code", None)
             exit_str = "" if exit_code is None else str(int(exit_code))
@@ -452,7 +467,9 @@ class _SflowTextualApp(App[None]):
         super().__init__()
         self._owner = owner
         self._last_rendered_log_record: logging.LogRecord | None = None
-        self._task_rows_snapshot: tuple[tuple[str, str, str, str], ...] | None = None
+        self._task_rows_snapshot: (
+            tuple[tuple[str, str, str, str, str], ...] | None
+        ) = None
         self._backend_rows_snapshot: (
             tuple[tuple[str, str, str, str, str], ...] | None
         ) = None
@@ -489,7 +506,9 @@ class _SflowTextualApp(App[None]):
     def _update_header(self) -> None:
         self.query_one("#header", Static).update(self._owner._header_text())
 
-    def _task_rows(self, tasks: list[Task]) -> tuple[tuple[str, str, str, str], ...]:
+    def _task_rows(
+        self, tasks: list[Task]
+    ) -> tuple[tuple[str, str, str, str, str], ...]:
         rows = []
         for task in tasks:
             exit_code = getattr(task, "exit_code", None)
@@ -499,7 +518,18 @@ class _SflowTextualApp(App[None]):
                 nodes_str = nodes
             else:
                 nodes_str = ",".join(str(node) for node in nodes)
-            rows.append((task.name, str(task.status), exit_str, nodes_str))
+            # (name, status value [for styling], status display [with sub-status],
+            # exit, nodes). The display is snapshotted too, so a sub-status change
+            # triggers a re-render.
+            rows.append(
+                (
+                    task.name,
+                    str(task.status),
+                    self._owner._status_display(task),
+                    exit_str,
+                    nodes_str,
+                )
+            )
         return tuple(rows)
 
     def _update_tasks(self, tasks: list[Task], *, force: bool = False) -> None:
@@ -512,10 +542,13 @@ class _SflowTextualApp(App[None]):
         table.clear(columns=True)
         table.add_columns("Task", "Status", "Exit", "Nodes")
 
-        for name, status, exit_str, nodes_str in rows:
+        for name, status_value, status_display, exit_str, nodes_str in rows:
             table.add_row(
                 name,
-                Text(status, style=self._owner._status_style(TaskStatus(status))),
+                Text(
+                    status_display,
+                    style=self._owner._status_style(TaskStatus(status_value)),
+                ),
                 exit_str,
                 nodes_str,
             )

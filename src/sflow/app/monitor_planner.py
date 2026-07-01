@@ -138,6 +138,9 @@ class _MonitorPlanner:
         self._units: dict[CollectorKey, _CollectorUnit] = {}
         # Map each config task name -> its runtime tasks (replicas included).
         self._replicas_by_base: dict[str, list[Task]] = self._build_replicas_by_base()
+        # Backends whose monitor targets were skipped because they don't support
+        # host-level monitoring yet (e.g. Kubernetes). Surfaced once in build().
+        self._skipped_monitor_backends: set[str] = set()
 
     # --- task / backend lookup -------------------------------------------------
 
@@ -171,6 +174,21 @@ class _MonitorPlanner:
             return self.state.default_backend
         return next(iter(self.state.backends.values()), None)
 
+    def _monitorable(self, backend: Backend | None) -> bool:
+        """Whether the bare-host monitor can run on this backend's nodes.
+
+        Backends without host-level monitoring (e.g. Kubernetes, which has no
+        node-level collector mechanism yet) are skipped -- running the collector
+        on the sflow driver host would sample the driver, not the reserved nodes.
+        The skip is recorded so ``build`` can log a single hint.
+        """
+        if backend is None:
+            return False
+        if not getattr(backend.capabilities, "supports_host_monitoring", True):
+            self._skipped_monitor_backends.add(backend.name)
+            return False
+        return True
+
     # --- node / gpu resolution -------------------------------------------------
 
     def _resolve_keys_and_gpus(
@@ -185,7 +203,7 @@ class _MonitorPlanner:
             for ref in resources.used_by_tasks:
                 for rt in self._runtime_tasks_for(ref):
                     backend = self._backend_for_task(rt)
-                    if backend is None:
+                    if not self._monitorable(backend):
                         continue
                     for node in rt.assigned_nodes:
                         keys.append((backend.name, node))
@@ -200,7 +218,7 @@ class _MonitorPlanner:
             backend = self._default_backend()
             default_nodes = _backend_node_names(backend)
 
-        if backend is None:
+        if not self._monitorable(backend):
             return [], None
 
         node_names = self._resolve_nodes(resources, backend, default_nodes)
@@ -408,8 +426,11 @@ class _MonitorPlanner:
         rts = [
             rt
             for rt in self._runtime_tasks_for(resource_task)
-            if rt.assigned_nodes
-            or parse_cuda_visible_devices(rt.envs.get("CUDA_VISIBLE_DEVICES"))
+            if (
+                rt.assigned_nodes
+                or parse_cuda_visible_devices(rt.envs.get("CUDA_VISIBLE_DEVICES"))
+            )
+            and self._monitorable(self._backend_for_task(rt))
         ]
         if not rts:
             return []
@@ -513,6 +534,18 @@ class _MonitorPlanner:
                 if consumer is not None:
                     task_consumers.append((rt, consumer))
                     consumers.append(consumer)
+
+        # Hint (once) when configured monitors were dropped for a backend that has
+        # no host-level monitoring yet (e.g. Kubernetes) -- so the absence of a
+        # sflow_monitor report is explained rather than silent.
+        if self._skipped_monitor_backends:
+            _logger.warning(
+                "Hardware monitor skipped for backend(s) %s: node-level hardware "
+                "monitoring is not implemented for this backend yet (e.g. "
+                "Kubernetes needs a DCGM/DaemonSet collector). No sflow_monitor "
+                "samples or reports will be produced for their tasks.",
+                ", ".join(sorted(self._skipped_monitor_backends)),
+            )
 
         if not self._units:
             return None

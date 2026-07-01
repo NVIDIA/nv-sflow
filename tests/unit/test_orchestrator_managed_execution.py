@@ -42,7 +42,9 @@ class _ManagedOp(Operator):
     def manages_own_execution(self) -> bool:
         return True
 
-    async def execute(self, *, launcher, output_logger, env, task_name, script) -> int:
+    async def execute(
+        self, *, launcher, output_logger, env, task_name, script, status_note=None
+    ) -> int:
         self.executed = True
         return self._rc
 

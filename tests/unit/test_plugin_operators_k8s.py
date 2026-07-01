@@ -7,6 +7,11 @@ the create-before-destroy handoff gating (GPU tasks only)."""
 
 import json
 import logging
+import os
+import re
+import stat
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -16,6 +21,7 @@ from sflow.core.artifact import Artifact
 from sflow.core.backend import Allocation
 from sflow.core.compute_node import ComputeNode
 from sflow.plugins.backends.kubernetes import KubernetesBackend, KubernetesBackendConfig
+from sflow.plugins.operators import _k8s_shell as k8s_shell
 from sflow.plugins.operators.k8s import K8sOperator, K8sOperatorConfig
 
 _MARK = "SFLOW_K8S_MANIFEST"
@@ -49,12 +55,13 @@ def _backend(scheduling="dra", gpus_per_node=8, nodes=2, namespace="default",
 
 def _build(
     backend, assigned_nodes, *, gpu_count, task="t", script=("run",), envs=None,
-    artifacts=(),
+    artifacts=(), cuda_visible=None,
 ):
     op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
     op.apply_backend_context(
         backend=backend, assigned_nodes=list(assigned_nodes),
         artifacts=list(artifacts), gpu_count=gpu_count,
+        cuda_visible_devices=cuda_visible,
     )
     cmd = op.build_command(task_name=task, script=list(script), envs=dict(envs or {}))
     shell = cmd.as_list()[-1]
@@ -643,6 +650,174 @@ def test_no_network_env_when_no_rdma_detected():
         for e in _pods(manifest)[0]["spec"]["containers"][0].get("env", [])
     }
     assert "UCX_NET_DEVICES" not in env and "NCCL_IB_HCA" not in env
+
+
+# ---------------------------------------------------------------------------
+# Scoped per-pod RDMA NIC slice: node-aware, aligned to the node-local GPU slot
+# ---------------------------------------------------------------------------
+
+
+def _rdma_backend(gpus_per_node=8, nics=8):
+    """A single-node backend with the RDMA fast path enabled and ``nics`` NICs."""
+    be = _backend("device_plugin", gpus_per_node, nodes=1)
+    be._rdma_enabled = True
+    be._rdma_nic_specs = [
+        (f"networking.gke.io.networks/rdma-{i}", f"mlx5_{i}") for i in range(nics)
+    ]
+    return be
+
+
+def _rdma_nic_indices(pod):
+    """The rdma-N NIC indices this pod requests, from its container limits."""
+    limits = pod["spec"]["containers"][0].get("resources", {}).get("limits", {})
+    out = []
+    for key in limits:
+        m = re.fullmatch(r"networking\.gke\.io\.networks/rdma-(\d+)", key)
+        if m:
+            out.append(int(m.group(1)))
+    return sorted(out)
+
+
+def test_rdma_nic_window_aligns_to_node_local_gpu_slot():
+    # A decode pod holding node-local GPU slot 4-7 must claim NICs rdma-4..7
+    # (aligned to its GPUs), NOT rdma-0..3 -- otherwise it collides with prefill
+    # pods packed onto GPUs 0-3 of the same node and never schedules.
+    manifest, _ = _build(
+        _rdma_backend(), ["node-0"], gpu_count=4, cuda_visible="4,5,6,7"
+    )
+    pod = _pods(manifest)[0]
+    assert _rdma_nic_indices(pod) == [4, 5, 6, 7]
+    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0]["env"]}
+    assert env["NCCL_IB_HCA"] == "mlx5_4,mlx5_5,mlx5_6,mlx5_7"
+    assert env["UCX_NET_DEVICES"] == "mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1"
+
+
+def test_colocated_prefill_decode_get_disjoint_nic_windows():
+    # 2x TP2 prefill + 1x TP4 decode packed onto one 8-GPU/8-NIC node: each pod's
+    # NIC window is aligned to its node-local GPU slot, so all three are disjoint
+    # and fit (the bug packed every task onto rdma-0.. -> decode stayed Pending).
+    be = _rdma_backend()
+    p0 = _pods(_build(be, ["node-0"], gpu_count=2, cuda_visible="0,1")[0])[0]
+    p1 = _pods(_build(be, ["node-0"], gpu_count=2, cuda_visible="2,3")[0])[0]
+    d0 = _pods(_build(be, ["node-0"], gpu_count=4, cuda_visible="4,5,6,7")[0])[0]
+    nics_p0 = set(_rdma_nic_indices(p0))
+    nics_p1 = set(_rdma_nic_indices(p1))
+    nics_d0 = set(_rdma_nic_indices(d0))
+    assert nics_p0 == {0, 1}
+    assert nics_p1 == {2, 3}
+    assert nics_d0 == {4, 5, 6, 7}
+    assert nics_p0.isdisjoint(nics_d0)
+    assert nics_p1.isdisjoint(nics_d0)
+
+
+def test_rdma_nic_window_falls_back_to_replica_index_without_gpu_slot():
+    # Without a planner-reserved GPU slot (cuda_visible_devices=None, e.g. dry-run
+    # with no allocation), same-task replicas still get disjoint NICs by offsetting
+    # on the replica index.
+    manifest, _ = _build(
+        _rdma_backend(), ["node-0"], gpu_count=2,
+        envs={"SFLOW_REPLICA_INDEX": "1"},
+    )
+    assert _rdma_nic_indices(_pods(manifest)[0]) == [2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Fail-fast on unrecoverable pod-start states (Unschedulable / ImagePullBackOff)
+# ---------------------------------------------------------------------------
+
+
+def _write_kubectl_stub(bin_dir: Path, body: str) -> Path:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "kubectl"
+    stub.write_text("#!/usr/bin/env bash\n" + body)
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return stub
+
+
+def _run_wait_lines(
+    tmp_path, monkeypatch, fake_process, *, stub_body, env=None, grace=2, sleep_secs=0
+):
+    """Run the generated pod-start wait bash with a stubbed ``kubectl`` on PATH."""
+    # The autouse fake_process fixture blocks real subprocesses; let bash (and its
+    # child kubectl stub, an OS-level process it doesn't intercept) run for real.
+    fake_process.allow_unregistered(True)
+    monkeypatch.setattr(k8s_shell, "UNRECOVERABLE_GRACE_POLLS", grace)
+    monkeypatch.setattr(k8s_shell, "POLL_SLEEP_SECS", sleep_secs)
+    bin_dir = tmp_path / "bin"
+    _write_kubectl_stub(bin_dir, stub_body)
+    lines = k8s_shell.wait_for_pod_ready_lines("pod/x", "", label="x")
+    script = "set -euo pipefail\n" + "\n".join(lines)
+    run_env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    if env:
+        run_env.update(env)
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=run_env, timeout=30
+    )
+
+
+def test_wait_fails_fast_on_persistent_unschedulable(tmp_path, monkeypatch, fake_process):
+    # A pod that stays Pending/Unschedulable past the grace window aborts the apply
+    # step (exit 1) instead of waiting out the full budget -> the task fails fast
+    # with the reason, rather than hanging until the readiness-probe timeout.
+    stub = textwrap.dedent("""\
+        if [ "$1" = "describe" ]; then echo DESCRIBE; exit 0; fi
+        if [ "$1" = "get" ] && [ "$2" = "events" ]; then echo ""; exit 0; fi
+        case "$*" in
+          *"status.phase"*) echo "Pending";;
+          *'PodScheduled")].reason'*) echo "Unschedulable";;
+          *) echo "";;
+        esac
+    """)
+    r = _run_wait_lines(tmp_path, monkeypatch, fake_process, stub_body=stub)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "Unschedulable" in r.stdout
+    assert "aborting" in r.stdout.lower()
+
+
+def test_wait_fails_fast_on_image_pull_backoff(tmp_path, monkeypatch, fake_process):
+    stub = textwrap.dedent("""\
+        if [ "$1" = "describe" ]; then echo DESCRIBE; exit 0; fi
+        if [ "$1" = "get" ] && [ "$2" = "events" ]; then echo ""; exit 0; fi
+        case "$*" in
+          *"status.phase"*) echo "Pending";;
+          *"waiting.reason"*) echo "ImagePullBackOff";;
+          *) echo "";;
+        esac
+    """)
+    r = _run_wait_lines(tmp_path, monkeypatch, fake_process, stub_body=stub)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "ImagePullBackOff" in r.stdout
+
+
+def test_wait_tolerates_transient_state_then_running(tmp_path, monkeypatch, fake_process):
+    # A brief Unschedulable that clears (the pod goes Running within the grace
+    # window) must NOT fail the task -- the bad-state streak resets on recovery.
+    counter = tmp_path / "n"
+    stub = textwrap.dedent("""\
+        if [ "$1" = "describe" ]; then echo DESCRIBE; exit 0; fi
+        if [ "$1" = "get" ] && [ "$2" = "events" ]; then echo ""; exit 0; fi
+        case "$*" in
+          *"status.phase"*)
+            n=$(cat "$COUNTER" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$COUNTER";
+            if [ "$n" -le 1 ]; then echo "Pending"; else echo "Running"; fi;;
+          *'PodScheduled")].reason'*) echo "Unschedulable";;
+          *) echo "";;
+        esac
+    """)
+    r = _run_wait_lines(
+        tmp_path, monkeypatch, fake_process, stub_body=stub,
+        env={"COUNTER": str(counter)}, grace=2,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "final phase=Running" in r.stdout
+
+
+def test_apply_shell_contains_fail_fast_tokens():
+    _, shell = _build(_backend("dra", 8), ["node-0"], gpu_count=2)
+    assert "Unschedulable" in shell
+    assert "ImagePullBackOff" in shell
+    assert "CrashLoopBackOff" in shell
+    assert "exit 1" in shell
 
 
 def test_pods_get_ram_backed_dev_shm_by_default():

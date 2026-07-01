@@ -183,6 +183,9 @@ def test_capabilities_node_placement_and_no_gpu_sharing():
     assert caps.supports_gpu_env is False
     # GPUs are hard-exclusive under DRA/device-plugin.
     assert caps.supports_gpu_sharing is False
+    # Node-level hardware monitoring is not implemented for k8s yet (would need a
+    # DCGM/DaemonSet collector), so the planner skips it.
+    assert caps.supports_host_monitoring is False
 
 
 def test_scheduling_and_dra_defaults():

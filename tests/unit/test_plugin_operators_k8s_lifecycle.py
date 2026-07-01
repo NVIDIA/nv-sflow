@@ -121,6 +121,243 @@ def test_delete_objects_issues_nonblocking_delete(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# multi-pod fail-fast: one dead sub-pod fails the whole task (no hang on peers)
+# ---------------------------------------------------------------------------
+
+
+def test_gather_pods_fail_fast_all_succeed():
+    async def ok(code, phase):
+        return (code, phase)
+
+    results = asyncio.run(
+        life.gather_pods_fail_fast([ok(0, "Succeeded"), ok(0, "Succeeded")])
+    )
+    assert results == [(0, "Succeeded"), (0, "Succeeded")]
+
+
+def test_gather_pods_fail_fast_cancels_peers_when_one_fails():
+    # The leader fails fast while the worker "watcher" would idle for a long time
+    # (mirrors a multi-node worker pod on `sleep 3600` after the leader crashed).
+    # The failure must cancel the worker and return at once -- not block on it.
+    cancelled = {"worker": False}
+
+    async def leader():
+        return (1, "Failed")
+
+    async def worker():
+        try:
+            await asyncio.sleep(3600)
+            return (0, "Succeeded")
+        except asyncio.CancelledError:
+            cancelled["worker"] = True
+            raise
+
+    async def drive():
+        # wait_for is the regression guard: pre-fix this blocked until SIGINT.
+        return await asyncio.wait_for(
+            life.gather_pods_fail_fast([leader(), worker()]), timeout=2
+        )
+
+    results = asyncio.run(drive())
+    assert results[0] == (1, "Failed")
+    assert results[1] is None  # worker cancelled -> no result
+    assert cancelled["worker"] is True
+
+
+def test_gather_pods_fail_fast_treats_watcher_exception_as_failure():
+    async def boom():
+        raise RuntimeError("kubectl blew up")
+
+    async def ok():
+        return (0, "Succeeded")
+
+    results = asyncio.run(life.gather_pods_fail_fast([boom(), ok()]))
+    assert results[0] == (1, "Failed")  # a raising watcher counts as a failed pod
+
+
+def test_task_exit_code_any_failed_pod_fails_task():
+    # Leader succeeded but a worker failed -> the task fails (not leader-only).
+    assert life.task_exit_code([(0, "Succeeded"), (7, "Failed")]) == 7
+    # Failed phase with a 0/unknown numeric code still fails (-> 1).
+    assert life.task_exit_code([(0, "Failed"), None]) == 1
+    # Leader failed, peer cancelled (None) -> the leader's non-zero code.
+    assert life.task_exit_code([(1, "Failed"), None]) == 1
+
+
+def test_task_exit_code_all_ok_uses_leader():
+    assert life.task_exit_code([(0, "Succeeded"), (0, "Succeeded")]) == 0
+    assert life.task_exit_code([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# format_pod_start_note + status-note poller (live sub-status while starting)
+# ---------------------------------------------------------------------------
+
+
+def _fake_kubectl(phase, *, waiting="", sched=""):
+    async def fake(args, *, global_args=()):
+        j = " ".join(str(a) for a in args)
+        if "status.phase" in j:
+            return (0, phase, "")
+        if "waiting.reason" in j:
+            return (0, waiting, "")
+        if "PodScheduled" in j:
+            return (0, sched, "")
+        return (0, "", "")
+
+    return fake
+
+
+def test_format_pod_start_note_reports_unschedulable(monkeypatch):
+    monkeypatch.setattr(
+        life, "run_kubectl", _fake_kubectl("Pending", sched="Unschedulable")
+    )
+    note = asyncio.run(life.format_pod_start_note("pod/x", global_args=[], ns_args=[]))
+    assert note == "Pending: Unschedulable"
+
+
+def test_format_pod_start_note_prefers_container_waiting_reason(monkeypatch):
+    monkeypatch.setattr(
+        life, "run_kubectl", _fake_kubectl("Pending", waiting="ImagePullBackOff")
+    )
+    note = asyncio.run(life.format_pod_start_note("pod/x", global_args=[], ns_args=[]))
+    assert note == "Pending: ImagePullBackOff"
+
+
+def test_format_pod_start_note_none_when_running(monkeypatch):
+    monkeypatch.setattr(life, "run_kubectl", _fake_kubectl("Running"))
+    assert (
+        asyncio.run(life.format_pod_start_note("pod/x", global_args=[], ns_args=[]))
+        is None
+    )
+
+
+def test_format_pod_start_note_none_when_gone(monkeypatch):
+    monkeypatch.setattr(life, "run_kubectl", _fake_kubectl(""))
+    assert (
+        asyncio.run(life.format_pod_start_note("pod/x", global_args=[], ns_args=[]))
+        is None
+    )
+
+
+def test_format_pod_start_note_phase_only_without_reason(monkeypatch):
+    monkeypatch.setattr(life, "run_kubectl", _fake_kubectl("Pending"))
+    assert (
+        asyncio.run(life.format_pod_start_note("pod/x", global_args=[], ns_args=[]))
+        == "Pending"
+    )
+
+
+def test_status_note_for_pods_labels_each_pod_when_multiple(monkeypatch):
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend(nodes=2, gpus_per_node=8),
+        assigned_nodes=["node-0", "node-1"], artifacts=[], gpu_count=16,
+    )
+
+    async def fake_note(pod_ref, *, global_args, ns_args):
+        return "Pending" if pod_ref.endswith("-0") else None
+
+    monkeypatch.setattr(life, "format_pod_start_note", fake_note)
+    note = asyncio.run(
+        op._status_note_for_pods(["pod/t-0", "pod/t-1"], global_args=[], ns_args=[])
+    )
+    assert note == "t-0: Pending"
+
+
+def test_status_note_for_pods_none_when_all_running(monkeypatch):
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend(), assigned_nodes=["node-0"], artifacts=[], gpu_count=2
+    )
+
+    async def fake_note(pod_ref, *, global_args, ns_args):
+        return None
+
+    monkeypatch.setattr(life, "format_pod_start_note", fake_note)
+    assert (
+        asyncio.run(op._status_note_for_pods(["pod/t"], global_args=[], ns_args=[]))
+        is None
+    )
+
+
+def test_poll_status_note_reports_until_cancelled(monkeypatch):
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend(), assigned_nodes=["node-0"], artifacts=[], gpu_count=2
+    )
+
+    async def fake_note(pod_ref, *, global_args, ns_args):
+        return "Pending: Unschedulable"
+
+    monkeypatch.setattr(life, "format_pod_start_note", fake_note)
+    notes: list = []
+
+    async def drive():
+        poller = asyncio.ensure_future(
+            op._poll_status_note(
+                ["pod/x"], global_args=[], ns_args=[],
+                status_note=notes.append, interval=0,
+            )
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        poller.cancel()
+        await asyncio.gather(poller, return_exceptions=True)
+
+    asyncio.run(drive())
+    assert "Pending: Unschedulable" in notes
+
+
+def test_execute_clears_status_note_after_startup(monkeypatch, tmp_path):
+    # When a status_note callback is provided, execute stops annotating the sub-
+    # status once the startup wait is over (pod running) -> the note is cleared.
+    async def _noop_stream(log_command, dest_path):
+        return _FakeProc()
+
+    async def _noop_tail(path, *, task_name):
+        await asyncio.sleep(3600)
+
+    async def _watch(pod_ref, **kw):
+        return "Succeeded"
+
+    async def _term(p):
+        pass
+
+    async def _finalize(*a, **k):
+        pass
+
+    async def _exit(pod_ref, *, phase="", **kw):
+        return 0
+
+    async def _delete(refs, **kw):
+        pass
+
+    monkeypatch.setattr(life, "start_pod_log_file_stream", _noop_stream)
+    monkeypatch.setattr(life, "tail_file_to_console", _noop_tail)
+    monkeypatch.setattr(life, "watch_until_terminal", _watch)
+    monkeypatch.setattr(life, "terminate_process", _term)
+    monkeypatch.setattr(life, "finalize_complete_log", _finalize)
+    monkeypatch.setattr(life, "pod_exit_code", _exit)
+    monkeypatch.setattr(life, "delete_objects", _delete)
+
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(backend=_backend(), assigned_nodes=["node-0"],
+                             artifacts=[], gpu_count=2)
+    notes: list = []
+    rc = asyncio.run(
+        op.execute(
+            launcher=_FakeLauncher(), output_logger=None,
+            env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+            task_name="decode_server_0", script=["run"],
+            status_note=notes.append,
+        )
+    )
+    assert rc == 0
+    assert notes and notes[-1] is None
+
+
+# ---------------------------------------------------------------------------
 # K8sContainerOperator.execute orchestration (launcher + kubectl faked)
 # ---------------------------------------------------------------------------
 
@@ -220,6 +457,74 @@ def test_execute_offloads_stream_and_stops_on_terminal(monkeypatch, tmp_path):
         < kinds.index("finalize")
     )
     assert kinds[-1] == "delete"
+
+
+def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
+    # Regression: a multi-node task is 2 pods (leader + worker on `sleep 3600`).
+    # When the leader pod dies, execute() must fail the whole task at once instead
+    # of blocking on the still-running worker (which pre-fix hung until SIGINT).
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(backend=_backend(nodes=2, gpus_per_node=8),
+                             assigned_nodes=["node-0", "node-1"], artifacts=[],
+                             gpu_count=16)
+    plan = op._build_execution_plan(
+        task_name="decode_server_0", script=["run"],
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+    )
+    assert len(plan.pod_refs) == 2  # one pod per node
+    leader_ref = plan.pod_refs[0]
+    worker_cancelled = {"v": False}
+
+    async def fake_start_stream(log_command, dest_path):
+        return _FakeProc()
+
+    async def fake_tail(path, *, task_name):
+        await asyncio.sleep(3600)
+
+    async def fake_watch(pod_ref, **kw):
+        if pod_ref == leader_ref:
+            return "Failed"  # leader's engine init failed
+        try:
+            await asyncio.sleep(3600)  # worker idles on `sleep 3600`
+            return "Succeeded"
+        except asyncio.CancelledError:
+            worker_cancelled["v"] = True
+            raise
+
+    async def fake_terminate(p):
+        pass
+
+    async def fake_exit(pod_ref, *, phase="", **kw):
+        return 1 if phase == "Failed" else 0
+
+    async def fake_finalize(*a, **k):
+        pass
+
+    async def fake_delete(refs, **kw):
+        pass
+
+    monkeypatch.setattr(life, "start_pod_log_file_stream", fake_start_stream)
+    monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
+    monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
+    monkeypatch.setattr(life, "terminate_process", fake_terminate)
+    monkeypatch.setattr(life, "pod_exit_code", fake_exit)
+    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "delete_objects", fake_delete)
+
+    launcher = _FakeLauncher()
+
+    async def drive():
+        # wait_for is the regression guard: pre-fix this blocked on the worker.
+        return await asyncio.wait_for(
+            op.execute(launcher=launcher, output_logger=None,
+                       env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+                       task_name="decode_server_0", script=["run"]),
+            timeout=2,
+        )
+
+    rc = asyncio.run(drive())
+    assert rc == 1  # the dead leader fails the whole task ...
+    assert worker_cancelled["v"] is True  # ... and the idle worker was cancelled
 
 
 def test_run_pod_stream_status_authoritative_interrupts_stream(monkeypatch, tmp_path):

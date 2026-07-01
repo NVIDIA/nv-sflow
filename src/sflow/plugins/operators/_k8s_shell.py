@@ -20,10 +20,29 @@ from sflow.core.command import Command
 from sflow.plugins.operators._k8s_render import SFLOW_ALLOC_LABEL
 
 # kubectl logs -f bails with BadRequest on a not-yet-started container, so the
-# apply command polls the pod phase first (READY_RETRIES * 2s budget) before the
-# driver attaches the log stream. Status/exit-code polling and the early stop
-# live driver-side in _k8s_lifecycle, not in this bash.
+# apply command polls the pod phase first (READY_RETRIES * POLL_SLEEP_SECS budget)
+# before the driver attaches the log stream. Status/exit-code polling and the
+# early stop live driver-side in _k8s_lifecycle, not in this bash.
 READY_RETRIES = 300
+# Seconds between pod-phase polls in the apply wait loop.
+POLL_SLEEP_SECS = 2
+# Consecutive polls a pod may sit in an unrecoverable start state (Unschedulable,
+# ImagePullBackOff, ...) before the apply step aborts the task (exit 1) instead of
+# waiting out the full budget + readiness-probe timeout. A grace window (rather
+# than failing on the first bad poll) tolerates transient blips -- e.g. a brief
+# post-handoff scheduling gap, or an ErrImagePull that resolves on retry.
+UNRECOVERABLE_GRACE_POLLS = 15
+# Container waiting reasons / scheduling reason that do not clear on their own, so
+# a pod stuck in one past the grace window is treated as a hard failure.
+_UNRECOVERABLE_WAITING_REASONS = (
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "InvalidImageName",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+    "RunContainerError",
+    "CrashLoopBackOff",
+)
 
 _MANIFEST_HEREDOC = "SFLOW_K8S_MANIFEST"
 
@@ -90,15 +109,22 @@ def wait_for_pod_ready_lines(pod_ref: str, ns_seg: str, *, label: str) -> list[s
     """Shell lines that wait for ``pod_ref`` to start, echoing phase/reason.
 
     Polls the pod phase and a short ``reason`` (container waiting reason, else the
-    ``PodScheduled`` condition message) and echoes ``[sflow] <label>: phase=<p>
+    ``PodScheduled`` reason/message) and echoes ``[sflow] <label>: phase=<p>
     reason=<r> <detail> (<n>s)`` to stdout on change or every ~30s, so a slow
     image pull / unschedulable pod is never silent. ``<detail>`` adds live
     insight that ``reason`` alone hides (a bare ``ContainerCreating`` covers image
     pull, volume mounts, and sandbox setup): the container ``waiting.message``
     when set (e.g. ``Back-off pulling image``), otherwise the pod's most recent
     Event (e.g. ``Pulling: Pulling image "..."`` vs ``Failed: ...``) -- the only
-    pull signal Kubernetes exposes (the API has no pull-progress percentage). On
-    the timeout fall-through it dumps ``kubectl describe`` + recent events.
+    pull signal Kubernetes exposes (the API has no pull-progress percentage).
+
+    Fail-fast: if the pod sits in an unrecoverable start state
+    (``Unschedulable``, ``ImagePullBackOff``, ...) for ``UNRECOVERABLE_GRACE_POLLS``
+    consecutive polls, it dumps ``kubectl describe`` + events and exits non-zero --
+    aborting the apply (and thus the task) in ~grace seconds instead of hanging
+    until the readiness-probe timeout. A grace window (and a streak that resets on
+    recovery) tolerates transient blips. On the budget fall-through it likewise
+    dumps ``kubectl describe`` + recent events.
     """
     reason_jsonpath = (
         "jsonpath={.status.containerStatuses[*].state.waiting.reason}"
@@ -106,7 +132,11 @@ def wait_for_pod_ready_lines(pod_ref: str, ns_seg: str, *, label: str) -> list[s
     msg_jsonpath = (
         "jsonpath={.status.containerStatuses[*].state.waiting.message}"
     )
+    sched_reason_jsonpath = (
+        'jsonpath={.status.conditions[?(@.type=="PodScheduled")].reason}'
+    )
     cond_jsonpath = 'jsonpath={.status.conditions[?(@.type=="PodScheduled")].message}'
+    unrecoverable_pattern = "|".join(_UNRECOVERABLE_WAITING_REASONS)
     # Most recent pod Event as "<reason>: <message>" (sorted ascending, take last).
     # custom-columns avoids embedding jsonpath newlines in the shell line.
     events_latest = (
@@ -115,28 +145,48 @@ def wait_for_pod_ready_lines(pod_ref: str, ns_seg: str, *, label: str) -> list[s
         "--no-headers -o custom-columns=R:.reason,M:.message 2>/dev/null "
         "| tail -n 1 | tr -s ' ' || true"
     )
+    diagnostics_dump = (
+        f"kubectl describe {pod_ref}{ns_seg} 2>/dev/null || true; "
+        f"kubectl get events{ns_seg} --field-selector "
+        f"involvedObject.name={shlex.quote(label)} --sort-by=.lastTimestamp "
+        "2>/dev/null | tail -n 10 || true"
+    )
     return [
         'last=""',
+        "bad=0",
         "for i in $(seq 1 %d); do" % READY_RETRIES,
         f"  phase=$(kubectl get {pod_ref}{ns_seg} -o jsonpath='{{.status.phase}}' 2>/dev/null || true);",
-        f"  reason=$(kubectl get {pod_ref}{ns_seg} -o '{reason_jsonpath}' 2>/dev/null || true);",
+        f"  wreason=$(kubectl get {pod_ref}{ns_seg} -o '{reason_jsonpath}' 2>/dev/null || true);",
         f"  msg=$(kubectl get {pod_ref}{ns_seg} -o '{msg_jsonpath}' 2>/dev/null || true);",
+        f"  sched=$(kubectl get {pod_ref}{ns_seg} -o '{sched_reason_jsonpath}' 2>/dev/null || true);",
+        '  reason="$wreason";',
+        '  if [ -z "$reason" ] && [ -n "$sched" ]; then reason="$sched"; fi;',
         f'  if [ -z "$reason" ]; then reason=$(kubectl get {pod_ref}{ns_seg} -o \'{cond_jsonpath}\' 2>/dev/null || true); fi;',
         '  cur="$phase|$reason|$msg";',
         '  if [ "$cur" != "$last" ] || [ $((i % 15)) -eq 0 ]; then',
         '    detail="";',
         '    if [ -n "$msg" ]; then detail=" msg=$msg";',
         f'    else ev=$({events_latest}); if [ -n "$ev" ]; then detail=" event=$ev"; fi; fi;',
-        f'    echo "[sflow] {label}: phase=${{phase:-?}} reason=${{reason:-}}${{detail}} ($((i * 2))s)";',
+        f'    echo "[sflow] {label}: phase=${{phase:-?}} reason=${{reason:-}}${{detail}} ($((i * {POLL_SLEEP_SECS}))s)";',
         '    last="$cur";',
         "  fi;",
         '  case "$phase" in Running|Succeeded|Failed) break;; esac;',
-        "  sleep 2;",
+        # Unrecoverable-state streak: fail the task early rather than idle until the
+        # readiness-probe timeout. Resets whenever the pod is not in a bad state.
+        "  isbad=0;",
+        f'  case "$wreason" in {unrecoverable_pattern}) isbad=1;; esac;',
+        '  if [ "$sched" = "Unschedulable" ]; then isbad=1; fi;',
+        '  if [ "$isbad" = "1" ]; then bad=$((bad + 1)); else bad=0; fi;',
+        '  if [ "$bad" -ge %d ]; then' % UNRECOVERABLE_GRACE_POLLS,
+        f'    echo "[sflow] {label}: FATAL phase=${{phase:-?}} reason=${{reason:-}} — unrecoverable pod start state; aborting task early ($((i * {POLL_SLEEP_SECS}))s)";',
+        f"    {diagnostics_dump};",
+        "    exit 1;",
+        "  fi;",
+        f"  sleep {POLL_SLEEP_SECS};",
         "done",
         f'echo "[sflow] {label}: final phase=${{phase:-?}}";',
         f'if [ "${{phase:-}}" != "Running" ] && [ "${{phase:-}}" != "Succeeded" ]; then '
-        f"kubectl describe {pod_ref}{ns_seg} 2>/dev/null || true; "
-        f"kubectl get events{ns_seg} --field-selector involvedObject.name={shlex.quote(label)} --sort-by=.lastTimestamp 2>/dev/null | tail -n 10 || true; fi",
+        f"{diagnostics_dump}; fi",
     ]
 
 

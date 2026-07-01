@@ -632,6 +632,9 @@ class Orchestrator:
                     env=task.envs,
                     task_name=task.name,
                     script=task.script,
+                    status_note=lambda note, _t=task: setattr(
+                        _t, "status_detail", note
+                    ),
                 )
             return self._subprocess_launcher.run_async(
                 task.launch_command,

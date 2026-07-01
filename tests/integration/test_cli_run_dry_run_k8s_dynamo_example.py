@@ -12,6 +12,7 @@ nodes by the planner (one pod per node).
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from sflow.cli import app
@@ -88,3 +89,52 @@ def test_k8s_dynamo_dry_run_multinode_worker_spans_nodes(tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     assert "prefill_server_0  (backend=k8s_cluster, operator=k8s" in result.output
+
+
+# The other native-Kubernetes dynamo ports (agg + sglang). Dry-run each with the
+# shipped defaults (single node, 8 GPUs) so the ${{ }} expressions, artifacts
+# (incl. the trtllm engine-config ConfigMap), backend refs and probes all resolve
+# and the server tasks land on the k8s operator/backend.
+@pytest.mark.parametrize(
+    "recipe,server_markers",
+    [
+        ("kubernetes_dynamo_trtllm_agg.yaml", ["agg_server_0"]),
+        ("kubernetes_dynamo_sglang_agg.yaml", ["agg_server_0"]),
+        (
+            "kubernetes_dynamo_sglang_disagg.yaml",
+            ["prefill_server_0", "decode_server_0"],
+        ),
+    ],
+)
+def test_k8s_dynamo_recipe_dry_runs(tmp_path: Path, recipe, server_markers):
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = repo_root / "examples" / recipe
+    assert cfg.exists()
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    out_dir = tmp_path / "out"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "-f",
+            str(cfg),
+            "--artifact",
+            f"LOCAL_MODEL_PATH=fs://{model_dir}",
+            "--workspace-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out_dir),
+            "--dry-run",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "backend 'k8s_cluster'" in result.output
+    for marker in server_markers:
+        assert f"{marker}  (backend=k8s_cluster, operator=k8s" in result.output
+    # Dry-run must not create output dirs.
+    assert not out_dir.exists()
