@@ -19,15 +19,11 @@ from collections.abc import Mapping, Sequence
 from sflow.core.command import Command
 from sflow.plugins.operators._k8s_render import SFLOW_ALLOC_LABEL
 
-# kubectl logs -f bails with BadRequest on a not-yet-started container, so we
-# poll the pod phase first; terminated.exitCode also lags container exit, so we
-# poll that too. 300 * 2s readiness budget, 30 * 1s exit-code budget.
+# kubectl logs -f bails with BadRequest on a not-yet-started container, so the
+# apply command polls the pod phase first (READY_RETRIES * 2s budget) before the
+# driver attaches the log stream. Status/exit-code polling and the early stop
+# live driver-side in _k8s_lifecycle, not in this bash.
 READY_RETRIES = 300
-EXIT_CODE_RETRIES = 30
-# Seconds between pod-phase polls while the live log stream is following. The
-# moment the pod is terminal we stop draining the (possibly minutes-behind) log
-# backlog, so this bounds how long after pod exit the wrapper keeps waiting.
-PHASE_POLL_INTERVAL = 2
 
 _MANIFEST_HEREDOC = "SFLOW_K8S_MANIFEST"
 
@@ -144,90 +140,31 @@ def wait_for_pod_ready_lines(pod_ref: str, ns_seg: str, *, label: str) -> list[s
     ]
 
 
-def stream_pod_logs_lines(
+def build_log_stream_command(
     pod_ref: str,
-    ns_seg: str,
     *,
-    label: str,
-    complete_log_path: str | None,
-    background: bool,
-) -> list[str]:
-    """Follow ``pod_ref``'s logs live, but stop the moment the pod is terminal.
+    ns_args: Sequence[str] = (),
+    kubectl_global_args: Sequence[str] = (),
+) -> Command:
+    """Build the standalone ``kubectl logs -f`` Command for one pod.
 
-    Kubernetes prioritizes pod execution over log delivery, so ``kubectl logs -f``
-    can lag minutes behind a finished pod while it drains a backlog. Blocking on
-    that backlog delays the wrapper's exit -- and therefore the sflow driver's
-    view of the task's status, which is derived from the wrapper exit code -- by
-    the whole drain time. So follow the logs in the *background* (the live stream
-    still reaches the console + ``<task>.log`` through the driver) and poll the
-    pod phase; as soon as it is terminal (``Succeeded``/``Failed``) write the
-    COMPLETE container log straight to ``complete_log_path`` (a temp file written
-    by a direct ``kubectl logs`` that bypasses the slow per-line driver pipeline,
-    so nothing is lost), stop the live stream, and emit a hint. Once the task is
-    done the driver swaps that temp file in as the final ``<task>.log`` and
-    deletes it (see ``K8sContainerOperator.finalize_task_log``), so there is a
-    single complete log and no duplicate. When the live stream instead ends on
-    its own (small/quiet pod) the loop just falls through -- no kill, no temp
-    file -- preserving the prior fast path.
-
-    Returns the shell lines. For multi-pod tasks (``background``) the whole block
-    is wrapped in a backgrounded subshell so per-pod streams run concurrently
-    (the caller ``wait``s afterwards); each subshell owns its own ``$!``/``$dest``.
+    Run by the sflow driver as its own subprocess (see
+    ``K8sContainerOperator.execute``) so its stdout streams live to ``<task>.log``
+    through the launcher, and the driver can stop it the moment a background
+    status-watch sees the pod go terminal -- instead of blocking on the K8s log
+    backlog. The CLI-level global flags are prefixed directly (no shell wrapper).
     """
-    follow = f"kubectl logs -f {pod_ref}{ns_seg} --all-containers --prefix"
-    phase = (
-        f"kubectl get {pod_ref}{ns_seg} -o jsonpath='{{.status.phase}}' "
-        "2>/dev/null || true"
-    )
-    hint_prefix = (
-        f"[sflow] {label}: pod finished (phase=$ph); stopped live log stream "
-        "early (K8s log flush lags pod exit)"
-    )
-    terminal: list[str] = []
-    if complete_log_path is not None:
-        terminal.append(f"      __sflow_dest={shlex.quote(complete_log_path)};")
-        terminal.append(
-            f"      kubectl logs {pod_ref}{ns_seg} --all-containers --prefix "
-            '> "$__sflow_dest" 2>/dev/null || true;'
-        )
-        terminal.append('      kill "$__sflow_log_pid" 2>/dev/null || true;')
-        terminal.append(
-            f'      echo "{hint_prefix} -- complete container log captured '
-            'for the per-task log";'
-        )
-    else:
-        terminal.append('      kill "$__sflow_log_pid" 2>/dev/null || true;')
-        terminal.append(f'      echo "{hint_prefix}";')
-    body = [
-        f"{follow} &",
-        "__sflow_log_pid=$!",
-        'while kill -0 "$__sflow_log_pid" 2>/dev/null; do',
-        f"  ph=$({phase});",
-        '  case "${ph:-}" in',
-        "    Succeeded|Failed)",
-        *terminal,
-        "      break;;",
-        "  esac;",
-        f"  sleep {PHASE_POLL_INTERVAL};",
-        "done",
-        'wait "$__sflow_log_pid" 2>/dev/null || true',
-    ]
-    if background:
-        return ["(", *[f"  {line}" for line in body], ") &"]
-    return body
-
-
-def exit_code_poll_lines(pod_ref: str, ns_seg: str) -> list[str]:
-    """Poll ``pod_ref`` terminated.exitCode, then ``exit`` it (fallback 1)."""
-    return [
-        "exit_code=''",
-        (
-            f"for _ in $(seq 1 {EXIT_CODE_RETRIES}); do "
-            f"exit_code=$(kubectl get {pod_ref}{ns_seg} -o jsonpath='{{.status.containerStatuses[0].state.terminated.exitCode}}' 2>/dev/null || true); "
-            f'if [ -n "$exit_code" ]; then break; fi; sleep 1; done'
-        ),
-        'exit "${exit_code:-1}"',
-    ]
+    cmd = Command(exec="kubectl")
+    for arg in kubectl_global_args:
+        cmd.add_arg(str(arg))
+    cmd.add_arg("logs")
+    cmd.add_arg("-f")
+    cmd.add_arg(pod_ref)
+    for arg in ns_args:
+        cmd.add_arg(str(arg))
+    cmd.add_arg("--all-containers")
+    cmd.add_arg("--prefix")
+    return cmd
 
 
 def kubectl_global_args_prelude(args: Sequence[str]) -> list[str]:
@@ -270,76 +207,44 @@ def handoff_delete_lines(reservation_pods: Sequence[str], ns_seg: str) -> list[s
     ]
 
 
-def build_k8s_task_command(
+def build_apply_command(
     *,
     manifest_json: str,
     ns_seg: str,
     pod_names: Sequence[str],
-    configmap_name: str,
-    rct_name: str | None,
     secret_name: str | None,
     envs: Mapping[str, str],
     handoff_delete_pods: Sequence[str],
-    parallel_logs: bool,
     kubectl_global_args: Sequence[str] = (),
     allocation_id: str | None = None,
-    artifacts_configmap_name: str | None = None,
-    complete_log_paths: Sequence[str | None] = (),
 ) -> Command:
-    """Build the ``kubectl`` wrapper for a (possibly multi-pod) task.
+    """Build the ``kubectl apply`` step for a (possibly multi-pod) task.
 
-    The script: optionally creates an env Secret, registers a cleanup trap,
-    applies ``manifest_json`` (a v1/List of the ConfigMap + optional
-    ResourceClaimTemplate + the task pod(s)), runs the create-before-destroy
-    handoff (deletes the assigned node(s)' placeholder pods so the already-Pending
-    task pod(s) bind), waits for each pod to start before streaming its logs (in
-    parallel when ``parallel_logs``), then propagates the exit code from the
-    leader pod (``pod_names[0]``).
-
-    Log streaming stops as soon as a pod is terminal rather than blocking on the
-    log backlog (see ``stream_pod_logs_lines``); ``complete_log_paths`` gives the
-    per-pod file (aligned with ``pod_names``) the complete container log is dumped
-    to in that case (``None`` -> no dump, e.g. when the task output dir is unknown).
+    This is the FIRST, fire-and-return half of a k8s task: optionally create the
+    env Secret, ``kubectl apply`` the manifest (ConfigMap + optional
+    ResourceClaimTemplate + the task pod(s)), run the create-before-destroy
+    handoff (delete the assigned node(s)' placeholder pods so the already-Pending
+    task pod(s) bind), then wait for each pod to leave Pending/ContainerCreating
+    (echoing phase/reason). It then exits -- it does NOT stream logs, poll the
+    exit code, or register a cleanup trap. The sflow driver (``execute``) takes
+    over from there: it attaches the log stream, watches pod status, and deletes
+    the task objects, while the kubernetes backend's allocation-label sweep is the
+    backstop on Ctrl+C / crash.
     """
     use_secret = secret_name is not None
     pod_refs = [f"pod/{shlex.quote(p)}" for p in pod_names]
 
-    cleanup_refs = [*pod_refs, f"configmap/{shlex.quote(configmap_name)}"]
-    if artifacts_configmap_name is not None:
-        cleanup_refs.append(f"configmap/{shlex.quote(artifacts_configmap_name)}")
-    if secret_name is not None:
-        cleanup_refs.append(f"secret/{shlex.quote(secret_name)}")
-    if rct_name is not None:
-        cleanup_refs.append(
-            f"resourceclaimtemplate.resource.k8s.io/{shlex.quote(rct_name)}"
-        )
-    cleanup_delete = (
-        f"kubectl delete {' '.join(cleanup_refs)}{ns_seg} "
-        "--ignore-not-found >/dev/null 2>&1 || true"
-    )
-    cleanup_body = "; ".join(
-        ['rm -f "$env_file"', cleanup_delete] if use_secret else [cleanup_delete]
-    )
-
     lines = ["set -euo pipefail"]
     # Define a kubectl() wrapper carrying the CLI-level global flags (if any) so
-    # every kubectl call below (apply / logs / delete / secret / handoff) uses them.
+    # every kubectl call below (secret / apply / handoff / wait) uses them.
     lines.extend(kubectl_global_args_prelude(kubectl_global_args))
     if use_secret:
         lines.append("env_file=$(mktemp)")
-    # Trap INT/TERM as well as EXIT: a bare EXIT trap does not run when bash is
-    # killed by the SIGTERM the launcher sends on Ctrl+C, which would leak the
-    # task objects. Disarm inside cleanup so it runs exactly once, then re-exit
-    # with the original status.
-    lines.append(
-        f"cleanup() {{ rc=$?; trap - INT TERM EXIT; {cleanup_body}; exit $rc; }}"
-    )
-    lines.append("trap cleanup INT TERM EXIT")
-    if secret_name is not None:
         lines.extend(secret_printf_lines(envs))
         lines.append(create_secret_cmd(secret_name, ns_seg))
         if allocation_id:
             lines.append(label_secret_cmd(secret_name, ns_seg, allocation_id))
+        lines.append('rm -f "$env_file"')
 
     # Quoted heredoc keeps the JSON literal (the user script may contain single quotes).
     lines.append(
@@ -351,27 +256,9 @@ def build_k8s_task_command(
     # empty list otherwise, so CPU-only tasks coexist with the placeholder).
     lines.extend(handoff_delete_lines(handoff_delete_pods, ns_seg))
 
-    # Wait for each pod to leave Pending/ContainerCreating before streaming it,
-    # echoing phase/reason while it starts up. Then follow its logs but stop the
-    # moment the pod is terminal (so the wrapper -- and the sflow driver's task
-    # status -- isn't held back by the K8s log-delivery backlog).
-    for idx, (pod_ref, pod_name) in enumerate(zip(pod_refs, pod_names, strict=True)):
+    # Wait for each pod to leave Pending/ContainerCreating before returning, so
+    # the driver's `kubectl logs -f` does not bail on a not-yet-started container.
+    for pod_ref, pod_name in zip(pod_refs, pod_names, strict=True):
         lines.extend(wait_for_pod_ready_lines(pod_ref, ns_seg, label=pod_name))
-        complete_log_path = (
-            complete_log_paths[idx] if idx < len(complete_log_paths) else None
-        )
-        lines.extend(
-            stream_pod_logs_lines(
-                pod_ref,
-                ns_seg,
-                label=pod_name,
-                complete_log_path=complete_log_path,
-                background=parallel_logs,
-            )
-        )
-    if parallel_logs:
-        # `wait` blocks until all backgrounded per-pod stream watchers close.
-        lines.append("wait")
 
-    lines.extend(exit_code_poll_lines(pod_refs[0], ns_seg))
     return bash_lc_command(lines)

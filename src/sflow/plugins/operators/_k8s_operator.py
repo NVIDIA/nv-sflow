@@ -14,9 +14,11 @@ node IPs, placeholder pods to hand off) is injected via ``apply_backend_context`
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -25,9 +27,9 @@ import yaml
 from pydantic import ConfigDict, field_validator
 
 from sflow.core.command import Command
-from sflow.core.log_offload import unsupported_offload_warning
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.logging import get_logger
+from sflow.plugins.operators import _k8s_lifecycle as k8s_lifecycle
 from sflow.plugins.operators._k8s_render import (
     DEFAULT_GPU_TOLERATION,
     SFLOW_ENTRYPOINT_FILE,
@@ -36,7 +38,8 @@ from sflow.plugins.operators._k8s_render import (
     render_task_pod,
 )
 from sflow.plugins.operators._k8s_shell import (
-    build_k8s_task_command,
+    build_apply_command,
+    build_log_stream_command,
     configmap_data_key,
     namespace_segment,
     sanitize_name,
@@ -44,6 +47,27 @@ from sflow.plugins.operators._k8s_shell import (
 from sflow.utils.container import validate_container_image_reference
 
 _logger = get_logger(__name__)
+
+
+@dataclass
+class _K8sExecPlan:
+    """The decoupled steps for one k8s task, built deterministically from
+    ``task_name``/``script``/``envs`` (no cross-task instance state).
+
+    ``execute`` runs ``apply_command`` (start the pod), then per pod streams
+    ``log_stream_commands`` while watching pod status, and on terminal/teardown
+    dumps the complete log to ``complete_log_paths`` and deletes ``cleanup_refs``.
+    """
+
+    apply_command: Command
+    pod_refs: list[str]
+    log_stream_commands: list[Command]
+    # Single per-task log file all pods' `kubectl logs -f` append to (offload);
+    # None when the task output dir is unknown (dry-run). The console tailer reads it.
+    task_log_path: str | None
+    cleanup_refs: list[str]
+    global_args: list[str] = field(default_factory=list)
+    ns_args: list[str] = field(default_factory=list)
 
 
 class K8sContainerOperatorConfig(OperatorConfig):
@@ -101,10 +125,11 @@ class K8sContainerOperatorConfig(OperatorConfig):
         return value
 
     def runtime_warnings(self) -> list[str]:
-        # Per-task log offload is not implemented for the kubernetes operator yet
-        # (logs stream through the sflow driver via `kubectl logs`); surface that
-        # at dry-run instead of silently ignoring an offload request.
-        return unsupported_offload_warning(self.type)
+        # The kubernetes operator always offloads: each pod's log is written
+        # straight to <task>.log by `kubectl logs -f` (the sflow driver is never
+        # in the per-line path), and a decoupled tailer streams it to the console.
+        # So there is nothing to warn about re: offload support.
+        return []
 
 
 class K8sContainerOperator(Operator):
@@ -449,13 +474,13 @@ class K8sContainerOperator(Operator):
                 f"could not persist k8s manifest for '{task_name}': {exc}"
             )
 
-    def build_command(
+    def _build_execution_plan(
         self,
         *,
         task_name: str,
         script: Sequence[str],
         envs: Mapping[str, str],
-    ) -> Command:
+    ) -> _K8sExecPlan:
         if not self._image:
             raise ValueError(
                 f"k8s operator '{self.config.name}' has no image configured; set "
@@ -578,75 +603,219 @@ class K8sContainerOperator(Operator):
 
         manifest = {"apiVersion": "v1", "kind": "List", "items": items}
         self._persist_rendered_manifest(manifest, task_name=task_name, envs=envs)
-        # Per-pod file the complete container log is dumped to when the live
-        # stream is stopped early on pod terminal (sits next to <task>.log and
-        # <task>.k8s.yaml). None per pod when the task output dir is unknown
-        # (dry-run-like): the wrapper then just stops the stream without a dump.
+
+        ns_seg = namespace_segment(self._namespace)
+        ns_args = ["--namespace", self._namespace] if self._namespace else []
+        global_args = list(self._kubectl_global_args)
+        pod_refs = [f"pod/{p}" for p in pod_names]
+
+        # The per-task log file each pod's `kubectl logs -f` is redirected to
+        # (offload -- the driver never processes these lines). One file per task;
+        # multi-pod pods append (O_APPEND) with their `[pod/...]` prefix. None when
+        # the task output dir is unknown (dry-run).
         task_out = envs.get("SFLOW_TASK_OUTPUT_DIR")
-        complete_log_paths: list[str | None] = (
-            [os.path.join(task_out, f"{p}.pod.log") for p in pod_names]
-            if task_out
-            else [None] * len(pod_names)
-        )
-        return build_k8s_task_command(
+        task_log_path = os.path.join(task_out, f"{task_name}.log") if task_out else None
+
+        # Objects this task owns, deleted by name when it ends (the kubernetes
+        # backend's allocation-label sweep is the backstop on Ctrl+C / crash).
+        cleanup_refs = [*pod_refs, f"configmap/{configmap_name}"]
+        if artifacts_cm_name is not None:
+            cleanup_refs.append(f"configmap/{artifacts_cm_name}")
+        if use_secret:
+            cleanup_refs.append(f"secret/{secret_name}")
+        if rct_name is not None:
+            cleanup_refs.append(
+                f"resourceclaimtemplate.resource.k8s.io/{rct_name}"
+            )
+
+        apply_command = build_apply_command(
             manifest_json=json.dumps(manifest, separators=(",", ":")),
-            ns_seg=namespace_segment(self._namespace),
+            ns_seg=ns_seg,
             pod_names=pod_names,
-            configmap_name=configmap_name,
-            rct_name=rct_name,
             secret_name=secret_name if use_secret else None,
             envs=envs,
             handoff_delete_pods=self._handoff_pods,
-            parallel_logs=n > 1,
-            kubectl_global_args=self._kubectl_global_args,
+            kubectl_global_args=global_args,
             allocation_id=self._allocation_id,
-            artifacts_configmap_name=artifacts_cm_name,
-            complete_log_paths=complete_log_paths,
+        )
+        log_stream_commands = [
+            build_log_stream_command(
+                ref, ns_args=ns_args, kubectl_global_args=global_args
+            )
+            for ref in pod_refs
+        ]
+        return _K8sExecPlan(
+            apply_command=apply_command,
+            pod_refs=pod_refs,
+            log_stream_commands=log_stream_commands,
+            task_log_path=task_log_path,
+            cleanup_refs=cleanup_refs,
+            global_args=global_args,
+            ns_args=ns_args,
         )
 
-    def finalize_task_log(
+    def build_command(
         self,
         *,
         task_name: str,
-        task_output_dir: str | None,
-        release_handler: Callable[[], None],
-    ) -> None:
-        """Swap the complete container log captured on early-stop into ``<task>.log``.
+        script: Sequence[str],
+        envs: Mapping[str, str],
+    ) -> Command:
+        """The ``kubectl apply`` step (start the pod).
 
-        When the live stream was stopped on pod terminal, the wrapper dumped each
-        pod's COMPLETE container log to ``<pod>.pod.log`` (see
-        ``stream_pod_logs_lines``). Now that the task is done, replace the
-        (possibly truncated) live-streamed ``<task>.log`` with that complete copy
-        so the per-task log is the single, complete source of truth -- aligned
-        with the other backends -- then drop the temp file(s). No-op when no
-        ``.pod.log`` exists (the stream finished on its own, so ``<task>.log`` is
-        already complete) -- in that case the driver's handler is left untouched.
+        Used for dry-run display and ``<task>.k8s.yaml`` persistence. The full run
+        (apply -> stream -> status-watch -> stop) is driven by :meth:`execute`,
+        since this operator returns True from :meth:`manages_own_execution`.
         """
-        if not task_output_dir:
-            return
+        return self._build_execution_plan(
+            task_name=task_name, script=script, envs=envs
+        ).apply_command
+
+    def manages_own_execution(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        *,
+        launcher: Any,
+        output_logger: Any,
+        env: Mapping[str, str],
+        task_name: str,
+        script: Sequence[str],
+    ) -> int:
+        """Driver-managed run: apply the pod(s), then stream + watch each pod.
+
+        K8s is async: ``kubectl apply`` starts the pod and the bash apply step
+        returns once it is scheduled/started. Each pod's ``kubectl logs -f`` is then
+        OFFLOADED -- redirected straight to ``<task>.log`` (no sflow-driver per-line
+        processing) -- while a single decoupled tailer echoes that file to the
+        console (TTY). The pod STATUS is the authoritative completion signal
+        (``watch_until_terminal``); the log stream is a side channel that is
+        interrupted the instant the pod is terminal (or the workflow ends and this
+        coroutine is cancelled). The leader pod's exit code is the task's.
+
+        Once the DAG status check has finished for every pod (the ``gather``
+        returns) and their live streams are interrupted, the on-disk ``<task>.log``
+        is REBUILT from a one-shot re-fetch of each pod's COMPLETE container log
+        (see ``finalize_complete_log``) -- a double-confirm that the saved file is
+        complete before the orchestrator runs probes + output/result parsing on it.
+        The console/TUI stream is only for live observation and may be cut early;
+        the disk log is ground truth. The ``finally`` stops the tailer and deletes
+        the task's objects either way.
+        """
+        plan = self._build_execution_plan(
+            task_name=task_name, script=list(script), envs=dict(env)
+        )
+        tailer: asyncio.Future | None = None
         try:
-            pod_logs = sorted(Path(task_output_dir).glob("*.pod.log"))
-        except OSError:
-            return
-        if not pod_logs:
-            return
-        # Single-writer handoff: have the driver flush + close its <task>.log
-        # handler before we replace the file out from under it.
-        release_handler()
-        task_log = os.path.join(task_output_dir, f"{task_name}.log")
-        try:
-            if len(pod_logs) == 1:
-                # Atomic rename: the complete log becomes <task>.log in one step.
-                os.replace(str(pod_logs[0]), task_log)
-            else:
-                # Multi-pod: concatenate the per-pod complete logs (each line
-                # already carries its `[pod/...]` prefix), then drop the temps.
-                with open(task_log, "w", encoding="utf-8") as out:
-                    for pl in pod_logs:
-                        out.write(pl.read_text(encoding="utf-8", errors="replace"))
-                for pl in pod_logs:
-                    pl.unlink(missing_ok=True)
-        except OSError as exc:  # never break finalize over a log-swap hiccup
-            _logger.debug(
-                f"could not finalize '{task_name}' task log from pod logs: {exc}"
+            rc = await launcher.run_async(
+                plan.apply_command,
+                output_logger=output_logger,
+                env=env,
+                task_name=task_name,
             )
+            if rc != 0:
+                return rc
+            # Bytes already in <task>.log after apply == the driver/apply
+            # diagnostics the launcher flushed (before any pod log). We preserve
+            # this prefix when we rebuild the file from the complete pod logs.
+            apply_prefix_size = 0
+            if plan.task_log_path:
+                try:
+                    apply_prefix_size = os.path.getsize(plan.task_log_path)
+                except OSError:
+                    apply_prefix_size = 0
+            # One decoupled console tailer per task, reading the offloaded
+            # <task>.log (TTY only). It is independent of the file writers.
+            if plan.task_log_path:
+                tailer = asyncio.ensure_future(
+                    k8s_lifecycle.tail_file_to_console(
+                        plan.task_log_path, task_name=task_name
+                    )
+                )
+            results = await asyncio.gather(
+                *[
+                    self._run_pod_stream(plan=plan, index=i)
+                    for i in range(len(plan.pod_refs))
+                ]
+            )
+            exit_codes = [rc for rc, _ in results]
+            phases = [phase for _, phase in results]
+            # All pods are terminal and their live streams are cut. Stop the
+            # console tailer, then re-fetch every pod's COMPLETE log and rename it
+            # into <task>.log -- so the on-disk log is complete (ground truth) for
+            # the probes + output/result parsing the orchestrator runs next.
+            if tailer is not None:
+                tailer.cancel()
+                await asyncio.gather(tailer, return_exceptions=True)
+                tailer = None
+            if plan.task_log_path:
+                await k8s_lifecycle.finalize_complete_log(
+                    plan.pod_refs,
+                    plan.task_log_path,
+                    prefix_size=apply_prefix_size,
+                    phases=phases,
+                    global_args=plan.global_args,
+                    ns_args=plan.ns_args,
+                )
+            # The leader pod (index 0) carries the task's exit code.
+            return exit_codes[0] if exit_codes else 0
+        finally:
+            if tailer is not None and not tailer.done():
+                tailer.cancel()
+            if tailer is not None:
+                await asyncio.gather(tailer, return_exceptions=True)
+            await k8s_lifecycle.delete_objects(
+                plan.cleanup_refs, global_args=plan.global_args, ns_args=plan.ns_args
+            )
+
+    async def _run_pod_stream(
+        self, *, plan: _K8sExecPlan, index: int
+    ) -> tuple[int, str]:
+        """Offload one pod's log to ``<task>.log`` while its STATUS drives completion.
+
+        The pod phase (``watch_until_terminal``) is authoritative -- it, not the log
+        stream, decides when the task is done -- so the DAG/status stays the single
+        source of truth and a dropped stream never completes or fails a running task.
+        ``kubectl logs -f`` is redirected straight to the file (driver-free); it is
+        interrupted the moment the pod is terminal, or on teardown (cancellation) via
+        the ``finally``. For a long-lived READY service the watch never returns, so
+        the task stays alive until the orchestrator cancels it at workflow end.
+
+        Returns ``(exit_code, final_phase)``; the caller (``execute``) uses the phases
+        to re-fetch the complete on-disk log once all pods are terminal.
+        """
+        pod_ref = plan.pod_refs[index]
+        stream_proc = None
+        if plan.task_log_path:
+            stream_proc = await k8s_lifecycle.start_pod_log_file_stream(
+                plan.log_stream_commands[index], plan.task_log_path
+            )
+        final_phase = ""
+        try:
+            final_phase = await k8s_lifecycle.watch_until_terminal(
+                pod_ref, global_args=plan.global_args, ns_args=plan.ns_args
+            )
+        finally:
+            # The log is a side channel: interrupt it on terminal / teardown.
+            if stream_proc is not None:
+                await k8s_lifecycle.terminate_process(stream_proc)
+        exit_code = await k8s_lifecycle.pod_exit_code(
+            pod_ref,
+            global_args=plan.global_args,
+            ns_args=plan.ns_args,
+            phase=final_phase,
+        )
+        return exit_code, final_phase
+
+    def writes_own_task_log(self) -> bool:
+        """K8s always offloads: the pod log is written straight to ``<task>.log``.
+
+        Returning True makes the app skip attaching a live ``CoalescingFileHandler``
+        (it uses a ``DeferredTaskLogHandler`` for driver-side diagnostics instead),
+        so the only live writer of ``<task>.log`` is ``kubectl logs -f`` redirected
+        to it (see ``execute`` / ``_run_pod_stream``). This keeps the sflow driver's
+        event loop out of the per-line byte path entirely; a decoupled tailer
+        handles console/TUI visibility.
+        """
+        return True

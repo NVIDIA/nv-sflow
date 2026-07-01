@@ -130,11 +130,12 @@ def test_multinode_splits_pods_and_wires_env():
     assert env1["SFLOW_TASK_NODE_INDEX"] == "1"
     assert env0["SFLOW_LEADER_ADDRESS"] == "10.0.0.1"
     assert env1["SFLOW_LEADER_ADDRESS"] == "10.0.0.1"
-    # Each pod pinned to its node; both placeholders handed off; parallel logs.
+    # Each pod pinned to its node; both placeholders handed off in the apply step.
     assert pods[0]["spec"]["nodeSelector"]["kubernetes.io/hostname"] == "node-0"
     assert pods[1]["spec"]["nodeSelector"]["kubernetes.io/hostname"] == "node-1"
     assert "res-0" in shell and "res-1" in shell
-    assert shell.count("kubectl logs -f") == 2
+    # Log streaming is now a separate driver-managed step, not in the apply command.
+    assert "kubectl logs -f" not in shell
 
 
 # ---------------------------------------------------------------------------
@@ -292,131 +293,77 @@ def test_wrapper_echoes_phase_and_reason_while_waiting():
 
 
 # ---------------------------------------------------------------------------
-# log streaming: stop on pod terminal so the driver status syncs with the pod,
-# dumping the complete container log straight to a sibling file (K8s log
-# delivery lags pod exit, so blocking on the backlog would stall the wrapper).
+# decoupled execution: build_command is the apply step only (start the pod);
+# the driver (execute) streams + watches + stops. The apply command must NOT
+# stream logs, poll the exit code, or register a cleanup trap.
 # ---------------------------------------------------------------------------
 
 
-def test_wrapper_stops_stream_on_terminal_phase_and_dumps_complete_log(tmp_path):
-    _, shell = _build(
-        _backend("dra", 8), ["node-0"], gpu_count=2,
-        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+def test_build_command_is_apply_only():
+    _, shell = _build(_backend("dra", 8), ["node-0"], gpu_count=2, envs={"T": "x"})
+    # Apply step: create the env secret, apply the manifest, hand off the
+    # placeholder, and wait for the pod to start.
+    assert "kubectl create secret generic" in shell
+    assert "kubectl apply -f -" in shell
+    assert "res-0" in shell  # handoff (GPU task)
+    assert "[sflow]" in shell and "phase=" in shell  # wait-for-ready diagnostics
+    # It is NOT the old all-in-one wrapper: no live stream, no exit-code poll,
+    # and no cleanup trap (the driver owns the stream/status/teardown now).
+    assert "kubectl logs -f" not in shell
+    assert "terminated.exitCode" not in shell
+    assert "trap cleanup" not in shell
+
+
+def test_k8s_operator_manages_own_execution():
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    assert op.manages_own_execution() is True
+
+
+def test_log_stream_command_is_bare_follow_with_global_args():
+    from sflow.core.kubectl_config import KubectlConfig
+    from sflow.plugins.operators._k8s_shell import build_log_stream_command
+
+    cmd = build_log_stream_command(
+        "pod/t-0",
+        ns_args=["--namespace", "ns"],
+        kubectl_global_args=["--kubeconfig", "/k/cfg"],
     )
-    # The live follow is backgrounded so the driver/console keep getting output
-    # in real time while the wrapper independently watches the pod phase.
-    assert "kubectl logs -f pod/t" in shell
-    assert "--all-containers --prefix &" in shell
-    assert 'while kill -0 "$__sflow_log_pid" 2>/dev/null; do' in shell
-    assert 'case "${ph:-}" in' in shell
-    assert "Succeeded|Failed)" in shell
-    # On terminal: dump the COMPLETE container log straight to the sibling file
-    # (a no-`-f` `kubectl logs` that bypasses the slow driver pipeline), then
-    # stop the live stream, hint, and fall through to the exit-code poll.
-    assert f"{tmp_path}/t.pod.log" in shell
-    assert '--all-containers --prefix > "$__sflow_dest" 2>/dev/null || true' in shell
-    assert "stopped live log stream early" in shell
-    assert "complete container log captured for the per-task log" in shell
-    assert 'wait "$__sflow_log_pid" 2>/dev/null || true' in shell
+    argv = cmd.as_list()
+    assert argv == [
+        "kubectl", "--kubeconfig", "/k/cfg", "logs", "-f", "pod/t-0",
+        "--namespace", "ns", "--all-containers", "--prefix",
+    ]
+    # The operator builds one stream command per pod with the backend's kube flags.
+    backend = _backend("dra", 8, nodes=1, namespace="ns")
+    backend.apply_kubectl_config(KubectlConfig(kubeconfig="/k/cfg"))
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(backend=backend, assigned_nodes=["node-0"], artifacts=[],
+                             gpu_count=2)
+    plan = op._build_execution_plan(task_name="t", script=["run"], envs={})
+    assert [c.as_list() for c in plan.log_stream_commands] == [
+        ["kubectl", "--kubeconfig", "/k/cfg", "logs", "-f", "pod/t",
+         "--namespace", "ns", "--all-containers", "--prefix"]
+    ]
+    assert plan.task_log_path is None  # no SFLOW_TASK_OUTPUT_DIR -> no offload file
 
 
-def test_wrapper_multinode_stops_each_stream_and_dumps_per_pod(tmp_path):
-    _, shell = _build(
-        _backend("dra", 8, nodes=2), ["node-0", "node-1"], gpu_count=16,
-        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+def test_execution_plan_task_log_path_and_cleanup_refs(tmp_path):
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(backend=_backend("dra", 8, nodes=1, namespace="ns"),
+                             assigned_nodes=["node-0"], artifacts=[], gpu_count=2)
+    plan = op._build_execution_plan(
+        task_name="decode_server_0", script=["run"],
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path), "TOKEN": "x"},
     )
-    # Each pod is followed + phase-watched in its own backgrounded subshell and
-    # gets its own complete-log sibling file; one bare `wait` joins them before
-    # the leader's exit-code poll.
-    assert shell.count("kubectl logs -f pod/t-0") == 1
-    assert shell.count("kubectl logs -f pod/t-1") == 1
-    assert f"{tmp_path}/t-0.pod.log" in shell
-    assert f"{tmp_path}/t-1.pod.log" in shell
-    assert shell.count(") &") == 2
-    assert shell.count("stopped live log stream early") == 2
-    assert "\nwait\n" in shell
-
-
-def test_wrapper_stops_stream_without_output_dir_skips_complete_dump():
-    # No SFLOW_TASK_OUTPUT_DIR (dry-run-like): still background + phase-watch +
-    # stop early, but with no known destination there is no complete-log dump.
-    _, shell = _build(_backend("dra", 8), ["node-0"], gpu_count=2)
-    assert "--all-containers --prefix &" in shell
-    assert 'while kill -0 "$__sflow_log_pid" 2>/dev/null; do' in shell
-    assert "stopped live log stream early" in shell
-    assert "__sflow_dest" not in shell
-    assert ".pod.log" not in shell
-    assert "complete container log captured" not in shell
-
-
-# ---------------------------------------------------------------------------
-# finalize_task_log: after the task is done, swap the complete <pod>.pod.log the
-# wrapper captured on early-stop into <task>.log (single complete source of
-# truth, aligned with other backends) and delete the temp; no-op otherwise.
-# ---------------------------------------------------------------------------
-
-
-def _operator():
-    return K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
-
-
-def test_finalize_task_log_swaps_single_pod_log_into_task_log(tmp_path):
-    # Live stream wrote a truncated <task>.log; the wrapper captured the complete
-    # log to <pod>.pod.log. finalize swaps it in (atomic rename) and drops the temp.
-    (tmp_path / "decode_server_0.log").write_text("live-truncated\n")
-    (tmp_path / "decode-server-0.pod.log").write_text("complete-1\ncomplete-2\n")
-    released = []
-    _operator().finalize_task_log(
-        task_name="decode_server_0",
-        task_output_dir=str(tmp_path),
-        release_handler=lambda: released.append(True),
-    )
-    # The driver was asked to release <task>.log before the swap.
-    assert released == [True]
-    assert (tmp_path / "decode_server_0.log").read_text() == "complete-1\ncomplete-2\n"
-    # The temp pod log is gone -> no duplicate.
-    assert not (tmp_path / "decode-server-0.pod.log").exists()
-
-
-def test_finalize_task_log_concatenates_multi_pod_logs(tmp_path):
-    (tmp_path / "t.log").write_text("live\n")
-    (tmp_path / "t-0.pod.log").write_text("pod0-line\n")
-    (tmp_path / "t-1.pod.log").write_text("pod1-line\n")
-    released = []
-    _operator().finalize_task_log(
-        task_name="t",
-        task_output_dir=str(tmp_path),
-        release_handler=lambda: released.append(True),
-    )
-    assert released == [True]
-    assert (tmp_path / "t.log").read_text() == "pod0-line\npod1-line\n"
-    assert not (tmp_path / "t-0.pod.log").exists()
-    assert not (tmp_path / "t-1.pod.log").exists()
-
-
-def test_finalize_task_log_noop_without_pod_log_keeps_live_log(tmp_path):
-    # Stream finished on its own: no <pod>.pod.log -> <task>.log is already
-    # complete, so finalize leaves it untouched and never releases the handler.
-    (tmp_path / "t.log").write_text("live-complete\n")
-    released = []
-    _operator().finalize_task_log(
-        task_name="t",
-        task_output_dir=str(tmp_path),
-        release_handler=lambda: released.append(True),
-    )
-    assert released == []
-    assert (tmp_path / "t.log").read_text() == "live-complete\n"
-
-
-def test_finalize_task_log_noop_without_output_dir():
-    released = []
-    # No output dir (dry-run-like): nothing to do, handler left alone.
-    _operator().finalize_task_log(
-        task_name="t",
-        task_output_dir=None,
-        release_handler=lambda: released.append(True),
-    )
-    assert released == []
+    assert plan.pod_refs == ["pod/decode-server-0"]
+    # The pod log is offloaded straight to <task>.log (raw task name), which the
+    # decoupled console tailer reads.
+    assert plan.task_log_path == str(tmp_path / "decode_server_0.log")
+    # Cleanup deletes this task's own objects by name (backstop: backend sweep).
+    assert "pod/decode-server-0" in plan.cleanup_refs
+    assert "configmap/decode-server-0-cfg" in plan.cleanup_refs
+    assert "secret/decode-server-0-env" in plan.cleanup_refs
+    assert any(r.startswith("resourceclaimtemplate") for r in plan.cleanup_refs)
 
 
 def test_gpu_oversubscription_detected_at_plan_time():
@@ -481,15 +428,15 @@ def test_task_objects_carry_allocation_label():
 
 
 # ---------------------------------------------------------------------------
-# cleanup: wrapper traps signals so Ctrl+C deletes the task objects
+# cleanup: the driver (execute) deletes the task objects; the apply step does
+# not register a trap (the backend's allocation-label sweep is the backstop).
 # ---------------------------------------------------------------------------
 
 
-def test_wrapper_traps_int_term_exit():
+def test_apply_command_has_no_cleanup_trap():
     _, shell = _build(_backend("dra", 8), ["node-0"], gpu_count=2, envs={"T": "x"})
-    assert "trap cleanup INT TERM EXIT" in shell
-    # cleanup disarms itself to avoid re-entry when it exits.
-    assert "trap - INT TERM EXIT" in shell
+    assert "trap cleanup" not in shell
+    assert "trap - INT TERM EXIT" not in shell
 
 
 # ---------------------------------------------------------------------------

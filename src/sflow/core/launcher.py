@@ -67,6 +67,15 @@ def _emit_task_output_line(
 # while it keeps redrawing without a newline (e.g. docker pull / pip / aiperf).
 _PARTIAL_FLUSH_INTERVAL = 0.4
 
+# Max 64KB PTY reads drained per event-loop wakeup before yielding back to the
+# loop. Draining the whole buffer in one wakeup lets a single chatty stream (e.g.
+# a high-volume server log delivering a backlog burst) monopolize the loop and
+# starve every other coroutine -- including the K8s pod-status watches and the
+# orchestrator's DAG poll, which is what delays detecting that a task (and the
+# workflow) has finished. Capping reads per wakeup keeps those responsive; the
+# reader stays registered, so any remaining data is drained on the next tick.
+_MAX_PTY_READS_PER_LOOP = 8
+
 
 # Compiled once at import time: recompiling per line was a measurable cost when
 # task output is chatty (this runs for every line of every task's stdout/stderr).
@@ -295,11 +304,14 @@ class SubprocessLauncher:
                 partial_text = None
 
         def _on_readable() -> None:
-            # Drain everything currently available, then return. A read of b""
-            # (or EIO on the PTY master) means the child closed the slave: stop
-            # watching and signal completion.
+            # Drain a BOUNDED amount, then return so the event loop can service
+            # other coroutines (pod-status watches, the orchestrator, other tasks'
+            # streams) before we read more. Draining the whole PTY buffer in one
+            # wakeup lets a single chatty stream monopolize the loop and starve
+            # everything else. A read of b"" (or EIO on the PTY master) means the
+            # child closed the slave: stop watching and signal completion.
             try:
-                while True:
+                for _ in range(_MAX_PTY_READS_PER_LOOP):
                     try:
                         chunk = os.read(master_fd, 65536)
                     except BlockingIOError:
@@ -313,6 +325,11 @@ class SubprocessLauncher:
                     if not chunk:
                         break
                     _feed(chunk)
+                else:
+                    # Hit the per-wakeup read cap with data likely still buffered.
+                    # Yield to the loop; the reader stays registered, so this fires
+                    # again next tick after other tasks have had a turn.
+                    return
             except OSError:
                 # Treat any unexpected read error as EOF so we never hang.
                 pass

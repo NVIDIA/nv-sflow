@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel
 
@@ -103,26 +103,35 @@ class Operator(ABC):
         """
         return []
 
-    def finalize_task_log(
+    def manages_own_execution(self) -> bool:
+        """Whether the orchestrator should run this task via :meth:`execute`.
+
+        Default False: the task is launched as a single subprocess from
+        ``build_command()`` by the launcher. Operators that orchestrate their own
+        multi-step, driver-managed run (e.g. the kubernetes operator: apply the
+        pod, stream logs as a separate process, watch pod status, stop on status
+        change) return True so the orchestrator awaits :meth:`execute` instead.
+        """
+        return False
+
+    async def execute(
         self,
         *,
+        launcher: Any,
+        output_logger: Any,
+        env: Mapping[str, str],
         task_name: str,
-        task_output_dir: str | None,
-        release_handler: Callable[[], None],
-    ) -> None:
-        """Optionally rewrite ``<task>.log`` in place once a task is terminal.
+        script: Sequence[str],
+    ) -> int:
+        """Run the task as a driver-managed flow and return its exit code.
 
-        Called by the orchestrator when a task reaches a terminal state (never on
-        a pending retry). Default: no-op. Operators that captured a more complete
-        copy of the log out-of-band override this to swap that copy into
-        ``<task>.log`` so it is the single, complete source of truth -- e.g. the
-        kubernetes operator dumps each pod's full container log to a temp
-        ``<pod>.pod.log`` when it stops the live stream early (the K8s log backlog
-        lags pod exit), then swaps it in here.
-
-        ``release_handler`` makes the driver flush + close its ``<task>.log`` file
-        handler so there is a single writer; it MUST be called before writing the
-        file, and only when actually rewriting it (so unaffected tasks keep their
-        handler untouched).
+        Only called when :meth:`manages_own_execution` is True. Receives the
+        shared ``launcher`` (so sub-steps stream through the same per-task log),
+        the task's ``output_logger`` / ``env`` / ``name`` / ``script``. Must return
+        an int exit code (0 == success) just like a subprocess, and propagate
+        ``asyncio.CancelledError`` on teardown after cleaning up. Default: not
+        implemented.
         """
-        return None
+        raise NotImplementedError(
+            f"operator '{getattr(self.config, 'type', '?')}' does not implement execute()"
+        )

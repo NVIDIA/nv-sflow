@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import os
 import subprocess
 import time
 from datetime import timedelta
@@ -247,13 +246,6 @@ class Orchestrator:
 
                 for name in finished:
                     ft = self.workflow.get_task(name)
-                    # Once a task is terminal (not a pending retry), let its
-                    # operator finalize <task>.log -- e.g. the k8s operator swaps
-                    # in the complete container log it captured on early stop.
-                    # Success was already finalized in _finalize_successful_task
-                    # (before result parsing), so only handle failed/cancelled here.
-                    if ft.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                        self._finalize_task_log(ft)
                     del self._subprocess_tasks[name]
                     # The task's process exited (completed/failed/retry); release
                     # its monitor. A node still referenced by the workflow monitor
@@ -338,6 +330,13 @@ class Orchestrator:
                         await self._release_all_task_monitors()
                         break
 
+            # Workflow finished: stop any still-running task processes (long-lived
+            # READY services whose process never exits on its own) right now,
+            # instead of leaving them streaming until interpreter shutdown. For
+            # the k8s operator this cancels execute(), which stops the log stream
+            # and deletes the pod promptly.
+            await self._stop_remaining_subprocess_tasks(reason="workflow finished")
+
         except asyncio.CancelledError:
             # Cooperative cancellation path (e.g., app shutdown). Do best-effort cleanup
             # of in-flight subprocess tasks and mark remaining tasks as CANCELLED.
@@ -372,57 +371,6 @@ class Orchestrator:
                 "workflow_finished", status=summary_status, detail=summary_detail
             )
 
-    def _task_log_dir(self, t: Task) -> str | None:
-        """Directory holding the task's ``<task>.log`` (from its file handler)."""
-        logger = getattr(t, "logger", None)
-        for handler in getattr(logger, "handlers", []) or []:
-            if isinstance(handler, CoalescingFileHandler):
-                base = getattr(handler, "baseFilename", None)
-                if base:
-                    return os.path.dirname(base)
-        return None
-
-    def _release_task_log_handler(self, t: Task) -> None:
-        """Flush, close, and detach the per-task stream file handler.
-
-        Lets a single writer replace ``<task>.log`` afterwards (e.g. the k8s
-        complete-log swap). Only safe once the task is terminal (no retry), since
-        a re-submission would otherwise have no handler to write through.
-        """
-        logger = getattr(t, "logger", None)
-        if logger is None:
-            return
-        for handler in list(getattr(logger, "handlers", []) or []):
-            if isinstance(handler, CoalescingFileHandler):
-                try:
-                    handler.flush()
-                    handler.close()
-                except Exception:
-                    pass
-                logger.removeHandler(handler)
-
-    def _finalize_task_log(self, t: Task) -> None:
-        """Let a terminal task's operator rewrite ``<task>.log`` in place.
-
-        The k8s operator uses this to swap in the complete container log it
-        captured when it stopped the live stream early. Best-effort: a no-op for
-        operators that don't override the hook, and never raises. The operator
-        calls ``release_handler`` itself, but only when it actually rewrites the
-        file, so unaffected tasks keep their handler.
-        """
-        op = getattr(t, "operator", None)
-        finalize = getattr(op, "finalize_task_log", None)
-        if not callable(finalize):
-            return
-        try:
-            finalize(
-                task_name=t.name,
-                task_output_dir=self._task_log_dir(t),
-                release_handler=lambda: self._release_task_log_handler(t),
-            )
-        except Exception as exc:
-            _logger.debug(f"finalize_task_log failed for '{t.name}': {exc}")
-
     async def _finalize_successful_task(self, t: Task) -> None:
         """
         Run post-process work that must finish before DAG dependents can submit.
@@ -432,11 +380,6 @@ class Orchestrator:
         have finished.
         """
         t.status = TaskStatus.FINALIZING
-
-        # Swap the complete log into <task>.log BEFORE parsing, so result/output
-        # parsing (which reads <task>.log) sees the full log even if the live
-        # stream was stopped early (k8s). No-op for other operators / no early stop.
-        self._finalize_task_log(t)
 
         # MVP outputs parsing: parse from task log after process success.
         if getattr(t, "output_specs", None):
@@ -645,6 +588,25 @@ class Orchestrator:
         """
         self._run_teardown_commands(self._container_teardown_commands(task))
 
+    async def _stop_remaining_subprocess_tasks(self, *, reason: str) -> None:
+        """Cancel and await any still-running task processes, then clear the map.
+
+        Used when the workflow finishes: long-lived READY services keep their
+        subprocess (and log stream / pod) alive, so stop them promptly rather than
+        leaving them running until the event loop tears down. Cancelling each
+        task triggers its launcher/operator cleanup (k8s ``execute`` stops the
+        stream and deletes the pod). Safe to call when nothing remains.
+        """
+        pending = [t for t in self._subprocess_tasks.values() if not t.done()]
+        if pending:
+            _logger.info(
+                f"Stopping {len(pending)} still-running task process(es) ({reason})."
+            )
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._subprocess_tasks.clear()
+
     async def _launch_task_with_timeout(self, task: Task, timeout: int | None = None):
         # Reap any stale container from a crashed prior run / previous attempt so a
         # deterministic --name cannot collide ("name already in use"). Only container
@@ -654,22 +616,36 @@ class Orchestrator:
         stale_reap = self._container_teardown_commands(task)
         if stale_reap:
             await asyncio.to_thread(self._run_teardown_commands, stale_reap)
-        try:
-            if timeout:
-                async with asyncio.timeout(timeout):
-                    return await self._subprocess_launcher.run_async(
-                        task.launch_command,
-                        output_logger=task.logger,
-                        env=task.envs,
-                        task_name=task.name,
-                    )
-            else:
-                return await self._subprocess_launcher.run_async(
-                    task.launch_command,
+
+        def _run():
+            # Operators that orchestrate their own multi-step, driver-managed run
+            # (e.g. k8s: apply -> stream -> status-watch -> stop) get awaited
+            # directly; everyone else launches one subprocess from build_command.
+            # Either way the awaitable resolves to an int exit code.
+            operator = getattr(task, "operator", None)
+            if operator is not None and getattr(
+                operator, "manages_own_execution", lambda: False
+            )():
+                return operator.execute(
+                    launcher=self._subprocess_launcher,
                     output_logger=task.logger,
                     env=task.envs,
                     task_name=task.name,
+                    script=task.script,
                 )
+            return self._subprocess_launcher.run_async(
+                task.launch_command,
+                output_logger=task.logger,
+                env=task.envs,
+                task_name=task.name,
+            )
+
+        try:
+            if timeout:
+                async with asyncio.timeout(timeout):
+                    return await _run()
+            else:
+                return await _run()
         finally:
             # Runs on success, failure, timeout, and cancellation -- the only path
             # that guarantees the container is gone if the launch process was

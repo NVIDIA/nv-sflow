@@ -562,8 +562,10 @@ def test_build_task_graph_k8s_multinode_sizes_to_requested_node_count():
     assert (
         rct[0]["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"] == 2
     )
-    # One log stream per pod (leader + 3 workers).
-    assert shell.count("kubectl logs -f") == 4
+    # The apply step waits for each of the 4 pods to start (leader + 3 workers);
+    # log streaming is a separate driver-managed step, not in the apply command.
+    assert shell.count("final phase=") == 4
+    assert "kubectl logs -f" not in shell
 
 
 def test_build_task_graph_rejects_explicit_indices_on_non_placement_backend():

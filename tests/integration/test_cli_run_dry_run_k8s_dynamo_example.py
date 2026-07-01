@@ -68,6 +68,12 @@ def test_k8s_dynamo_dry_run_multinode_worker_spans_nodes(tmp_path: Path):
     # CTX_GPUS_PER_WORKER (=CTX_TP_SIZE=4) > GPUS_PER_NODE (=2) -> the prefill
     # worker spans 2 nodes; the planner's GPU-only inference assigns 2 nodes and
     # the k8s operator renders one pod per node.
+    #
+    # Keep total GPU demand within the 10-GPU budget (NUM_NODES=5 * GPUS_PER_NODE=2):
+    # prefill = NUM_CTX_SERVERS(1) * CTX_TP_SIZE(4) = 4 (spanning 2 nodes), decode =
+    # NUM_GEN_SERVERS(1) * GEN_TP_SIZE(2) = 2, total 6. The default NUM_GEN_SERVERS=4
+    # would need 4+8=12 GPUs and the planner would (correctly) reject it since the
+    # prefill server holds its GPUs release_after=workflow_completion.
     result, _ = _run_dry(
         tmp_path,
         [
@@ -75,7 +81,8 @@ def test_k8s_dynamo_dry_run_multinode_worker_spans_nodes(tmp_path: Path):
             "GPUS_PER_NODE=2",
             "NUM_CTX_SERVERS=1",  # this test exercises one worker spanning nodes
             "CTX_TP_SIZE=4",
-            "GEN_TP_SIZE=2",
+            "NUM_GEN_SERVERS=1",
+            "GEN_TP_SIZE=6",
         ],
     )
 
