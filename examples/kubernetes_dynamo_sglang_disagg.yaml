@@ -38,9 +38,13 @@ variables:
   # --- Kubernetes backend configuration ---
   K8S_NAMESPACE:
     description: "Kubernetes namespace for all pods"
-    # Runs in mlperf-sflow so pods can mount the deepseek-r1-model-lustre PVC
-    # (PVCs are namespace-scoped; the model lives on that Lustre volume).
+    # PVCs are namespace-scoped, so this must be the namespace that holds
+    # MODEL_PVC_CLAIM. Override both together per cluster, e.g.:
+    #   -s K8S_NAMESPACE=perflab-hpcdl -s MODEL_PVC_CLAIM=shared-storage
     value: mlperf-sflow
+  MODEL_PVC_CLAIM:
+    description: "Existing PVC that holds the model weights (mounted read-only at /models); override per cluster"
+    value: deepseek-r1-model-lustre
   GPUS_PER_NODE:
     description: "GPUs per node"
     type: integer
@@ -59,8 +63,8 @@ variables:
     description: "In-pod mount path for the persistent kernel/JIT cache"
     value: /cache
   CACHE_PVC_CLAIM:
-    description: "Existing RWX PVC that stores the kernel cache (defaults to the model PVC; set a dedicated RWX cache PVC if you have one)"
-    value: deepseek-r1-model-lustre
+    description: "RWX PVC that stores the kernel cache (defaults to the model PVC; set a dedicated RWX cache PVC if you have one)"
+    value: ${{ variables.MODEL_PVC_CLAIM }}
 
   # Model Configuration
   SERVED_MODEL_NAME:
@@ -276,7 +280,7 @@ backends:
     # at /models/Qwen3-8B-FP8.
     volumes:
       - name: model-store
-        claim: deepseek-r1-model-lustre
+        claim: ${{ variables.MODEL_PVC_CLAIM }}
         mount_path: /models
         read_only: true
       # Writable cache PVC: persists the JIT/kernel cache (DeepGEMM/DeepEP/Triton/
