@@ -383,14 +383,29 @@ workflow:
         - frontend_server
       probes:
         readiness:
-          http_post:
-            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
-            headers:
-              Content-Type: "application/json"
-            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
-          timeout: 1200
-          each_check_timeout: 20
-          interval: 20
+          # Two readiness probes -- the task is READY only when BOTH fire.
+          # 1) The frontend endpoint answers. On its own this is unreliable for
+          #    disaggregated serving: the endpoint responds as soon as ANY worker
+          #    registers (e.g. only prefill), so a request can still fail because
+          #    this worker (e.g. decode) is not actually serving yet.
+          - http_post:
+              url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+              headers:
+                Content-Type: "application/json"
+              body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+            timeout: 1200
+            each_check_timeout: 20
+            interval: 20
+          # 2) This worker's OWN log confirms it finished loading and opened its
+          #    dynamo readiness gate ("register_model_with_readiness_gate: Model
+          #    registration succeeded; processing queued requests"). This is the
+          #    authoritative per-worker signal, so a dependent (benchmark) never
+          #    starts before this specific worker is genuinely serving.
+          - log_watch:
+              match_pattern: "Model registration succeeded"
+              match_count: 1
+            timeout: 1200
+            interval: 10
         failure:
           log_watch:
             match_pattern: "Traceback (most recent call last)"
