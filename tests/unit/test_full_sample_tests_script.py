@@ -402,6 +402,43 @@ def test_full_sample_covers_backend_agnostic_examples():
     assert "id=kubernetes" in script
 
 
+def test_full_sample_covers_kubernetes_dynamo_and_standalone_examples():
+    # Every shipped native-Kubernetes example must have a dry-run preflight case:
+    # the 6 Dynamo recipes (via the loop), plus the pd_smoke / apply_launch ones.
+    script = Path("scripts/full_sample_tests.sh").read_text()
+
+    for recipe, workflow in [
+        ("kubernetes_dynamo_vllm_agg", "dynamo_vllm_agg"),
+        ("kubernetes_dynamo_vllm_disagg", "dynamo_vllm_disagg"),
+        ("kubernetes_dynamo_trtllm_agg", "dynamo_trtllm_agg"),
+        ("kubernetes_dynamo_trtllm_disagg", "dynamo_trtllm_disagg"),
+        ("kubernetes_dynamo_sglang_agg", "dynamo_sglang_agg"),
+        ("kubernetes_dynamo_sglang_disagg", "dynamo_sglang_disagg"),
+    ]:
+        assert f"{recipe}:{workflow}" in script
+    # The templated dynamo run_check title + the standalone cases.
+    assert "dry-run ${k8s_dynamo_example} uses k8s operator" in script
+    assert (
+        "dry-run kubernetes_pd_smoke resolves cross-task node IPs via k8s operator"
+        in script
+    )
+    assert "dry-run kubernetes_apply_launch uses k8s operator" in script
+
+
+def test_full_sample_covers_cli_backend_extra_arg_and_kube_flags():
+    # The new CLI extra-arg routing + kube access flags must be smoke-tested via
+    # sflow run --dry-run: salloc merge, namespace override, and the kubectl
+    # misrouting warning for a generic --extra-args value.
+    script = Path("scripts/full_sample_tests.sh").read_text()
+
+    assert "dry-run --extra-salloc-args merges into the Slurm backend" in script
+    assert "'slurm': ['--gpus-per-node=4']" in script
+    assert "dry-run --kube-namespace overrides the kubernetes backend namespace" in script
+    assert "namespace: ns-override" in script
+    assert "dry-run generic --extra-args routed to kubectl warns about misrouting" in script
+    assert "applying generic --extra-args as kubectl" in script
+
+
 def test_full_sample_covers_dry_run_report_reformat():
     script = Path("scripts/full_sample_tests.sh").read_text()
 

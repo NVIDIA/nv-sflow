@@ -34,6 +34,30 @@ EnableTaskMonitorOption = Annotated[
     ),
 ]
 
+# Shared `--include-nodes` / `--exclude-nodes` definitions (single source of truth
+# for `sflow run` and `sflow batch`). Backend-agnostic host lists that each backend
+# translates to its native node selection: Slurm `--nodelist`/`--exclude`, K8s
+# `kubernetes.io/hostname` In/NotIn nodeAffinity, Docker host-pool filtering.
+IncludeNodesOption = Annotated[
+    Optional[List[str]],
+    typer.Option(
+        "--include-nodes",
+        help="Restrict the candidate node pool to these hostnames across all "
+        "backends. Accepts comma-separated (--include-nodes a,b), a quoted "
+        'whitespace-separated list (--include-nodes "a b"), and/or repeated flags.',
+    ),
+]
+
+ExcludeNodesOption = Annotated[
+    Optional[List[str]],
+    typer.Option(
+        "--exclude-nodes",
+        help="Remove these hostnames from the candidate node pool across all "
+        "backends. Accepts comma-separated (--exclude-nodes a,b), a quoted "
+        'whitespace-separated list (--exclude-nodes "a b"), and/or repeated flags.',
+    ),
+]
+
 
 def split_list_arg(values: list[str] | None) -> list[str] | None:
     """Normalize a repeatable CLI list option into individual tokens.

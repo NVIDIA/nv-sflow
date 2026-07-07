@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import logging
 import unittest.mock as mock
 
@@ -68,16 +69,14 @@ def test_volume_mount_path_must_be_absolute():
 
 
 def test_rdma_config_modes():
-    # auto (default): nothing injected until detection runs.
+    # auto (default): nothing injected until detection runs at allocation.
     assert KubernetesBackend(_cfg()).network_env == {}
     # off: never inject.
     assert KubernetesBackend(_cfg(rdma="off")).network_env == {}
-    # explicit list: UCX + NCCL HCA env built from the given device specs.
-    be = KubernetesBackend(_cfg(rdma=["mlx5_0:1", "mlx5_1:1"]))
-    env = be.network_env
-    assert env["UCX_NET_DEVICES"] == "mlx5_0:1,mlx5_1:1"
-    assert env["NCCL_IB_HCA"] == "mlx5_0,mlx5_1"  # ports stripped for NCCL HCA names
-    assert be.rdma_net_devices == "mlx5_0:1,mlx5_1:1"  # back-compat accessor
+    # a named provider pins that mechanism (chain still runs at allocation).
+    be = KubernetesBackend(_cfg(rdma="shared_device_plugin"))
+    assert be._rdma_mode == "auto" and be._rdma_forced == "shared_device_plugin"
+    assert be.network_env == {}
 
 
 def test_rdma_invalid_string_rejected():
@@ -87,24 +86,130 @@ def test_rdma_invalid_string_rejected():
         _cfg(rdma="bogus")
 
 
-def test_detect_network_env_pins_routable_iface_not_rdma(monkeypatch):
-    # auto pins UCX/NCCL/gloo to the routable NIC (UCX can only use TCP NICs in the
-    # pod); it must NOT force the RDMA HCAs (that breaks UCX), only expose them.
-    be = KubernetesBackend(_cfg())  # auto
+def _fake_kubectl(probe_out, *, node_json=None, node_name="node-a"):
+    """Fake ``_kubectl`` answering the RDMA exec probe + node-allocatable fetch."""
+
+    async def _run(args):
+        a = list(args)
+        if a and a[0] == "exec":
+            return 0, probe_out, ""
+        if a[:2] == ["get", "pod"]:
+            return 0, node_name, ""
+        if a[:2] == ["get", "node"]:
+            return (0, node_json, "") if node_json is not None else (1, "", "")
+        return 0, "", ""
+
+    return _run
+
+
+def test_detect_network_env_host_device_when_hcas_and_host_network(monkeypatch):
+    # HCAs present + host_network + no device plugin -> the host-device provider
+    # grants verbs access via /dev/infiniband + IPC_LOCK (RDMA, not the TCP fallback).
+    be = KubernetesBackend(_cfg())  # host_network defaults True
+    monkeypatch.setattr(
+        be, "_kubectl",
+        _fake_kubectl("HCA mlx5_0\nHCA mlx5_1\nHCA mlx5_2\nIFACE eth0\n"),
+    )
+    asyncio.run(be._detect_network_env(["res-0"]))
+    assert be.rdma_enabled is True
+    assert be.rdma_host_device_paths == ["/dev/infiniband"]
+    assert be.rdma_ipc_lock is True
+    # Every NIC spec is resource-less (access via the device mount, not a resource).
+    assert [r for r, _h in be.rdma_nic_specs] == ["", "", ""]
+    env = be.network_env
+    assert env["NCCL_SOCKET_IFNAME"] == "eth0"  # control NIC pinned
+    assert env["SFLOW_RDMA_HCAS"] == "mlx5_0,mlx5_1,mlx5_2"
+    # UCX_NET_DEVICES is set per-pod by the operator, not backend-wide.
+    assert "UCX_NET_DEVICES" not in env
+
+
+def test_detect_network_env_pins_routable_iface_when_no_host_network(monkeypatch):
+    # Without host_network the host-device path does not apply; fall back to pinning
+    # the routable TCP NIC (and only expose the HCAs informationally).
+    be = KubernetesBackend(_cfg(host_network=False))
+    monkeypatch.setattr(
+        be, "_kubectl", _fake_kubectl("HCA mlx5_0\nHCA mlx5_1\nIFACE eth0\n")
+    )
+    asyncio.run(be._detect_network_env(["res-0"]))
+    assert be.rdma_enabled is False
+    env = be.network_env
+    assert "UCX_NET_DEVICES" not in env
+    assert env["NCCL_SOCKET_IFNAME"] == "eth0"
+    assert env["SFLOW_RDMA_HCAS"] == "mlx5_0,mlx5_1"  # informational only
+    assert "NCCL_IB_HCA" not in env
+
+
+def test_build_time_tcp_fallback_warns_when_hcas_present(monkeypatch, caplog):
+    # HCAs exist on the node but no usable provider (host_network off) -> the
+    # build-time plan degrades to TCP; sflow must WARN so slow KV transport is not
+    # silent.
+    be = KubernetesBackend(_cfg(host_network=False))
+    monkeypatch.setattr(
+        be, "_kubectl", _fake_kubectl("HCA mlx5_0\nHCA mlx5_1\nIFACE eth0\n")
+    )
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._detect_network_env(["res-0"]))
+    assert be.rdma_enabled is False
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a WARNING when RDMA HCAs degrade to TCP"
+    msg = warnings[0].getMessage()
+    assert "TCP" in msg and "mlx5_0" in msg
+
+
+def test_build_time_no_hcas_does_not_warn(monkeypatch, caplog):
+    # No RDMA hardware at all -> TCP is expected, not a degradation: no WARNING.
+    be = KubernetesBackend(_cfg())
 
     async def fake_kubectl(args):
-        return 0, "HCA mlx5_0\nHCA mlx5_1\nHCA mlx5_2\nIFACE eth0\n", ""
+        return 0, "IFACE eth0\n", ""
 
     monkeypatch.setattr(be, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.INFO, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._detect_network_env(["res-0"]))
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_detect_network_env_gke_provider(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    node_json = json.dumps(
+        {
+            "status": {
+                "allocatable": {
+                    "networking.gke.io.networks/rdma-0": "1",
+                    "networking.gke.io.networks/rdma-1": "1",
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(
+        be, "_kubectl",
+        _fake_kubectl("HCA mlx5_0\nHCA mlx5_1\nIFACE eth0\n", node_json=node_json),
+    )
     asyncio.run(be._detect_network_env(["res-0"]))
-    env = be.network_env
-    assert env["UCX_NET_DEVICES"] == "eth0"  # routable NIC, not mlx5
-    assert env["NCCL_SOCKET_IFNAME"] == "eth0"
-    assert env["GLOO_SOCKET_IFNAME"] == "eth0"
-    assert env["SFLOW_PRIMARY_IFACE"] == "eth0"
-    assert env["SFLOW_RDMA_HCAS"] == "mlx5_0,mlx5_1,mlx5_2"  # informational only
-    assert "NCCL_IB_HCA" not in env  # not forced (pods lack RDMA verbs access)
-    assert "mlx5" not in env["UCX_NET_DEVICES"]
+    assert be.rdma_enabled is True
+    assert be.rdma_nic_specs == [
+        ("networking.gke.io.networks/rdma-0", "mlx5_0"),
+        ("networking.gke.io.networks/rdma-1", "mlx5_1"),
+    ]
+    assert be.rdma_host_device_paths == []  # device plugin, no host mount
+    assert be.rdma_lib_mounts  # GKE gIB libs present
+
+
+def test_detect_network_env_shared_device_plugin_provider(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    node_json = json.dumps({"status": {"allocatable": {"rdma/hca": "2"}}})
+    monkeypatch.setattr(
+        be, "_kubectl",
+        _fake_kubectl("HCA mlx5_0\nHCA mlx5_1\nIFACE eth0\n", node_json=node_json),
+    )
+    asyncio.run(be._detect_network_env(["res-0"]))
+    assert be.rdma_enabled is True
+    # Shared resource -> all HCAs behind the one rdma/* resource.
+    assert be.rdma_nic_specs == [("rdma/hca", "mlx5_0"), ("rdma/hca", "mlx5_1")]
+    assert be.rdma_ipc_lock is True
+    assert be.rdma_host_device_paths == []
 
 
 def test_detect_network_env_pins_iface_even_without_rdma(monkeypatch):
@@ -116,7 +221,7 @@ def test_detect_network_env_pins_iface_even_without_rdma(monkeypatch):
     monkeypatch.setattr(be, "_kubectl", fake_kubectl)
     asyncio.run(be._detect_network_env(["res-0"]))
     env = be.network_env
-    assert env["UCX_NET_DEVICES"] == "eth0"
+    assert "UCX_NET_DEVICES" not in env
     assert env["NCCL_SOCKET_IFNAME"] == "eth0"
     assert "SFLOW_RDMA_HCAS" not in env
 
@@ -137,12 +242,23 @@ def test_resolve_config_preserves_rdma():
         def resolve(self, v, ctx):
             return v
 
-    conf = _cfg(rdma=["mlx5_0:1"])
+    conf = _cfg(rdma="auto")
     resolved = KubernetesBackend.resolve_config(
         conf, resolver=_Id(), ctx={}, workflow_name="wf"
     )
-    assert resolved.rdma == ["mlx5_0:1"]
-    assert KubernetesBackend(resolved).rdma_net_devices == "mlx5_0:1"
+    assert resolved.rdma == "auto"
+
+
+def test_rdma_forces_named_provider():
+    # A specific `rdma` value pins that provider (skips the auto chain order).
+    be = KubernetesBackend(_cfg(rdma="host_device"))
+    assert be._rdma_mode == "auto" and be._rdma_forced == "host_device"
+
+
+def test_rdma_off_disables_detection():
+    be = KubernetesBackend(_cfg(rdma="off"))
+    assert be._rdma_mode == "off" and be._rdma_forced is None
+    assert be.network_env == {} and be.rdma_enabled is False
 
 
 def test_resolve_config_preserves_and_resolves_pvc_volumes():
@@ -168,6 +284,379 @@ def test_resolve_config_preserves_and_resolves_pvc_volumes():
     assert v.mount_path == "/models" and v.read_only is True
     # And the live backend object exposes it for the operator.
     assert KubernetesBackend(resolved).volumes[0]["claim"] == "real-pvc"
+
+
+# ---------------------------------------------------------------------------
+# NVLink-domain scope detection (component 2)
+# ---------------------------------------------------------------------------
+
+
+def _fake_kubectl_sync(*, product="", crd_present=False):
+    """Fake ``_kubectl_sync`` answering the CRD presence + GPU-product queries."""
+
+    def _run(args, *, timeout="10s"):
+        a = list(args)
+        if a[:2] == ["get", "crd"]:
+            return (0, "customresourcedefinition.apiextensions.k8s.io/computedomains.resource.nvidia.com", "") if crd_present else (1, "", "NotFound")
+        if a[:2] == ["get", "nodes"]:
+            return (0, product, "") if product else (0, "", "")
+        return 0, "", ""
+
+    return _run
+
+
+def test_nvlink_scope_from_pure_helper():
+    be = KubernetesBackend(_cfg())
+    # GB200/GB300-class board + ComputeDomain CRD -> rack-scoped MNNVL.
+    assert be._nvlink_scope_from(product="NVIDIA-GB200", compute_domain_crd=True) == "rack"
+    assert be._nvlink_scope_from(product="NVIDIA GB300", compute_domain_crd=True) == "rack"
+    # GB200 board but no IMEX driver/CRD -> only intra-node NVLink.
+    assert be._nvlink_scope_from(product="NVIDIA-GB200", compute_domain_crd=False) == "node"
+    # NVSwitch/NVLink node GPUs (B200/H100) -> node scope.
+    assert be._nvlink_scope_from(product="NVIDIA-B200", compute_domain_crd=False) == "node"
+    assert be._nvlink_scope_from(product="NVIDIA-H100-80GB-HBM3", compute_domain_crd=True) == "node"
+    # Unknown/absent product -> off (no NVLink assumption).
+    assert be._nvlink_scope_from(product="", compute_domain_crd=True) == "off"
+    assert be._nvlink_scope_from(product="Tesla-T4", compute_domain_crd=False) == "off"
+
+
+def test_detect_nvlink_scope_explicit_override_wins_without_kubectl():
+    for override in ("node", "rack", "off"):
+        be = KubernetesBackend(_cfg(nvlink_domain=override))
+
+        def _boom(*a, **k):
+            raise AssertionError("detection must not run when overridden")
+
+        be._kubectl_sync = _boom  # type: ignore[assignment]
+        assert be._detect_nvlink_scope() == override
+        assert be.nvlink_domain_scope == override
+
+
+def test_detect_nvlink_scope_rack_from_product_and_crd(monkeypatch):
+    be = KubernetesBackend(_cfg())  # nvlink_domain defaults to auto
+    monkeypatch.setattr(
+        be, "_kubectl_sync", _fake_kubectl_sync(product="NVIDIA-GB200", crd_present=True)
+    )
+    assert be._detect_nvlink_scope() == "rack"
+    assert be.nvlink_domain_scope == "rack"
+
+
+def test_detect_nvlink_scope_node_when_crd_absent(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setattr(
+        be, "_kubectl_sync", _fake_kubectl_sync(product="NVIDIA-GB200", crd_present=False)
+    )
+    assert be._detect_nvlink_scope() == "node"
+
+
+def test_detect_nvlink_scope_off_when_undetectable(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setattr(be, "_kubectl_sync", _fake_kubectl_sync(product="", crd_present=False))
+    assert be._detect_nvlink_scope() == "off"
+
+
+def test_detect_nvlink_scope_warn_only_on_kubectl_error(monkeypatch):
+    be = KubernetesBackend(_cfg())
+
+    def _err(args, *, timeout="10s"):
+        raise RuntimeError("kubectl blew up")
+
+    monkeypatch.setattr(be, "_kubectl_sync", _err)
+    # Never raises; degrades to off.
+    assert be._detect_nvlink_scope() == "off"
+
+
+def test_detect_nvlink_scope_logs_resolved_scope(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setattr(
+        be, "_kubectl_sync", _fake_kubectl_sync(product="NVIDIA-GB200", crd_present=True)
+    )
+    messages, handler = _capture_info()
+    k8s_mod._logger.addHandler(handler)
+    k8s_mod._logger.setLevel(logging.INFO)
+    try:
+        be._detect_nvlink_scope()
+    finally:
+        k8s_mod._logger.removeHandler(handler)
+    assert any("NVLink" in m and "rack" in m for m in messages)
+
+
+def test_nvlink_domain_scope_none_before_detection():
+    # auto + no detection yet (e.g. dry-run) -> unresolved (None).
+    assert KubernetesBackend(_cfg()).nvlink_domain_scope is None
+
+
+# ---------------------------------------------------------------------------
+# ComputeDomain detection + `auto` channel resolution (component 4)
+# ---------------------------------------------------------------------------
+
+
+def _cds_json(*pairs):
+    """Build a `kubectl get computedomains -o json` payload from (name, channel)."""
+    items = [
+        {
+            "metadata": {"name": name},
+            "spec": {"channel": {"resourceClaimTemplate": {"name": channel}}},
+        }
+        for name, channel in pairs
+    ]
+    return json.dumps({"items": items})
+
+
+def test_detect_compute_domains_parses_json(monkeypatch):
+    be = KubernetesBackend(_cfg(namespace="ml"))
+
+    def fake_sync(args, *, timeout="10s"):
+        if args[:2] == ["get", "computedomains"]:
+            return 0, _cds_json(("cd-a", "cd-a-channel"), ("cd-b", "cd-b-channel")), ""
+        return 1, "", ""
+
+    monkeypatch.setattr(be, "_kubectl_sync", fake_sync)
+    assert be._detect_compute_domains() == [
+        ("cd-a", "cd-a-channel"),
+        ("cd-b", "cd-b-channel"),
+    ]
+
+
+def test_detect_compute_domains_empty_on_error(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setattr(be, "_kubectl_sync", lambda args, *, timeout="10s": (1, "", "boom"))
+    assert be._detect_compute_domains() == []
+
+
+def test_resolve_auto_channel_uses_sole_domain(monkeypatch):
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="auto"))
+    )
+    monkeypatch.setattr(
+        be, "_detect_compute_domains", lambda: [("cd-only", "cd-only-channel")]
+    )
+    be._resolve_use_compute_domain_channel()
+    assert be.compute_domain_channel == "cd-only-channel"
+
+
+def test_resolve_auto_channel_zero_domains_hints(monkeypatch, caplog):
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="auto"))
+    )
+    monkeypatch.setattr(be, "_detect_compute_domains", lambda: [])
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        be._resolve_use_compute_domain_channel()
+    assert be.compute_domain_channel is None
+    assert any("no existing ComputeDomain" in r.getMessage() for r in caplog.records)
+
+
+def test_resolve_auto_channel_many_domains_hints(monkeypatch, caplog):
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="auto"))
+    )
+    monkeypatch.setattr(
+        be,
+        "_detect_compute_domains",
+        lambda: [("cd-a", "cd-a-channel"), ("cd-b", "cd-b-channel")],
+    )
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        be._resolve_use_compute_domain_channel()
+    # Ambiguous -> never guess a domain.
+    assert be.compute_domain_channel is None
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("cd-a" in m and "cd-b" in m for m in msgs)
+
+
+def test_resolve_named_channel_is_noop(monkeypatch):
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="cd-named"))
+    )
+
+    def _boom():
+        raise AssertionError("must not detect for a named channel")
+
+    monkeypatch.setattr(be, "_detect_compute_domains", _boom)
+    be._resolve_use_compute_domain_channel()
+    assert be.compute_domain_channel == "cd-named"
+
+
+def test_resolve_off_channel_is_noop(monkeypatch):
+    be = KubernetesBackend(_cfg())
+
+    def _boom():
+        raise AssertionError("must not detect when channel is off")
+
+    monkeypatch.setattr(be, "_detect_compute_domains", _boom)
+    be._resolve_use_compute_domain_channel()
+    assert be.compute_domain_channel is None
+
+
+def test_resolve_auto_channel_best_effort_on_error(monkeypatch):
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="auto"))
+    )
+
+    def _err():
+        raise RuntimeError("kubectl blew up")
+
+    monkeypatch.setattr(be, "_detect_compute_domains", _err)
+    be._resolve_use_compute_domain_channel()  # must not raise
+    assert be.compute_domain_channel is None
+
+
+# ---------------------------------------------------------------------------
+# NVLink-domain placement (component 6): reservation podAffinity + validation
+# ---------------------------------------------------------------------------
+
+
+def _capture_reservation_render(monkeypatch, backend):
+    captured: dict = {}
+
+    def fake_render(**kwargs):
+        captured.update(kwargs)
+        return {"kind": "Pod", "metadata": {"name": kwargs["pod_name"]}, "spec": {}}
+
+    monkeypatch.setattr(k8s_mod, "render_reservation_pod_manifest", fake_render)
+
+    async def fake_alloc(alloc_id, pod_names, manifests):
+        return Allocation(allocation_id=alloc_id, nodes=[], owned=True)
+
+    async def fake_detect(pod_names):
+        return None
+
+    monkeypatch.setattr(backend, "_allocate_reserved", fake_alloc)
+    monkeypatch.setattr(backend, "_detect_network_env", fake_detect)
+    return captured
+
+
+def test_reservation_gets_nvlink_podaffinity_when_rack_multinode(monkeypatch):
+    backend = KubernetesBackend(
+        _cfg(
+            nodes=2,
+            gpus_per_node=0,
+            nvlink_domain="rack",  # explicit override -> no detection kubectl
+            dra=KubernetesDraConfig(nvlink_domain_label_key="nvidia.com/gpu.clique"),
+        )
+    )
+    captured = _capture_reservation_render(monkeypatch, backend)
+    asyncio.run(backend.allocate())
+    assert captured.get("nvlink_domain_topology_key") == "nvidia.com/gpu.clique"
+
+
+def test_reservation_no_nvlink_podaffinity_when_node_scope(monkeypatch):
+    backend = KubernetesBackend(
+        _cfg(
+            nodes=2,
+            gpus_per_node=0,
+            nvlink_domain="node",
+            dra=KubernetesDraConfig(nvlink_domain_label_key="nvidia.com/gpu.clique"),
+        )
+    )
+    captured = _capture_reservation_render(monkeypatch, backend)
+    asyncio.run(backend.allocate())
+    assert captured.get("nvlink_domain_topology_key") is None
+
+
+def test_reservation_no_nvlink_podaffinity_single_node(monkeypatch):
+    backend = KubernetesBackend(
+        _cfg(
+            nodes=1,
+            gpus_per_node=0,
+            nvlink_domain="rack",
+            dra=KubernetesDraConfig(nvlink_domain_label_key="nvidia.com/gpu.clique"),
+        )
+    )
+    captured = _capture_reservation_render(monkeypatch, backend)
+    asyncio.run(backend.allocate())
+    assert captured.get("nvlink_domain_topology_key") is None
+
+
+def test_reservation_no_nvlink_podaffinity_without_label_key(monkeypatch):
+    backend = KubernetesBackend(_cfg(nodes=2, gpus_per_node=0, nvlink_domain="rack"))
+    captured = _capture_reservation_render(monkeypatch, backend)
+    asyncio.run(backend.allocate())
+    assert captured.get("nvlink_domain_topology_key") is None
+
+
+def test_node_label_reads_escaped_jsonpath(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    seen: dict = {}
+
+    async def fake_kubectl(args):
+        seen["args"] = list(args)
+        return 0, "clique-7", ""
+
+    monkeypatch.setattr(be, "_kubectl", fake_kubectl)
+    val = asyncio.run(be._node_label("node-a", "nvidia.com/gpu.clique"))
+    assert val == "clique-7"
+    assert any("nvidia\\.com/gpu\\.clique" in a for a in seen["args"])
+
+
+def _rack_backend_with_label():
+    return KubernetesBackend(
+        _cfg(
+            nvlink_domain="rack",
+            dra=KubernetesDraConfig(nvlink_domain_label_key="nvidia.com/gpu.clique"),
+        )
+    )
+
+
+def test_validate_nvlink_placement_warns_on_span(monkeypatch, caplog):
+    be = _rack_backend_with_label()
+    labels = {"node-a": "clique-1", "node-b": "clique-2"}
+
+    async def fake_label(n, key, *, fallback=""):
+        return labels[n]
+
+    monkeypatch.setattr(be, "_node_label", fake_label)
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._validate_nvlink_domain_placement(["node-a", "node-b"]))
+    assert any(
+        "domain" in r.getMessage().lower()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    )
+
+
+def test_validate_nvlink_placement_warns_on_missing_label(monkeypatch, caplog):
+    be = _rack_backend_with_label()
+
+    async def fake_label(n, key, *, fallback=""):
+        return {"node-a": "", "node-b": "clique-1"}[n]
+
+    monkeypatch.setattr(be, "_node_label", fake_label)
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._validate_nvlink_domain_placement(["node-a", "node-b"]))
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("label" in m.lower() for m in msgs)
+
+
+def test_validate_nvlink_placement_ok_same_domain(monkeypatch, caplog):
+    be = _rack_backend_with_label()
+
+    async def fake_label(n, key, *, fallback=""):
+        return "clique-1"
+
+    monkeypatch.setattr(be, "_node_label", fake_label)
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._validate_nvlink_domain_placement(["node-a", "node-b"]))
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_validate_nvlink_placement_noop_when_node_scope(monkeypatch):
+    be = KubernetesBackend(
+        _cfg(
+            nvlink_domain="node",
+            dra=KubernetesDraConfig(nvlink_domain_label_key="nvidia.com/gpu.clique"),
+        )
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("must not read node labels on node scope")
+
+    monkeypatch.setattr(be, "_node_label", _boom)
+    asyncio.run(be._validate_nvlink_domain_placement(["node-a", "node-b"]))  # no-op
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +772,7 @@ def test_preflight_device_plugin_skips_deviceclass_check():
     with (
         mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
         mock.patch.object(backend, "_preflight_check_connectivity"),
+        mock.patch.object(backend, "_detect_nvlink_scope"),
         mock.patch("subprocess.run") as run,
     ):
         backend.preflight_validate()
@@ -403,6 +893,7 @@ def test_preflight_connectivity_skipped_via_env(monkeypatch):
     backend = KubernetesBackend(_cfg(namespace="ml", scheduling="device_plugin"))
     with (
         mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+        mock.patch.object(backend, "_detect_nvlink_scope"),
         mock.patch("subprocess.run") as run,
     ):
         backend.preflight_validate()
@@ -519,21 +1010,61 @@ def test_apply_kubectl_config_global_args_and_namespace_override():
     assert details["kubectl_args"] == "['--insecure-skip-tls-verify']"
 
 
-def test_apply_kubectl_config_sets_exclude_nodes():
-    from sflow.core.kubectl_config import KubectlConfig
-
-    backend = KubernetesBackend(_cfg())
-    backend.apply_kubectl_config(KubectlConfig(exclude_nodes=["bad-1", "bad-2"]))
+def test_backend_reads_node_filters_from_config():
+    backend = KubernetesBackend(
+        _cfg(include_nodes=["want-1"], exclude_nodes=["bad-1", "bad-2"])
+    )
+    assert backend.include_nodes == ["want-1"]
     assert backend.exclude_nodes == ["bad-1", "bad-2"]
 
 
-def test_exclude_nodes_threaded_into_reservation_manifests(monkeypatch):
-    # Regression guard: --kube-exclude-node must reach the reservation pod render (the
-    # place that decides node placement), not just sit on the backend.
+def test_backend_normalizes_comma_joined_node_filters_from_config():
+    backend = KubernetesBackend(_cfg(exclude_nodes=["bad-1,bad-2", "bad-3"]))
+    assert backend.exclude_nodes == ["bad-1", "bad-2", "bad-3"]
+
+
+def test_apply_kubectl_config_warns_on_generic_args_applied_as_kubectl_globals():
+    # A generic --extra-args value (Slurm-ism) fanned into kubectl globals must warn,
+    # since kubectl rejects unknown global flags and every call would fail.
     from sflow.core.kubectl_config import KubectlConfig
 
-    backend = KubernetesBackend(_cfg(nodes=1, gpus_per_node=0))
-    backend.apply_kubectl_config(KubectlConfig(exclude_nodes=["bad-1"]))
+    backend = KubernetesBackend(_cfg(namespace="default"))
+    messages, handler = _capture_warnings()
+    k8s_mod._logger.addHandler(handler)
+    try:
+        backend.apply_kubectl_config(
+            KubectlConfig(
+                extra_args=["--gpus-per-node=4"],
+                generic_extra_args=["--gpus-per-node=4"],
+            )
+        )
+    finally:
+        k8s_mod._logger.removeHandler(handler)
+    assert any("--gpus-per-node=4" in m and "kubectl" in m for m in messages)
+
+
+def test_apply_kubectl_config_no_warning_for_explicit_kubectl_args():
+    # An explicit --extra-kubectl-args value (no generic origin) must NOT warn.
+    from sflow.core.kubectl_config import KubectlConfig
+
+    backend = KubernetesBackend(_cfg(namespace="default"))
+    messages, handler = _capture_warnings()
+    k8s_mod._logger.addHandler(handler)
+    try:
+        backend.apply_kubectl_config(
+            KubectlConfig(extra_args=["--insecure-skip-tls-verify"])
+        )
+    finally:
+        k8s_mod._logger.removeHandler(handler)
+    assert not any("global flags" in m for m in messages)
+
+
+def test_node_filters_threaded_into_reservation_manifests(monkeypatch):
+    # Regression guard: include/exclude node filters must reach the reservation pod
+    # render (the place that decides node placement), not just sit on the backend.
+    backend = KubernetesBackend(
+        _cfg(nodes=1, gpus_per_node=0, include_nodes=["want-1"], exclude_nodes=["bad-1"])
+    )
 
     captured: dict = {}
 
@@ -551,7 +1082,9 @@ def test_exclude_nodes_threaded_into_reservation_manifests(monkeypatch):
 
     monkeypatch.setattr(backend, "_allocate_reserved", fake_alloc)
     monkeypatch.setattr(backend, "_detect_network_env", fake_detect)
+    monkeypatch.setattr(backend, "_detect_nvlink_scope", lambda: "off")
     asyncio.run(backend.allocate())
+    assert captured.get("include_nodes") == ["want-1"]
     assert captured.get("exclude_nodes") == ["bad-1"]
 
 
@@ -590,7 +1123,9 @@ def test_resolve_config_preserves_namespace_scheduling_and_dra():
     conf = _cfg(
         namespace="bench",
         scheduling="dra",
-        dra=KubernetesDraConfig(gpu_device_class="gpu.nvidia.com", compute_domain=True),
+        dra=KubernetesDraConfig(
+            gpu_device_class="gpu.nvidia.com", create_compute_domain=True
+        ),
         reservation=KubernetesReservationConfig(timeout=120),
     )
     resolved = KubernetesBackend.resolve_config(
@@ -599,9 +1134,102 @@ def test_resolve_config_preserves_namespace_scheduling_and_dra():
     assert resolved.namespace == "bench"
     assert resolved.scheduling == "dra"
     assert resolved.dra.gpu_device_class == "gpu.nvidia.com"
-    assert resolved.dra.compute_domain is True
+    assert resolved.dra.create_compute_domain is True
     assert resolved.reservation.timeout == 120
     assert not hasattr(resolved, "image")
+
+
+def test_resolve_config_preserves_dra_rdma_coalloc():
+    conf = _cfg(
+        scheduling="dra",
+        dra=KubernetesDraConfig(
+            rdma_device_class="rdma.nvidia.com",
+            rdma_match_attribute="resource.kubernetes.io/pcieRoot",
+        ),
+    )
+    resolved = KubernetesBackend.resolve_config(
+        conf, resolver=_IdentityResolver(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.dra.rdma_device_class == "rdma.nvidia.com"
+    assert resolved.dra.rdma_match_attribute == "resource.kubernetes.io/pcieRoot"
+
+
+def test_backend_exposes_dra_rdma_properties_with_defaults():
+    # Default: co-allocation off, and runtime affinity off until a provider enables it.
+    plain = KubernetesBackend(_cfg(scheduling="dra"))
+    assert plain.dra_rdma_device_class is None
+    assert plain.dra_rdma_match_attribute == "resource.kubernetes.io/pcieRoot"
+    assert plain.rdma_runtime_affinity is False
+
+    configured = KubernetesBackend(
+        _cfg(
+            scheduling="dra",
+            dra=KubernetesDraConfig(
+                rdma_device_class="dra.net", rdma_match_attribute="dra.net/numaNode"
+            ),
+        )
+    )
+    assert configured.dra_rdma_device_class == "dra.net"
+    assert configured.dra_rdma_match_attribute == "dra.net/numaNode"
+
+
+def test_host_ipc_config_default_and_override():
+    # Off by default (privileged); opt-in enables cross-pod CUDA IPC / NVLink.
+    assert KubernetesBackend(_cfg()).host_ipc is False
+    assert KubernetesBackend(_cfg(host_ipc=True)).host_ipc is True
+
+
+def test_resolve_config_preserves_host_ipc():
+    resolved = KubernetesBackend.resolve_config(
+        _cfg(host_ipc=True), resolver=_IdentityResolver(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.host_ipc is True
+    assert KubernetesBackend(resolved).host_ipc is True
+
+
+def test_merge_colocated_gpu_pods_tristate_resolves_to_bool():
+    # Tri-state: default `auto` (and `on`/True) enable merging; `off`/False disable.
+    # The backend property returns the RESOLVED bool so _plan_merge_groups is unchanged.
+    assert KubernetesBackend(_cfg()).merge_colocated_gpu_pods is True  # default auto
+    assert KubernetesBackend(_cfg(merge_colocated_gpu_pods="auto")).merge_colocated_gpu_pods is True
+    assert KubernetesBackend(_cfg(merge_colocated_gpu_pods="on")).merge_colocated_gpu_pods is True
+    assert KubernetesBackend(_cfg(merge_colocated_gpu_pods=True)).merge_colocated_gpu_pods is True
+    assert KubernetesBackend(_cfg(merge_colocated_gpu_pods="off")).merge_colocated_gpu_pods is False
+    assert KubernetesBackend(_cfg(merge_colocated_gpu_pods=False)).merge_colocated_gpu_pods is False
+
+
+def test_merge_colocated_gpu_pods_invalid_rejected():
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(merge_colocated_gpu_pods="sometimes")
+
+
+def test_resolve_config_preserves_merge_colocated_gpu_pods():
+    # `off` must survive resolve_config as `off` (NOT coerced to a truthy bool).
+    resolved = KubernetesBackend.resolve_config(
+        _cfg(merge_colocated_gpu_pods="off"),
+        resolver=_IdentityResolver(),
+        ctx={},
+        workflow_name="wf",
+    )
+    assert KubernetesBackend(resolved).merge_colocated_gpu_pods is False
+    resolved_on = KubernetesBackend.resolve_config(
+        _cfg(merge_colocated_gpu_pods=True),
+        resolver=_IdentityResolver(),
+        ctx={},
+        workflow_name="wf",
+    )
+    assert KubernetesBackend(resolved_on).merge_colocated_gpu_pods is True
+
+
+def test_merge_colocated_gpu_pods_surfaced_in_dry_run_details():
+    # Enabled (default auto) -> surfaced; explicitly off -> not surfaced.
+    details = dict(KubernetesBackend(_cfg()).dry_run_details())
+    assert details.get("merge_colocated_gpu_pods") == "True"
+    assert "merge_colocated_gpu_pods" not in dict(
+        KubernetesBackend(_cfg(merge_colocated_gpu_pods="off")).dry_run_details()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +1259,7 @@ def _reserve(backend: KubernetesBackend) -> tuple[Allocation, list[dict]]:
         mock.patch.object(backend, "_wait_for_pod_scheduled", side_effect=fake_wait),
         mock.patch.object(backend, "_node_internal_ip", side_effect=fake_internal),
         mock.patch.object(backend, "_detect_network_env", side_effect=fake_detect),
+        mock.patch.object(backend, "_detect_nvlink_scope", return_value="off"),
     ):
         allocation = asyncio.run(backend.allocate())
     return allocation, applied
@@ -685,7 +1314,7 @@ def test_compute_domain_allocation_creates_compute_domain():
         _cfg(
             nodes=2,
             gpus_per_node=8,
-            dra=KubernetesDraConfig(compute_domain=True),
+            dra=KubernetesDraConfig(create_compute_domain=True),
         )
     )
     _, applied = _reserve(backend)
@@ -694,6 +1323,145 @@ def test_compute_domain_allocation_creates_compute_domain():
     assert len(cds) == 1
     assert cds[0]["spec"]["numNodes"] == 2
     assert backend.compute_domain_channel is not None
+
+
+def test_compute_domain_created_with_device_plugin_scheduling():
+    # ComputeDomain (IMEX / NVLink) is decoupled from GPU scheduling: it stands up
+    # even on device_plugin GPUs (ComputeDomain-only DRA-driver clusters), so
+    # co-located pods can use cuda_ipc over the NVLink fabric.
+    backend = KubernetesBackend(
+        _cfg(
+            nodes=2,
+            gpus_per_node=8,
+            scheduling="device_plugin",
+            dra=KubernetesDraConfig(create_compute_domain=True),
+        )
+    )
+    _, applied = _reserve(backend)
+    cds = [m for m in applied if m.get("kind") == "ComputeDomain"]
+    assert len(cds) == 1 and backend.compute_domain_channel is not None
+    # RBAC must request ComputeDomain perms even without DRA GPU scheduling.
+    perms = backend._required_permissions()
+    assert ("create", "computedomains.resource.nvidia.com", True) in perms
+    # ...but NOT the DRA GPU-allocation perms (GPUs stay on the device plugin).
+    assert ("create", "resourceclaimtemplates.resource.k8s.io", True) not in perms
+
+
+def test_use_compute_domain_channel_reuses_existing_without_creating():
+    # Referencing an existing channel: NO ComputeDomain is created, no computedomains
+    # RBAC required, and the channel is exposed for task pods to claim.
+    backend = KubernetesBackend(
+        _cfg(
+            nodes=2,
+            gpus_per_node=8,
+            scheduling="device_plugin",
+            dra=KubernetesDraConfig(use_compute_domain_channel="cd-existing"),
+        )
+    )
+    assert backend.compute_domain_channel == "cd-existing"
+    perms = backend._required_permissions()
+    assert ("create", "computedomains.resource.nvidia.com", True) not in perms
+    assert ("delete", "computedomains.resource.nvidia.com", True) not in perms
+    _, applied = _reserve(backend)
+    assert not [m for m in applied if m.get("kind") == "ComputeDomain"]  # none created
+
+
+def test_use_compute_domain_channel_empty_is_off():
+    backend = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="  "))
+    )
+    assert backend.compute_domain_channel is None
+
+
+def test_use_compute_domain_channel_auto_not_claimed_until_resolved():
+    # `auto` is resolved to the single existing ComputeDomain at preflight/allocate
+    # (component 4); before that resolution there is no channel to claim.
+    backend = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="auto"))
+    )
+    assert backend.compute_domain_channel is None
+    # ...and `auto` never creates a domain (detection-only path).
+    perms = backend._required_permissions()
+    assert ("create", "computedomains.resource.nvidia.com", True) not in perms
+
+
+def test_resolve_config_preserves_use_compute_domain_channel():
+    conf = _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="cd-x"))
+    resolved = KubernetesBackend.resolve_config(
+        conf, resolver=_IdentityResolver(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.dra.use_compute_domain_channel == "cd-x"
+
+
+# ---------------------------------------------------------------------------
+# deprecated dra aliases: compute_domain -> create_compute_domain,
+# compute_domain_channel -> use_compute_domain_channel
+# ---------------------------------------------------------------------------
+
+
+def test_deprecated_compute_domain_alias_still_accepted():
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dra = KubernetesDraConfig(compute_domain=True)
+    assert dra.create_compute_domain is True
+    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+    # The old attribute name is gone (renamed field).
+    assert not hasattr(dra, "compute_domain")
+
+
+def test_deprecated_compute_domain_channel_alias_still_accepted():
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dra = KubernetesDraConfig(compute_domain_channel="cd-legacy")
+    assert dra.use_compute_domain_channel == "cd-legacy"
+    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+    assert KubernetesBackend(_cfg(dra=dra)).compute_domain_channel == "cd-legacy"
+
+
+# ---------------------------------------------------------------------------
+# nvlink_domain + nvlink_domain_label_key config
+# ---------------------------------------------------------------------------
+
+
+def test_nvlink_domain_default_is_auto():
+    assert KubernetesBackend(_cfg()).nvlink_domain == "auto"
+
+
+def test_nvlink_domain_override_accepted():
+    for v in ("node", "rack", "off", "auto"):
+        assert KubernetesBackend(_cfg(nvlink_domain=v)).nvlink_domain == v
+
+
+def test_nvlink_domain_invalid_rejected():
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(nvlink_domain="bogus")
+
+
+def test_nvlink_domain_label_key_default_and_set():
+    assert KubernetesBackend(_cfg()).nvlink_domain_label_key is None
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(nvlink_domain_label_key="nvidia.com/gpu.clique"))
+    )
+    assert be.nvlink_domain_label_key == "nvidia.com/gpu.clique"
+
+
+def test_resolve_config_preserves_nvlink_domain_and_label_key():
+    conf = _cfg(
+        nvlink_domain="rack",
+        dra=KubernetesDraConfig(nvlink_domain_label_key="nvidia.com/gpu.clique"),
+    )
+    resolved = KubernetesBackend.resolve_config(
+        conf, resolver=_IdentityResolver(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.nvlink_domain == "rack"
+    assert resolved.dra.nvlink_domain_label_key == "nvidia.com/gpu.clique"
+    assert KubernetesBackend(resolved).nvlink_domain == "rack"
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +1553,7 @@ def test_allocate_releases_reservation_on_cancel():
     with (
         mock.patch.object(backend, "_allocate_reserved", side_effect=boom),
         mock.patch.object(backend, "_release_alloc", side_effect=fake_release),
+        mock.patch.object(backend, "_detect_nvlink_scope", return_value="off"),
     ):
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(backend.allocate())

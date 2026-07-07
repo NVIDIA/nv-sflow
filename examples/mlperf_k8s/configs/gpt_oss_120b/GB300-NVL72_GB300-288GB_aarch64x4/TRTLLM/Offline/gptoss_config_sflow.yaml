@@ -1,0 +1,56 @@
+# Experiment config for gpt-oss-120b / GB300-NVL72_GB300-288GB_aarch64x4 / TRTLLM / Offline.
+#
+# This file is BACKEND-AGNOSTIC and is copied verbatim from the MLPerf SLURM recipe
+# (closed/NVIDIA/configs/.../TRTLLM/Offline/gptoss_config_sflow.yaml): topology,
+# model path, per-rank engine-config paths (read from the /work mount), and the
+# benchmark identity. Nothing here is SLURM- or Kubernetes-specific, so the same
+# file drives both backends -- to switch backends you swap ONLY the env file
+# (slurm_env_sflow.yaml <-> k8s_env_sflow.yaml); the workflow template is shared.
+#
+# Run on SLURM:
+#   sflow run \
+#     -f configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x4/TRTLLM/Offline/gptoss_config_sflow.yaml \
+#     -f configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x4/TRTLLM/Offline/slurm_env_sflow.yaml \
+#     -f templates/trtllm_ifb_loadgen.yaml \
+#     --set WORK_DIR=$PWD
+#
+# Run on Kubernetes (swap ONLY the env file):
+#   sflow run \
+#     -f configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x4/TRTLLM/Offline/gptoss_config_sflow.yaml \
+#     -f configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x4/TRTLLM/Offline/k8s_env_sflow.yaml \
+#     -f templates/trtllm_ifb_loadgen.yaml \
+#     --set K8S_NAMESPACE=... --set WORK_PVC_CLAIM=... --set SCRATCH_PVC_CLAIM=...
+variables:
+  # IFB topology - gb300x4 scale.
+  DP_MULTIPLICITY:
+    type: integer
+    value: 4
+  GPUS_PER_DP_RANK:
+    type: integer
+    value: 1
+  TOTAL_GPUS:
+    type: integer
+    value: ${{ variables.DP_MULTIPLICITY * variables.GPUS_PER_DP_RANK }}
+
+  BASE_PORT:
+    value: 8336
+
+  MODEL_PATH:
+    value: /home/mlperf_inference_storage/models/gpt-oss/gpt-oss-120b
+  TRTLLM_YAML:
+    value: /work/configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x4/TRTLLM/Offline/trtllm-serve-ifb-1gpu.yaml
+  TRTLLM_ENV_YAML:
+    value: /work/configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x4/TRTLLM/Offline/trtllm-serve-ifb-1gpu-env.yaml
+
+  BENCHMARK:
+    value: gpt-oss-120b
+  SCENARIO:
+    value: Offline
+  SYSTEM_NAME:
+    value: GB300-NVL72_GB300-288GB_aarch64x4
+  TEST_MODE:
+    description: "default performance only mode"
+    value: PerformanceOnly
+  HARNESS_EXTRA_ARGS:
+    description: "Additional harness flags; TEST_MODE is passed separately."
+    value: ""

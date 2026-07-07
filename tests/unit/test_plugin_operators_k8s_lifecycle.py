@@ -862,3 +862,138 @@ def test_run_pod_stream_cancel_interrupts_stream_without_finalize(monkeypatch, t
     asyncio.run(drive())
     assert terminated == [True]  # stream interrupted on teardown
     assert finalized == []  # no complete-log re-fetch for a cancelled service
+
+
+# ---------------------------------------------------------------------------
+# Merge-pod log demux: one container stream -> per-task <task>.log files
+# ---------------------------------------------------------------------------
+
+
+class _FakeStdout:
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    async def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+
+class _FakeStreamProc:
+    def __init__(self, lines):
+        self.stdout = _FakeStdout(lines)
+
+
+def test_demux_stream_routes_tagged_lines_to_per_task_files(tmp_path):
+    decode = tmp_path / "decode.log"
+    prefill = tmp_path / "prefill.log"
+    default = tmp_path / "leader.log"
+    proc = _FakeStreamProc(
+        [
+            b"[[sflow-mux:decode]] hello from decode\n",
+            b"[[sflow-mux:prefill]] hello from prefill\n",
+            b"untagged apply diagnostics\n",
+            b"[[sflow-mux:unknown]] no such member\n",
+            b"[[sflow-mux:decode]] second decode line\n",
+        ]
+    )
+    asyncio.run(
+        life._demux_stream(
+            proc,
+            {"decode": str(decode), "prefill": str(prefill)},
+            str(default),
+        )
+    )
+    # Tagged lines land (untagged) in their member's log.
+    assert decode.read_text() == "hello from decode\nsecond decode line\n"
+    assert prefill.read_text() == "hello from prefill\n"
+    # Untagged + unknown-tag lines fall back to the leader/default log verbatim.
+    default_text = default.read_text()
+    assert "untagged apply diagnostics\n" in default_text
+    assert "[[sflow-mux:unknown]] no such member\n" in default_text
+
+
+def test_demux_stream_echoes_console_with_task_prefix(tmp_path, monkeypatch):
+    # On a TTY, each merged member's line is echoed tagged with its task name so
+    # the interleaved console/TUI output is attributable; the on-disk files stay
+    # clean (tag stripped, no console prefix).
+    decode = tmp_path / "decode.log"
+    default = tmp_path / "leader.log"
+    proc = _FakeStreamProc(
+        [
+            b"[[sflow-mux:decode_server_1]] hello from decode_1\n",
+            b"pod-level startup line\n",
+        ]
+    )
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    seen: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    handler = _Cap(level=logging.DEBUG)
+    prev_level = life._logger.level
+    life._logger.setLevel(logging.DEBUG)
+    life._logger.addHandler(handler)
+    try:
+        asyncio.run(
+            life._demux_stream(
+                proc,
+                {"decode_server_1": str(decode)},
+                str(default),
+                console_label="decode_server_0",
+            )
+        )
+    finally:
+        life._logger.removeHandler(handler)
+        life._logger.setLevel(prev_level)
+
+    # Member line tagged with its own task; pod-level (untagged) line tagged leader.
+    assert "[decode_server_1] hello from decode_1" in seen
+    assert "[decode_server_0] pod-level startup line" in seen
+    # The per-task file keeps the clean body (no tag, no console prefix).
+    assert decode.read_text() == "hello from decode_1\n"
+
+
+def test_demux_stream_no_console_echo_without_label(tmp_path, monkeypatch):
+    # Without console_label, no console echo even on a TTY (files only).
+    decode = tmp_path / "decode.log"
+    default = tmp_path / "leader.log"
+    proc = _FakeStreamProc([b"[[sflow-mux:decode]] x\n"])
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    seen: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    handler = _Cap()
+    life._logger.addHandler(handler)
+    try:
+        asyncio.run(life._demux_stream(proc, {"decode": str(decode)}, str(default)))
+    finally:
+        life._logger.removeHandler(handler)
+    assert seen == []
+    assert decode.read_text() == "x\n"
+
+
+def test_stream_and_demux_pod_log_spawns_and_reads(tmp_path, monkeypatch):
+    decode = tmp_path / "decode.log"
+    default = tmp_path / "leader.log"
+    proc = _FakeStreamProc([b"[[sflow-mux:decode]] line\n"])
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", _fake_exec)
+
+    async def drive():
+        p, reader = await life.stream_and_demux_pod_log(
+            life.Command(exec="kubectl").add_arg("logs"),
+            tag_paths={"decode": str(decode)},
+            default_path=str(default),
+        )
+        assert p is proc
+        await reader
+
+    asyncio.run(drive())
+    assert decode.read_text() == "line\n"

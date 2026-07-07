@@ -347,6 +347,65 @@ if true; then
             grep -F -- 'operator: k8s' \"$KUBERNETES_LWS_DRYRUN_LOG\" && \
             grep -F -- 'Dry-run complete: k8s_multinode' \"$KUBERNETES_LWS_DRYRUN_LOG\""
 
+    # -- sflow run --dry-run: cross-task IP resolution + apply/validate k8s example.
+    #    pd_smoke reserves 3 nodes and resolves ${{ backends.k8s.nodes[0].ip_address }}
+    #    across tasks (exit 0 proves the reference resolved); apply_launch is the
+    #    single-pod apply/validate recipe. Both render via the k8s operator. --
+    KUBERNETES_PD_SMOKE_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_pd_smoke.log"
+    KUBERNETES_APPLY_LAUNCH_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_apply_launch.log"
+    run_check "dry-run kubernetes_pd_smoke resolves cross-task node IPs via k8s operator" \
+        bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_pd_smoke.yaml\" --dry-run --verbose > \"$KUBERNETES_PD_SMOKE_LOG\" 2>&1 && \
+            grep -F -- 'id=kubernetes' \"$KUBERNETES_PD_SMOKE_LOG\" && \
+            grep -F -- 'operator: k8s' \"$KUBERNETES_PD_SMOKE_LOG\" && \
+            grep -F -- 'Dry-run complete: k8s_pd_smoke' \"$KUBERNETES_PD_SMOKE_LOG\""
+    run_check "dry-run kubernetes_apply_launch uses k8s operator" \
+        bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_apply_launch.yaml\" --dry-run --verbose > \"$KUBERNETES_APPLY_LAUNCH_LOG\" 2>&1 && \
+            grep -F -- 'id=kubernetes' \"$KUBERNETES_APPLY_LAUNCH_LOG\" && \
+            grep -F -- 'operator: k8s' \"$KUBERNETES_APPLY_LAUNCH_LOG\" && \
+            grep -F -- 'Dry-run complete: k8s_apply_validate' \"$KUBERNETES_APPLY_LAUNCH_LOG\""
+
+    # -- sflow run --dry-run: native Kubernetes Dynamo recipes (vLLM / SGLang /
+    #    TRT-LLM, agg + disagg). Each plans on the kubernetes backend and renders
+    #    server tasks via the k8s operator; the LOCAL_MODEL_PATH fs:// artifact is
+    #    passed through (off-host backend) instead of validated on the controller. --
+    K8S_DYNAMO_DIR="$BACKEND_AGNOSTIC_DIR/kubernetes_dynamo"
+    mkdir -p "$K8S_DYNAMO_DIR"
+    for k8s_dynamo_case in \
+        "kubernetes_dynamo_vllm_agg:dynamo_vllm_agg" \
+        "kubernetes_dynamo_vllm_disagg:dynamo_vllm_disagg" \
+        "kubernetes_dynamo_trtllm_agg:dynamo_trtllm_agg" \
+        "kubernetes_dynamo_trtllm_disagg:dynamo_trtllm_disagg" \
+        "kubernetes_dynamo_sglang_agg:dynamo_sglang_agg" \
+        "kubernetes_dynamo_sglang_disagg:dynamo_sglang_disagg"; do
+        k8s_dynamo_example="${k8s_dynamo_case%%:*}"
+        k8s_dynamo_workflow="${k8s_dynamo_case##*:}"
+        k8s_dynamo_log="$K8S_DYNAMO_DIR/${k8s_dynamo_example}.log"
+        run_check "dry-run ${k8s_dynamo_example} uses k8s operator" \
+            bash -c "sflow run \"$EXAMPLES_DIR/${k8s_dynamo_example}.yaml\" --dry-run --verbose > \"$k8s_dynamo_log\" 2>&1 && \
+                grep -F -- 'id=kubernetes' \"$k8s_dynamo_log\" && \
+                grep -F -- 'operator: k8s' \"$k8s_dynamo_log\" && \
+                grep -F -- 'Dry-run complete: ${k8s_dynamo_workflow}' \"$k8s_dynamo_log\""
+    done
+
+    # -- sflow run --dry-run: CLI backend extra-arg routing + kube access flags.
+    #    Verifies the new flags reach the plan: --extra-salloc-args merges into the
+    #    Slurm backend, --kube-namespace overrides the k8s namespace, and a generic
+    #    --extra-args (Slurm-ism) routed to kubectl surfaces the misrouting warning. --
+    CLI_FLAGS_DIR="$PREFLIGHT_DIR/cli_backend_flags"
+    SALLOC_ARGS_LOG="$CLI_FLAGS_DIR/extra_salloc_args.log"
+    KUBE_NS_LOG="$CLI_FLAGS_DIR/kube_namespace.log"
+    KUBECTL_MISROUTE_LOG="$CLI_FLAGS_DIR/kubectl_misroute_warning.log"
+    mkdir -p "$CLI_FLAGS_DIR"
+    run_check "dry-run --extra-salloc-args merges into the Slurm backend" \
+        bash -c "sflow run \"$EXAMPLES_DIR/slurm_auto_replica.yaml\" --dry-run --verbose --extra-salloc-args=--gpus-per-node=4 > \"$SALLOC_ARGS_LOG\" 2>&1 && \
+            grep -F -- \"'slurm': ['--gpus-per-node=4']\" \"$SALLOC_ARGS_LOG\""
+    run_check "dry-run --kube-namespace overrides the kubernetes backend namespace" \
+        bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_hello_world.yaml\" --dry-run --verbose --kube-namespace ns-override > \"$KUBE_NS_LOG\" 2>&1 && \
+            grep -F -- 'namespace: ns-override' \"$KUBE_NS_LOG\""
+    run_check "dry-run generic --extra-args routed to kubectl warns about misrouting" \
+        bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_hello_world.yaml\" --dry-run -e --gpus-per-node=4 > \"$KUBECTL_MISROUTE_LOG\" 2>&1 && \
+            grep -F -- 'applying generic --extra-args as kubectl' \"$KUBECTL_MISROUTE_LOG\""
+
     # -- sflow run --dry-run: standardized report layout (envelope + section
     #    dividers), compact-vs-verbose Tasks, storage/uploads sections, replica
     #    auto-rename, and sbatch out/err surfaced in the Plan via `sflow batch` --

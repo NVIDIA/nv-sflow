@@ -1,0 +1,112 @@
+# Kubernetes environment for the gpt-oss-120b Offline IFB recipe -- one of the two
+# swappable backend files (the other is slurm_env_sflow.yaml). It defines the
+# container image, the compute backend, the `test_container` operator, the storage
+# mounts, and SERVE_LAUNCHER. The experiment config (gptoss_config_sflow.yaml) and
+# the workflow template (templates/trtllm_ifb_loadgen.yaml) are shared and unchanged.
+#
+# Swap backends by choosing the env file:
+#   sflow run -f .../gptoss_config_sflow.yaml -f .../k8s_env_sflow.yaml -f templates/trtllm_ifb_loadgen.yaml ...
+#
+# vs slurm_env_sflow.yaml:
+#   * backend  slurm -> kubernetes (device_plugin scheduling, host_network).
+#   * operator srun  -> k8s (image on the operator; no ntasks/mpi/container_* knobs).
+#   * SERVE_LAUNCHER "trtllm-llmapi-launch" -> "" (single-GPU server, no MPI launcher).
+#   * the SLURM `--container-mounts WORK_DIR:/work,SCRATCH_DIR:/home/mlperf_inference_storage`
+#     become two pre-existing PVCs under the backend `volumes:` (mounted into every task pod).
+#
+# Model checkpoint override: this recipe serves the DeepSeek-R1-0528 FP4 checkpoint
+# staged on the RWX CephFS PVC `shared-storage`. It is mounted read-only at
+# CHECKPOINT_MOUNT_PATH (/checkpoints) and MODEL_PATH is redefined here to point at
+# it, overriding the gpt-oss MODEL_PATH from gptoss_config_sflow.yaml (this env file
+# is a later `-f` file, so it wins the merge). K8S_NAMESPACE is set to perflab-hpcdl
+# because a PVC can only be mounted by pods in its own namespace, and shared-storage
+# lives there -- WORK_PVC_CLAIM / SCRATCH_PVC_CLAIM must also resolve in that
+# namespace (override with --set) for the harness's /work + scratch mounts.
+variables:
+  CONTAINER_IMAGE:
+    description: "Container image (NGC URL) with TRT-LLM + nv-mlpinf. Override via --set CONTAINER_IMAGE=..."
+    value: "nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_aarch64"
+
+  # Backend-neutral hook consumed by templates/trtllm_ifb_loadgen.yaml: each server
+  # is one GPU (TP=1), so no MPI launcher is needed (empty prefix).
+  SERVE_LAUNCHER:
+    description: "trtllm-serve launch prefix (empty on k8s: single-process server)."
+    value: ""
+
+  # --- Storage: the SLURM bind mounts become pre-existing PVCs (must exist in K8S_NAMESPACE) ---
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods (must hold the PVCs below). Set to perflab-hpcdl because that is where the shared-storage checkpoint PVC lives (PVCs are namespace-scoped)."
+    value: perflab-hpcdl
+  WORK_PVC_CLAIM:
+    description: "PVC holding the closed/NVIDIA checkout, mounted read-write at /work (== SLURM WORK_DIR)"
+    value: mlperf-work
+  SCRATCH_PVC_CLAIM:
+    description: "PVC holding MLPerf scratch (models + preprocessed data), mounted read-only at /home/mlperf_inference_storage (== SLURM SCRATCH_DIR)"
+    value: mlperf-scratch
+
+  # --- Model checkpoint: DeepSeek-R1-0528 FP4, staged on the shared-storage CephFS PVC ---
+  CHECKPOINT_PVC_CLAIM:
+    description: "Pre-existing RWX PVC holding the model checkpoint (must exist in K8S_NAMESPACE)."
+    value: shared-storage
+  CHECKPOINT_MOUNT_PATH:
+    description: "Absolute path where CHECKPOINT_PVC_CLAIM is mounted read-only in every task pod."
+    value: /checkpoints
+  MODEL_PATH:
+    description: "DeepSeek-R1-0528 FP4 checkpoint dir on shared-storage. Overrides the gpt-oss MODEL_PATH from gptoss_config_sflow.yaml (this env file is a later -f file, so it wins the merge)."
+    value: ${{ variables.CHECKPOINT_MOUNT_PATH }}/gcn/builds/HuggingFace_Models_nvidia_DeepSeek_R1_0528_FP4_v2_1
+
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+  NUM_NODES:
+    description: "ceil(TOTAL_GPUS / GPUS_PER_NODE) -- TOTAL_GPUS comes from gptoss_config_sflow.yaml"
+    type: integer
+    value: ${{ ((variables.TOTAL_GPUS / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+
+operators:
+  # k8s counterpart of the srun `test_container` operator. Same name so the shared
+  # workflow template's `operator: test_container` works unchanged. No ntasks: the
+  # template does not set srun-only fields, and one pod == one replica here.
+  - name: test_container
+    type: k8s
+    image: ${{ variables.CONTAINER_IMAGE }}
+    # TRT-LLM needs a larger /dev/shm than the k8s 64Mi default.
+    shm_size: 32Gi
+
+backends:
+  - name: k8s_cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so the harness reaches each replica at its node
+    # IP:(BASE_PORT + i) (from SFLOW_TASK_ASSIGNED_NODE_IPS in the template).
+    host_network: true
+    # Request GPUs via the legacy nvidia.com/gpu device plugin; use 'dra' for DRA.
+    scheduling: device_plugin
+    # Each server is one independent GPU (TP=1) -> no inter-GPU NCCL / KV transfer,
+    # so no RDMA fast path is needed. (Quoted so YAML doesn't read `off` as false.)
+    rdma: "off"
+    # SLURM container mounts -> PVCs. Declared backend volumes mount into EVERY task
+    # pod. Single-node here, so all pods land on the one reserved node and RWO PVCs
+    # suffice (use ROX/RWX to scale past one node).
+    volumes:
+      - name: work
+        claim: ${{ variables.WORK_PVC_CLAIM }}
+        mount_path: /work
+        # read-write: the harness does an editable `pip install -e` under /work.
+        read_only: false
+      - name: scratch
+        claim: ${{ variables.SCRATCH_PVC_CLAIM }}
+        mount_path: /home/mlperf_inference_storage
+        read_only: true
+      # DeepSeek-R1-0528 FP4 checkpoint PVC (shared-storage). MODEL_PATH points at a
+      # subdir of this mount. Read-only: serving only reads the weights, and the RWX
+      # PVC is shared with other workloads.
+      - name: checkpoints
+        claim: ${{ variables.CHECKPOINT_PVC_CLAIM }}
+        mount_path: ${{ variables.CHECKPOINT_MOUNT_PATH }}
+        read_only: true
+    reservation:
+      timeout: 1200

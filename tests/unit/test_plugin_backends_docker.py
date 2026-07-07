@@ -139,6 +139,47 @@ def test_docker_backend_allocates_configured_remote_hosts():
     assert backend.host_for_node("dgx-b").context == "dgx-b-context"
 
 
+def _docker_hosts_cfg(**extra):
+    return DockerBackendConfig(
+        name="docker_cluster",
+        type="docker",
+        image="ubuntu:22.04",
+        hosts=[
+            {"name": "dgx-a", "docker_host": "ssh://dgx-a", "ip_address": "10.0.0.11"},
+            {"name": "dgx-b", "docker_host": "ssh://dgx-b", "ip_address": "10.0.0.12"},
+            {"name": "dgx-c", "docker_host": "ssh://dgx-c", "ip_address": "10.0.0.13"},
+        ],
+        **extra,
+    )
+
+
+def test_docker_backend_include_restricts_host_pool():
+    backend = DockerBackend(_docker_hosts_cfg(include_nodes=["dgx-a", "dgx-c"]))
+    allocation = asyncio.run(backend.allocate())
+    assert [n.name for n in allocation.nodes] == ["dgx-a", "dgx-c"]
+    assert backend.host_for_node("dgx-b") is None
+
+
+def test_docker_backend_exclude_drops_hosts():
+    backend = DockerBackend(_docker_hosts_cfg(exclude_nodes=["dgx-b"]))
+    allocation = asyncio.run(backend.allocate())
+    assert [n.name for n in allocation.nodes] == ["dgx-a", "dgx-c"]
+    assert backend.host_for_node("dgx-b") is None
+
+
+def test_docker_backend_include_removing_all_hosts_raises():
+    with pytest.raises(ValueError):
+        DockerBackend(
+            DockerBackendConfig(
+                name="d",
+                type="docker",
+                image="ubuntu:22.04",
+                include_nodes=["nope"],
+                hosts=[{"name": "dgx-a", "docker_host": "ssh://dgx-a"}],
+            )
+        )
+
+
 def test_docker_backend_context_keeps_configured_ips_per_node():
     backend = DockerBackend(
         DockerBackendConfig(

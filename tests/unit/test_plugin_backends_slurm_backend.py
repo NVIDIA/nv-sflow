@@ -87,6 +87,102 @@ def test_merge_extra_args_dedups_by_option_cli_wins():
     assert merged.extra_args == ["--exclusive", "--gres=gpu:4"]
 
 
+def test_salloc_includes_nodelist_and_exclude_flags(monkeypatch, slurm_test_logger):
+    # Host include/exclude become salloc --nodelist / --exclude, placed before the
+    # user's extra_args so an explicit extra_args override still wins.
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="b",
+            type="slurm",
+            account="acct",
+            partition="batch",
+            nodes=1,
+            time="00:10:00",
+            job_name="job",
+            include_nodes=["node001", "node002"],
+            exclude_nodes=["bad001"],
+            gpus_per_node=8,
+        )
+    )
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (0, ["salloc: Granted job allocation 1", "salloc: Nodes node001 are ready for job"]),
+            (0, ["node001: 10.0.0.1:123"]),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+    asyncio.run(backend.allocate())
+
+    salloc_cmd = list(fake_launcher.calls[0]["command"])
+    assert "--nodelist" in salloc_cmd
+    assert salloc_cmd[salloc_cmd.index("--nodelist") + 1] == "node001,node002"
+    assert "--exclude" in salloc_cmd
+    assert salloc_cmd[salloc_cmd.index("--exclude") + 1] == "bad001"
+    # Node filters precede the user's extra_args.
+    assert salloc_cmd.index("--nodelist") < salloc_cmd.index("--no-shell") + 2
+
+
+def test_env_reuse_applies_exclude_filter(monkeypatch, slurm_test_logger):
+    # A reused Slurm allocation can't take salloc flags, so exclude filters the
+    # resolved node pool instead.
+    monkeypatch.setenv("SLURM_JOB_ID", "555")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "node[001-003]")
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="b",
+            type="slurm",
+            account="acct",
+            partition="batch",
+            nodes=3,
+            time="00:10:00",
+            exclude_nodes=["node002"],
+            gpus_per_node=8,
+        )
+    )
+
+    async def fake_resolve(*, nodelist, job_id):
+        from sflow.core.compute_node import ComputeNode
+
+        return [
+            ComputeNode(name=f"node00{i}", ip_address=f"10.0.0.{i}", index=i - 1, num_gpus=8)
+            for i in (1, 2, 3)
+        ]
+
+    monkeypatch.setattr(backend, "_resolve_nodes_from_nodelist", fake_resolve)
+    allocation = asyncio.run(backend.allocate())
+    assert [n.name for n in allocation.nodes] == ["node001", "node003"]
+    assert allocation.owned is False
+
+
+def test_resolve_config_preserves_node_filters():
+    class _Id:
+        def resolve(self, v, ctx):
+            return v
+
+    conf = SlurmBackendConfig(
+        name="b",
+        type="slurm",
+        account="a",
+        partition="p",
+        nodes=1,
+        time="1",
+        gpus_per_node=1,
+        include_nodes=["want-1"],
+        exclude_nodes=["bad-1"],
+    )
+    resolved = SlurmBackend.resolve_config(
+        conf, resolver=_Id(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.include_nodes == ["want-1"]
+    assert resolved.exclude_nodes == ["bad-1"]
+
+
 def test_allocate_success_single_node(monkeypatch, slurm_test_logger):
     # Ensure we don't accidentally take the "reuse existing allocation" path.
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)

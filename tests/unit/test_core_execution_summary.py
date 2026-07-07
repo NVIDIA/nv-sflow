@@ -154,6 +154,50 @@ def test_summary_writer_write_failure_removes_temp_file(tmp_path, monkeypatch):
     assert not summary_path.exists()
 
 
+def test_summary_renders_network_warnings_section(tmp_path):
+    # A recorded network warning (e.g. RDMA -> TCP fallback) surfaces in a
+    # dedicated section, prefixed with the task name for triage.
+    tg = TaskGraph()
+    server = _task("decode_server_0", tmp_path)
+    tg.dag.add_node("decode_server_0", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="rt",
+        command_log_paths={},
+    )
+    writer.record_network_warning(
+        server, "RDMA requested but pods fell back to slow TCP (all ports DOWN)"
+    )
+    writer.workflow_finished(status="READY")
+
+    text = (tmp_path / "sflow_summary.log").read_text()
+    assert "Network Warnings" in text
+    assert (
+        "decode_server_0: RDMA requested but pods fell back to slow TCP "
+        "(all ports DOWN)" in text
+    )
+
+
+def test_summary_omits_network_warnings_section_when_none(tmp_path):
+    tg = TaskGraph()
+    server = _task("s", tmp_path)
+    tg.dag.add_node("s", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="rt",
+        command_log_paths={},
+    )
+    writer.workflow_finished(status="READY")
+    assert "Network Warnings" not in (tmp_path / "sflow_summary.log").read_text()
+
+
 def test_summary_writer_renders_header_dag_timeline_chart_and_final_summary(tmp_path):
     tg = TaskGraph()
     load = _task("load", tmp_path)

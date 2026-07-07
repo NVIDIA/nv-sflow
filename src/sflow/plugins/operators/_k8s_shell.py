@@ -17,7 +17,11 @@ import shlex
 from collections.abc import Mapping, Sequence
 
 from sflow.core.command import Command
-from sflow.plugins.operators._k8s_render import SFLOW_ALLOC_LABEL
+from sflow.plugins.operators._k8s_render import (
+    MERGE_MUX_CLOSE,
+    MERGE_MUX_OPEN,
+    SFLOW_ALLOC_LABEL,
+)
 
 # kubectl logs -f bails with BadRequest on a not-yet-started container, so the
 # apply command polls the pod phase first (READY_RETRIES * POLL_SLEEP_SECS budget)
@@ -195,6 +199,7 @@ def build_log_stream_command(
     *,
     ns_args: Sequence[str] = (),
     kubectl_global_args: Sequence[str] = (),
+    prefix: bool = True,
 ) -> Command:
     """Build the standalone ``kubectl logs -f`` Command for one pod.
 
@@ -203,6 +208,11 @@ def build_log_stream_command(
     through the launcher, and the driver can stop it the moment a background
     status-watch sees the pod go terminal -- instead of blocking on the K8s log
     backlog. The CLI-level global flags are prefixed directly (no shell wrapper).
+
+    ``prefix`` toggles kubectl's ``[pod/<pod>/<container>]`` line prefix. Merge-pod
+    streams pass ``prefix=False`` so each line begins with the launcher's own
+    ``[[sflow-mux:<task>]] `` tag (the driver demuxes on it); everything else keeps
+    the prefix for readable multi-pod logs.
     """
     cmd = Command(exec="kubectl")
     for arg in kubectl_global_args:
@@ -213,7 +223,8 @@ def build_log_stream_command(
     for arg in ns_args:
         cmd.add_arg(str(arg))
     cmd.add_arg("--all-containers")
-    cmd.add_arg("--prefix")
+    if prefix:
+        cmd.add_arg("--prefix")
     return cmd
 
 
@@ -255,6 +266,133 @@ def handoff_delete_lines(reservation_pods: Sequence[str], ns_seg: str) -> list[s
         "--ignore-not-found >/dev/null 2>&1 || true"
         for pod in reservation_pods
     ]
+
+
+def merged_launcher_lines(
+    members: Sequence[tuple[str, str, str, str]],
+    *,
+    preamble_lines: Sequence[str] = (),
+) -> list[str]:
+    """Entrypoint for a merge-pod: run each member's script as a background process.
+
+    ``members`` is ``[(task_name, cuda_visible_devices, script_path, env_path)]``.
+    All members share the one container (so they see every GPU -> NVLink/cuda_ipc),
+    but each runs in its own subshell with its packed ``CUDA_VISIBLE_DEVICES`` and
+    its own sourced env file. Each member's combined stdout/stderr is tagged
+    ``[[sflow-mux:<task>]] `` so the driver can demux the single container log into
+    per-task ``<task>.log`` files. The launcher exits non-zero if any member does
+    (its container exit code is the merge leader task's), and blocks in ``wait``
+    for long-lived services until the pod is torn down. ``preamble_lines`` (e.g. the
+    RDMA affinity preamble) run once in the parent shell before any member starts.
+    """
+    tag_fmt = f"{MERGE_MUX_OPEN}%s{MERGE_MUX_CLOSE}%s\\n"
+    lines: list[str] = ["set -uo pipefail"]
+    lines.extend(list(preamble_lines))
+    lines.extend(
+        [
+            '_sflow_rc_dir="$(mktemp -d)"',
+            "_sflow_run() {",
+            '  _name="$1"; _cvd="$2"; _script="$3"; _envf="$4"',
+            "  (",
+            '    export CUDA_VISIBLE_DEVICES="$_cvd"',
+            '    if [ -f "$_envf" ]; then . "$_envf"; fi',
+            '    bash -l "$_script"',
+            '    echo "$?" > "$_sflow_rc_dir/$_name"',
+            "  ) 2>&1 | while IFS= read -r _sflow_line; do",
+            f"      printf '{tag_fmt}' \"$_name\" \"$_sflow_line\"",
+            "    done &",
+            "}",
+        ]
+    )
+    for name, cvd, script_path, env_path in members:
+        lines.append(
+            "_sflow_run "
+            f"{shlex.quote(name)} {shlex.quote(cvd)} "
+            f"{shlex.quote(script_path)} {shlex.quote(env_path)}"
+        )
+    lines.extend(
+        [
+            "wait",
+            "_sflow_rc=0",
+            'for _f in "$_sflow_rc_dir"/*; do',
+            '  _c="$(cat "$_f" 2>/dev/null || echo 1)"',
+            '  [ "$_c" = "0" ] || _sflow_rc="$_c"',
+            "done",
+            'exit "$_sflow_rc"',
+        ]
+    )
+    return lines
+
+
+def merged_env_secret_lines(
+    secret_name: str,
+    ns_seg: str,
+    key_pairs: Sequence[tuple[str, str]],
+    *,
+    allocation_id: str | None = None,
+) -> list[str]:
+    """Lines writing one member's env to a single shell-sourceable Secret file.
+
+    ``key_pairs`` is ``[(original_key, prefixed_shell_var)]``. Values are read from
+    the (prefixed) process env at apply time via ``%q`` (never inlined into the
+    manifest) and written as ``export KEY=<quoted>`` lines into a Secret's single
+    ``envsh`` key, which the pod mounts as a file the member subshell sources. The
+    prefix keeps merged members' identically-named vars from colliding in the one
+    launcher process env.
+    """
+    lines = ["menv=$(mktemp)"]
+    for orig, pref in key_pairs:
+        lines.append(
+            "printf 'export %s=%q\\n' "
+            + shlex.quote(orig)
+            + ' "${'
+            + pref
+            + '-}" >> "$menv"'
+        )
+    lines.append(
+        f"kubectl create secret generic {shlex.quote(secret_name)}{ns_seg} "
+        '--from-file=envsh="$menv" --dry-run=client -o yaml | kubectl apply -f -'
+    )
+    if allocation_id:
+        lines.append(label_secret_cmd(secret_name, ns_seg, allocation_id))
+    lines.append('rm -f "$menv"')
+    return lines
+
+
+def build_merged_apply_command(
+    *,
+    manifest_json: str,
+    ns_seg: str,
+    pod_name: str,
+    member_env_secrets: Sequence[tuple[str, Sequence[tuple[str, str]]]],
+    handoff_delete_pods: Sequence[str],
+    kubectl_global_args: Sequence[str] = (),
+    allocation_id: str | None = None,
+) -> Command:
+    """Apply step for a merge-pod: per-member env Secrets, then the single pod.
+
+    Like :func:`build_apply_command` but creates one env Secret per merged member
+    (each mounted as a sourceable file, not a shared ``envFrom``) instead of one
+    task-wide Secret, then applies the manifest (ConfigMap with the merged launcher
+    + per-member scripts, optional union GPU ResourceClaimTemplate, one Pod), runs
+    the create-before-destroy handoff, and waits for the single pod to start.
+    """
+    lines = ["set -euo pipefail"]
+    lines.extend(kubectl_global_args_prelude(kubectl_global_args))
+    for secret_name, key_pairs in member_env_secrets:
+        lines.extend(
+            merged_env_secret_lines(
+                secret_name, ns_seg, key_pairs, allocation_id=allocation_id
+            )
+        )
+    lines.append(
+        f"cat <<'{_MANIFEST_HEREDOC}' | kubectl apply -f -\n{manifest_json}\n{_MANIFEST_HEREDOC}"
+    )
+    lines.extend(handoff_delete_lines(handoff_delete_pods, ns_seg))
+    lines.extend(
+        wait_for_pod_ready_lines(f"pod/{shlex.quote(pod_name)}", ns_seg, label=pod_name)
+    )
+    return bash_lc_command(lines)
 
 
 def build_apply_command(

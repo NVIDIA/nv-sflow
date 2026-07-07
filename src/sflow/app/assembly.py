@@ -13,6 +13,7 @@ This module is the single place where we wire together:
 from __future__ import annotations
 
 import itertools
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from sflow.resolution import (
@@ -34,6 +35,7 @@ from sflow.app.backend_lifecycle import (
     seed_placeholder_backend_allocations as _seed_placeholder_backend_allocations_impl,
 )
 from sflow.app.resource_planner import plan_resource_placements
+from sflow.app.run_support import backends_execute_offhost
 from sflow.app.task_context import (
     build_task_info,
     build_task_expression_hint,
@@ -191,21 +193,6 @@ def resolve_artifacts(
     )
 
 
-def _backends_execute_offhost(state: SflowState) -> bool:
-    """True if any backend executes off the controller host (no host-path mounts).
-
-    Such backends (e.g. Kubernetes) run tasks remotely, so local ``fs://`` artifact
-    paths refer to the cluster/image rather than the controller and must not be
-    validated or created locally.
-    """
-    return any(
-        not getattr(
-            getattr(backend, "capabilities", None), "supports_host_path_mounts", True
-        )
-        for backend in (state.backends or {}).values()
-    )
-
-
 def _seed_placeholder_backend_allocations(state: SflowState) -> SflowState:
     return _seed_placeholder_backend_allocations_impl(state)
 
@@ -317,6 +304,237 @@ def resolve_storage_targets(config: SflowConfig, state: SflowState) -> SflowStat
         state.add_storage_target(target)
 
     return state
+
+
+def _plan_merge_groups(
+    task_graph: TaskGraph, resource_placements: "Mapping[str, Any]"
+) -> None:
+    """Bundle single-node GPU tasks co-located on one node into one merged pod.
+
+    Runs at assembly time after resource placement. For each backend that opts in
+    via ``merge_colocated_gpu_pods``, tasks with >0 GPUs assigned to exactly one
+    physical node are grouped by ``(backend, node)``. Groups with >=2 members
+    become one merged pod owned by a deterministic leader (first member by name):
+
+    * every member sees ALL union GPUs (``CUDA_VISIBLE_DEVICES``), with its own
+      packed slice listed FIRST so the workload uses it as ``cuda:0`` -- exposing
+      the peers' GPUs is what lets cross-member ``cuda_ipc``/NVLink P2P work (a
+      single-GPU-per-member visibility hides the peers and forces UCX/NIXL to TCP);
+    * the leader is made to depend on the union of the members' external deps so
+      the whole group starts together (followers are not launched on their own);
+    * the leader's operator is handed the ordered member Task objects + union GPU
+      count via ``apply_merge_group`` (duck-typed; only the k8s operator uses it).
+
+    Merged members may not depend on one another (they run concurrently in one
+    pod), so an intra-group completion dependency raises ``ValueError``. Multi-node
+    GPU tasks and CPU-only tasks are never merged.
+    """
+    groups: dict[tuple[str, str], list[str]] = {}
+    gpu_counts: dict[str, int] = {}
+    for name, placement in resource_placements.items():
+        backend = getattr(placement, "backend", None)
+        if backend is None or not getattr(
+            backend, "merge_colocated_gpu_pods", False
+        ):
+            continue
+        try:
+            gpu_count = int(getattr(placement, "gpu_count", 0) or 0)
+        except (TypeError, ValueError):
+            gpu_count = 0
+        assigned = list(getattr(placement, "assigned_nodes", None) or [])
+        # Only single-node GPU tasks merge; multi-node tasks and CPU-only infra
+        # (etcd/nats/frontend) keep their own pods.
+        if gpu_count <= 0 or len(assigned) != 1:
+            continue
+        groups.setdefault((str(backend.name), assigned[0]), []).append(name)
+        gpu_counts[name] = gpu_count
+
+    for (backend_name, node), members in groups.items():
+        if len(members) < 2:
+            continue
+        members = sorted(members)
+        member_set = set(members)
+        # Concurrent-only: a member depending on another member (completion-
+        # before-start) can't be honored inside one concurrent pod.
+        for m in members:
+            for dep in task_graph.dag.get_dependencies(m):
+                if dep in member_set:
+                    raise ValueError(
+                        f"Cannot merge co-located tasks {members} on node "
+                        f"'{node}': '{m}' depends on '{dep}' in the same merge "
+                        "group, but merged tasks run concurrently in one pod. "
+                        "Remove the intra-group dependency or disable "
+                        "merge_colocated_gpu_pods on the backend."
+                    )
+        leader_name = members[0]
+        group_id = f"{backend_name}:{node}"
+        # Every member's container sees ALL union GPUs, but with its OWN packed
+        # slice FIRST so the workload uses that as cuda:0 / its local rank. Exposing
+        # the peers' GPUs (not just its own) is what lets cross-member cuda_ipc /
+        # NVLink P2P work -- a single-GPU-per-member CUDA_VISIBLE_DEVICES hides the
+        # peers and forces UCX/NIXL onto TCP, defeating the point of merging.
+        union_gpus = sum(gpu_counts[m] for m in members)
+        start = 0
+        member_tasks: list[Task] = []
+        for m in members:
+            t = task_graph.get_task(m)
+            count = gpu_counts[m]
+            own = list(range(start, start + count))
+            others = [i for i in range(union_gpus) if i not in own]
+            t.merge_cuda_visible_devices = ",".join(str(i) for i in own + others)
+            t.merge_group_id = group_id
+            start += count
+            member_tasks.append(t)
+        leader = task_graph.get_task(leader_name)
+        leader.merge_members = list(members)
+        for m in members:
+            if m != leader_name:
+                task_graph.get_task(m).merge_leader = leader_name
+        # The leader waits for the union of every member's external deps so the
+        # group starts together (followers never launch on their own).
+        for m in members:
+            for dep in task_graph.dag.get_dependencies(m):
+                if dep not in member_set and dep != leader_name:
+                    task_graph.dag.add_edge(dep, leader_name)
+        # Hand the leader's operator the ordered member tasks + union GPU count so
+        # it renders the single merged pod. Duck-typed: only the k8s container
+        # operator implements apply_merge_group; other operators simply lack it.
+        apply_merge_group = getattr(leader.operator, "apply_merge_group", None)
+        if callable(apply_merge_group):
+            apply_merge_group(members=member_tasks, union_gpus=union_gpus)
+        # Transparent log: merging changes the pod topology (sflow-owned), so make
+        # it visible which co-located GPU tasks now share one pod/node.
+        _logger.info(
+            "Kubernetes backend '%s': merged %d co-located GPU tasks %s on node "
+            "'%s' into one pod (%d GPUs; shared NVLink/cuda_ipc, one IMEX channel "
+            "claim per node).",
+            backend_name,
+            len(members),
+            members,
+            node,
+            union_gpus,
+        )
+
+
+def _warn_channel_contention(resource_placements: "Mapping[str, Any]") -> None:
+    """Hard-warn when a ComputeDomain channel claim contends with pod topology.
+
+    The NVIDIA DRA driver publishes ONE IMEX channel per node per ComputeDomain, so
+    a channel claim needs at most one channel-claiming (GPU) pod per node. Merge
+    (default ``auto``) guarantees that. But when a backend has a channel configured
+    AND ``merge_colocated_gpu_pods`` is off, two+ GPU pods can land on one node and
+    all but one fail scheduling ("cannot allocate all claims"). Warn once per
+    backend at plan time (recommend ``merge: auto`` or one GPU pod per node); the
+    run still proceeds. Duck-typed on the backend (only the k8s backend exposes a
+    ``compute_domain_channel``); other backends simply never trigger it.
+    """
+    per_node: dict[tuple[str, str], int] = {}
+    backends_by_name: dict[str, Any] = {}
+    for _name, placement in resource_placements.items():
+        backend = getattr(placement, "backend", None)
+        if backend is None:
+            continue
+        try:
+            gpu_count = int(getattr(placement, "gpu_count", 0) or 0)
+        except (TypeError, ValueError):
+            gpu_count = 0
+        if gpu_count <= 0:
+            continue  # only GPU pods claim the channel
+        backends_by_name[str(backend.name)] = backend
+        for node in getattr(placement, "assigned_nodes", None) or []:
+            per_node[(str(backend.name), str(node))] = (
+                per_node.get((str(backend.name), str(node)), 0) + 1
+            )
+
+    warned: set[str] = set()
+    for (backend_name, node), count in sorted(per_node.items()):
+        if count < 2 or backend_name in warned:
+            continue
+        backend = backends_by_name[backend_name]
+        channel = getattr(backend, "compute_domain_channel", None)
+        merge = getattr(backend, "merge_colocated_gpu_pods", False)
+        if channel and not merge:
+            warned.add(backend_name)
+            _logger.warning(
+                "Kubernetes backend '%s': a ComputeDomain channel ('%s') is claimed "
+                "by every GPU pod, but merge_colocated_gpu_pods is off and %d GPU "
+                "tasks are placed on node '%s'. The NVIDIA driver publishes ONE IMEX "
+                "channel per node, so all but one channel-claiming pod on that node "
+                "will fail scheduling ('cannot allocate all claims'). Set "
+                "merge_colocated_gpu_pods: auto (recommended) or place one GPU pod "
+                "per node.",
+                backend_name,
+                channel,
+                count,
+                node,
+            )
+
+
+def _warn_interconnect_hints(resource_placements: "Mapping[str, Any]") -> None:
+    """App-agnostic interconnect hints from cross-node GPU placement + scope + IB.
+
+    The interconnect priority is NVLink -> IB/RDMA -> TCP. When a backend's GPU pods
+    land on >=2 distinct nodes (cross-node GPU communication is possible) and the
+    fast tier is not reachable, hint the framework/admin-owned piece sflow does not
+    own (it never pins the transport):
+
+    * node-scoped NVLink + IB down -> no fast cross-node path; co-locate
+      prefill+decode per node (intra-node NVLink) or enable IB.
+    * rack-scoped NVLink + no IMEX channel -> provide
+      ``dra.use_compute_domain_channel`` (a name or ``auto``) for MNNVL; otherwise
+      cross-node KV falls back to IB (if up) or slow TCP.
+
+    Duck-typed on the backend (only the k8s backend exposes ``nvlink_domain_scope``
+    / ``rdma_enabled`` / ``compute_domain_channel``); warn-only, once per backend.
+    Scope ``None`` (undetected, e.g. dry-run) or ``off`` -> no hint (stay quiet when
+    unsure). The vLLM knob is named only as an example.
+    """
+    gpu_nodes: dict[str, set[str]] = {}
+    backends_by_name: dict[str, Any] = {}
+    for _name, placement in resource_placements.items():
+        backend = getattr(placement, "backend", None)
+        if backend is None:
+            continue
+        try:
+            gpu_count = int(getattr(placement, "gpu_count", 0) or 0)
+        except (TypeError, ValueError):
+            gpu_count = 0
+        if gpu_count <= 0:
+            continue
+        backends_by_name[str(backend.name)] = backend
+        nodes = gpu_nodes.setdefault(str(backend.name), set())
+        for node in getattr(placement, "assigned_nodes", None) or []:
+            nodes.add(str(node))
+
+    for backend_name, nodes in sorted(gpu_nodes.items()):
+        if len(nodes) < 2:
+            continue  # single-node GPU placement: intra-node NVLink handles it
+        backend = backends_by_name[backend_name]
+        scope = getattr(backend, "nvlink_domain_scope", None)
+        rdma_enabled = bool(getattr(backend, "rdma_enabled", False))
+        channel = getattr(backend, "compute_domain_channel", None)
+        if scope == "node" and not rdma_enabled:
+            _logger.warning(
+                "Kubernetes backend '%s': GPU tasks span %d nodes but the NVLink "
+                "domain is node-scoped and IB/RDMA is down -- there is no fast "
+                "cross-node interconnect, so cross-node KV transfer will use slow "
+                "TCP. Co-locate prefill+decode per node (intra-node NVLink) or "
+                "enable IB/RDMA.",
+                backend_name,
+                len(nodes),
+            )
+        elif scope == "rack" and not channel:
+            _logger.warning(
+                "Kubernetes backend '%s': GPU tasks span %d nodes on a rack-scoped "
+                "(MNNVL) cluster but no IMEX ComputeDomain channel is configured. "
+                "Set dra.use_compute_domain_channel (a channel name or 'auto') so "
+                "cross-node KV rides NVLink/MNNVL; otherwise it falls back to IB (if "
+                "up) or slow TCP. Cross-node MNNVL also needs the framework's "
+                "fabric/VMM KV memory (e.g. vLLM --enable-sleep-mode) + "
+                "UCX_CUDA_IPC_ENABLE_MNNVL=y (recipe-owned).",
+                backend_name,
+                len(nodes),
+            )
 
 
 def build_task_graph(
@@ -1228,6 +1446,17 @@ def build_task_graph(
                 new_script.append(line)
         task.script = new_script
 
+    # Merge-pod mode (default auto per Kubernetes backend): bundle single-node GPU
+    # tasks the planner co-located on one node into one pod so they share
+    # NVLink/cuda_ipc (and one IMEX channel claim per node).
+    _plan_merge_groups(task_graph, resource_placements)
+    # Guard: a claimed ComputeDomain channel + merge off + >1 GPU pod/node contends
+    # on the node's single IMEX channel -> hard-warn (still attempts).
+    _warn_channel_contention(resource_placements)
+    # App-agnostic interconnect hints (cross-node GPU placement + scope + IB +
+    # channel) for the framework/admin-owned pieces sflow does not own.
+    _warn_interconnect_hints(resource_placements)
+
     return task_graph
 
 
@@ -1295,7 +1524,7 @@ async def build_state(
             workspace_dir=workspace_dir,
             output_dir=output_dir,
             materialize=allocate,
-            remote_filesystem=_backends_execute_offhost(state),
+            remote_filesystem=backends_execute_offhost(state),
         )
 
         # Top-level variables may defer references to backends.* and artifacts.*

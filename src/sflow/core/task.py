@@ -233,6 +233,32 @@ class Task:
     # exits / at workflow teardown.
     monitor: "MonitorConsumer | None" = None
 
+    # --- Merge-pod mode (Kubernetes): co-located GPU tasks share one pod ---
+    # Stable id shared by every member of one merge group (backend+node scoped).
+    merge_group_id: str | None = None
+    # Set on a merge FOLLOWER to the leader task's name (the task that owns and
+    # launches the shared pod); None on the leader and on non-merged tasks. A
+    # follower is never launched on its own -- the leader runs its script as a
+    # background process in the merged container and the orchestrator mirrors the
+    # follower's lifecycle off the leader while keeping its own log/probes.
+    merge_leader: str | None = None
+    # Non-empty on the merge LEADER: ordered member task names (leader first) that
+    # run in the leader's single merged pod/container. Empty otherwise.
+    merge_members: list[str] = field(default_factory=list)
+    # Packed CUDA_VISIBLE_DEVICES slice for this member within the merged
+    # container's union GPU range (e.g. "0,1"); None when not merged.
+    merge_cuda_visible_devices: str | None = None
+
+    @property
+    def is_merge_leader(self) -> bool:
+        """True when this task owns a merged pod running several members' scripts."""
+        return bool(self.merge_members)
+
+    @property
+    def is_merge_follower(self) -> bool:
+        """True when this task runs inside another (leader) task's merged pod."""
+        return self.merge_leader is not None
+
     @cached_property
     def launch_command(self) -> Command:
         return self.operator.build_command(

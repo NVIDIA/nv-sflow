@@ -25,16 +25,26 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import shutil
 import sys
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
+from typing import Any
 
 from sflow.core.command import Command
 from sflow.core.launcher import _strip_ansi
 from sflow.logging import SFLOW_TASK_STREAM_ATTR, get_logger
+from sflow.plugins.operators._k8s_render import MERGE_MUX_CLOSE, MERGE_MUX_OPEN
 
 _logger = get_logger(__name__)
+
+# Matches one merge-pod launcher line: "[[sflow-mux:<task>]] <body>". The tag is
+# emitted by _k8s_shell.merged_launcher_lines; both sides share MERGE_MUX_* so the
+# literal never drifts. Group 1 = task name, group 2 = the original line body.
+_MUX_RE = re.compile(
+    "^" + re.escape(MERGE_MUX_OPEN) + r"([^\]]+)" + re.escape(MERGE_MUX_CLOSE) + "(.*)$"
+)
 
 # Seconds between pod-phase polls (the authoritative completion signal).
 PHASE_POLL_INTERVAL = 2.0
@@ -265,6 +275,114 @@ async def start_pod_log_file_stream(
     argv = " ".join(shlex.quote(str(a)) for a in log_command.as_list())
     shell = f"exec {argv} >> {shlex.quote(dest_path)} 2>/dev/null"
     return await asyncio.create_subprocess_exec("bash", "-c", shell)
+
+
+async def _demux_stream(
+    proc: asyncio.subprocess.Process,
+    tag_paths: Mapping[str, str],
+    default_path: str,
+    *,
+    console_label: str = "",
+) -> None:
+    """Read ``proc`` stdout line by line, routing each line to a per-task file.
+
+    A merge-pod runs several members' scripts in one container, each line tagged
+    ``[[sflow-mux:<task>]] `` by the launcher. Lines whose tag names a known member
+    are written (untagged) to that member's ``<task>.log``; everything else (apply
+    diagnostics, the RDMA preamble, unknown tags) goes to ``default_path`` (the
+    leader's log). Files are opened lazily and appended to, mirroring the offloaded
+    single-pod stream. Best-effort per line so one bad line never drops the stream.
+
+    When ``console_label`` is set and stdout is a TTY, each line is ALSO echoed to
+    the console/TUI tagged ``[<task>] `` -- the member's own task name for tagged
+    lines, else ``console_label`` (the leader) for pod-level lines -- so the
+    interleaved output of the merged members is attributable live. The on-disk
+    ``<task>.log`` files stay clean (the mux tag is stripped, no console prefix).
+    """
+    files: dict[str, Any] = {}
+    echo_console = bool(console_label) and _console_active()
+
+    def _fh(path: str):
+        fh = files.get(path)
+        if fh is None:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            fh = open(path, "ab")  # noqa: SIM115 -- closed in finally
+            files[path] = fh
+        return fh
+
+    assert proc.stdout is not None
+    try:
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            text = raw.decode("utf-8", errors="replace")
+            stripped = text.rstrip("\n")
+            m = _MUX_RE.match(stripped)
+            if m and m.group(1) in tag_paths:
+                name = m.group(1)
+                path = tag_paths[name]
+                line_body = m.group(2)
+                body = (line_body + "\n").encode("utf-8")
+            else:
+                name = console_label
+                path = default_path
+                line_body = stripped
+                body = text.encode("utf-8")
+            try:
+                fh = _fh(path)
+                fh.write(body)
+                fh.flush()
+            except OSError:
+                pass
+            if echo_console:
+                clean = _strip_ansi(line_body).rstrip()
+                if clean:
+                    # Tag each merged member's line with its task name so the
+                    # interleaved TUI/console output is readable.
+                    _logger.info(
+                        f"[{name}] {clean}",
+                        extra={SFLOW_TASK_STREAM_ATTR: True},
+                    )
+    finally:
+        for fh in files.values():
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+
+async def stream_and_demux_pod_log(
+    log_command: Command,
+    *,
+    tag_paths: Mapping[str, str],
+    default_path: str,
+    console_label: str = "",
+) -> tuple[asyncio.subprocess.Process, asyncio.Future]:
+    """Start ``kubectl logs -f`` for a merge-pod and demux it into per-task files.
+
+    Unlike the single-pod offload (a driver-free shell redirect), a merge-pod's one
+    container carries several members' logs, so the driver reads the stream and
+    splits it by the ``[[sflow-mux:<task>]] `` tag into each member's ``<task>.log``
+    (see :func:`_demux_stream`). ``console_label`` (the leader task) enables the
+    per-task-tagged console echo for the interleaved output. Returns the kubectl
+    process and the reader task; the caller drains/cancels the reader and terminates
+    the process on terminal / teardown. Best-effort dir creation.
+    """
+    parent = os.path.dirname(default_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        *[str(a) for a in log_command.as_list()],
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    reader = asyncio.ensure_future(
+        _demux_stream(proc, tag_paths, default_path, console_label=console_label)
+    )
+    return proc, reader
 
 
 async def terminate_process(proc: asyncio.subprocess.Process) -> None:

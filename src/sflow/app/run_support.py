@@ -129,6 +129,12 @@ def _resolve_raw_variable_refs(uri: str, raw_vars: dict[str, Any]) -> str:
     return re.sub(r"\$\{\{(.+?)\}\}", _resolve_var, uri)
 
 
+# Off-host backend detection lives here as the single source of truth. There are
+# two checks because they run at different stages, but they must agree:
+#   * config_uses_offhost_backend  -- by backend *type*, BEFORE resolution.
+#   * backends_execute_offhost     -- by *capability*, AFTER resolution.
+# When adding a new off-host backend, add its type here AND set
+# ``supports_host_path_mounts=False`` on its capabilities so both checks match.
 _OFFHOST_BACKEND_TYPES = frozenset({"kubernetes"})
 
 
@@ -138,8 +144,8 @@ def config_uses_offhost_backend(config: Any) -> bool:
     Determined from the backend *type* at config time (before backends are
     resolved). Such backends run tasks remotely, so a local ``fs://`` artifact path
     refers to a location on the cluster/image, not the controller -- it must not be
-    hard-validated locally. Mirrors the capability-based check used after resolution
-    (``supports_host_path_mounts``); keep this set in sync with off-host backends.
+    hard-validated locally. Pre-resolution twin of :func:`backends_execute_offhost`
+    (which checks ``supports_host_path_mounts`` on resolved backends).
     """
     for backend in getattr(config, "backends", None) or []:
         btype = getattr(backend, "type", None)
@@ -148,6 +154,23 @@ def config_uses_offhost_backend(config: Any) -> bool:
         if str(btype) in _OFFHOST_BACKEND_TYPES:
             return True
     return False
+
+
+def backends_execute_offhost(state: Any) -> bool:
+    """True if any resolved backend executes off the controller host (no host mounts).
+
+    Post-resolution twin of :func:`config_uses_offhost_backend`: checks the
+    resolved backends' ``supports_host_path_mounts`` capability. Such backends
+    (e.g. Kubernetes) run tasks remotely, so local ``fs://`` artifact paths refer
+    to the cluster/image rather than the controller and must not be validated or
+    created locally.
+    """
+    return any(
+        not getattr(
+            getattr(backend, "capabilities", None), "supports_host_path_mounts", True
+        )
+        for backend in (getattr(state, "backends", None) or {}).values()
+    )
 
 
 def preflight_validate_artifacts(

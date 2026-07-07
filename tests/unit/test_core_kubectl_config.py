@@ -35,10 +35,11 @@ def test_namespace_excluded_from_global_args():
     assert cfg.is_empty() is False
 
 
-def test_exclude_nodes_is_not_a_kubectl_flag_but_marks_config_non_empty():
-    # exclude_nodes is a pod scheduling constraint (nodeAffinity), not a kubectl
-    # client flag, so it stays out of global_args() but still makes the config
-    # non-empty (so it is applied to backends).
-    cfg = KubectlConfig(exclude_nodes=["node-a", "node-b"])
-    assert cfg.global_args() == []
-    assert cfg.is_empty() is False
+def test_node_filters_are_not_kubectl_config_fields():
+    # Node include/exclude now flow through backend config (BackendConfig fields /
+    # the --include-nodes / --exclude-nodes flags), not KubectlConfig.
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(KubectlConfig)}
+    assert "exclude_nodes" not in field_names
+    assert "include_nodes" not in field_names

@@ -87,6 +87,39 @@ def _merge_backend_extra_args(
     return config
 
 
+def _merge_backend_node_filters(
+    config: SflowConfig,
+    include_nodes: list[str] | None,
+    exclude_nodes: list[str] | None,
+) -> SflowConfig:
+    """Union CLI ``--include-nodes`` / ``--exclude-nodes`` into every backend.
+
+    The same host lists apply to all backends; each one later translates them to
+    its native node selection (Slurm ``--nodelist``/``--exclude``, K8s
+    ``nodeAffinity``, Docker host pool). CLI values are unioned over any recipe
+    ``include_nodes`` / ``exclude_nodes`` (see ``BackendConfig.merge_node_filters``).
+    """
+    if not config.backends or not (include_nodes or exclude_nodes):
+        return config
+
+    updated_backends = []
+    merged_any = False
+    for b in config.backends:
+        merge = getattr(b, "merge_node_filters", None)
+        updated = merge(include_nodes, exclude_nodes) if callable(merge) else b
+        updated_backends.append(updated)
+        if updated is not b:
+            merged_any = True
+
+    if merged_any:
+        _logger.info(
+            "Applied CLI node filters to backend(s): "
+            f"include={include_nodes or []} exclude={exclude_nodes or []}"
+        )
+        return config.model_copy(update={"backends": updated_backends})
+    return config
+
+
 class SflowApp:
     """
     Application facade used by CLI/UI integrations.
@@ -113,6 +146,11 @@ class SflowApp:
         # CLI-provided backend extra args keyed by backend type:
         # {"slurm": [...salloc args...], "docker": [...docker run args...]}.
         backend_extra_args_by_type: dict[str, list[str]] | None = None,
+        # CLI-provided node include/exclude host lists, unioned into every backend
+        # (--include-nodes / --exclude-nodes). Each backend translates to its own
+        # node selection mechanism.
+        include_nodes: list[str] | None = None,
+        exclude_nodes: list[str] | None = None,
         # CLI-level Kubernetes access (KubectlConfig) from `sflow run` flags;
         # applied to kubernetes backends so recipes stay cluster-agnostic.
         kubectl_config: Any | None = None,
@@ -154,6 +192,9 @@ class SflowApp:
 
         if backend_extra_args_by_type:
             config = _merge_backend_extra_args(config, backend_extra_args_by_type)
+
+        if include_nodes or exclude_nodes:
+            config = _merge_backend_node_filters(config, include_nodes, exclude_nodes)
 
         # Export KUBECONFIG so kubectl invoked directly inside user task scripts
         # (not just sflow's own calls) also targets the selected cluster. sflow's

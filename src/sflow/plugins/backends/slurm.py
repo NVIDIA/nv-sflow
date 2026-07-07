@@ -19,6 +19,7 @@ from sflow.core.operator import Operator
 from sflow.logging import get_logger
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
 from sflow.utils.logging import isolated_logger, temporary_handler
+from sflow.utils.node_filters import normalize_node_list, resolve_node_filters
 from sflow.utils.parser import ParseLogHandler
 from sflow.utils.slurm import emit_gpus_per_node_semantics_warning_once
 
@@ -69,6 +70,10 @@ class SlurmBackend(Backend):
         self._time = str(config.time)
         self._job_name = str(config.job_name or config.name)
         self._extra_args = [str(a) for a in (config.extra_args or [])]
+        # Host include/exclude -> salloc --nodelist / --exclude (and a post-filter
+        # for reused env allocations, where salloc flags can't apply).
+        self._include_nodes = normalize_node_list(config.include_nodes)
+        self._exclude_nodes = normalize_node_list(config.exclude_nodes)
         try:
             self._gpu_per_node = int(config.gpus_per_node)
         except Exception as e:
@@ -77,6 +82,37 @@ class SlurmBackend(Backend):
             ) from e
         self._subprocess_launcher = SubprocessLauncher()
         self._warned_gpus_per_node_semantics = False
+
+    def _apply_node_filters(self, nodes: list[ComputeNode]) -> list[ComputeNode]:
+        """Restrict/steer a resolved node list by include/exclude host names.
+
+        Used for reused env allocations where salloc ``--nodelist``/``--exclude``
+        can't apply. Keeps only ``include_nodes`` (when set) and drops
+        ``exclude_nodes``; raises if that empties the pool.
+        """
+        if not (self._include_nodes or self._exclude_nodes):
+            return nodes
+        include = set(self._include_nodes)
+        exclude = set(self._exclude_nodes)
+        filtered = [
+            n
+            for n in nodes
+            if (not include or n.name in include) and n.name not in exclude
+        ]
+        if len(filtered) != len(nodes):
+            _logger.warning(
+                "Slurm backend '%s': include/exclude node filters reduced the reused "
+                "allocation from %d to %d node(s).",
+                self.name,
+                len(nodes),
+                len(filtered),
+            )
+        if not filtered:
+            raise RuntimeError(
+                f"Slurm backend '{self.name}': include/exclude node filters removed "
+                "all nodes from the reused allocation"
+            )
+        return filtered
 
     def preflight_validate(self) -> None:
         required = ["salloc", "srun", "scontrol", "scancel"]
@@ -334,6 +370,9 @@ class SlurmBackend(Backend):
             nodes = await self._resolve_nodes_from_nodelist(
                 nodelist=nodelist, job_id=job_id
             )
+            # salloc's --nodelist/--exclude can't steer a pre-existing allocation, so
+            # honor include/exclude by filtering the reused node pool here.
+            nodes = self._apply_node_filters(nodes)
             if self._nodes and len(nodes) != self._nodes:
                 _logger.warning(
                     "Slurm allocation node count differs from backend config (continuing): "
@@ -352,6 +391,13 @@ class SlurmBackend(Backend):
             .add_opt("--job-name", self._job_name)
             .add_opt("--no-shell")
         )
+
+        # Translate host include/exclude to Slurm's own flags. Added before the
+        # user's extra_args so an explicit extra_args --nodelist/--exclude wins.
+        if self._include_nodes:
+            command.add_opt("--nodelist", ",".join(self._include_nodes))
+        if self._exclude_nodes:
+            command.add_opt("--exclude", ",".join(self._exclude_nodes))
 
         for arg in self._extra_args:
             command.add_opt(arg)
@@ -520,6 +566,8 @@ class SlurmBackend(Backend):
                 f"Backend '{conf.name}' gpus_per_node must be >= 0, got {gpus_per_node}"
             )
 
+        include_nodes, exclude_nodes = resolve_node_filters(resolver, conf, ctx)
+
         return SlurmBackendConfig(
             name=conf.name,
             type="slurm",
@@ -529,6 +577,8 @@ class SlurmBackend(Backend):
             time=str(time),
             nodes=nodes_i,
             extra_args=extra_args,
+            include_nodes=include_nodes,
+            exclude_nodes=exclude_nodes,
             job_name=str(workflow_name),
             gpus_per_node=gpus_per_node,
             offload_task_logs=bool(getattr(conf, "offload_task_logs", True)),

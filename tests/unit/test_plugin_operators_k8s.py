@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
 import subprocess
 import textwrap
@@ -20,6 +21,7 @@ import yaml
 from sflow.core.artifact import Artifact
 from sflow.core.backend import Allocation
 from sflow.core.compute_node import ComputeNode
+from sflow.plugins.backends._k8s_rdma import RdmaPlan
 from sflow.plugins.backends.kubernetes import KubernetesBackend, KubernetesBackendConfig
 from sflow.plugins.operators import _k8s_shell as k8s_shell
 from sflow.plugins.operators.k8s import K8sOperator, K8sOperatorConfig
@@ -73,6 +75,14 @@ def _build(
 
 def _pods(manifest):
     return [i for i in manifest["items"] if i["kind"] == "Pod"]
+
+
+def _entrypoint(manifest):
+    """The task entrypoint script text from the rendered ConfigMap."""
+    for item in manifest["items"]:
+        if item["kind"] == "ConfigMap" and "entrypoint.sh" in item.get("data", {}):
+            return item["data"]["entrypoint.sh"]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -623,21 +633,24 @@ def test_no_pvc_mounted_when_backend_has_no_volumes():
 
 
 def test_network_env_injected_into_pod_env():
-    # When the backend detected RDMA, every task pod gets the IB/NCCL/UCX/gloo env
-    # so all libs use the fast NICs + the routable control interface.
+    # When the backend detected RDMA, every task pod gets NCCL/gloo socket env
+    # plus optional NCCL_IB_HCA. UCX is left unset.
     be = _backend("device_plugin", 8)
-    be._rdma_env = {  # simulate reservation-time detection
-        "UCX_NET_DEVICES": "mlx5_0:1,mlx5_1:1",
-        "NCCL_IB_HCA": "mlx5_0,mlx5_1",
-        "NCCL_SOCKET_IFNAME": "eth0",
-        "GLOO_SOCKET_IFNAME": "eth0",
-    }
+    be._rdma_plan = RdmaPlan(  # simulate reservation-time detection
+        provider="explicit",
+        enabled=False,
+        net_env={
+            "NCCL_IB_HCA": "mlx5_0,mlx5_1",
+            "NCCL_SOCKET_IFNAME": "eth0",
+            "GLOO_SOCKET_IFNAME": "eth0",
+        },
+    )
     manifest, _ = _build(be, ["node-0"], gpu_count=2)
     env = {
         e["name"]: e["value"]
         for e in _pods(manifest)[0]["spec"]["containers"][0].get("env", [])
     }
-    assert env.get("UCX_NET_DEVICES") == "mlx5_0:1,mlx5_1:1"
+    assert "UCX_NET_DEVICES" not in env
     assert env.get("NCCL_IB_HCA") == "mlx5_0,mlx5_1"
     assert env.get("NCCL_SOCKET_IFNAME") == "eth0"
     assert env.get("GLOO_SOCKET_IFNAME") == "eth0"
@@ -652,6 +665,164 @@ def test_no_network_env_when_no_rdma_detected():
     assert "UCX_NET_DEVICES" not in env and "NCCL_IB_HCA" not in env
 
 
+def test_shared_device_plugin_plan_requests_single_deduped_resource():
+    # A shared rdma/* resource maps to many HCAs but must be requested ONCE as a
+    # limit. The shared resource grants access to every node HCA, so NIC selection
+    # is deferred to the in-pod runtime affinity preamble (allow_runtime_affinity).
+    be = _backend("device_plugin", 8, nodes=1)
+    be._rdma_plan = RdmaPlan(
+        provider="shared_device_plugin",
+        enabled=True,
+        nic_specs=tuple(("rdma/hca", f"mlx5_{i}") for i in range(4)),
+        ipc_lock=True,
+        allow_runtime_affinity=True,
+    )
+    manifest, _ = _build(be, ["node-0"], gpu_count=4, cuda_visible="0,1,2,3")
+    pod = _pods(manifest)[0]
+    limits = pod["spec"]["containers"][0]["resources"]["limits"]
+    assert limits["rdma/hca"] == "1"  # one shared resource, not four
+    assert limits["nvidia.com/gpu"] == "4"
+    sc = pod["spec"]["containers"][0]["securityContext"]
+    assert sc["capabilities"]["add"] == ["IPC_LOCK"]
+    # NIC pinned in-pod (verified) -> no static build-time UCX/NCCL_IB env.
+    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0].get("env", [])}
+    assert "NCCL_IB_HCA" not in env and "UCX_NET_DEVICES" not in env
+    assert "_sflow_rdma_setup" in _entrypoint(manifest)
+
+
+def test_host_device_plan_mounts_dev_infiniband_no_extended_resource():
+    # host-device provider: no extended RDMA resource, verbs access via the
+    # /dev/infiniband hostPath mount + IPC_LOCK. The mount exposes every node HCA,
+    # so NIC selection is deferred to the in-pod runtime affinity preamble.
+    be = _backend("device_plugin", 8, nodes=1)
+    be._rdma_plan = RdmaPlan(
+        provider="host_device",
+        enabled=True,
+        nic_specs=tuple(("", f"mlx5_{i}") for i in range(4)),
+        ipc_lock=True,
+        host_device_paths=("/dev/infiniband",),
+        allow_runtime_affinity=True,
+    )
+    manifest, _ = _build(be, ["node-0"], gpu_count=4, cuda_visible="0,1,2,3")
+    pod = _pods(manifest)[0]
+    vols = pod["spec"]["volumes"]
+    assert any(v.get("hostPath", {}).get("path") == "/dev/infiniband" for v in vols)
+    limits = pod["spec"]["containers"][0]["resources"].get("limits", {})
+    assert not any(k.startswith("rdma/") or "gke.io" in k for k in limits)
+    sc = pod["spec"]["containers"][0]["securityContext"]
+    assert sc["capabilities"]["add"] == ["IPC_LOCK"]
+    # NIC pinned in-pod (verified) -> no static build-time UCX/NCCL_IB env; the
+    # preamble runs before the workload and falls back to TCP if RDMA is unusable.
+    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0].get("env", [])}
+    assert "UCX_NET_DEVICES" not in env and "NCCL_IB_HCA" not in env
+    assert "_sflow_rdma_setup" in _entrypoint(manifest)
+
+
+def test_dra_rdma_coalloc_adds_nic_request_and_constraint():
+    # scheduling: dra + dra.rdma_device_class -> the per-task claim co-requests a
+    # NIC on the same PCIe root as the GPU, the pod gets IPC_LOCK, and the runtime
+    # affinity preamble sets the env to the co-allocated NIC (with TCP fallback).
+    be = _backend("dra", 8, nodes=1)
+    be._dra_rdma_device_class = "rdma.nvidia.com"
+    manifest, _ = _build(be, ["node-0"], gpu_count=2, cuda_visible="0,1")
+    rct = [i for i in manifest["items"] if i["kind"] == "ResourceClaimTemplate"][0]
+    devices = rct["spec"]["spec"]["devices"]
+    assert [r["name"] for r in devices["requests"]] == ["gpu", "rdma"]
+    nic = [r for r in devices["requests"] if r["name"] == "rdma"][0]["exactly"]
+    assert nic["deviceClassName"] == "rdma.nvidia.com"
+    assert nic["count"] == 2
+    assert devices["constraints"] == [
+        {
+            "requests": ["gpu", "rdma"],
+            "matchAttribute": "resource.kubernetes.io/pcieRoot",
+        }
+    ]
+    # The container references the single claim -> receives both GPU and NIC.
+    pod = _pods(manifest)[0]
+    assert pod["spec"]["containers"][0]["resources"]["claims"] == [{"name": "gpu"}]
+    sc = pod["spec"]["containers"][0]["securityContext"]
+    assert sc["capabilities"]["add"] == ["IPC_LOCK"]
+    assert "_sflow_rdma_setup" in _entrypoint(manifest)
+
+
+def test_dra_rdma_coalloc_respects_custom_match_attribute():
+    be = _backend("dra", 8, nodes=1)
+    be._dra_rdma_device_class = "dra.net"
+    be._dra_rdma_match_attribute = "dra.net/numaNode"
+    manifest, _ = _build(be, ["node-0"], gpu_count=1, cuda_visible="0")
+    devices = [
+        i for i in manifest["items"] if i["kind"] == "ResourceClaimTemplate"
+    ][0]["spec"]["spec"]["devices"]
+    assert devices["constraints"][0]["matchAttribute"] == "dra.net/numaNode"
+    nic = [r for r in devices["requests"] if r["name"] == "rdma"][0]["exactly"]
+    assert nic["deviceClassName"] == "dra.net"
+
+
+def test_host_ipc_threads_to_pod_spec_and_shares_dev_shm():
+    # Backend host_ipc -> pod spec.hostIPC + shared hostPath /dev/shm, so co-located
+    # prefill/decode pods can do cross-pod CUDA IPC (NVLink) for KV transfer.
+    be = _backend("device_plugin", 8, nodes=1)
+    be._host_ipc = True
+    manifest, _ = _build(be, ["node-0"], gpu_count=4, cuda_visible="0,1,2,3")
+    pod = _pods(manifest)[0]
+    assert pod["spec"]["hostIPC"] is True
+    dshm = [v for v in pod["spec"]["volumes"] if v["name"] == "dshm"][0]
+    assert dshm["hostPath"] == {"path": "/dev/shm", "type": "Directory"}
+
+
+def test_host_ipc_off_by_default_keeps_private_dev_shm():
+    manifest, _ = _build(_backend("device_plugin", 8, nodes=1), ["node-0"], gpu_count=4)
+    pod = _pods(manifest)[0]
+    assert "hostIPC" not in pod["spec"]
+    dshm = [v for v in pod["spec"]["volumes"] if v["name"] == "dshm"][0]
+    assert "emptyDir" in dshm
+
+
+def test_compute_domain_channel_claimed_with_device_plugin_gpus():
+    # ComputeDomain (IMEX) is decoupled from scheduling: a device_plugin GPU pod can
+    # ALSO claim the compute-domain channel, so the nvidia.com/gpu limit and the DRA
+    # channel claim coexist on the same pod (needed for NVLink KV transfer).
+    be = _backend("device_plugin", 8, nodes=1)
+    be._compute_domain_channel = "cd-chan"
+    manifest, _ = _build(be, ["node-0"], gpu_count=4)
+    pod = _pods(manifest)[0]
+    claims = pod["spec"].get("resourceClaims", [])
+    assert any(c.get("resourceClaimTemplateName") == "cd-chan" for c in claims)
+    res = pod["spec"]["containers"][0]["resources"]
+    assert res["limits"]["nvidia.com/gpu"] == "4"
+    assert {"name": "compute-domain-channel"} in res["claims"]
+
+
+def test_compute_domain_channel_not_claimed_by_cpu_only_pods():
+    # Infra pods (no GPUs) must NOT claim the compute-domain channel. The DRA driver
+    # publishes ONE single-allocation IMEX channel per node, so a CPU-only pod (e.g.
+    # nats/etcd/frontend) claiming it starves the node's single channel and leaves
+    # co-located pods Pending ("cannot allocate all claims"). Only GPU pods join the
+    # IMEX domain.
+    be = _backend("device_plugin", 8, nodes=1)
+    be._compute_domain_channel = "cd-chan"
+    manifest, _ = _build(be, ["node-0"], gpu_count=0)
+    pod = _pods(manifest)[0]
+    claims = pod["spec"].get("resourceClaims", [])
+    assert not any(c.get("resourceClaimTemplateName") == "cd-chan" for c in claims)
+    res = pod["spec"]["containers"][0].get("resources", {})
+    assert all(
+        c.get("name") != "compute-domain-channel" for c in res.get("claims", [])
+    )
+
+
+def test_dra_without_rdma_device_class_stays_gpu_only():
+    # Default DRA path is unchanged: one GPU request, no NIC, no constraint, and
+    # no affinity preamble (no RDMA provider configured).
+    manifest, _ = _build(_backend("dra", 8, nodes=1), ["node-0"], gpu_count=2)
+    devices = [
+        i for i in manifest["items"] if i["kind"] == "ResourceClaimTemplate"
+    ][0]["spec"]["spec"]["devices"]
+    assert [r["name"] for r in devices["requests"]] == ["gpu"]
+    assert "constraints" not in devices
+    assert "_sflow_rdma_setup" not in _entrypoint(manifest)
+
+
 # ---------------------------------------------------------------------------
 # Scoped per-pod RDMA NIC slice: node-aware, aligned to the node-local GPU slot
 # ---------------------------------------------------------------------------
@@ -660,10 +831,14 @@ def test_no_network_env_when_no_rdma_detected():
 def _rdma_backend(gpus_per_node=8, nics=8):
     """A single-node backend with the RDMA fast path enabled and ``nics`` NICs."""
     be = _backend("device_plugin", gpus_per_node, nodes=1)
-    be._rdma_enabled = True
-    be._rdma_nic_specs = [
-        (f"networking.gke.io.networks/rdma-{i}", f"mlx5_{i}") for i in range(nics)
-    ]
+    be._rdma_plan = RdmaPlan(
+        provider="gke",
+        enabled=True,
+        nic_specs=tuple(
+            (f"networking.gke.io.networks/rdma-{i}", f"mlx5_{i}") for i in range(nics)
+        ),
+        ipc_lock=True,
+    )
     return be
 
 
@@ -689,7 +864,7 @@ def test_rdma_nic_window_aligns_to_node_local_gpu_slot():
     assert _rdma_nic_indices(pod) == [4, 5, 6, 7]
     env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0]["env"]}
     assert env["NCCL_IB_HCA"] == "mlx5_4,mlx5_5,mlx5_6,mlx5_7"
-    assert env["UCX_NET_DEVICES"] == "mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1"
+    assert "UCX_NET_DEVICES" not in env
 
 
 def test_colocated_prefill_decode_get_disjoint_nic_windows():
@@ -719,6 +894,21 @@ def test_rdma_nic_window_falls_back_to_replica_index_without_gpu_slot():
         envs={"SFLOW_REPLICA_INDEX": "1"},
     )
     assert _rdma_nic_indices(_pods(manifest)[0]) == [2, 3]
+
+
+def test_gke_keeps_static_pin_and_no_runtime_affinity_preamble():
+    # GKE grants a fixed per-pod NIC subset (allow_runtime_affinity=False), so it
+    # must keep the build-time per-pod pin and must NOT get the expose-all runtime
+    # affinity preamble (which assumes the pod can see every node HCA).
+    manifest, _ = _build(
+        _rdma_backend(), ["node-0"], gpu_count=4, cuda_visible="4,5,6,7"
+    )
+    pod = _pods(manifest)[0]
+    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0]["env"]}
+    assert env["NCCL_IB_HCA"] == "mlx5_4,mlx5_5,mlx5_6,mlx5_7"  # static pin kept
+    assert "UCX_NET_DEVICES" not in env
+    assert _rdma_nic_indices(pod) == [4, 5, 6, 7]
+    assert "_sflow_rdma_setup" not in _entrypoint(manifest)  # no affinity preamble
 
 
 # ---------------------------------------------------------------------------
@@ -897,3 +1087,236 @@ def test_build_command_does_not_persist_manifest_without_output_dir(tmp_path):
     # The command was still rendered normally.
     assert manifest["kind"] == "List"
     assert _MARK in shell
+
+
+# ---------------------------------------------------------------------------
+# network_fallback_status: surface the in-pod RDMA->TCP fallback from <task>.log
+# ---------------------------------------------------------------------------
+
+
+def _task_with_out(name, out_dir):
+    from sflow.core.task import Task
+
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    task = Task(
+        name=name,
+        logger=logging.getLogger(f"sflow.task.{name}"),
+        operator=op,
+        script=[f"echo {name}"],
+    )
+    if out_dir is not None:
+        task.envs["SFLOW_TASK_OUTPUT_DIR"] = str(out_dir)
+    return task, op
+
+
+def test_network_fallback_status_detects_tcp_from_task_log(tmp_path):
+    task_dir = tmp_path / "decode_server_0"
+    task_dir.mkdir()
+    (task_dir / "decode_server_0.log").write_text(
+        "[pod/x/x] [sflow-rdma] WARNING RDMA requested but unusable in pod "
+        "(no InfiniBand/RoCE port is ACTIVE (all ports DOWN)): using TCP "
+        "for NCCL (NCCL_IB_DISABLE=1); UCX device selection left to the library\n"
+    )
+    task, op = _task_with_out("decode_server_0", task_dir)
+    status = op.network_fallback_status(task)
+    assert status is not None and status.degraded_to_tcp
+    assert "all ports DOWN" in status.reason
+
+
+def test_network_fallback_status_none_without_marker(tmp_path):
+    task_dir = tmp_path / "s"
+    task_dir.mkdir()
+    (task_dir / "s.log").write_text("regular vllm output\n")
+    task, op = _task_with_out("s", task_dir)
+    assert op.network_fallback_status(task) is None
+
+
+def test_network_fallback_status_none_without_output_dir(tmp_path):
+    task, op = _task_with_out("s", None)
+    assert op.network_fallback_status(task) is None
+
+
+def test_network_fallback_status_none_when_log_missing(tmp_path):
+    # Output dir set but no <task>.log yet -> best-effort None (never raises).
+    task, op = _task_with_out("s", tmp_path / "nolog")
+    assert op.network_fallback_status(task) is None
+
+
+# ---------------------------------------------------------------------------
+# Merge-pod mode: several co-located GPU tasks share one pod (union of GPUs)
+# ---------------------------------------------------------------------------
+
+
+def _member_task(name, script, envs, cvd):
+    from sflow.core.task import Task, TaskStatus
+
+    t = Task(
+        name=name,
+        logger=logging.getLogger(f"test.{name}"),
+        operator=object(),  # unused: the leader operator reads member attrs only
+        status=TaskStatus.INITIATED,
+        script=list(script),
+        envs=dict(envs),
+    )
+    t.merge_cuda_visible_devices = cvd
+    return t
+
+
+def _merged_build(backend, *, scheduling_gpu=True):
+    """Build a merge-pod plan for decode(4 GPU)+prefill(2 GPU) -> union 6 on node-0."""
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=backend, assigned_nodes=["node-0"], artifacts=[],
+        gpu_count=4, cuda_visible_devices="0,1,2,3",
+    )
+    decode = _member_task(
+        "decode", ["run-decode"],
+        {"MODEL": "m", "SFLOW_TASK_OUTPUT_DIR": "/out/decode"}, "0,1,2,3",
+    )
+    prefill = _member_task(
+        "prefill", ["run-prefill"],
+        {"MODEL": "m", "ROLE": "prefill", "SFLOW_TASK_OUTPUT_DIR": "/out/prefill"}, "4,5",
+    )
+    op.apply_merge_group(members=[decode, prefill], union_gpus=6)
+    cmd = op.build_command(task_name="decode", script=["run-decode"], envs=decode.envs)
+    shell = cmd.as_list()[-1]
+    after = shell.split(_MARK, 1)[1]
+    body = after.split("\n" + _MARK, 1)[0]
+    manifest = json.loads(body.split("\n", 1)[1])
+    return manifest, shell, op
+
+
+def test_merge_pod_single_pod_with_union_gpus():
+    manifest, shell, _ = _merged_build(_backend("dra", 8))
+    pods = _pods(manifest)
+    # Pod is named after the merged members (not the leader alone) so it's clear
+    # in `kubectl get pods` that it runs several tasks.
+    assert len(pods) == 1
+    assert pods[0]["metadata"]["name"].startswith("merged-decode-prefill-")
+    # Union GPU request: the one container's RCT asks for 6 (4 decode + 2 prefill).
+    rct = [i for i in manifest["items"] if i["kind"] == "ResourceClaimTemplate"][0]
+    assert rct["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"] == 6
+    pod = pods[0]
+    assert pod["spec"]["containers"][0]["resources"]["claims"] == [{"name": "gpu"}]
+    # Pinned to the shared node; placeholder handed off once.
+    assert pod["spec"]["nodeSelector"]["kubernetes.io/hostname"] == "node-0"
+    assert "res-0" in shell
+
+
+def test_merge_pod_device_plugin_union_limit():
+    manifest, _, _ = _merged_build(_backend("device_plugin", 8))
+    pod = _pods(manifest)[0]
+    assert pod["spec"]["containers"][0]["resources"]["limits"] == {"nvidia.com/gpu": "6"}
+
+
+def test_merge_pod_configmap_has_launcher_and_member_scripts():
+    manifest, _, _ = _merged_build(_backend("dra", 8))
+    cm = [
+        i for i in manifest["items"]
+        if i["kind"] == "ConfigMap" and "entrypoint.sh" in i.get("data", {})
+    ][0]
+    data = cm["data"]
+    assert data["merge_decode.sh"] == "run-decode"
+    assert data["merge_prefill.sh"] == "run-prefill"
+    launcher = data["entrypoint.sh"]
+    # Each member launched with its packed CUDA_VISIBLE_DEVICES + tagged output.
+    assert "_sflow_run decode 0,1,2,3 /sflow/merge_decode.sh" in launcher
+    assert "_sflow_run prefill 4,5 /sflow/merge_prefill.sh" in launcher
+    assert "[[sflow-mux:" in launcher
+    assert 'export CUDA_VISIBLE_DEVICES="$_cvd"' in launcher
+
+
+def test_merge_pod_per_member_env_secrets_not_envfrom():
+    manifest, shell, _ = _merged_build(_backend("dra", 8))
+    container = _pods(manifest)[0]["spec"]["containers"][0]
+    # No container-wide envFrom (would collide across members); env is per-member.
+    assert "envFrom" not in container
+    mounts = {m["mountPath"] for m in container["volumeMounts"]}
+    assert "/sflow/menv/decode" in mounts and "/sflow/menv/prefill" in mounts
+    # The apply step creates one env Secret per member (named off the merged pod)
+    # from prefix-namespaced vars.
+    pod_base = _pods(manifest)[0]["metadata"]["name"]
+    assert f"{pod_base}-menv-0" in shell and f"{pod_base}-menv-1" in shell
+    assert "${SFMERGE0__MODEL-}" in shell
+    assert "${SFMERGE1__ROLE-}" in shell
+
+
+def test_merge_pod_plan_demux_paths_and_launcher_env():
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend("dra", 8), assigned_nodes=["node-0"], artifacts=[],
+        gpu_count=4, cuda_visible_devices="0,1,2,3",
+    )
+    decode = _member_task(
+        "decode", ["run-decode"],
+        {"MODEL": "m", "SFLOW_TASK_OUTPUT_DIR": "/out/decode"}, "0,1",
+    )
+    prefill = _member_task(
+        "prefill", ["run-prefill"],
+        {"ROLE": "prefill", "SFLOW_TASK_OUTPUT_DIR": "/out/prefill"}, "2,3",
+    )
+    op.apply_merge_group(members=[decode, prefill], union_gpus=4)
+    plan = op._build_execution_plan(
+        task_name="decode", script=["run-decode"], envs=decode.envs
+    )
+    # One pod named after the merged members.
+    assert len(plan.pod_refs) == 1
+    assert plan.pod_refs[0].startswith("pod/merged-decode-prefill-")
+    pod_base = plan.pod_refs[0].split("/", 1)[1]
+    # Each member's stream is demuxed to its own <task>.log; leader is the default.
+    assert plan.merge_tag_paths == {
+        "decode": "/out/decode/decode.log",
+        "prefill": "/out/prefill/prefill.log",
+    }
+    assert plan.task_log_path == "/out/decode/decode.log"
+    # Launcher env is prefix-namespaced so members' identical keys don't collide.
+    assert plan.merge_launcher_env["SFMERGE0__MODEL"] == "m"
+    assert plan.merge_launcher_env["SFMERGE1__ROLE"] == "prefill"
+    # Per-member env Secrets (named off the merged pod) are cleaned up with the task.
+    assert f"secret/{pod_base}-menv-0" in plan.cleanup_refs
+    assert f"secret/{pod_base}-menv-1" in plan.cleanup_refs
+
+
+def test_merge_pod_host_ipc_propagated():
+    backend = _backend("dra", 8)
+    backend._host_ipc = True
+    manifest, _, _ = _merged_build(backend)
+    pod = _pods(manifest)[0]
+    assert pod["spec"]["hostIPC"] is True
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="bash not available")
+def test_merge_pod_launcher_and_apply_are_valid_bash(fake_process):
+    # The merged launcher (entrypoint.sh) and apply command are generated shell;
+    # `bash -n` parses them without executing to catch quoting/syntax breakage.
+    fake_process.allow_unregistered(True)  # let the real bash run for the check
+    from sflow.plugins.operators._k8s_shell import (
+        build_merged_apply_command,
+        merged_launcher_lines,
+    )
+
+    launcher = "\n".join(
+        merged_launcher_lines(
+            [
+                ("decode", "0,1,2,3", "/sflow/merge_decode.sh", "/sflow/menv/decode/envsh"),
+                ("prefill", "4,5", "/sflow/merge_prefill.sh", "/sflow/menv/prefill/envsh"),
+            ],
+            preamble_lines=["echo preamble"],
+        )
+    )
+    apply = build_merged_apply_command(
+        manifest_json='{"kind":"List"}',
+        ns_seg=" --namespace ns",
+        pod_name="decode",
+        member_env_secrets=[
+            ("decode-menv-0", [("MODEL", "SFMERGE0__MODEL")]),
+            ("decode-menv-1", [("ROLE", "SFMERGE1__ROLE")]),
+        ],
+        handoff_delete_pods=["res-0"],
+        allocation_id="abc",
+    ).as_list()[-1]
+    for text in (launcher, apply):
+        proc = subprocess.run(
+            [shutil.which("bash"), "-n"], input=text, capture_output=True, text=True
+        )
+        assert proc.returncode == 0, proc.stderr

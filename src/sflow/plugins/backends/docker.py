@@ -25,6 +25,7 @@ from sflow.plugins.operators.docker_run import (
     DockerRunOperator,
     DockerRunOperatorConfig,
 )
+from sflow.utils.node_filters import normalize_node_list, resolve_node_filters
 
 _logger = get_logger(__name__)
 
@@ -78,7 +79,9 @@ class DockerBackend(Backend):
     def __init__(self, config: DockerBackendConfig):
         super().__init__(name=config.name)
         self.config = config
-        self._hosts = list(config.hosts or [])
+        self._include_nodes = normalize_node_list(config.include_nodes)
+        self._exclude_nodes = normalize_node_list(config.exclude_nodes)
+        self._hosts = self._filter_hosts(list(config.hosts or []))
         self._host_by_name = {host.name: host for host in self._hosts}
         self.capabilities = BackendCapabilities(
             supports_node_placement=True,
@@ -95,6 +98,44 @@ class DockerBackend(Backend):
         self._mounts = [str(m) for m in (config.mounts or [])]
         self._workdir = str(config.workdir) if config.workdir is not None else None
         self._extra_args = [str(a) for a in (config.extra_args or [])]
+
+    def _filter_hosts(
+        self, hosts: list[DockerHostConfig]
+    ) -> list[DockerHostConfig]:
+        """Restrict/steer the ``hosts:`` pool by include/exclude host names.
+
+        No-op (with a warning) when there is no ``hosts:`` pool: containers then
+        run on the local Docker daemon, where hostname filters are meaningless.
+        """
+        if not (self._include_nodes or self._exclude_nodes):
+            return hosts
+        if not hosts:
+            _logger.warning(
+                "Docker backend '%s': --include-nodes/--exclude-nodes have no effect "
+                "without a 'hosts:' pool (containers run on the local daemon).",
+                self.name,
+            )
+            return hosts
+        include = set(self._include_nodes)
+        exclude = set(self._exclude_nodes)
+        filtered = [
+            h
+            for h in hosts
+            if (not include or h.name in include) and h.name not in exclude
+        ]
+        if not filtered:
+            raise ValueError(
+                f"Docker backend '{self.name}': include/exclude node filters removed "
+                "all hosts from the pool"
+            )
+        if len(filtered) != len(hosts):
+            _logger.info(
+                "Docker backend '%s': node filters selected %d of %d host(s).",
+                self.name,
+                len(filtered),
+                len(hosts),
+            )
+        return filtered
 
     def preflight_validate(self) -> None:
         if shutil.which("docker") is None:
@@ -270,6 +311,8 @@ class DockerBackend(Backend):
             if conf.workdir is not None
             else None
         )
+        include_nodes, exclude_nodes = resolve_node_filters(resolver, conf, ctx)
+
         return DockerBackendConfig(
             name=conf.name,
             type="docker",
@@ -281,5 +324,7 @@ class DockerBackend(Backend):
             mounts=mounts,
             workdir=workdir,
             extra_args=extra_args,
+            include_nodes=include_nodes,
+            exclude_nodes=exclude_nodes,
             offload_task_logs=bool(getattr(conf, "offload_task_logs", True)),
         )

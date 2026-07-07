@@ -45,6 +45,10 @@ HOSTNAME_LABEL = "kubernetes.io/hostname"
 RESOURCE_API_VERSION = "resource.k8s.io/v1"
 # In-pod name for the GPU ResourceClaim (referenced by container.resources.claims).
 GPU_CLAIM_NAME = "gpu"
+# Request name for the co-allocated RDMA NIC in the same ResourceClaim (DRA
+# GPU<->NIC topology alignment). The container references the claim (not the
+# individual request), so it receives both the GPU and the NIC.
+NIC_CLAIM_NAME = "rdma"
 
 # NVIDIA DRA ComputeDomain (Multi-Node NVLink / IMEX) constants.
 COMPUTE_DOMAIN_API_VERSION = "resource.nvidia.com/v1beta1"
@@ -63,6 +67,15 @@ RESERVATION_POD_IMAGE = "bash:5"
 SFLOW_SCRIPT_DIR = "/sflow"
 SFLOW_ENTRYPOINT_FILE = "entrypoint.sh"
 SFLOW_ENTRYPOINT_PATH = f"{SFLOW_SCRIPT_DIR}/{SFLOW_ENTRYPOINT_FILE}"
+
+# Merge-pod log demux tag. In merge-pod mode one container runs several members'
+# scripts; the merged launcher prefixes each member's stdout line with
+# ``[[sflow-mux:<task>]] `` so the sflow driver can split the single container log
+# stream into per-task ``<task>.log`` files. Emitter:
+# ``_k8s_shell.merged_launcher_lines``; parser: ``_k8s_lifecycle`` demux. Kept here
+# so both sides agree on the exact literal.
+MERGE_MUX_OPEN = "[[sflow-mux:"
+MERGE_MUX_CLOSE = "]] "
 _SCRIPT_VOLUME_NAME = "sflow-scripts"
 # Volume name for inline file:// artifacts injected as a ConfigMap. Each artifact
 # is mounted (read-only, via subPath) at its resolved in-task path so task scripts
@@ -148,6 +161,20 @@ def _gpu_request(
     return resources, pod_claims
 
 
+def _device_exactly(
+    device_class: str, count: int, selectors: Sequence[str] | None
+) -> dict[str, Any]:
+    """Build one ``exactly`` device request body (class + count + CEL selectors)."""
+    exactly: dict[str, Any] = {
+        "deviceClassName": device_class,
+        "allocationMode": "ExactCount",
+        "count": int(count),
+    }
+    if selectors:
+        exactly["selectors"] = [{"cel": {"expression": str(s)}} for s in selectors]
+    return exactly
+
+
 def render_resource_claim_template(
     *,
     name: str,
@@ -157,6 +184,10 @@ def render_resource_claim_template(
     namespace: str | None = None,
     allocation_id: str | None = None,
     task_label: str | None = None,
+    nic_device_class: str | None = None,
+    nic_count: int | None = None,
+    nic_selectors: Sequence[str] | None = None,
+    match_attribute: str = "resource.kubernetes.io/pcieRoot",
 ) -> dict[str, Any]:
     """Render a ``resource.k8s.io/v1`` ``ResourceClaimTemplate`` for GPUs.
 
@@ -164,14 +195,34 @@ def render_resource_claim_template(
     so each pod gets its own (exclusive) set of ``count`` devices from
     ``device_class``. ``selectors`` are optional CEL expressions narrowing the
     eligible devices.
+
+    When ``nic_device_class`` is set, the claim also requests ``nic_count`` (or
+    ``count``) NIC devices from that class and adds a ``constraints`` entry
+    requiring the GPU and NIC requests to share ``match_attribute`` (default the
+    standardized ``resource.kubernetes.io/pcieRoot``). The scheduler then places
+    the GPU and its RDMA NIC on the same PCIe root complex, and the pod -- which
+    already references this claim for its GPU -- receives the co-allocated NIC
+    too. Requires a NIC DRA driver that publishes ``match_attribute``.
     """
-    exactly: dict[str, Any] = {
-        "deviceClassName": device_class,
-        "allocationMode": "ExactCount",
-        "count": int(count),
-    }
-    if selectors:
-        exactly["selectors"] = [{"cel": {"expression": str(s)}} for s in selectors]
+    requests: list[dict[str, Any]] = [
+        {"name": GPU_CLAIM_NAME, "exactly": _device_exactly(device_class, count, selectors)}
+    ]
+    devices: dict[str, Any] = {"requests": requests}
+    if nic_device_class:
+        requests.append(
+            {
+                "name": NIC_CLAIM_NAME,
+                "exactly": _device_exactly(
+                    nic_device_class, nic_count if nic_count else count, nic_selectors
+                ),
+            }
+        )
+        devices["constraints"] = [
+            {
+                "requests": [GPU_CLAIM_NAME, NIC_CLAIM_NAME],
+                "matchAttribute": match_attribute,
+            }
+        ]
     labels: dict[str, str] = {}
     if allocation_id:
         labels[SFLOW_ALLOC_LABEL] = allocation_id
@@ -181,13 +232,7 @@ def render_resource_claim_template(
         "apiVersion": RESOURCE_API_VERSION,
         "kind": "ResourceClaimTemplate",
         "metadata": _manifest_metadata(name, namespace, labels=labels or None),
-        "spec": {
-            "spec": {
-                "devices": {
-                    "requests": [{"name": GPU_CLAIM_NAME, "exactly": exactly}]
-                }
-            }
-        },
+        "spec": {"spec": {"devices": devices}},
     }
 
 
@@ -253,7 +298,9 @@ def render_reservation_pod_manifest(
     host_network: bool = False,
     node_selector: Mapping[str, str] | None = None,
     tolerations: Sequence[Mapping[str, Any]] | None = None,
+    include_nodes: Sequence[str] = (),
     exclude_nodes: Sequence[str] = (),
+    nvlink_domain_topology_key: str | None = None,
 ) -> dict[str, Any]:
     """Render a placeholder Pod that reserves a node (one per node via anti-affinity).
 
@@ -262,9 +309,17 @@ def render_reservation_pod_manifest(
     until a GPU task is pinned to the node and the operator deletes it on the
     create-before-destroy handoff (or release() tears the allocation down).
 
-    ``exclude_nodes`` adds a ``kubernetes.io/hostname NotIn`` nodeAffinity so the
-    reservation (and thus every task pinned to a reserved node) avoids those nodes
-    -- e.g. a node with a broken driver, passed via ``sflow run --kube-exclude-node``.
+    ``include_nodes`` / ``exclude_nodes`` add a ``kubernetes.io/hostname``
+    ``In`` / ``NotIn`` nodeAffinity so the reservation (and thus every task pinned
+    to a reserved node) is restricted to / steered away from those hosts -- from
+    ``--include-nodes`` / ``--exclude-nodes`` or the backend config fields.
+
+    ``nvlink_domain_topology_key`` (a node label KEY, e.g. ``nvidia.com/gpu.clique``)
+    adds a ``podAffinity`` with that ``topologyKey`` so every reservation pod lands
+    in the SAME physical NVLink domain (required for cross-node NVLink on a
+    multi-domain, rack-scoped cluster). The per-hostname ``podAntiAffinity`` still
+    spreads one pod per node; the group bootstraps because each pod carries the very
+    labels the affinity selects.
     """
     container: dict[str, Any] = {
         "name": "reserve",
@@ -305,21 +360,48 @@ def render_reservation_pod_manifest(
             }
         },
     }
-    # Steer the reservation (and thus the pinned tasks) away from excluded nodes.
+    # NVLink-domain co-location: keep every reservation pod within one physical
+    # NVLink domain (topologyKey = the label) so cross-node NVLink is possible.
+    # Symmetric podAffinity to the reservation role/alloc labels the pods carry, so
+    # the first pod bootstraps the group and the rest follow into the same domain.
+    if nvlink_domain_topology_key:
+        pod_spec["affinity"]["podAffinity"] = {
+            "requiredDuringSchedulingIgnoredDuringExecution": [
+                {
+                    "labelSelector": {
+                        "matchLabels": {
+                            SFLOW_ALLOC_LABEL: allocation_id,
+                            SFLOW_ROLE_LABEL: RESERVATION_ROLE,
+                        }
+                    },
+                    "topologyKey": nvlink_domain_topology_key,
+                }
+            ]
+        }
+    # Restrict the reservation (and thus the pinned tasks) to the included hosts
+    # and/or steer it away from the excluded hosts. Both operators live in one
+    # nodeSelectorTerm (AND semantics): a node must be In include AND NotIn exclude.
+    host_match_expressions: list[dict[str, Any]] = []
+    if include_nodes:
+        host_match_expressions.append(
+            {
+                "key": HOSTNAME_LABEL,
+                "operator": "In",
+                "values": [str(n) for n in include_nodes],
+            }
+        )
     if exclude_nodes:
+        host_match_expressions.append(
+            {
+                "key": HOSTNAME_LABEL,
+                "operator": "NotIn",
+                "values": [str(n) for n in exclude_nodes],
+            }
+        )
+    if host_match_expressions:
         pod_spec["affinity"]["nodeAffinity"] = {
             "requiredDuringSchedulingIgnoredDuringExecution": {
-                "nodeSelectorTerms": [
-                    {
-                        "matchExpressions": [
-                            {
-                                "key": HOSTNAME_LABEL,
-                                "operator": "NotIn",
-                                "values": [str(n) for n in exclude_nodes],
-                            }
-                        ]
-                    }
-                ]
+                "nodeSelectorTerms": [{"matchExpressions": host_match_expressions}]
             }
         }
     if pod_claims:
@@ -352,6 +434,7 @@ def render_task_pod(
     per_pod_gpus: int | None = None,
     resource_claim_name: str | None = None,
     host_network: bool = False,
+    host_ipc: bool = False,
     node_selector: Mapping[str, str] | None = None,
     assigned_node: str | None = None,
     tolerations: Sequence[Mapping[str, Any]] | None = None,
@@ -366,7 +449,9 @@ def render_task_pod(
     shm_size: str | None = None,
     rdma_nic_resources: Sequence[str] = (),
     rdma_ipc_lock: bool = False,
+    rdma_host_device_paths: Sequence[str] = (),
     rdma_lib_mounts: Sequence[tuple[str, str]] = (),
+    env_file_secrets: Sequence[tuple[str, str]] = (),
 ) -> dict[str, Any]:
     """Render one task Pod manifest (dict) for ``kubectl apply``.
 
@@ -387,11 +472,17 @@ def render_task_pod(
     with ``name``/``claim``/``mount_path``/``sub_path``/``read_only``), e.g. shared
     model storage that ``fs://`` artifacts point into.     ``shm_size`` optionally caps
     the RAM-backed ``/dev/shm`` (always mounted; the K8s 64Mi default is too small
-    for MPI/NCCL). ``rdma_nic_resources`` requests scoped GKE RDMA NIC device
-    resources (e.g. ``networking.gke.io.networks/rdma-0``) as container limits;
-    paired with ``rdma_ipc_lock`` (adds ``CAP_IPC_LOCK``) this gives the pod RDMA
+    for MPI/NCCL). ``rdma_nic_resources`` requests scoped RDMA NIC device resources
+    (e.g. ``networking.gke.io.networks/rdma-0`` or a shared ``rdma/hca``) as
+    container limits; ``rdma_host_device_paths`` instead hostPath-mounts the host IB
+    device dir (e.g. ``/dev/infiniband``) when no device plugin advertises the NICs.
+    Either, paired with ``rdma_ipc_lock`` (adds ``CAP_IPC_LOCK``), gives the pod RDMA
     verbs access for UCX/NIXL/NCCL without running privileged. ``rdma_lib_mounts``
     hostPath-mounts the GKE gIB libs (read-only) for multi-node NCCL.
+    ``env_file_secrets`` is ``[(secret_name, mount_path)]``; each secret's ``envsh``
+    key is mounted (read-only) as a shell-sourceable env file at ``mount_path`` --
+    used by merge-pod mode to give each merged member its own isolated env without
+    a container-wide ``envFrom`` (which would collide across members).
     """
     volume_mounts: list[dict[str, Any]] = [
         {"name": _SCRIPT_VOLUME_NAME, "mountPath": SFLOW_SCRIPT_DIR}
@@ -399,13 +490,23 @@ def render_task_pod(
     volumes: list[dict[str, Any]] = [
         {"name": _SCRIPT_VOLUME_NAME, "configMap": {"name": configmap_name}}
     ]
-    # RAM-backed /dev/shm (tmpfs) so MPI/NCCL/UCX have enough shared memory; the
-    # 64Mi K8s default segfaults multi-GPU/multi-node jobs. Optional ``shm_size``
-    # caps it (else it is bounded by node memory).
-    shm_emptydir: dict[str, Any] = {"medium": "Memory"}
-    if shm_size:
-        shm_emptydir["sizeLimit"] = shm_size
-    volumes.append({"name": _DSHM_VOLUME_NAME, "emptyDir": shm_emptydir})
+    # /dev/shm for MPI/NCCL/UCX shared memory (the 64Mi K8s default segfaults
+    # multi-GPU/multi-node jobs). With ``host_ipc`` the co-located pods share the
+    # node's IPC namespace for cross-pod CUDA IPC (NVLink), so /dev/shm is the
+    # node's shared hostPath (POSIX shm visible across those pods); otherwise it is
+    # a private RAM-backed emptyDir (``shm_size`` caps it, else bounded by node RAM).
+    if host_ipc:
+        volumes.append(
+            {
+                "name": _DSHM_VOLUME_NAME,
+                "hostPath": {"path": SFLOW_SHM_DIR, "type": "Directory"},
+            }
+        )
+    else:
+        shm_emptydir: dict[str, Any] = {"medium": "Memory"}
+        if shm_size:
+            shm_emptydir["sizeLimit"] = shm_size
+        volumes.append({"name": _DSHM_VOLUME_NAME, "emptyDir": shm_emptydir})
     volume_mounts.append({"name": _DSHM_VOLUME_NAME, "mountPath": SFLOW_SHM_DIR})
     # Inline file:// artifacts: one ConfigMap volume, each entry mounted read-only
     # at its resolved path via subPath (key == ConfigMap data key).
@@ -447,6 +548,18 @@ def render_task_pod(
         )
     # Pre-existing PVCs (e.g. shared model storage). The claim + data must already
     # exist in the namespace; sflow only references it.
+    # Host RDMA device nodes (e.g. /dev/infiniband) for the host-device provider:
+    # no device plugin advertises the NICs, so hostPath-mount the device dir (paired
+    # with CAP_IPC_LOCK below) to give the pod verbs access. `type: Directory` fails
+    # the pod loudly if the node lacks the device dir.
+    for idx, host_path in enumerate(rdma_host_device_paths):
+        vol_name = f"sflow-rdma-dev-{idx}"
+        volumes.append(
+            {"name": vol_name, "hostPath": {"path": host_path, "type": "Directory"}}
+        )
+        volume_mounts.append({"name": vol_name, "mountPath": host_path})
+    # Pre-existing PVCs (e.g. shared model storage). The claim + data must already
+    # exist in the namespace; sflow only references it.
     for pvc in pvc_mounts:
         vol_name = str(pvc["name"])
         read_only = bool(pvc.get("read_only", True))
@@ -467,6 +580,26 @@ def render_task_pod(
         if pvc.get("sub_path"):
             mount["subPath"] = str(pvc["sub_path"])
         volume_mounts.append(mount)
+    # Per-member env files (merge-pod mode): each Secret's single ``envsh`` key is
+    # mounted read-only as one shell-sourceable file, so the merged launcher can
+    # ``. <mount_path>`` a member's env in its own subshell (no container-wide
+    # envFrom, which would collide when merged members set the same var).
+    for idx, (secret_name, mount_path) in enumerate(env_file_secrets):
+        vol_name = f"sflow-menv-{idx}"
+        parent = str(mount_path).rsplit("/", 1)[0] or "/"
+        file_name = str(mount_path).rsplit("/", 1)[-1]
+        volumes.append(
+            {
+                "name": vol_name,
+                "secret": {
+                    "secretName": str(secret_name),
+                    "items": [{"key": "envsh", "path": file_name}],
+                },
+            }
+        )
+        volume_mounts.append(
+            {"name": vol_name, "mountPath": parent, "readOnly": True}
+        )
 
     container: dict[str, Any] = {
         "name": pod_name,
@@ -475,8 +608,8 @@ def render_task_pod(
         "volumeMounts": volume_mounts,
     }
     # Scoped RDMA verbs access (no privileged): CAP_IPC_LOCK lets the libs pin
-    # memory for RDMA; the device nodes themselves are granted by the GKE RDMA
-    # device plugin via the rdma NIC resource requests below.
+    # memory for RDMA; the device nodes themselves come from a device plugin (via
+    # the rdma NIC resource requests below) or the hostPath device mount above.
     if rdma_ipc_lock:
         container["securityContext"] = {"capabilities": {"add": ["IPC_LOCK"]}}
     if image_pull_policy:
@@ -519,6 +652,8 @@ def render_task_pod(
         pod_spec["resourceClaims"] = pod_claims
     if host_network:
         pod_spec["hostNetwork"] = True
+    if host_ipc:
+        pod_spec["hostIPC"] = True
     effective_selector = _merged_node_selector(node_selector, assigned_node)
     if effective_selector:
         pod_spec["nodeSelector"] = effective_selector

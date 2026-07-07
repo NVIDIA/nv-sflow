@@ -214,6 +214,14 @@ backends:
 | `time`          | int/str | No       |         | SLURM time limit (minutes)           |
 | `gpus_per_node` | int     | No       |         | GPUs per node (must be positive)     |
 | `extra_args`    | list    | No       | []      | Additional backend arguments         |
+| `include_nodes` | list    | No       | []      | Restrict the node pool to these hostnames (also `--include-nodes`) |
+| `exclude_nodes` | list    | No       | []      | Remove these hostnames from the node pool (also `--exclude-nodes`) |
+
+Node include/exclude is backend-agnostic: it works on any backend and is also
+settable via the `--include-nodes` / `--exclude-nodes` flags on `sflow run` and
+`sflow batch` (CLI values union over the recipe values). A host may not appear in
+both lists. Each backend translates it natively (Slurm `--nodelist`/`--exclude`,
+Kubernetes `hostname` In/NotIn nodeAffinity, Docker host-pool filtering).
 
 **local backend**: Creates synthetic nodes (`localhost`). Default operator is `bash`.
 

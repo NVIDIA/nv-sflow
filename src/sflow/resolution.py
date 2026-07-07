@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -898,7 +899,6 @@ def resolve_artifacts(
     accept it (the file/fs resolver) so local ``fs://`` paths are passed through
     instead of being validated/created on the controller.
     """
-    import inspect
     ensure_builtin_artifacts_registered()
 
     ws_dir = Path(workspace_dir) if workspace_dir is not None else Path.cwd()
@@ -1089,14 +1089,13 @@ def resolve_and_update_variables(
             if not resolver.has_expression(value)
         }
         # Wrap in VariableValue so expressions can read `.domain`/`.value`
-        # metadata (e.g. `variables.CONCURRENCY.domain | max`), matching the
-        # compose (`build_variables_ctx_from_raw`) and workflow/task-script
-        # (`build_variables_ctx`) paths. Arithmetic and string rendering
-        # transparently delegate to the underlying value.
-        wrapped_values = {
-            key: VariableValue(value, domain=variables[key].domain)
-            for key, value in ctx_values.items()
-        }
+        # metadata (e.g. `variables.CONCURRENCY.domain | max`). Reuse the shared
+        # builder (also used by the compose path) so wrapping stays one
+        # ground-truth; arithmetic and string rendering transparently delegate to
+        # the underlying value.
+        wrapped_values = build_variables_ctx_from_raw(
+            ctx_values, {key: variables[key].domain for key in ctx_values}
+        )
         ctx: dict[str, Any] = {"variables": wrapped_values, **wrapped_values}
         if extra_ctx:
             ctx.update(extra_ctx)

@@ -86,7 +86,7 @@ def test_resolve_artifacts_fs_local_creates_missing_path(tmp_path: Path):
 def test_backends_execute_offhost_detects_offhost_backends():
     from types import SimpleNamespace
 
-    from sflow.app.assembly import _backends_execute_offhost
+    from sflow.app.run_support import backends_execute_offhost
 
     def _be(supports_host_path_mounts: bool):
         return SimpleNamespace(
@@ -97,9 +97,9 @@ def test_backends_execute_offhost_detects_offhost_backends():
 
     state = _empty_state()
     state.backends = {"local": _be(True)}
-    assert _backends_execute_offhost(state) is False
+    assert backends_execute_offhost(state) is False
     state.backends = {"local": _be(True), "k8s": _be(False)}
-    assert _backends_execute_offhost(state) is True
+    assert backends_execute_offhost(state) is True
 
 
 def test_resolve_artifacts_inline_file_content_materializes_only_when_enabled(

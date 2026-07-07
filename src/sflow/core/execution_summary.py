@@ -87,6 +87,7 @@ class SflowSummaryWriter:
         self._workflow_detail: str | None = None
         self._timeline: list[_TimelineEvent] = []
         self._failure_hints: list[str] = []
+        self._network_warnings: list[str] = []
         self._uploads: list[UploadResult] = []
         self._task_started: dict[str, float] = {}
         self._task_ready: dict[str, float] = {}
@@ -173,6 +174,18 @@ class SflowSummaryWriter:
         self._task_ready[task.name] = ready_at
         self._task_finished[task.name] = ready_at
         self._append_event("READY", task)
+
+    def record_network_warning(self, task: Task, message: str, **_: Any) -> None:
+        """Record a non-fatal network warning (e.g. RDMA -> TCP fallback).
+
+        Surfaced in the dedicated 'Network Warnings' section, prefixed with the
+        task name. Duck-typed like the other summary hooks, so consumers that
+        don't implement it are unaffected.
+        """
+        if not message:
+            return
+        self._network_warnings.append(f"{task.name}: {message}")
+        self._schedule_render()
 
     def record_uploads(self, results: list[UploadResult], **_: Any) -> None:
         """Record upload outcomes for the dedicated end-of-run Uploads section.
@@ -337,6 +350,8 @@ class SflowSummaryWriter:
         lines.extend(self._end_summary_lines(tasks))
         lines.extend(["", "Runtime", "-------"])
         lines.extend(self._runtime_info_text.splitlines() or ["(runtime unavailable)"])
+
+        lines.extend(self._network_warning_lines())
 
         if self._status == "FAILED":
             lines.extend(["", "Failure Hints", "-------------"])
@@ -719,6 +734,12 @@ class SflowSummaryWriter:
         if self._uploads:
             lines.append(f"Uploads     : {format_upload_counts(self._uploads)}")
         return lines
+
+    def _network_warning_lines(self) -> list[str]:
+        """Render the 'Network Warnings' section, or [] when none were recorded."""
+        if not self._network_warnings:
+            return []
+        return ["", "Network Warnings", "----------------", *self._network_warnings]
 
     def _upload_section_lines(self) -> list[str]:
         """Render the dedicated 'Uploads' section, or [] when no uploads ran."""

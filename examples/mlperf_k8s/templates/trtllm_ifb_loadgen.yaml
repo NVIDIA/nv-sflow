@@ -1,0 +1,112 @@
+version: "0.1"
+
+# IFB (In-Flight Batching) workflow with MLPerf loadgen client -- BACKEND-NEUTRAL.
+# Launches DP_MULTIPLICITY trtllm-serve replicas (one per data-parallel rank), then
+# runs nv-mlpinf run_harness against the union of their URLs.
+#
+# The SAME template drives both SLURM and Kubernetes: to switch backends you swap
+# ONLY the env file (slurm_env_sflow.yaml <-> k8s_env_sflow.yaml). This template
+# references nothing backend-specific -- it relies on three portable pieces the env
+# file / assembly layer provide on every backend:
+#   * operator `test_container`            (defined by the env file; srun or k8s)
+#   * variable `SERVE_LAUNCHER`            (defined by the env file: the MPI launch
+#                                           prefix on SLURM, empty on k8s)
+#   * env `SFLOW_TASK_ASSIGNED_NODE_IPS`   (injected by sflow for every task on both
+#                                           backends -> the task's node IP(s))
+#   * env `SFLOW_REPLICA_INDEX`            (injected by sflow per replica)
+#
+# Pair with a config folder containing:
+#   - <benchmark>_config_sflow.yaml  (DP_MULTIPLICITY, model/yaml paths, harness args)
+#   - slurm_env_sflow.yaml  OR  k8s_env_sflow.yaml  (backend + `test_container` + mounts)
+# The per-rank trtllm-serve-ifb-*-{,env-}yaml are read from the /work mount at the
+# paths in <benchmark>_config_sflow.yaml (TRTLLM_YAML / TRTLLM_ENV_YAML).
+#
+# Single-node assumption: DP_MULTIPLICITY replicas fit on the reserved node(s) and
+# the harness (pinned to 1 node) shares a node with them, so every replica is
+# reachable at that node's IP:(BASE_PORT + replica_index). Scaling past one node
+# would need per-replica IP registration (an RWX shared path).
+
+variables:
+  BASE_PORT:
+    description: "Base port; each replica gets BASE_PORT + SFLOW_REPLICA_INDEX"
+    value: 8336
+  COLLECT_NSYS:
+    description: "Set to 1 to collect one nsys profile per trtllm-serve replica (each rank/pod sees its GPU as device 0)."
+    value: "0"
+  SERVE_LAUNCHER:
+    description: "Prefix before trtllm-serve. Set by the env file: 'trtllm-llmapi-launch' on SLURM (MPI world), empty on k8s (single process)."
+    value: ""
+  # DP_MULTIPLICITY, GPUS_PER_DP_RANK, MODEL_PATH, TRTLLM_YAML, TRTLLM_ENV_YAML,
+  # BENCHMARK, SCENARIO, SYSTEM_NAME, TEST_MODE, HARNESS_EXTRA_ARGS come from the
+  # per-experiment <benchmark>_config_sflow.yaml; the backend/operator/mounts come
+  # from the env file.
+
+workflow:
+  name: trtllm_ifb
+  tasks:
+    - name: server
+      replicas:
+        count: ${{ variables.DP_MULTIPLICITY }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_DP_RANK }}
+      # Operator referenced by NAME only -- srun-specific knobs (ntasks/...) live in
+      # slurm_env_sflow.yaml's operator so this stays valid for the k8s operator too.
+      operator: test_container
+      script:
+        # Load env.yaml from the /work mount: print each export to stderr (logged),
+        # then eval to apply it in the current shell.
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML }} | tee /dev/stderr)"
+        # This replica's port; SFLOW_REPLICA_INDEX is injected per replica by sflow.
+        - export PORT=$(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX:-0} ))
+        # SERVE_LAUNCHER is 'trtllm-llmapi-launch' on SLURM (MPI) and empty on k8s.
+        - >
+          NSYS_CMD="";
+          if [ "${{ variables.COLLECT_NSYS }}" = "1" ]; then
+            NSYS_CMD="/usr/local/bin/nsys profile --force-overwrite=true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace=node --capture-range-end=stop --gpu-metrics-devices=0 --wait=all --output ${SFLOW_TASK_OUTPUT_DIR}/nsys_profile-dp${SFLOW_REPLICA_INDEX:-0}";
+          fi;
+          ${NSYS_CMD} ${{ variables.SERVE_LAUNCHER }} trtllm-serve ${{ variables.MODEL_PATH }}
+          --host 0.0.0.0
+          --port ${PORT}
+          --extra_llm_api_options ${{ variables.TRTLLM_YAML }}
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 1800
+          interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: mlperf_harness
+      operator: test_container
+      resources:
+        # CPU-only client on a single node; on this single-node config it shares the
+        # node with the server replicas, so its own node IP is the servers' IP.
+        nodes:
+          count: 1
+      script:
+        # Install nv-mlpinf into this task's container -- only the harness needs it
+        # (trtllm-serve workers don't import nv_mlpinf). PYTHONUNBUFFERED so progress
+        # streams to the task log. `cd /work` matches the srun container_workdir and
+        # is where run_harness resolves repo paths (also fine on k8s).
+        - export PYTHONUNBUFFERED=1
+        - export MLPERF_SCRATCH_PATH=/home/mlperf_inference_storage
+        - cd /work
+        - pip install -e ".[llm]" -q --no-build-isolation
+        # Portable server-host discovery: the harness node IP (== servers' node IP on
+        # this single-node config) comes from SFLOW_TASK_ASSIGNED_NODE_IPS, which
+        # sflow injects for every task on both backends. Build the comma-joined list.
+        - export HOST_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          SERVER_URLS=$(for i in $(seq 0 $(( ${{ variables.DP_MULTIPLICITY }} - 1 ))); do
+          echo "${HOST_IP}:$(( ${{ variables.BASE_PORT }} + i ))";
+          done | paste -sd,)
+        - echo "Server URLs ${SERVER_URLS}"
+        - nv-mlpinf run_harness --benchmarks=${{ variables.BENCHMARK }} --scenarios=${{ variables.SCENARIO }} --system_name=${{ variables.SYSTEM_NAME }} --trtllm_server_urls=${SERVER_URLS} --test_mode=${{ variables.TEST_MODE }} ${{ variables.HARNESS_EXTRA_ARGS }}
+      depends_on:
+        - server

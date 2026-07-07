@@ -143,6 +143,14 @@ class BackendConfig(BaseModel):
     # `0` is allowed and means "CPU-only" (tasks requesting GPUs will be rejected
     # downstream with a clear error).
     gpus_per_node: Optional[Resolvable[int]] = None
+    # Backend-agnostic node include/exclude host lists. Also settable via the
+    # ``--include-nodes`` / ``--exclude-nodes`` CLI flags (which union over these).
+    # Each backend translates them to its native node selection: Slurm
+    # ``--nodelist`` / ``--exclude``, Kubernetes ``nodeAffinity`` In/NotIn, Docker
+    # host-pool filtering. Entries may be ``${{ }}`` expressions and may be comma-
+    # or whitespace-joined (backends normalize after resolution).
+    include_nodes: Optional[List[Resolvable[str]]] = None
+    exclude_nodes: Optional[List[Resolvable[str]]] = None
 
     def container_images(self) -> list[str]:
         """Return backend-owned default operator image references, if any."""
@@ -169,6 +177,53 @@ class BackendConfig(BaseModel):
         if merged == existing:
             return self
         return self.model_copy(update={"extra_args": merged})
+
+    def merge_node_filters(
+        self,
+        include_nodes: list[str] | None,
+        exclude_nodes: list[str] | None,
+    ) -> "BackendConfig":
+        """Return a copy with CLI include/exclude node lists unioned over YAML.
+
+        CLI-provided hosts are appended to any recipe ``include_nodes`` /
+        ``exclude_nodes`` (order preserved, deduped by exact string). Raises if the
+        merge makes a concrete host appear in both lists.
+        """
+        from sflow.utils.node_filters import find_node_filter_overlap, merge_node_lists
+
+        update: dict[str, Any] = {}
+        if include_nodes:
+            update["include_nodes"] = merge_node_lists(self.include_nodes, include_nodes)
+        if exclude_nodes:
+            update["exclude_nodes"] = merge_node_lists(self.exclude_nodes, exclude_nodes)
+        if not update:
+            return self
+        merged = self.model_copy(update=update)
+        overlap = find_node_filter_overlap(
+            [n for n in (merged.include_nodes or []) if not is_expression(n)],
+            [n for n in (merged.exclude_nodes or []) if not is_expression(n)],
+        )
+        if overlap:
+            raise ValueError(
+                f"backend '{self.name}': node(s) {overlap} appear in both "
+                "include_nodes and exclude_nodes after merging CLI flags"
+            )
+        return merged
+
+    @model_validator(mode="after")
+    def _node_filters_must_not_overlap(self) -> "BackendConfig":
+        from sflow.utils.node_filters import find_node_filter_overlap
+
+        overlap = find_node_filter_overlap(
+            [n for n in (self.include_nodes or []) if not is_expression(n)],
+            [n for n in (self.exclude_nodes or []) if not is_expression(n)],
+        )
+        if overlap:
+            raise ValueError(
+                f"backend '{self.name}': node(s) {overlap} appear in both "
+                "include_nodes and exclude_nodes"
+            )
+        return self
 
     @field_validator("gpus_per_node")
     @classmethod

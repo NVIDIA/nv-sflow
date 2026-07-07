@@ -11,7 +11,11 @@ from sflow.core.backend import Allocation, Backend
 from sflow.core.backend_registry import register_backend
 from sflow.core.compute_node import ComputeNode
 from sflow.core.operator import Operator
+from sflow.logging import get_logger
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
+from sflow.utils.node_filters import normalize_node_list, resolve_node_filters
+
+_logger = get_logger(__name__)
 
 
 class LocalBackendConfig(BackendConfig):
@@ -44,6 +48,14 @@ class LocalBackend(Backend):
         self._gpu_per_node = (
             int(config.gpus_per_node) if config.gpus_per_node is not None else None
         )
+        if normalize_node_list(config.include_nodes) or normalize_node_list(
+            config.exclude_nodes
+        ):
+            _logger.warning(
+                "Local backend '%s': --include-nodes/--exclude-nodes are ignored "
+                "(the local backend always runs on this single machine).",
+                self.name,
+            )
 
     def placeholder_allocation(self) -> Allocation:
         count = max(int(self._nodes), 1)
@@ -119,11 +131,15 @@ class LocalBackend(Backend):
                     f"Backend '{conf.name}' gpus_per_node must be >= 0, got {gpus_per_node}"
                 )
 
+        include_nodes, exclude_nodes = resolve_node_filters(resolver, conf, ctx)
+
         return LocalBackendConfig(
             name=conf.name,
             type="local",
             default=bool(getattr(conf, "default", False)),
             nodes=nodes_i,
             gpus_per_node=gpus_per_node,
+            include_nodes=include_nodes,
+            exclude_nodes=exclude_nodes,
             offload_task_logs=bool(getattr(conf, "offload_task_logs", True)),
         )

@@ -33,10 +33,10 @@ def test_run_dry_run_threads_kube_cli_flags(tmp_path: Path):
             "--kube-namespace",
             "team-ns",
             "--extra-kubectl-args=--request-timeout=30s",
-            "--kube-exclude-node",
-            "bad-node-1",
-            "--kube-exclude-node",
-            "bad-node-2",
+            "--include-nodes",
+            "good-node-1",
+            "--exclude-nodes",
+            "bad-node-1,bad-node-2",
             "--workspace-dir",
             str(tmp_path),
             "--output-dir",
@@ -54,5 +54,8 @@ def test_run_dry_run_threads_kube_cli_flags(tmp_path: Path):
     # --kube-namespace overrides the recipe's namespace.
     assert "namespace: team-ns" in result.output
     assert "--request-timeout=30s" in result.output
-    # --kube-exclude-node (repeatable) threads through as a cluster-agnostic CLI flag.
+    # --include-nodes / --exclude-nodes thread through as backend-agnostic node
+    # filters and are surfaced in the kubernetes backend's dry-run details.
+    assert "include_nodes" in result.output and "good-node-1" in result.output
+    assert "exclude_nodes" in result.output
     assert "bad-node-1" in result.output and "bad-node-2" in result.output

@@ -26,6 +26,8 @@ from sflow.cli import DOCS_URL, app
 from sflow.cli._args import (  # split_list_arg re-exported for back-compat
     EnableTaskMonitorOption,
     EnableWorkflowMonitorOption,
+    ExcludeNodesOption,
+    IncludeNodesOption,
     split_list_arg,
 )
 from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
@@ -484,6 +486,8 @@ def _build_multi_backend_driver_directives(
     sbatch_error: str,
     time: str | None,
     leader_extra_args: list[str],
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Build #SBATCH directives + markers for a multi-backend driver job.
 
@@ -513,6 +517,11 @@ def _build_multi_backend_driver_directives(
     component_time = leader.time or time
     if component_time:
         directives.append(f"#SBATCH --time={component_time}")
+    # Steer the driver allocation with the node filters (before extra_args wins).
+    if include_nodes:
+        directives.append(f"#SBATCH --nodelist={','.join(include_nodes)}")
+    if exclude_nodes:
+        directives.append(f"#SBATCH --exclude={','.join(exclude_nodes)}")
     # #SBATCH directives carry only the LEADER backend's merged set (its own
     # extra_args + the CLI --sbatch-extra-args, de-duped by option, CLI wins).
     # The non-leader backends pick the CLI args up at runtime: the generated
@@ -551,6 +560,8 @@ def _generate_sbatch_script(
     sflow_index_url: str | None = None,
     enable_workflow_monitor: bool = False,
     enable_task_monitors: list[str] | None = None,
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
 ) -> str:
     """Generate the content of an sbatch script that wraps ``sflow run``.
 
@@ -591,6 +602,14 @@ def _generate_sbatch_script(
     if output_dir:
         sflow_cmd_parts.extend(["--output-dir", shlex.quote(str(output_dir))])
 
+    # Forward node include/exclude to the inner `sflow run` so every backend
+    # applies them (the leader backend that reuses this allocation post-filters;
+    # backends that salloc themselves get --nodelist/--exclude at runtime).
+    for host in include_nodes or []:
+        sflow_cmd_parts.extend(["--include-nodes", shlex.quote(host)])
+    for host in exclude_nodes or []:
+        sflow_cmd_parts.extend(["--exclude-nodes", shlex.quote(host)])
+
     resolved_extra_args = (
         _resolve_sbatch_extra_args(sbatch_extra_args, files, set_var)
         if sbatch_extra_args
@@ -619,6 +638,8 @@ def _generate_sbatch_script(
                 sbatch_error=sbatch_error,
                 time=time,
                 leader_extra_args=resolved_extra_args,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         )
         generated_by = (
@@ -638,6 +659,12 @@ def _generate_sbatch_script(
             sbatch_directives.append(f"#SBATCH --nodes={nodes}")
         if time:
             sbatch_directives.append(f"#SBATCH --time={time}")
+        # Steer the driver allocation with the node filters (before extra_args so an
+        # explicit --sbatch-extra-args --nodelist/--exclude still wins).
+        if include_nodes:
+            sbatch_directives.append(f"#SBATCH --nodelist={','.join(include_nodes)}")
+        if exclude_nodes:
+            sbatch_directives.append(f"#SBATCH --exclude={','.join(exclude_nodes)}")
         # Include the (single) slurm backend's extra_args, merged with the CLI
         # --sbatch-extra-args and de-duped by option (CLI wins on conflict).
         backend_extra_args = slurm_backends[0].extra_args if slurm_backends else []
@@ -930,6 +957,8 @@ class BatchLauncherRequest:
     sflow_index_url: str | None = None
     enable_workflow_monitor: bool = False
     enable_task_monitors: list[str] | None = None
+    include_nodes: list[str] | None = None
+    exclude_nodes: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1099,6 +1128,8 @@ class SlurmBatchLaunchStrategy:
             sflow_index_url=request.sflow_index_url,
             enable_workflow_monitor=request.enable_workflow_monitor,
             enable_task_monitors=request.enable_task_monitors,
+            include_nodes=request.include_nodes,
+            exclude_nodes=request.exclude_nodes,
         )
 
     def submit(self, script_path: Path) -> str:
@@ -1952,6 +1983,8 @@ def _run_bulk_submit(
     resolve: bool = False,
     enable_workflow_monitor: bool = False,
     enable_task_monitors: list[str] | None = None,
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
 ) -> None:
     """Process multiple self-contained sflow YAML configs as individual batch jobs."""
     import re as _re
@@ -2056,6 +2089,8 @@ def _run_bulk_submit(
                     sbatch_error=sbatch_error,
                     enable_workflow_monitor=enable_workflow_monitor,
                     enable_task_monitors=enable_task_monitors,
+                    include_nodes=include_nodes,
+                    exclude_nodes=exclude_nodes,
                 )
         except Exception as e:
             failed_count += 1
@@ -2124,6 +2159,8 @@ def _run_bulk_submit(
                 sflow_index_url=sflow_index_url,
                 enable_workflow_monitor=enable_workflow_monitor,
                 enable_task_monitors=enable_task_monitors,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         )
         script_path = bulk_dir / f"{job_name}.sh"
@@ -2257,6 +2294,8 @@ def _run_bulk_edit(
     missable_tasks: list[str] | None = None,
     enable_workflow_monitor: bool = False,
     enable_task_monitors: list[str] | None = None,
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
 ) -> None:
     """Generate (and optionally submit) one sbatch job per CSV row.
 
@@ -2388,6 +2427,8 @@ def _run_bulk_edit(
                     sbatch_error=sbatch_error,
                     enable_workflow_monitor=enable_workflow_monitor,
                     enable_task_monitors=enable_task_monitors,
+                    include_nodes=include_nodes,
+                    exclude_nodes=exclude_nodes,
                 )
         except Exception as e:
             failed_count += 1
@@ -2468,6 +2509,8 @@ def _run_bulk_edit(
                 sflow_index_url=sflow_index_url,
                 enable_workflow_monitor=enable_workflow_monitor,
                 enable_task_monitors=enable_task_monitors,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         )
         script_path.write_text(script)
@@ -2588,6 +2631,8 @@ def batch(
     ] = None,
     enable_workflow_monitor: EnableWorkflowMonitorOption = False,
     enable_task_monitor: EnableTaskMonitorOption = None,
+    include_nodes: IncludeNodesOption = None,
+    exclude_nodes: ExcludeNodesOption = None,
     log_level: Annotated[
         str,
         typer.Option(
@@ -2954,6 +2999,8 @@ def batch(
 
     # Accept comma- and/or whitespace-separated task names (and repeated flags).
     enable_task_monitor = split_list_arg(enable_task_monitor)
+    include_nodes = split_list_arg(include_nodes)
+    exclude_nodes = split_list_arg(exclude_nodes)
 
     # Per-invocation override for the per-task log offload. Setting it here makes
     # the in-process dry-run plan reflect the choice; _generate_sbatch_script also
@@ -3043,6 +3090,8 @@ def batch(
                 missable_tasks=missable_tasks,
                 enable_workflow_monitor=enable_workflow_monitor,
                 enable_task_monitors=enable_task_monitor,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         except ValueError as e:
             typer.echo(f"Error: {e}", err=True)
@@ -3107,6 +3156,8 @@ def batch(
                 resolve=resolve,
                 enable_workflow_monitor=enable_workflow_monitor,
                 enable_task_monitors=enable_task_monitor,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         except ValueError as e:
             typer.echo(f"Error: {e}", err=True)
@@ -3190,6 +3241,8 @@ def batch(
                 sbatch_error=sbatch_error,
                 enable_workflow_monitor=enable_workflow_monitor,
                 enable_task_monitors=enable_task_monitor,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         typer.echo("✓ Dry-run validation passed\n")
     except ValueError as e:
@@ -3230,6 +3283,8 @@ def batch(
             sflow_index_url=sflow_index_url,
             enable_workflow_monitor=enable_workflow_monitor,
             enable_task_monitors=enable_task_monitor,
+            include_nodes=include_nodes,
+            exclude_nodes=exclude_nodes,
         )
     )
 

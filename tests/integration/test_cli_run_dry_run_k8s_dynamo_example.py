@@ -100,8 +100,13 @@ def test_k8s_dynamo_dry_run_multinode_worker_spans_nodes(tmp_path: Path):
     [
         ("kubernetes_dynamo_trtllm_agg.yaml", ["agg_server_0"]),
         ("kubernetes_dynamo_sglang_agg.yaml", ["agg_server_0"]),
+        ("kubernetes_dynamo_vllm_agg.yaml", ["agg_server_0"]),
         (
             "kubernetes_dynamo_sglang_disagg.yaml",
+            ["prefill_server_0", "decode_server_0"],
+        ),
+        (
+            "kubernetes_dynamo_vllm_disagg.yaml",
             ["prefill_server_0", "decode_server_0"],
         ),
     ],

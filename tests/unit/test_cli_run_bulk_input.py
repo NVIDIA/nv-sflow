@@ -451,6 +451,40 @@ def test_cli_run_specific_extra_args_override_generic(mock_sflow_app, tmp_path):
     assert by_type["docker"] == ["--gres=gpu:1"]
 
 
+def test_cli_run_generic_extra_args_flagged_generic_for_kubectl(mock_sflow_app, tmp_path):
+    """Generic --extra-args routed to kubectl are flagged as generic-origin so the
+    k8s backend can warn they are being applied as kubectl global flags."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        ["run", "-f", str(wf), "--dry-run", "--extra-args", "--gpus-per-node=4"],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kube_cfg = mock_sflow_app.run.call_args.kwargs["kubectl_config"]
+    assert kube_cfg.extra_args == ["--gpus-per-node=4"]
+    assert kube_cfg.generic_extra_args == ["--gpus-per-node=4"]
+
+
+def test_cli_run_explicit_kubectl_args_not_flagged_generic(mock_sflow_app, tmp_path):
+    """An explicit --extra-kubectl-args value is intentional, so it is NOT flagged
+    as generic-origin (no misrouting warning). A generic arg on a different option
+    is still flagged."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "run", "-f", str(wf), "--dry-run",
+            "--extra-args", "--foo=1",
+            "--extra-kubectl-args", "--request-timeout=30s",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kube_cfg = mock_sflow_app.run.call_args.kwargs["kubectl_config"]
+    assert kube_cfg.extra_args == ["--foo=1", "--request-timeout=30s"]
+    # Only the generic --foo is flagged; the explicit --request-timeout is not.
+    assert kube_cfg.generic_extra_args == ["--foo=1"]
+
+
 # -- Shared batch helper unit tests --
 
 

@@ -152,6 +152,11 @@ class Orchestrator:
                         and time.time() < task.next_retry_at
                     ):
                         continue
+                    # Merge-pod follower: it runs as a background process inside its
+                    # leader's shared pod, never as its own pod. The leader promotes
+                    # it to RUNNING (below); skip launching it here.
+                    if getattr(task, "is_merge_follower", False):
+                        continue
                     _logger.info(f"Submitting task: {task.name}")
                     self._record_summary("task_unblocked", task)
                     task.attempts = int(getattr(task, "attempts", 0)) + 1
@@ -165,6 +170,11 @@ class Orchestrator:
                     # Fire this task's monitor trigger (start collectors on its
                     # nodes, or reuse if already running for another consumer).
                     await self._acquire_task_monitor(task)
+                    # Merge-pod leader: its followers run as background processes in
+                    # the same pod, so promote them to RUNNING alongside it. Each
+                    # keeps its own <task>.log + probes but is never launched alone.
+                    if getattr(task, "is_merge_leader", False):
+                        await self._promote_merge_followers(task)
 
                 # Update task statuses based on completed subprocesses
                 finished = []
@@ -243,6 +253,12 @@ class Orchestrator:
                             reason=f"cancelled after task '{t.name}' failed: {reason}",
                         )
                         raise
+
+                    # Merge-pod leader finished: mirror its outcome onto the
+                    # followers that ran inside its shared pod (never launched on
+                    # their own, so nothing else resolves them).
+                    if getattr(t, "is_merge_leader", False):
+                        await self._propagate_merge_leader_status(t)
 
                 for name in finished:
                     ft = self.workflow.get_task(name)
@@ -505,6 +521,7 @@ class Orchestrator:
                 return
             task.status = TaskStatus.READY
             self._record_summary("task_ready", task)
+            self._surface_network_fallback(task)
             for fname in getattr(task, "readiness_followers", []):
                 try:
                     ftask = self.workflow.get_task(fname)
@@ -513,6 +530,7 @@ class Orchestrator:
                 if ftask.status == TaskStatus.RUNNING:
                     ftask.status = TaskStatus.READY
                     self._record_summary("task_ready", ftask)
+                    self._surface_network_fallback(ftask)
                     _logger.info(
                         f"Task '{fname}' set to READY (follows probe from '{task.name}')"
                     )
@@ -745,6 +763,121 @@ class Orchestrator:
                         exit_code=exit_code,
                     )
             self._subprocess_tasks.pop(name, None)
+
+    async def _promote_merge_followers(self, leader: Task) -> None:
+        """Start a merge leader's followers alongside it (they share the leader's pod).
+
+        Merge-pod followers are never in ``get_tasks_to_submit`` output we act on
+        (the submit loop skips them): they run as background processes inside the
+        leader's single container. When the leader is submitted, promote each
+        still-unstarted follower to RUNNING -- resetting its probes and acquiring its
+        monitor -- so its own readiness/failure probes and <task>.log are evaluated
+        exactly like a normally launched task, without launching a second pod.
+        """
+        for name in getattr(leader, "merge_members", []) or []:
+            if name == leader.name:
+                continue
+            try:
+                follower = self.workflow.get_task(name)
+            except KeyError:
+                continue
+            if follower.status != TaskStatus.INITIATED:
+                continue
+            follower.attempts = int(getattr(follower, "attempts", 0)) + 1
+            for p in getattr(follower, "probes", []) or []:
+                p.reset()
+            self._record_summary("task_submitted", follower)
+            follower.status = TaskStatus.RUNNING
+            await self._acquire_task_monitor(follower)
+
+    async def _propagate_merge_leader_status(self, leader: Task) -> None:
+        """Mirror a finished merge leader's terminal outcome onto its followers.
+
+        The merged pod is one unit: its single container exit code is the leader's,
+        and the followers ran inside it. So when the leader resolves, resolve each
+        non-terminal follower the same way -- finalize on success (parsing its own
+        <task>.log + running its uploads), fail/cancel on failure/cancel, or reset to
+        INITIATED when the leader is retrying so it re-promotes on the next attempt.
+        Followers already terminal (e.g. a service that reached READY) are left as-is.
+        """
+        status = leader.status
+        for name in getattr(leader, "merge_members", []) or []:
+            if name == leader.name:
+                continue
+            try:
+                follower = self.workflow.get_task(name)
+            except KeyError:
+                continue
+            if follower.status.is_terminal():
+                continue
+            if status == TaskStatus.COMPLETED:
+                follower.exit_code = 0
+                await self._finalize_successful_task(follower)
+            elif status == TaskStatus.INITIATED:
+                # Leader is retrying -> reset so the next submit re-promotes it.
+                follower.status = TaskStatus.INITIATED
+            elif status == TaskStatus.CANCELLED:
+                follower.status = TaskStatus.CANCELLED
+                self._record_summary(
+                    "task_cancelled", follower, reason="merge leader cancelled"
+                )
+            else:  # FAILED / TIMEOUT
+                follower.exit_code = leader.exit_code
+                follower.status = TaskStatus.FAILED
+                self._record_summary(
+                    "task_failed",
+                    follower,
+                    reason=f"merge leader '{leader.name}' failed",
+                )
+
+    def _surface_network_fallback(self, task: Task) -> None:
+        """Warn + record when a task's pod(s) degraded RDMA -> TCP at runtime.
+
+        Best-effort and duck-typed: operators that expose
+        ``network_fallback_status`` (currently the k8s container operator) report
+        whether the in-pod RDMA preamble fell back to slow sockets -- invisible to
+        the driver because the pod log stream is offloaded straight to disk. Called
+        once, when the task goes READY, so silent slow-TCP KV/NCCL transport is
+        surfaced in the log and the run summary. Never raises.
+        """
+        operator = getattr(task, "operator", None)
+        probe_fn = getattr(operator, "network_fallback_status", None)
+        if probe_fn is None:
+            return
+        try:
+            status = probe_fn(task)
+        except Exception:
+            _logger.debug("network_fallback_status hook failed", exc_info=True)
+            return
+        if status is None:
+            return
+        messages: list[str] = []
+        if getattr(status, "degraded_to_tcp", False):
+            messages.append(
+                f"RDMA was requested but {status.pods_degraded}/{status.pods_total} "
+                f"pod(s) fell back to slow TCP for KV/NCCL/NIXL transport "
+                f"({status.reason}). Expect low interconnect performance."
+            )
+        if getattr(status, "ucx_intra_node_tcp", False):
+            transport = getattr(status, "ucx_transport", "") or "tcp"
+            messages.append(
+                f"UCX selected TCP for intra-node transport ({transport}); "
+                "cuda_ipc/NVLink is not active. Expect low KV transfer performance. "
+                "Intra-node, use regular (non-VMM) KV memory so classic cuda_ipc "
+                "rides NVLink. For cross-node MNNVL this needs BOTH an IMEX "
+                "ComputeDomain channel (set dra.use_compute_domain_channel to a name "
+                "or 'auto') AND the framework's fabric/VMM KV memory (e.g. vLLM "
+                "--enable-sleep-mode + UCX_CUDA_IPC_ENABLE_MNNVL=y, recipe-owned)."
+            )
+        if getattr(status, "gpudirect_rdma_unavailable", False):
+            reason = getattr(status, "gpudirect_rdma_reason", "") or "unknown reason"
+            messages.append(
+                f"GPUDirect RDMA unavailable ({reason}). RDMA may stage GPU "
+                "buffers through host memory; expect lower KV/NCCL performance."
+            )
+        for message in messages:
+            _logger.warning("Task '%s': %s", task.name, message)
+            self._record_summary("record_network_warning", task, message)
 
     def _record_summary(self, method_name: str, *args: Any, **kwargs: Any) -> None:
         # Mirror task lifecycle transitions onto the monitor timeline (best-effort,

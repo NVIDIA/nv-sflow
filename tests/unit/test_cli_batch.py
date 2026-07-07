@@ -68,6 +68,43 @@ workflow:
     return workflow_file
 
 
+def test_batch_node_filters_emit_sbatch_directives_and_forward_to_inner_run(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """--include-nodes/--exclude-nodes add #SBATCH --nodelist/--exclude and forward
+    to the inner `sflow run`."""
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "2",
+            "--sbatch-path",
+            str(sbatch_path),
+            "--include-nodes",
+            "node001,node002",
+            "--exclude-nodes",
+            "bad001",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert "#SBATCH --nodelist=node001,node002" in script_content
+    assert "#SBATCH --exclude=bad001" in script_content
+    # Forwarded to the inner sflow run so every backend applies them.
+    assert "--include-nodes node001" in script_content
+    assert "--exclude-nodes bad001" in script_content
+
+
 def test_batch_sbatch_extra_args_single(mock_sflow_app, temp_workflow_file, tmp_path):
     """Test that --sbatch-extra-args adds a single directive."""
     sbatch_path = tmp_path / "test.sh"

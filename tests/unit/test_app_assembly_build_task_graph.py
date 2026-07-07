@@ -568,6 +568,99 @@ def test_build_task_graph_k8s_multinode_sizes_to_requested_node_count():
     assert "kubectl logs -f" not in shell
 
 
+def test_build_task_graph_merges_colocated_gpu_pods_into_one_pod():
+    # End-to-end: with merge_colocated_gpu_pods, two GPU tasks the planner packs
+    # onto one node become a single merged pod requesting the union of their GPUs.
+    from sflow.core.operator_registry import ensure_builtin_operators_registered
+    from sflow.plugins.backends.kubernetes import (
+        KubernetesBackend,
+        KubernetesBackendConfig,
+    )
+
+    ensure_builtin_operators_registered()
+    state = _state()
+    backend = KubernetesBackend(
+        KubernetesBackendConfig(
+            name="k8s",
+            type="kubernetes",
+            namespace="default",
+            nodes=1,
+            gpus_per_node=8,
+            merge_colocated_gpu_pods=True,
+        )
+    )
+    backend.allocation = backend.placeholder_allocation()
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "k8s",
+                "type": "kubernetes",
+                "default": True,
+                "namespace": "default",
+                "nodes": 1,
+                "gpus_per_node": 8,
+                "merge_colocated_gpu_pods": True,
+            }
+        ],
+        operators=[{"name": "server", "type": "k8s", "image": "img:1"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="decode",
+                    operator="server",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0]),
+                        gpus=GpuResourceConfig(count=4),
+                    ),
+                    script=["run-decode"],
+                ),
+                TaskConfig(
+                    name="prefill",
+                    operator="server",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0]),
+                        gpus=GpuResourceConfig(count=2),
+                    ),
+                    script=["run-prefill"],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    leader = tg.get_task("decode")  # deterministic leader = first member by name
+    follower = tg.get_task("prefill")
+    assert leader.merge_members == ["decode", "prefill"]
+    assert follower.merge_leader == "decode"
+
+    # The leader renders exactly ONE pod requesting the union of GPUs (4 + 2 = 6),
+    # with both members' scripts mounted in the merged launcher's ConfigMap.
+    shell = leader.launch_command.as_list()[2]
+    start = shell.index("<<'SFLOW_K8S_MANIFEST'")
+    body_start = shell.index("\n", start) + 1
+    body_end = shell.index("\nSFLOW_K8S_MANIFEST", body_start)
+    manifest = json.loads(shell[body_start:body_end])
+    pods = [i for i in manifest["items"] if i["kind"] == "Pod"]
+    # The merged pod is named after its members (decode + prefill), not the leader
+    # alone, so it's clear in `kubectl get pods` that it runs several tasks.
+    assert len(pods) == 1
+    assert pods[0]["metadata"]["name"].startswith("merged-decode-prefill-")
+    rct = [i for i in manifest["items"] if i["kind"] == "ResourceClaimTemplate"][0]
+    assert rct["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"] == 6
+    cm = [
+        i
+        for i in manifest["items"]
+        if i["kind"] == "ConfigMap" and "entrypoint.sh" in i.get("data", {})
+    ][0]
+    assert cm["data"]["merge_decode.sh"] == "run-decode"
+    assert cm["data"]["merge_prefill.sh"] == "run-prefill"
+
+
 def test_build_task_graph_rejects_explicit_indices_on_non_placement_backend():
     # Count-only is allowed, but picking specific nodes (indices/exclude) is not.
     state = _state()

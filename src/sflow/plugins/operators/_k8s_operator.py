@@ -15,6 +15,7 @@ node IPs, placeholder pods to hand off) is injected via ``apply_backend_context`
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import Callable, Mapping, Sequence
@@ -30,9 +31,15 @@ from sflow.core.command import Command
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.logging import get_logger
 from sflow.plugins.operators import _k8s_lifecycle as k8s_lifecycle
+from sflow.plugins.operators._k8s_rdma_preamble import (
+    RdmaRuntimeStatus,
+    build_rdma_affinity_preamble,
+    parse_rdma_runtime_status,
+)
 from sflow.plugins.operators._k8s_render import (
     DEFAULT_GPU_TOLERATION,
     SFLOW_ENTRYPOINT_FILE,
+    SFLOW_SCRIPT_DIR,
     render_configmap,
     render_resource_claim_template,
     render_task_pod,
@@ -40,7 +47,9 @@ from sflow.plugins.operators._k8s_render import (
 from sflow.plugins.operators._k8s_shell import (
     build_apply_command,
     build_log_stream_command,
+    build_merged_apply_command,
     configmap_data_key,
+    merged_launcher_lines,
     namespace_segment,
     sanitize_name,
 )
@@ -48,6 +57,11 @@ from sflow.utils.container import validate_container_image_reference
 from sflow.utils.gpu import parse_cuda_visible_devices
 
 _logger = get_logger(__name__)
+
+# The in-pod RDMA decision marker is printed at container start, so only the
+# log's leading bytes need scanning to detect an RDMA->TCP fallback -- bounding
+# the read keeps this cheap even for tasks with large (e.g. pip/vllm) logs.
+_RDMA_SCAN_MAX_BYTES = 256 * 1024
 
 
 @dataclass
@@ -69,6 +83,15 @@ class _K8sExecPlan:
     cleanup_refs: list[str]
     global_args: list[str] = field(default_factory=list)
     ns_args: list[str] = field(default_factory=list)
+    # Merge-pod mode: when set, the single pod runs several members' scripts and
+    # its one (unprefixed) log stream is demuxed into these per-task ``<task>.log``
+    # files (task name -> path). ``merge_launcher_env`` is the prefix-namespaced env
+    # the apply command reads to build each member's isolated env Secret.
+    merge_tag_paths: dict[str, str] | None = None
+    merge_launcher_env: dict[str, str] | None = None
+    # Leader task name used to tag pod-level (untagged) merge lines in the console
+    # echo; per-member lines are tagged with their own task name by the demuxer.
+    merge_console_label: str | None = None
 
 
 class K8sContainerOperatorConfig(OperatorConfig):
@@ -159,6 +182,9 @@ class K8sContainerOperator(Operator):
         self._host_network: bool = (
             bool(config.host_network) if config.host_network is not None else False
         )
+        # Share the node IPC namespace + /dev/shm (cross-pod CUDA IPC / NVLink).
+        # Backend-driven only (no operator-level override); set in apply_backend_context.
+        self._host_ipc: bool = False
         self._node_selector: dict[str, str] | None = config.node_selector
         self._tolerations: list[dict[str, Any]] | None = config.tolerations
         self._shm_size: str | None = config.shm_size
@@ -191,6 +217,35 @@ class K8sContainerOperator(Operator):
         # GKE gIB libs + NCCL tuning script for multi-node NCCL over RDMA.
         self._rdma_lib_mounts: list[tuple[str, str]] = []
         self._rdma_nccl_env_script: str = ""
+        # Host device dirs (e.g. /dev/infiniband) to hostPath-mount, and whether
+        # RDMA pods need CAP_IPC_LOCK -- from the backend's resolved RDMA plan
+        # (host-device provider grants verbs access this way, not via a resource).
+        self._rdma_host_device_paths: list[str] = []
+        self._rdma_ipc_lock: bool = False
+        # Whether GPU pods pick their GPU-local RDMA NIC at runtime (host-device /
+        # shared-device-plugin providers): the operator injects the affinity
+        # preamble and skips the build-time per-pod NIC pin. See _k8s_rdma_preamble.
+        self._rdma_runtime_affinity: bool = False
+        # DRA GPU<->NIC topology co-allocation (opt-in via backend dra.rdma_*).
+        self._dra_rdma_device_class: str | None = None
+        self._dra_rdma_match_attribute: str = "resource.kubernetes.io/pcieRoot"
+        # Merge-pod mode (set by apply_merge_group when this task leads a merge
+        # group): the ordered member Task objects sharing this leader's single pod,
+        # and the union GPU count the one container requests. Empty => normal task.
+        self._merge_members: list[Any] = []
+        self._merge_union_gpus: int = 0
+
+    def apply_merge_group(self, *, members: Sequence[Any], union_gpus: int) -> None:
+        """Mark this operator as a merge-pod leader (see ``_plan_merge_groups``).
+
+        ``members`` are the ordered member Task objects (leader first) whose scripts
+        run as concurrent background processes in this leader's single container;
+        ``union_gpus`` is the total GPUs that container requests so every member
+        sees every GPU (NVLink/cuda_ipc). Their live ``script``/``envs`` and packed
+        ``merge_cuda_visible_devices`` are read at build/execute time.
+        """
+        self._merge_members = list(members)
+        self._merge_union_gpus = int(union_gpus)
 
     def apply_backend_context(
         self,
@@ -221,6 +276,19 @@ class K8sContainerOperator(Operator):
         self._rdma_nccl_env_script = str(
             getattr(backend, "rdma_nccl_env_script", "") or ""
         )
+        self._rdma_host_device_paths = [
+            str(p) for p in (getattr(backend, "rdma_host_device_paths", None) or [])
+        ]
+        self._rdma_ipc_lock = bool(getattr(backend, "rdma_ipc_lock", False))
+        self._rdma_runtime_affinity = bool(
+            getattr(backend, "rdma_runtime_affinity", False)
+        )
+        dra_nic = getattr(backend, "dra_rdma_device_class", None)
+        self._dra_rdma_device_class = str(dra_nic) if dra_nic is not None else None
+        self._dra_rdma_match_attribute = str(
+            getattr(backend, "dra_rdma_match_attribute", None)
+            or "resource.kubernetes.io/pcieRoot"
+        )
         self._scheduling = str(getattr(backend, "scheduling", "dra"))
         self._gpu_device_class = self.config.device_class or str(
             getattr(backend, "gpu_device_class", "gpu.nvidia.com")
@@ -235,6 +303,7 @@ class K8sContainerOperator(Operator):
             self._host_network = self.config.host_network
         else:
             self._host_network = bool(getattr(backend, "host_network", False))
+        self._host_ipc = bool(getattr(backend, "host_ipc", False))
         if self.config.node_selector is not None:
             self._node_selector = self.config.node_selector
         else:
@@ -289,11 +358,11 @@ class K8sContainerOperator(Operator):
                     if pod:
                         self._handoff_pods.append(pod)
 
-        # dra multi-node NVLink/IMEX: pods claim a ComputeDomain channel.
-        self._compute_domain_channel = (
-            getattr(backend, "compute_domain_channel", None)
-            if self._scheduling == "dra"
-            else None
+        # NVLink (MNNVL / IMEX): pods claim a ComputeDomain channel when the backend
+        # created one. Independent of GPU scheduling -- device_plugin GPU pods can
+        # also claim an IMEX channel (DRA ComputeDomain-only driver).
+        self._compute_domain_channel = getattr(
+            backend, "compute_domain_channel", None
         )
 
         # CLI-level kube access flags, applied to every kubectl call in the wrapper.
@@ -328,7 +397,9 @@ class K8sContainerOperator(Operator):
             return min(slots)
         return replica_index * self._per_pod_gpus
 
-    def _rdma_pod_nics(self, gpu_slot_start: int) -> tuple[list[str], list[str]]:
+    def _rdma_pod_nics(
+        self, gpu_slot_start: int, *, gpus: int | None = None
+    ) -> tuple[list[str], list[str]]:
         """Per-pod RDMA NIC slice as ``(resource_names, hca_names)``.
 
         Assigns ``per_pod_gpus`` of the node's RDMA NICs starting at this pod's
@@ -336,12 +407,17 @@ class K8sContainerOperator(Operator):
         the GPUs the pod occupies. Because the planner packs co-located pods onto
         disjoint GPU slots (e.g. prefill 0-1 / 2-3, decode 4-7), their NIC windows
         come out disjoint too -- and each NIC sits next to its GPU (mlx5_N next to
-        GPU N). The matching ``hca_names`` drive ``UCX_NET_DEVICES`` /
-        ``NCCL_IB_HCA``. Returns ``([], [])`` when the RDMA fast path is off or the
-        task requests no GPUs.
+        GPU N). The matching ``hca_names`` drive ``NCCL_IB_HCA`` when build-time
+        pinning applies. UCX device selection is left to the library. Returns
+        ``([], [])`` when the RDMA fast path is off or the task requests no GPUs.
+        Extended-resource names are de-duped and empty ones
+        (host-device provider, which grants access via a device mount not a
+        resource) are dropped, so the returned resource list is what the pod
+        actually requests as limits. ``gpus`` overrides the slice size (merge-pod
+        mode passes the union GPU count for its single container).
         """
         nics = len(self._rdma_nic_specs)
-        gpus = self._per_pod_gpus
+        gpus = self._per_pod_gpus if gpus is None else gpus
         if not (self._rdma_enabled and gpus > 0 and nics):
             return [], []
         if gpus >= nics:
@@ -350,18 +426,23 @@ class K8sContainerOperator(Operator):
             offset = gpu_slot_start % nics
             chosen = [(offset + k) % nics for k in range(gpus)]
         specs = [self._rdma_nic_specs[j] for j in chosen]
-        return [res for res, _hca in specs], [hca for _res, hca in specs]
+        resources: list[str] = []
+        seen: set[str] = set()
+        for res, _hca in specs:
+            if res and res not in seen:
+                seen.add(res)
+                resources.append(res)
+        return resources, [hca for _res, hca in specs]
 
     def _gib_preamble(self, hcas: list[str]) -> list[str]:
         """Shell lines enabling GKE gIB NCCL (GPUDirect-RDMA) for a multi-node pod.
 
         Prepends the node's NVIDIA driver libs to ``LD_LIBRARY_PATH``, sources
-        GKE's NCCL tuning, then re-pins ``NCCL_IB_HCA`` / ``UCX_NET_DEVICES`` to
-        this pod's granted NIC subset (``set_nccl_env.sh`` otherwise selects all
-        node NICs, which a partial-node pod cannot access).
+        GKE's NCCL tuning, then re-pins ``NCCL_IB_HCA`` to this pod's granted NIC
+        subset (``set_nccl_env.sh`` otherwise selects all node NICs, which a
+        partial-node pod cannot access). UCX device selection is left to the library.
         """
         ib = ",".join(hcas)
-        ucx = ",".join(f"{h}:1" for h in hcas)
         lines = ["export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"]
         if self._rdma_nccl_env_script:
             lines.append(
@@ -369,7 +450,6 @@ class K8sContainerOperator(Operator):
                 f"source {self._rdma_nccl_env_script} || true"
             )
         lines.append(f"export NCCL_IB_HCA={ib}")
-        lines.append(f"export UCX_NET_DEVICES={ucx}")
         return lines
 
     def _covering_pvc(self, path_str: str) -> dict[str, Any] | None:
@@ -500,6 +580,256 @@ class K8sContainerOperator(Operator):
                 f"could not persist k8s manifest for '{task_name}': {exc}"
             )
 
+    def _merged_pod_base(self) -> str:
+        """DNS-1123 base name for the merged pod + its objects (cfg/secrets/RCT).
+
+        A merge pod runs several tasks, so naming it after the leader alone (e.g.
+        ``decode-server-0``) is misleading in ``kubectl get pods``. Instead build
+        ``merged-<distinct member base names>-<hash>`` -- the distinct base names
+        (replicas collapse to their config task name, e.g. ``decode-server``) show
+        what the pod runs, and a short stable hash of the concrete member set keeps
+        it unique across nodes when the same task types are merged per node.
+        """
+        bases: list[str] = []
+        seen: set[str] = set()
+        for m in self._merge_members:
+            raw = str(getattr(m, "base_name", None) or getattr(m, "name", ""))
+            b = sanitize_name(raw)
+            if b and b not in seen:
+                seen.add(b)
+                bases.append(b)
+        label = "-".join(bases)[:48].strip("-") or "tasks"
+        names = sorted(str(getattr(m, "name", "")) for m in self._merge_members)
+        digest = hashlib.sha1("\n".join(names).encode()).hexdigest()[:6]
+        return sanitize_name(f"merged-{label}-{digest}")
+
+    def _build_merged_execution_plan(
+        self, *, task_name: str, envs: Mapping[str, str]
+    ) -> _K8sExecPlan:
+        """Build the plan for a merge-pod leader: one pod, one container, N members.
+
+        The single container requests the union of the members' GPUs (so every
+        member process sees every GPU -> NVLink/cuda_ipc) and runs the merged
+        launcher, which starts each member's script as a background process with its
+        packed ``CUDA_VISIBLE_DEVICES`` and its own sourced env file. Each member's
+        output is tagged so the driver demuxes the single container log into per-task
+        ``<task>.log`` files (``merge_tag_paths``). Member env is created as one
+        Secret file per member from a prefix-namespaced launcher env
+        (``merge_launcher_env``), avoiding a container-wide ``envFrom`` collision.
+        """
+        if not self._image:
+            raise ValueError(
+                f"k8s operator '{self.config.name}' has no image configured; set "
+                "'image' on the operator (the kubernetes backend has no image)."
+            )
+        c = self.config
+        # Name the pod (+ its ConfigMap/Secrets/RCT) after the merged members, not
+        # the leader alone, so `kubectl get pods` isn't misleading. The <task>.log /
+        # <task>.k8s.yaml still live under the leader task's output dir (task_name).
+        base = self._merged_pod_base()
+        members = self._merge_members
+        union_gpus = int(self._merge_union_gpus)
+        configmap_name = sanitize_name(f"{base}-cfg")
+        rct_name = (
+            sanitize_name(f"{base}-gpu")
+            if self._scheduling == "dra" and union_gpus > 0
+            else None
+        )
+        tolerations = self._effective_tolerations()
+
+        # RDMA NIC slice sized to the union (the one container holds every GPU).
+        rdma_nic_resources, rdma_hcas = self._rdma_pod_nics(0, gpus=union_gpus)
+        dra_coalloc = bool(
+            self._scheduling == "dra"
+            and self._dra_rdma_device_class
+            and union_gpus > 0
+        )
+        runtime_affinity = (
+            bool(rdma_hcas) and self._rdma_runtime_affinity
+        ) or dra_coalloc
+        # The RDMA affinity preamble runs once in the launcher's parent shell (its
+        # NCCL/UCX env is inherited by every member subshell).
+        preamble: list[str] = []
+        if runtime_affinity:
+            preamble = build_rdma_affinity_preamble(
+                self._network_env.get("SFLOW_PRIMARY_IFACE", "")
+            )
+
+        # Per-member scripts, env Secrets, packed CVD, and demux targets -- read
+        # live from the member Task objects (script/envs finalized by assembly +
+        # configure_task_runtime).
+        cm_data: dict[str, str] = {}
+        launcher_members: list[tuple[str, str, str, str]] = []
+        env_file_secrets: list[tuple[str, str]] = []
+        member_env_secrets: list[tuple[str, list[tuple[str, str]]]] = []
+        combined_env: dict[str, str] = {}
+        merge_tag_paths: dict[str, str] = {}
+        cleanup_secret_refs: list[str] = []
+        artifact_scan: list[str] = list(preamble)
+        for i, m in enumerate(members):
+            m_name = str(getattr(m, "name"))
+            m_script = list(getattr(m, "script", []) or [])
+            m_envs = {
+                str(k): str(v)
+                for k, v in dict(getattr(m, "envs", {}) or {}).items()
+            }
+            cvd = str(getattr(m, "merge_cuda_visible_devices", "") or "")
+            script_key = configmap_data_key(f"merge_{m_name}.sh")
+            cm_data[script_key] = "\n".join(m_script)
+            artifact_scan.extend(m_script)
+            script_path = f"{SFLOW_SCRIPT_DIR}/{script_key}"
+            env_path = f"{SFLOW_SCRIPT_DIR}/menv/{sanitize_name(m_name)}/envsh"
+            launcher_members.append((m_name, cvd, script_path, env_path))
+            prefix = f"SFMERGE{i}__"
+            key_pairs = [(k, f"{prefix}{k}") for k in m_envs]
+            if key_pairs:
+                secret_name = sanitize_name(f"{base}-menv-{i}")
+                member_env_secrets.append((secret_name, key_pairs))
+                env_file_secrets.append((secret_name, env_path))
+                cleanup_secret_refs.append(f"secret/{secret_name}")
+                for k, v in m_envs.items():
+                    combined_env[f"{prefix}{k}"] = v
+            out = m_envs.get("SFLOW_TASK_OUTPUT_DIR")
+            if out:
+                merge_tag_paths[m_name] = os.path.join(out, f"{m_name}.log")
+
+        launcher = merged_launcher_lines(launcher_members, preamble_lines=preamble)
+
+        cm_art_data, file_mounts, host_path_mounts, pvc_mounts = (
+            self._artifact_injection(artifact_scan)
+        )
+        artifacts_cm_name = sanitize_name(f"{base}-artifacts") if cm_art_data else None
+
+        items: list[dict[str, Any]] = [
+            render_configmap(
+                name=configmap_name,
+                namespace=self._namespace,
+                data={SFLOW_ENTRYPOINT_FILE: "\n".join(launcher), **cm_data},
+                task_label=base,
+                allocation_id=self._allocation_id,
+            )
+        ]
+        if artifacts_cm_name is not None:
+            items.append(
+                render_configmap(
+                    name=artifacts_cm_name,
+                    namespace=self._namespace,
+                    data=cm_art_data,
+                    task_label=base,
+                    allocation_id=self._allocation_id,
+                )
+            )
+        if rct_name is not None:
+            items.append(
+                render_resource_claim_template(
+                    name=rct_name,
+                    namespace=self._namespace,
+                    device_class=self._gpu_device_class,
+                    count=union_gpus,
+                    selectors=self._device_selectors,
+                    task_label=base,
+                    allocation_id=self._allocation_id,
+                    nic_device_class=(
+                        self._dra_rdma_device_class if dra_coalloc else None
+                    ),
+                    nic_count=union_gpus if dra_coalloc else None,
+                    match_attribute=self._dra_rdma_match_attribute,
+                )
+            )
+
+        extra_env: dict[str, str] = {}
+        extra_env.update(self._network_env)
+        if rdma_hcas and not runtime_affinity:
+            extra_env["NCCL_IB_HCA"] = ",".join(rdma_hcas)
+
+        items.append(
+            render_task_pod(
+                pod_name=base,
+                image=self._image,
+                configmap_name=configmap_name,
+                namespace=self._namespace,
+                image_pull_policy=c.image_pull_policy,
+                restart_policy=c.restart,
+                env_secret_name=None,
+                scheduling=self._scheduling,
+                per_pod_gpus=union_gpus,
+                resource_claim_name=rct_name,
+                host_network=self._host_network,
+                host_ipc=self._host_ipc,
+                node_selector=self._node_selector,
+                assigned_node=self._pin_node(0),
+                tolerations=tolerations,
+                extra_env=extra_env or None,
+                compute_domain_channel=(
+                    self._compute_domain_channel if union_gpus > 0 else None
+                ),
+                task_label=base,
+                allocation_id=self._allocation_id,
+                artifacts_configmap_name=artifacts_cm_name,
+                file_artifact_mounts=file_mounts,
+                host_path_mounts=host_path_mounts,
+                pvc_mounts=pvc_mounts,
+                shm_size=self._shm_size,
+                rdma_nic_resources=rdma_nic_resources,
+                rdma_ipc_lock=(bool(rdma_hcas) and self._rdma_ipc_lock) or dra_coalloc,
+                rdma_host_device_paths=(
+                    self._rdma_host_device_paths if rdma_hcas else []
+                ),
+                rdma_lib_mounts=[],
+                env_file_secrets=env_file_secrets,
+            )
+        )
+
+        manifest = {"apiVersion": "v1", "kind": "List", "items": items}
+        self._persist_rendered_manifest(manifest, task_name=task_name, envs=envs)
+
+        ns_seg = namespace_segment(self._namespace)
+        ns_args = ["--namespace", self._namespace] if self._namespace else []
+        global_args = list(self._kubectl_global_args)
+        pod_refs = [f"pod/{base}"]
+
+        task_out = envs.get("SFLOW_TASK_OUTPUT_DIR")
+        task_log_path = (
+            os.path.join(task_out, f"{task_name}.log") if task_out else None
+        )
+
+        cleanup_refs = [*pod_refs, f"configmap/{configmap_name}"]
+        if artifacts_cm_name is not None:
+            cleanup_refs.append(f"configmap/{artifacts_cm_name}")
+        cleanup_refs.extend(cleanup_secret_refs)
+        if rct_name is not None:
+            cleanup_refs.append(f"resourceclaimtemplate.resource.k8s.io/{rct_name}")
+
+        apply_command = build_merged_apply_command(
+            manifest_json=json.dumps(manifest, separators=(",", ":")),
+            ns_seg=ns_seg,
+            pod_name=base,
+            member_env_secrets=member_env_secrets,
+            handoff_delete_pods=self._handoff_pods,
+            kubectl_global_args=global_args,
+            allocation_id=self._allocation_id,
+        )
+        log_stream_commands = [
+            build_log_stream_command(
+                pod_refs[0],
+                ns_args=ns_args,
+                kubectl_global_args=global_args,
+                prefix=False,
+            )
+        ]
+        return _K8sExecPlan(
+            apply_command=apply_command,
+            pod_refs=pod_refs,
+            log_stream_commands=log_stream_commands,
+            task_log_path=task_log_path,
+            cleanup_refs=cleanup_refs,
+            global_args=global_args,
+            ns_args=ns_args,
+            merge_tag_paths=merge_tag_paths or None,
+            merge_launcher_env=combined_env,
+            merge_console_label=task_name,
+        )
+
     def _build_execution_plan(
         self,
         *,
@@ -507,6 +837,9 @@ class K8sContainerOperator(Operator):
         script: Sequence[str],
         envs: Mapping[str, str],
     ) -> _K8sExecPlan:
+        # Merge-pod leader: one pod runs every member's script (union GPUs).
+        if self._merge_members:
+            return self._build_merged_execution_plan(task_name=task_name, envs=envs)
         if not self._image:
             raise ValueError(
                 f"k8s operator '{self.config.name}' has no image configured; set "
@@ -536,6 +869,25 @@ class K8sContainerOperator(Operator):
             replica_index = 0
         gpu_slot_start = self._node_local_gpu_slot_start(replica_index)
         rdma_nic_resources, rdma_hcas = self._rdma_pod_nics(gpu_slot_start)
+        # DRA GPU<->NIC topology co-allocation (opt-in): the task GPU claim also
+        # requests a NIC on the same PCIe root, and the pod needs CAP_IPC_LOCK to
+        # pin memory for verbs. Independent of the device-plugin `rdma` providers.
+        dra_coalloc = bool(
+            self._scheduling == "dra"
+            and self._dra_rdma_device_class
+            and self._per_pod_gpus > 0
+        )
+        # Runtime NIC handling: the physical GPU is chosen by the device plugin/DRA,
+        # so for providers where the pod sees every node HCA (host-device / shared
+        # plugin) or a DRA co-allocated NIC, we defer NIC selection to the in-pod
+        # preamble. By default it exposes all NICs and lets NCCL/UCX auto-select the
+        # GPU-closest device (SFLOW_RDMA_AFFINITY=auto); it verifies RDMA is usable
+        # and falls back to TCP otherwise (never forcing a dead HCA -> NIXL_ERR_BACKEND).
+        # GKE is excluded (allow_runtime_affinity=False): it grants a fixed per-pod
+        # NIC subset, so it keeps the build-time pin + gIB preamble below.
+        runtime_affinity = (
+            bool(rdma_hcas) and self._rdma_runtime_affinity
+        ) or dra_coalloc
         # gIB (multi-node NCCL over RDMA) is enabled only when the task spans more
         # than one node: with gpus_per_node GPUs per node, a GPU claim that needs
         # node_count > 1 has cross-node NCCL collectives. Single-node TP stays on
@@ -545,6 +897,16 @@ class K8sContainerOperator(Operator):
         if n > 1 and rdma_hcas and self._rdma_lib_mounts:
             rdma_lib_mounts = self._rdma_lib_mounts
             script = self._gib_preamble(rdma_hcas) + script
+        elif runtime_affinity:
+            # Prepend the verified, topology-aware NIC selection (sets NCCL_IB_HCA
+            # in-pod when explicit, or NCCL_IB_DISABLE on dead HCA). Takes over from
+            # the build-time per-pod NIC pin below. UCX is left unset.
+            script = (
+                build_rdma_affinity_preamble(
+                    self._network_env.get("SFLOW_PRIMARY_IFACE", "")
+                )
+                + script
+            )
 
         # K8s-native artifact injection (file:// -> ConfigMap, fs:// -> PVC/hostPath).
         cm_data, file_mounts, host_path_mounts, pvc_mounts = self._artifact_injection(
@@ -581,6 +943,12 @@ class K8sContainerOperator(Operator):
                     selectors=self._device_selectors,
                     task_label=base,
                     allocation_id=self._allocation_id,
+                    # Co-allocate a PCIe-root-aligned NIC in the same claim (opt-in).
+                    nic_device_class=(
+                        self._dra_rdma_device_class if dra_coalloc else None
+                    ),
+                    nic_count=self._per_pod_gpus if dra_coalloc else None,
+                    match_attribute=self._dra_rdma_match_attribute,
                 )
             )
         for i, pod_name in enumerate(pod_names):
@@ -589,10 +957,11 @@ class K8sContainerOperator(Operator):
             # control interface (and expose SFLOW_* mirrors for explicit use). The
             # task script can still override any of these via `export`.
             extra_env.update(self._network_env)
-            # Per-pod RDMA devices override any backend-wide UCX default so NIXL/UCX
-            # (KV transfer) and NCCL use exactly the NICs this pod owns.
-            if rdma_hcas:
-                extra_env["UCX_NET_DEVICES"] = ",".join(f"{h}:1" for h in rdma_hcas)
+            # Per-pod RDMA devices override any backend-wide NCCL default so NCCL
+            # uses exactly the NICs this pod owns. Skipped when the runtime affinity
+            # preamble is active -- it selects (and verifies) the GPU-local NIC
+            # in-pod, so a build-time pin would only fight it. UCX is left unset.
+            if rdma_hcas and not runtime_affinity:
                 extra_env["NCCL_IB_HCA"] = ",".join(rdma_hcas)
             if n > 1:
                 extra_env["SFLOW_TASK_NODE_INDEX"] = str(i)
@@ -611,11 +980,23 @@ class K8sContainerOperator(Operator):
                     per_pod_gpus=self._per_pod_gpus,
                     resource_claim_name=rct_name,
                     host_network=self._host_network,
+                    host_ipc=self._host_ipc,
                     node_selector=self._node_selector,
                     assigned_node=self._pin_node(i),
                     tolerations=tolerations,
                     extra_env=extra_env or None,
-                    compute_domain_channel=self._compute_domain_channel,
+                    # Only GPU pods join the NVLink (IMEX) ComputeDomain. The driver
+                    # publishes ONE channel per node, single-allocation (one
+                    # channel-claiming pod per node per ComputeDomain), so CPU-only
+                    # infra pods (nats/etcd/frontend/download) must NOT claim it --
+                    # otherwise co-located pods contend for the node's single channel
+                    # and all but the first fail scheduling ("cannot allocate all
+                    # claims"). GPU workers still need a one-pod-per-node topology.
+                    compute_domain_channel=(
+                        self._compute_domain_channel
+                        if self._per_pod_gpus > 0
+                        else None
+                    ),
                     task_label=base,
                     allocation_id=self._allocation_id,
                     artifacts_configmap_name=artifacts_cm_name,
@@ -624,7 +1005,14 @@ class K8sContainerOperator(Operator):
                     pvc_mounts=pvc_mounts,
                     shm_size=self._shm_size,
                     rdma_nic_resources=rdma_nic_resources,
-                    rdma_ipc_lock=bool(rdma_nic_resources),
+                    # IPC_LOCK + host device mounts apply to pods that got an RDMA
+                    # NIC slice (device-plugin/host-device providers) or a DRA
+                    # co-allocated NIC -- both need CAP_IPC_LOCK to pin verbs memory.
+                    rdma_ipc_lock=(bool(rdma_hcas) and self._rdma_ipc_lock)
+                    or dra_coalloc,
+                    rdma_host_device_paths=(
+                        self._rdma_host_device_paths if rdma_hcas else []
+                    ),
                     rdma_lib_mounts=rdma_lib_mounts,
                 )
             )
@@ -800,11 +1188,15 @@ class K8sContainerOperator(Operator):
                     status_note=status_note,
                 )
             )
+        # Merge-pod: the apply command builds one env Secret per member from a
+        # prefix-namespaced launcher env (avoids envFrom collisions in the shared
+        # container); pass that instead of the leader's plain env.
+        apply_env = plan.merge_launcher_env if plan.merge_launcher_env is not None else env
         try:
             rc = await launcher.run_async(
                 plan.apply_command,
                 output_logger=output_logger,
-                env=env,
+                env=apply_env,
                 task_name=task_name,
             )
             # Startup wait is over (pod running, or apply failed fast): stop
@@ -827,8 +1219,11 @@ class K8sContainerOperator(Operator):
                 except OSError:
                     apply_prefix_size = 0
             # One decoupled console tailer per task, reading the offloaded
-            # <task>.log (TTY only). It is independent of the file writers.
-            if plan.task_log_path:
+            # <task>.log (TTY only). It is independent of the file writers. Skipped
+            # for merge-pods: their demuxer already echoes every member's line to
+            # the console tagged with its task name (tailing the leader log too
+            # would double-print the leader's lines).
+            if plan.task_log_path and not plan.merge_tag_paths:
                 tailer = asyncio.ensure_future(
                     k8s_lifecycle.tail_file_to_console(
                         plan.task_log_path, task_name=task_name
@@ -854,7 +1249,10 @@ class K8sContainerOperator(Operator):
                 tailer.cancel()
                 await asyncio.gather(tailer, return_exceptions=True)
                 tailer = None
-            if plan.task_log_path:
+            # Merge-pods stream through a driver-side demux (per line, flushed) into
+            # per-task logs, so there is no single container log to re-fetch/rebuild;
+            # skip the one-shot finalize (which assumes one log per pod).
+            if plan.task_log_path and not plan.merge_tag_paths:
                 await k8s_lifecycle.finalize_complete_log(
                     plan.pod_refs,
                     plan.task_log_path,
@@ -895,7 +1293,18 @@ class K8sContainerOperator(Operator):
         """
         pod_ref = plan.pod_refs[index]
         stream_proc = None
-        if plan.task_log_path:
+        demux_reader: asyncio.Future | None = None
+        if plan.merge_tag_paths and plan.task_log_path:
+            # Merge-pod: one container carries several members' logs; the driver
+            # reads the stream and splits it by the [[sflow-mux:<task>]] tag into
+            # each member's <task>.log (instead of a driver-free shell redirect).
+            stream_proc, demux_reader = await k8s_lifecycle.stream_and_demux_pod_log(
+                plan.log_stream_commands[index],
+                tag_paths=plan.merge_tag_paths,
+                default_path=plan.task_log_path,
+                console_label=plan.merge_console_label or "",
+            )
+        elif plan.task_log_path:
             stream_proc = await k8s_lifecycle.start_pod_log_file_stream(
                 plan.log_stream_commands[index], plan.task_log_path
             )
@@ -904,8 +1313,21 @@ class K8sContainerOperator(Operator):
             final_phase = await k8s_lifecycle.watch_until_terminal(
                 pod_ref, global_args=plan.global_args, ns_args=plan.ns_args
             )
+            # Terminal: `kubectl logs -f` EOFs on its own; let the demux drain the
+            # tail into the per-task files before we stop (bounded).
+            if demux_reader is not None:
+                try:
+                    await asyncio.wait_for(demux_reader, timeout=10)
+                except (asyncio.TimeoutError, Exception):
+                    pass
         finally:
             # The log is a side channel: interrupt it on terminal / teardown.
+            if demux_reader is not None and not demux_reader.done():
+                demux_reader.cancel()
+                try:
+                    await demux_reader
+                except BaseException:
+                    pass
             if stream_proc is not None:
                 await k8s_lifecycle.terminate_process(stream_proc)
         exit_code = await k8s_lifecycle.pod_exit_code(
@@ -915,6 +1337,29 @@ class K8sContainerOperator(Operator):
             phase=final_phase,
         )
         return exit_code, final_phase
+
+    def network_fallback_status(self, task: Any) -> RdmaRuntimeStatus | None:
+        """Report whether this task's pod(s) selected slow network transport.
+
+        The in-pod RDMA preamble prints a ``[sflow-rdma]`` decision marker to the
+        offloaded ``<task>.log`` (the driver is never in the per-line path), so
+        this reads that log's startup prefix and parses the marker -- letting the
+        orchestrator surface a silent TCP fallback (KV/NCCL over sockets instead
+        of RDMA). It also scans UCX debug lines for intra-node TCP, which means
+        cuda_ipc/NVLink was not selected. Best-effort: returns ``None`` when the
+        log is unavailable or has no relevant marker.
+        """
+        envs = getattr(task, "envs", None)
+        task_out = envs.get("SFLOW_TASK_OUTPUT_DIR") if isinstance(envs, dict) else None
+        if not task_out:
+            return None
+        log_path = os.path.join(task_out, f"{task.name}.log")
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_RDMA_SCAN_MAX_BYTES)
+        except OSError:
+            return None
+        return parse_rdma_runtime_status(text)
 
     def writes_own_task_log(self) -> bool:
         """K8s always offloads: the pod log is written straight to ``<task>.log``.

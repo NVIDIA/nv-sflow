@@ -46,6 +46,60 @@ def test_resource_claim_template_selectors_and_alloc_label():
     assert m["metadata"]["labels"][SFLOW_ALLOC_LABEL] == "abc"
 
 
+def test_resource_claim_template_gpu_only_has_no_constraints():
+    # Without a NIC device class the claim is GPU-only (no NIC request/constraint).
+    m = render_resource_claim_template(
+        name="gpu-rct", device_class="gpu.nvidia.com", count=2
+    )
+    devices = m["spec"]["spec"]["devices"]
+    assert [r["name"] for r in devices["requests"]] == ["gpu"]
+    assert "constraints" not in devices
+
+
+def test_resource_claim_template_coallocates_nic_with_pcie_root_constraint():
+    # NIC co-allocation: a second request + a matchAttribute constraint aligning
+    # the GPU and NIC on the same PCIe root complex (default pcieRoot).
+    m = render_resource_claim_template(
+        name="gpu-rct",
+        device_class="gpu.nvidia.com",
+        count=2,
+        nic_device_class="rdma.nvidia.com",
+    )
+    devices = m["spec"]["spec"]["devices"]
+    assert [r["name"] for r in devices["requests"]] == ["gpu", "rdma"]
+    nic = [r for r in devices["requests"] if r["name"] == "rdma"][0]["exactly"]
+    assert nic == {
+        "deviceClassName": "rdma.nvidia.com",
+        "allocationMode": "ExactCount",
+        "count": 2,
+    }
+    assert devices["constraints"] == [
+        {
+            "requests": ["gpu", "rdma"],
+            "matchAttribute": "resource.kubernetes.io/pcieRoot",
+        }
+    ]
+
+
+def test_resource_claim_template_nic_count_and_attribute_overrides():
+    m = render_resource_claim_template(
+        name="gpu-rct",
+        device_class="gpu.nvidia.com",
+        count=4,
+        nic_device_class="dra.net",
+        nic_count=1,
+        nic_selectors=["device.attributes['dra.net'].rdma == true"],
+        match_attribute="dra.net/numaNode",
+    )
+    devices = m["spec"]["spec"]["devices"]
+    nic = [r for r in devices["requests"] if r["name"] == "rdma"][0]["exactly"]
+    assert nic["count"] == 1  # NIC count independent of GPU count
+    assert nic["selectors"] == [
+        {"cel": {"expression": "device.attributes['dra.net'].rdma == true"}}
+    ]
+    assert devices["constraints"][0]["matchAttribute"] == "dra.net/numaNode"
+
+
 # ---------------------------------------------------------------------------
 # render_configmap
 # ---------------------------------------------------------------------------
@@ -170,6 +224,64 @@ def test_reservation_pod_exclude_nodes_adds_hostname_not_in_node_affinity():
     assert "podAntiAffinity" in m["spec"]["affinity"]
 
 
+def test_reservation_pod_include_nodes_adds_hostname_in_node_affinity():
+    m = render_reservation_pod_manifest(
+        pod_name="pod-0", allocation_id="abc", include_nodes=["want-1", "want-2"]
+    )
+    exprs = m["spec"]["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"][0]["matchExpressions"]
+    assert exprs == [
+        {"key": "kubernetes.io/hostname", "operator": "In", "values": ["want-1", "want-2"]}
+    ]
+
+
+def test_reservation_pod_include_and_exclude_combine_in_one_term():
+    m = render_reservation_pod_manifest(
+        pod_name="pod-0",
+        allocation_id="abc",
+        include_nodes=["want-1"],
+        exclude_nodes=["bad-1"],
+    )
+    exprs = m["spec"]["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"][0]["matchExpressions"]
+    assert exprs == [
+        {"key": "kubernetes.io/hostname", "operator": "In", "values": ["want-1"]},
+        {"key": "kubernetes.io/hostname", "operator": "NotIn", "values": ["bad-1"]},
+    ]
+
+
+def test_reservation_pod_no_node_filters_has_no_node_affinity():
+    m = render_reservation_pod_manifest(pod_name="pod-0", allocation_id="abc")
+    assert "nodeAffinity" not in m["spec"]["affinity"]
+
+
+def test_reservation_pod_nvlink_domain_podaffinity_when_key_set():
+    # When a NVLink-domain topology key is given, all reservation pods must land in
+    # ONE domain (podAffinity, topologyKey = the label), keeping the per-hostname
+    # one-per-node spread (podAntiAffinity).
+    m = render_reservation_pod_manifest(
+        pod_name="pod-0",
+        allocation_id="abc",
+        nvlink_domain_topology_key="nvidia.com/gpu.clique",
+    )
+    affinity = m["spec"]["affinity"]
+    aff = affinity["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
+    assert aff["topologyKey"] == "nvidia.com/gpu.clique"
+    assert aff["labelSelector"]["matchLabels"] == {
+        SFLOW_ALLOC_LABEL: "abc",
+        "sflow.ai/role": "reservation",
+    }
+    # The one-per-node spread anti-affinity is preserved.
+    assert "podAntiAffinity" in affinity
+
+
+def test_reservation_pod_no_podaffinity_without_key():
+    m = render_reservation_pod_manifest(pod_name="pod-0", allocation_id="abc")
+    assert "podAffinity" not in m["spec"]["affinity"]
+
+
 # ---------------------------------------------------------------------------
 # render_task_pod
 # ---------------------------------------------------------------------------
@@ -250,6 +362,31 @@ def test_task_pod_fs_artifact_hostpath_omits_type_when_unknown():
     assert hp["hostPath"] == {"path": "/mnt/out"}
 
 
+def test_task_pod_rdma_host_device_mount_and_ipc_lock():
+    # Host-device RDMA (no device plugin): /dev/infiniband is hostPath-mounted
+    # (type Directory) and the container gets CAP_IPC_LOCK for verbs access.
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        rdma_host_device_paths=["/dev/infiniband"],
+        rdma_ipc_lock=True,
+    )
+    spec = m["spec"]
+    dev = [
+        v for v in spec["volumes"]
+        if v.get("hostPath", {}).get("path") == "/dev/infiniband"
+    ]
+    assert dev and dev[0]["hostPath"] == {
+        "path": "/dev/infiniband", "type": "Directory"
+    }
+    mount = [
+        mt for mt in spec["containers"][0]["volumeMounts"]
+        if mt["mountPath"] == "/dev/infiniband"
+    ][0]
+    assert mount["name"] == dev[0]["name"]
+    sc = spec["containers"][0]["securityContext"]
+    assert sc["capabilities"]["add"] == ["IPC_LOCK"]
+
+
 def test_task_pod_without_artifacts_has_script_and_shm_volumes():
     # Even with no artifacts, task pods get the script ConfigMap and a RAM-backed
     # /dev/shm (the 64Mi K8s default segfaults MPI/NCCL).
@@ -269,6 +406,30 @@ def test_task_pod_shm_size_caps_tmpfs():
     )
     dshm = [v for v in m["spec"]["volumes"] if v["name"] == "dshm"][0]
     assert dshm["emptyDir"] == {"medium": "Memory", "sizeLimit": "16Gi"}
+
+
+def test_task_pod_defaults_no_host_ipc():
+    m = render_task_pod(pod_name="t", image="img:1", configmap_name="t-cfg")
+    assert "hostIPC" not in m["spec"]
+    dshm = [v for v in m["spec"]["volumes"] if v["name"] == "dshm"][0]
+    assert "emptyDir" in dshm and "hostPath" not in dshm
+
+
+def test_task_pod_host_ipc_shares_ipc_namespace_and_dev_shm():
+    # host_ipc -> spec.hostIPC + /dev/shm from the node's shared hostPath (so
+    # co-located pods can do cross-pod CUDA IPC / NVLink KV transfer).
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg", host_ipc=True
+    )
+    assert m["spec"]["hostIPC"] is True
+    dshm = [v for v in m["spec"]["volumes"] if v["name"] == "dshm"][0]
+    assert dshm["hostPath"] == {"path": "/dev/shm", "type": "Directory"}
+    assert "emptyDir" not in dshm
+    # still mounted at /dev/shm in the container
+    assert any(
+        mt["mountPath"] == "/dev/shm"
+        for mt in m["spec"]["containers"][0]["volumeMounts"]
+    )
 
 
 def test_task_pod_pvc_mounted():

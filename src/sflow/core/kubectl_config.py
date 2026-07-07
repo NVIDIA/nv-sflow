@@ -29,20 +29,19 @@ class KubectlConfig:
     # --extra-kubectl-args (repeatable): verbatim global kubectl flags, e.g.
     # "--insecure-skip-tls-verify", "--as=admin", "--request-timeout=30s".
     extra_args: list[str] = field(default_factory=list)
-    # --kube-exclude-node (repeatable): node hostnames to steer all pods away from, e.g.
-    # a node with a broken CSI driver. Unlike the others this is NOT a kubectl flag
-    # but a scheduling constraint (a ``kubernetes.io/hostname NotIn`` nodeAffinity on
-    # the reservation pods), so it is kept out of ``global_args()``. Volatile,
-    # cluster-specific node info belongs here (CLI) rather than in the recipe.
-    exclude_nodes: list[str] = field(default_factory=list)
+    # The subset of ``extra_args`` that originated from the generic, backend-agnostic
+    # ``--extra-args`` (fanned into every backend channel) rather than the
+    # kubectl-specific ``--extra-kubectl-args``. Diagnostic only (NOT part of
+    # ``global_args()`` -- they are already in ``extra_args``): lets a kubernetes
+    # backend warn that a generic arg (e.g. a Slurm-ism like ``--gpus-per-node``) is
+    # being applied as a kubectl global flag, where it would break every call.
+    generic_extra_args: list[str] = field(default_factory=list)
 
     def global_args(self) -> list[str]:
         """kubectl global flags for ``--kubeconfig`` / ``--context`` + passthroughs.
 
         ``namespace`` is intentionally excluded: it overrides the backend
         namespace and is already threaded onto every call via ``--namespace``.
-        ``exclude_nodes`` is also excluded: it is a pod scheduling constraint, not
-        a kubectl client flag.
         """
         args: list[str] = []
         if self.kubeconfig:
@@ -58,5 +57,4 @@ class KubectlConfig:
             or self.context
             or self.namespace
             or self.extra_args
-            or self.exclude_nodes
         )

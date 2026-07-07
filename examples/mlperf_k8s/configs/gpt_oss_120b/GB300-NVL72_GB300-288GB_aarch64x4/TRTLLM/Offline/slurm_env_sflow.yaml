@@ -1,0 +1,75 @@
+# SLURM environment for the gpt-oss-120b Offline IFB recipe -- one of the two
+# swappable backend files (the other is k8s_env_sflow.yaml). This is a copy of the
+# upstream MLPerf slurm_env_sflow.yaml with two additions that let the workflow
+# template stay backend-neutral:
+#   * SERVE_LAUNCHER = "trtllm-llmapi-launch" (the MPI launch prefix; empty on k8s).
+#   * ntasks / ntasks_per_node moved onto the `test_container` operator (the template
+#     no longer sets them, because the k8s operator rejects srun-only fields).
+#     ntasks=1 is correct for this GPUS_PER_DP_RANK=1 (TP=1) config; a TP>1 config
+#     would need per-task ntasks and thus a backend-specific server task again.
+#
+# Swap backends by choosing the env file:
+#   sflow run -f .../gptoss_config_sflow.yaml -f .../slurm_env_sflow.yaml -f templates/trtllm_ifb_loadgen.yaml ...
+variables:
+  CONTAINER_IMAGE:
+    description: "Container image (NGC URL or Enroot .sqsh) with TRT-LLM + nv-mlpinf. Override via --set CONTAINER_IMAGE=..."
+    value: "nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_aarch64"
+
+  WORK_DIR:
+    description: "REQUIRED. Host path to closed/NVIDIA, mounted at /work. Set via --set WORK_DIR=..."
+    value: ""
+  SCRATCH_DIR:
+    description: "Host path to MLPerf scratch (datasets + models), mounted at /home/mlperf_inference_storage."
+    value: /lustre/share/coreai_mlperf_inference/mlperf_inference_storage_clone
+  CONTAINER_MOUNTS:
+    value: "${{ variables.WORK_DIR }}:/work,${{ variables.SCRATCH_DIR }}:/home/mlperf_inference_storage"
+
+  # Backend-neutral hook consumed by templates/trtllm_ifb_loadgen.yaml: on SLURM the
+  # server is launched under the TRT-LLM MPI launcher.
+  SERVE_LAUNCHER:
+    description: "trtllm-serve launch prefix (MPI launcher on SLURM)."
+    value: "trtllm-llmapi-launch"
+
+  SLURM_ACCOUNT:
+    value: coreai_mlperf_inference
+  SLURM_PARTITION:
+    value: gb300
+  SLURM_TIME:
+    value: "04:00:00"
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+  SLURM_NODES:
+    description: "ceil(TOTAL_GPUS / GPUS_PER_NODE)"
+    type: integer
+    value: ${{ ((variables.TOTAL_GPUS / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+
+operators:
+  - name: test_container
+    type: srun
+    container_image: ${{ variables.CONTAINER_IMAGE }}
+    container_writable: false
+    container_mount_home: true
+    container_remap_root: true
+    mpi: pmix
+    container_mounts:
+      - ${{ variables.CONTAINER_MOUNTS }}
+    container_workdir: /work
+    export: "ALL,ENROOT_TRANSFER_RETRIES=3,ENROOT_CONNECT_TIMEOUT=60"
+    # One task per replica (TP=1). The template used to set these per-task; they now
+    # live here so the template is valid for the k8s operator too.
+    ntasks: 1
+    ntasks_per_node: 1
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: ${{ variables.SLURM_NODES }}
+    extra_args:
+      - "--segment=${{ variables.SLURM_NODES }}"
+      - "--exclusive"

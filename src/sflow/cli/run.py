@@ -19,13 +19,15 @@ from sflow.core.kubectl_config import KubectlConfig
 from sflow.cli._args import (
     EnableTaskMonitorOption,
     EnableWorkflowMonitorOption,
+    ExcludeNodesOption,
+    IncludeNodesOption,
     split_list_arg,
 )
 from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
 from sflow.logging import configure_logging, get_logger
 from sflow.resolution import enrich_error_with_location
 from sflow.runtime_info import log_runtime_info
-from sflow.utils.extra_args import dedup_merge_extra_args
+from sflow.utils.extra_args import dedup_merge_extra_args, extra_arg_key
 
 _logger = get_logger(__name__)
 
@@ -257,16 +259,8 @@ def run(
             "(e.g. --extra-kubectl-args=--insecure-skip-tls-verify). Repeatable.",
         ),
     ] = None,
-    kube_exclude_node: Annotated[
-        Optional[List[str]],
-        typer.Option(
-            "--kube-exclude-node",
-            help="Node hostname to keep all kubernetes pods off (e.g. a node with a "
-            "broken driver). Applied as a kubernetes.io/hostname NotIn nodeAffinity "
-            "on the reservation pods, so the run avoids it without a cluster-wide "
-            "cordon. Repeatable; keeps volatile node info out of the recipe.",
-        ),
-    ] = None,
+    include_nodes: IncludeNodesOption = None,
+    exclude_nodes: ExcludeNodesOption = None,
     enable_workflow_monitor: EnableWorkflowMonitorOption = False,
     enable_task_monitor: EnableTaskMonitorOption = None,
     bulk_input: Annotated[
@@ -473,13 +467,25 @@ def run(
         docker_args = dedup_merge_extra_args(generic_extra_args, list(extra_docker_args or []))
         kubectl_args = dedup_merge_extra_args(generic_extra_args, list(extra_kubectl_args or []))
 
+        # Generic args that end up as kubectl global flags (i.e. not overridden by an
+        # explicit --extra-kubectl-args on the same option). Passed through so a
+        # kubernetes backend can warn if one is actually a Slurm/docker-ism that would
+        # break every kubectl call; unlike salloc/docker, kubectl rejects unknown globals.
+        _kubectl_specific_keys = {extra_arg_key(a) for a in (extra_kubectl_args or [])}
+        generic_kubectl_args = [
+            a for a in kubectl_args if extra_arg_key(a) not in _kubectl_specific_keys
+        ]
+
         kube_cfg = KubectlConfig(
             kubeconfig=str(kubeconfig) if kubeconfig else None,
             context=kube_context,
             namespace=kube_namespace,
             extra_args=kubectl_args,
-            exclude_nodes=list(kube_exclude_node or []),
+            generic_extra_args=generic_kubectl_args,
         )
+
+        include_nodes = split_list_arg(include_nodes)
+        exclude_nodes = split_list_arg(exclude_nodes)
 
         # Route the resolved per-type args to their backend type: slurm -> salloc,
         # docker -> `docker run`. Empty buckets are omitted so backends without CLI
@@ -501,6 +507,8 @@ def run(
                 artifact_overrides=artifact,
                 missable_tasks=missable_tasks,
                 backend_extra_args_by_type=backend_extra_args_by_type or None,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
                 kubectl_config=kube_cfg,
                 enable_workflow_monitor=enable_workflow_monitor,
                 enable_task_monitors=enable_task_monitor,

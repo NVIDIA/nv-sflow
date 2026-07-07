@@ -157,6 +157,56 @@ sflow batch -f workflow.yaml -e "--gpus-per-node=8" -e "--segment=2"
 This is useful for quick adjustments or when testing different cluster configurations.
 :::
 
+## Selecting or excluding nodes (all backends)
+
+Restrict which cluster nodes a run may use with two backend-agnostic controls that
+apply to **every** backend:
+
+- CLI flags on `sflow run` and `sflow batch`: `--include-nodes` and
+  `--exclude-nodes`. Both accept comma-separated lists, quoted whitespace-separated
+  lists, and/or repeated flags (`--exclude-nodes a,b`, `--exclude-nodes "a b"`,
+  `--exclude-nodes a --exclude-nodes b`).
+- YAML fields on any backend: `include_nodes` and `exclude_nodes`. CLI values are
+  unioned over the recipe's values.
+
+`include_nodes` restricts the candidate pool to the listed hosts; `exclude_nodes`
+removes the listed hosts. A host may not appear in both.
+
+```bash
+# Keep this run off two flaky nodes, across whatever backend the recipe uses.
+sflow run -f workflow.yaml --exclude-nodes gpu-07,gpu-16
+
+# Pin an experiment to specific hosts.
+sflow run -f workflow.yaml --include-nodes gpu-01,gpu-02
+```
+
+```yaml
+backends:
+  - name: gpu_cluster
+    type: slurm
+    account: myproject
+    partition: gpu
+    time: "01:00:00"
+    nodes: 2
+    gpus_per_node: 8
+    exclude_nodes: [gpu-07, gpu-16]
+```
+
+Each backend translates the lists to its native node selection:
+
+| Backend | `include_nodes` | `exclude_nodes` |
+|---------|-----------------|-----------------|
+| Slurm | `salloc`/`#SBATCH --nodelist=` (reused allocations are filtered in-process) | `salloc`/`#SBATCH --exclude=` |
+| Kubernetes | `kubernetes.io/hostname` `In` nodeAffinity on the reservation pods | `kubernetes.io/hostname` `NotIn` nodeAffinity |
+| Docker (with `hosts:`) | keep only matching hosts in the pool | drop matching hosts from the pool |
+| Local / Docker without `hosts:` | ignored (single machine) with a warning | ignored with a warning |
+
+:::note
+Complex Slurm hostlist expressions (e.g. `node[01-05]`) should be passed through
+Slurm's own flags via `extra_args` / `-e`; `--include-nodes` / `--exclude-nodes`
+take plain hostnames.
+:::
+
 ## Docker backend
 
 The Docker backend uses a synthetic local allocation for planning and launches tasks
@@ -268,7 +318,7 @@ confirm the access is usable: it verifies the cluster is reachable and authentic
 namespace exists, and — via `kubectl auth can-i` (non-mutating) — that the credentials hold the
 RBAC needed for the operations sflow performs (create/delete pods, configmaps and secrets; get
 pods, pod logs and nodes; plus the DRA `resourceclaimtemplates`/`deviceclasses`, and
-`computedomains` when `compute_domain` is on). It fails fast with an actionable message
+`computedomains` when `dra.create_compute_domain` is on). It fails fast with an actionable message
 (missing permission, wrong namespace, or unreachable cluster) instead of leaving pods stuck.
 Set `SFLOW_SKIP_K8S_PREFLIGHT=1` to bypass the check.
 
@@ -305,7 +355,10 @@ backends:
     scheduling: dra             # or: device_plugin
     dra:
       gpu_device_class: gpu.nvidia.com
-      compute_domain: false     # true for multi-node NVLink (IMEX)
+      # Join an existing IMEX ComputeDomain for cross-node NVLink (MNNVL). Name its
+      # channel, or `auto` to claim the sole existing one; sflow does NOT create one
+      # by default (set create_compute_domain: true for that admin op).
+      use_compute_domain_channel: auto   # or a channel name, or off (default)
 
 operators:
   - {name: server_op, type: k8s, image: my/server:1.0}
@@ -364,4 +417,193 @@ workflow:
       resources: {gpus: {count: 2}}
       script:
         - nvidia-smi -L
+```
+
+### RDMA / InfiniBand networking
+
+At allocation time the backend probes a reservation pod for the node's RDMA HCAs
+(e.g. `mlx5_0`) and routable interface, then runs an RDMA **provider chain** to
+decide how task GPU pods get verbs access. The matching provider grants the pods
+`CAP_IPC_LOCK` and sets `UCX_NET_DEVICES` / `NCCL_IB_HCA` (plus
+`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` on the routable NIC), so NIXL/UCX KV
+transfer and NCCL run over RDMA. Auto priority order:
+
+- **GKE** — one `networking.gke.io.networks/rdma-N` extended resource per NIC,
+  plus the GKE gIB lib mounts + NCCL tuning for multi-node NCCL.
+- **shared device plugin** — a single shared `rdma/*` extended resource
+  (k8s-rdma-shared-dev-plugin / NVIDIA Network Operator) grants access to the
+  node's HCAs.
+- **host device** — generic bare-metal fallback with no device plugin: hostPath
+  mount `/dev/infiniband` + `CAP_IPC_LOCK` (requires `host_network: true`).
+
+When none applies, sflow falls back to pinning UCX/NCCL/gloo to the routable TCP
+interface (sockets, not RDMA) and only exposes the detected HCAs via
+`SFLOW_RDMA_HCAS`.
+
+#### GPU ↔ NIC affinity
+
+Because the GPU is requested by *count* (`nvidia.com/gpu` or a DRA claim), the
+device plugin / DRA driver — not sflow — chooses the physical GPU. Pinning a NIC
+at manifest-build time therefore risks pairing a GPU with a NIC on a different
+PCIe root (slow GPUDirect-RDMA), or worse, pinning an RDMA device that is not
+actually usable in the pod (UCX then aborts NIXL with `NIXL_ERR_BACKEND` instead
+of degrading to TCP). sflow addresses this two ways:
+
+- **Runtime selection (device-plugin / host-device / shared plugin).** For
+  providers where the pod sees every node HCA, task pods run a small preamble
+  before the workload, controlled by the `SFLOW_RDMA_AFFINITY` pod env:
+  - `auto` (default) — **expose every NIC and let the libraries choose.** Leaves
+    `NCCL_IB_HCA` unset (NCCL needs every rank to see every NIC to compute a
+    consistent topology-aware solution) and sets `UCX_NET_DEVICES=all` +
+    `UCX_MAX_RNDV_RAILS=1` so UCX/NIXL use each GPU's closest NIC (implicit
+    GPUDirect RDMA). This is NVIDIA's recommended setup and needs no per-GPU
+    mapping from sflow.
+  - `explicit` — pin each GPU to the NIC on its PCIe root (`nvidia-smi` bus id →
+    sysfs `pcieRoot`). Use when auto-detection mispairs because sysfs distance
+    isn't representative (e.g. GB300 Data-Direct sub-interfaces, SR-IOV VFs).
+  - `off` — inject nothing; the recipe controls device selection.
+
+  In all modes the preamble first verifies RDMA is usable in the pod (`rdma_cm` +
+  a verbs node + an `ACTIVE` port); if not, it pins the routable TCP interface and
+  sets `NCCL_IB_DISABLE=1`, so the workload always comes up instead of aborting on
+  a dead HCA.
+- **DRA topology co-allocation (`scheduling: dra`, opt-in).** Set
+  `dra.rdma_device_class` to co-request a NIC in the *same* `ResourceClaim` as
+  the GPU with a `matchAttribute` constraint (default
+  `resource.kubernetes.io/pcieRoot`), so the scheduler places the GPU and NIC on
+  the same PCIe root complex. Requires a NIC DRA driver that publishes the match
+  attribute (e.g. NVIDIA `rdma.nvidia.com`, DRANET `dra.net`). Note: on
+  GB300/Vera Rubin/Fractal the NIC's matching root is its Data-Direct
+  sub-interface root, which some NIC DRA drivers do not yet expose — override
+  `dra.rdma_match_attribute` per cluster if co-allocation finds no candidates.
+
+Config (all optional — the common case needs none of these):
+
+- `rdma` — `auto` (default) runs the provider chain then exposes all NICs for the
+  libs to auto-select; `off` disables RDMA; or force one provider with `gke`,
+  `shared_device_plugin`, or `host_device` (e.g. to opt out of the privileged-ish
+  host-device path on PodSecurity-restricted namespaces).
+- `dra.rdma_device_class` — NIC DeviceClass to co-allocate with each GPU (DRA
+  topology alignment; unset = off).
+- `dra.rdma_match_attribute` — attribute the GPU + NIC must share (default
+  `resource.kubernetes.io/pcieRoot`).
+- `host_ipc` — share the node IPC namespace (pod `hostIPC`) + a shared hostPath
+  `/dev/shm` across task pods (default `false`). This lets co-located prefill/decode
+  pods do **cross-pod CUDA IPC**, so same-node NIXL/UCX KV transfer can use **NVLink
+  (`cuda_ipc`)** instead of TCP. On GB200/GB300 the NVLink KV path is Multi-Node
+  NVLink (MNNVL) fabric handles, which additionally need `UCX_CUDA_IPC_ENABLE_MNNVL=y`
+  (task env), vLLM VMM allocation (`--enable-cumem-allocator`), and an IMEX domain
+  (`nvidia-imex`, or `scheduling: dra` + `dra.create_compute_domain: true`, or joining
+  an existing one via `dra.use_compute_domain_channel`). Privileged, so opt-in.
+- `merge_colocated_gpu_pods` — merge GPU tasks the planner assigns to the **same
+  physical node** into **one pod / one container** requesting the union of their
+  GPUs. Tri-state (`auto`/`on`/`off` or a bool), **default `auto` (enabled)**: merging
+  is sflow-owned pod topology — it enables intra-node NVLink between co-located
+  workers *and* guarantees one IMEX-channel-claiming pod per node. Set `off` to opt
+  out. Cross-pod GPU isolation means separate pods (even with
+  `host_ipc`) can't `cuda_ipc` to each other's GPUs; putting the co-located tasks
+  in one container that holds every node GPU is what makes intra-node **NVLink**
+  work between them. Each task keeps its own `<task>.log`, probes, readiness, and
+  dependents: the tasks run as concurrent background processes in the shared
+  container. Every task sees **all** the container's GPUs (its own listed first in
+  `CUDA_VISIBLE_DEVICES` so it uses that as `cuda:0`) — exposing the peers' GPUs is
+  what lets cross-task `cuda_ipc`/NVLink P2P work; each task still gets its own env,
+  and the driver demuxes the single container log stream back into per-task logs. Only
+  **single-node GPU tasks** co-located on a node merge (CPU-only infra and
+  multi-node tasks keep their own pods); merged tasks must be concurrent (a
+  completion-before-start dependency between two members is rejected). This is the
+  node-local counterpart to IB/RDMA: on a real multi-node IB cluster UCX already
+  auto-selects RDMA, but for same-node disaggregation NVLink needs the tasks in one
+  pod. Privileged-adjacent (pairs naturally with `host_ipc`), so opt-in.
+
+Per-pod NIC selection is further tunable at runtime via the `SFLOW_RDMA_AFFINITY`
+pod env (`auto` | `explicit` | `off`); see *GPU ↔ NIC affinity* above.
+
+```yaml
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    nodes: 2
+    gpus_per_node: 8
+    host_network: true
+    scheduling: device_plugin
+    rdma: auto                       # auto-detect + expose all NICs (or: off / a provider)
+    # host_ipc: true                 # cross-pod CUDA IPC (same-node NVLink KV)
+    # merge_colocated_gpu_pods: off  # opt OUT of merging same-node GPU tasks (default auto)
+
+  # DRA topology co-allocation: schedule each GPU with a PCIe-root-aligned NIC.
+  - name: k8s-dra
+    type: kubernetes
+    nodes: 2
+    gpus_per_node: 8
+    scheduling: dra
+    dra:
+      gpu_device_class: gpu.nvidia.com
+      rdma_device_class: rdma.nvidia.com          # NIC DRA driver's DeviceClass
+      # rdma_match_attribute: resource.kubernetes.io/pcieRoot
+```
+
+### Interconnect priority (NVLink → IB/RDMA → TCP)
+
+sflow picks the **highest reachable interconnect tier** for GPU↔GPU / KV transfer and
+claims only the resources it owns for it; it stays **transport-neutral** (it never pins
+`UCX_TLS`, so UCX/NCCL still auto-select). The tier depends on the cluster's **NVLink
+domain scope**:
+
+- **node-scope** (e.g. B200, H100/H200): NVLink/NVSwitch reaches GPUs **within one node**
+  only. Cross-node needs IB/RDMA, else TCP.
+- **rack-scope** (GB200/GB300 NVL72): NVLink also reaches **across nodes** via MNNVL —
+  but only with an IMEX ComputeDomain channel (and fabric/VMM KV memory in the app).
+
+sflow **detects** the scope at preflight/allocate from the GPU product label
+(`nvidia.com/gpu.product`) + the ComputeDomain CRD presence. Override with
+`nvlink_domain: auto` (default) | `node` | `rack` | `off`.
+
+**Ownership:**
+
+- **sflow owns (auto):** pod layout (`merge_colocated_gpu_pods`, default `auto`),
+  interconnect *detection*, and *claiming* what it controls — the ComputeDomain **channel
+  claim** on every GPU pod (when a channel is configured/detected) and **RDMA device
+  grants** (when IB is up).
+- **recipe/app owns:** the framework's KV-memory mode (VMM / vLLM `--enable-sleep-mode`)
+  and transport env like `UCX_CUDA_IPC_ENABLE_MNNVL=y`. sflow only *hints* (app-agnostically).
+- **cluster admin owns:** ComputeDomain **creation**. sflow **detects** an existing
+  domain/channel and hints; it does not create one unless `dra.create_compute_domain: true`.
+
+**ComputeDomain / MNNVL config (under `dra:`):**
+
+- `use_compute_domain_channel` — the channel ResourceClaimTemplate **every GPU pod claims**
+  to join an existing IMEX ComputeDomain. A **name**, or `auto` (claim the sole existing
+  domain — skips + hints on zero/many), or `off`/empty (default). *(Renamed from
+  `compute_domain_channel`, still accepted as a deprecated alias.)*
+- `create_compute_domain` — **create** a ComputeDomain CR (admin op; needs `computedomains`
+  RBAC). Default `false` — the default path is detect + hint. *(Renamed from
+  `compute_domain`, still accepted as a deprecated alias.)*
+- `nvlink_domain_label_key` — node label key (e.g. `nvidia.com/gpu.clique`) used for
+  **placement + validation only** on clusters with **multiple** NVLink domains (redundant
+  on a single NVL72 rack): reservation pods get a `podAffinity` on this key so all reserved
+  nodes share one domain, and a post-schedule check warns if they straddle domains.
+
+**KV-memory rule (name the vLLM knob only as an example):**
+
+- **Same-node** KV + regular memory: classic `cuda_ipc` over intra-node NVLink — no IMEX,
+  no VMM (cheapest). Enable it with `merge_colocated_gpu_pods` (default) and/or `host_ipc`.
+- **Cross-node** KV on **rack-scope**: needs an IMEX ComputeDomain **channel**
+  (`use_compute_domain_channel`) **and** the app's fabric/VMM KV memory (vLLM
+  `--enable-sleep-mode`) **and** `UCX_CUDA_IPC_ENABLE_MNNVL=y`. On **node-scope**, cross-node
+  KV must use IB, else TCP.
+- Enabling VMM (`--enable-sleep-mode`) **without** an IMEX channel forces the KV transfer
+  onto **slow TCP** even intra-node — so keep it off unless you have the channel.
+
+```yaml
+backends:
+  - name: k8s
+    type: kubernetes
+    nodes: 2
+    gpus_per_node: 8
+    # nvlink_domain: auto              # auto|node|rack|off (default auto = detect)
+    dra:
+      # use_compute_domain_channel: auto   # join sole existing IMEX domain (or a name)
+      # nvlink_domain_label_key: nvidia.com/gpu.clique  # multi-domain clusters only
 ```
