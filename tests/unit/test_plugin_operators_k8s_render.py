@@ -3,10 +3,14 @@
 
 from sflow.plugins.operators._k8s_render import (
     COMPUTE_DOMAIN_CLAIM_NAME,
+    PROBE_POD_IMAGE_DEFAULT,
+    PROBE_ROLE,
     RESERVATION_POD_IMAGE,
     SFLOW_ALLOC_LABEL,
+    SFLOW_ROLE_LABEL,
     render_compute_domain_manifest,
     render_configmap,
+    render_probe_pod_manifest,
     render_reservation_pod_manifest,
     render_resource_claim_template,
     render_task_pod,
@@ -387,6 +391,29 @@ def test_task_pod_rdma_host_device_mount_and_ipc_lock():
     assert sc["capabilities"]["add"] == ["IPC_LOCK"]
 
 
+def test_task_pod_rdma_lib_mounts_tolerate_missing_installer():
+    # GKE gIB libs exist only if the `nccl-rdma-installer` DaemonSet is deployed
+    # (not a default GKE path), so the hostPath must be DirectoryOrCreate -- a
+    # missing installer must not fail the pod (NCCL then uses its built-in IB).
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        rdma_lib_mounts=[("/home/kubernetes/bin/gib", "/usr/local/gib")],
+    )
+    spec = m["spec"]
+    gib = [
+        v for v in spec["volumes"]
+        if v.get("hostPath", {}).get("path") == "/home/kubernetes/bin/gib"
+    ]
+    assert gib and gib[0]["hostPath"] == {
+        "path": "/home/kubernetes/bin/gib", "type": "DirectoryOrCreate"
+    }
+    mount = [
+        mt for mt in spec["containers"][0]["volumeMounts"]
+        if mt["mountPath"] == "/usr/local/gib"
+    ][0]
+    assert mount["readOnly"] is True
+
+
 def test_task_pod_without_artifacts_has_script_and_shm_volumes():
     # Even with no artifacts, task pods get the script ConfigMap and a RAM-backed
     # /dev/shm (the 64Mi K8s default segfaults MPI/NCCL).
@@ -456,3 +483,104 @@ def test_task_pod_pvc_subpath_and_read_write():
     assert pv["persistentVolumeClaim"] == {"claimName": "c", "readOnly": False}
     mt = [x for x in m["spec"]["containers"][0]["volumeMounts"] if x["name"] == "v"][0]
     assert mt == {"name": "v", "mountPath": "/data", "readOnly": False, "subPath": "models"}
+
+
+def test_task_pod_emptydir_volume():
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        pvc_mounts=[{"name": "kernel-cache",
+                     "empty_dir": {"medium": "", "size_limit": None},
+                     "mount_path": "/cache", "read_only": False}],
+    )
+    vol = [v for v in m["spec"]["volumes"] if v["name"] == "kernel-cache"][0]
+    assert vol == {"name": "kernel-cache", "emptyDir": {}}
+    mt = [x for x in m["spec"]["containers"][0]["volumeMounts"]
+          if x["name"] == "kernel-cache"][0]
+    assert mt == {"name": "kernel-cache", "mountPath": "/cache", "readOnly": False}
+
+
+def test_task_pod_emptydir_medium_and_size_limit():
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        pvc_mounts=[{"name": "c",
+                     "empty_dir": {"medium": "Memory", "size_limit": "10Gi"},
+                     "mount_path": "/cache", "read_only": False}],
+    )
+    vol = [v for v in m["spec"]["volumes"] if v["name"] == "c"][0]
+    assert vol == {"name": "c", "emptyDir": {"medium": "Memory", "sizeLimit": "10Gi"}}
+
+
+def test_task_pod_ensure_writable_injects_root_init_container():
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        pvc_mounts=[{"name": "kernel-cache", "claim": "c", "mount_path": "/cache",
+                     "sub_path": "sflow-kernel-cache", "read_only": False,
+                     "ensure_writable": True}],
+    )
+    inits = m["spec"].get("initContainers")
+    assert inits and len(inits) == 1
+    ic = inits[0]
+    assert ic["image"] == "img:1"  # reuses the task image (already pulled)
+    assert ic["securityContext"] == {"runAsUser": 0, "runAsGroup": 0}
+    # Mounts the volume ROOT (no subPath) so it can create+chmod the subPath dir.
+    im = [x for x in ic["volumeMounts"] if x["name"] == "kernel-cache"][0]
+    assert im["mountPath"] == "/sflow-ensure-writable/kernel-cache"
+    assert "subPath" not in im
+    cmd = ic["command"][-1]
+    assert "chmod 0777" in cmd
+    assert "/sflow-ensure-writable/kernel-cache/sflow-kernel-cache" in cmd
+    # The workload container still mounts the PVC writable via subPath.
+    mt = [x for x in m["spec"]["containers"][0]["volumeMounts"]
+          if x["name"] == "kernel-cache"][0]
+    assert mt == {"name": "kernel-cache", "mountPath": "/cache",
+                  "readOnly": False, "subPath": "sflow-kernel-cache"}
+
+
+def test_task_pod_no_init_container_without_ensure_writable():
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        pvc_mounts=[{"name": "v", "claim": "c", "mount_path": "/data",
+                     "read_only": False}],
+    )
+    assert "initContainers" not in m["spec"]
+
+
+# ---------------------------------------------------------------------------
+# render_probe_pod_manifest (in-cluster probe pod)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_pod_manifest_defaults():
+    m = render_probe_pod_manifest(pod_name="sflow-probe-x", allocation_id="abc")
+    assert m["apiVersion"] == "v1"
+    assert m["kind"] == "Pod"
+    assert m["metadata"]["name"] == "sflow-probe-x"
+    assert m["metadata"]["labels"][SFLOW_ALLOC_LABEL] == "abc"
+    assert m["metadata"]["labels"][SFLOW_ROLE_LABEL] == PROBE_ROLE
+    container = m["spec"]["containers"][0]
+    assert container["image"] == PROBE_POD_IMAGE_DEFAULT
+    assert container["command"][0] == "sh"
+    # A probe pod holds no GPUs and needs no placement affinity.
+    assert "resources" not in container
+    assert "affinity" not in m["spec"]
+    assert "nodeSelector" not in m["spec"]
+
+
+def test_probe_pod_manifest_overrides():
+    m = render_probe_pod_manifest(
+        pod_name="p",
+        allocation_id="a",
+        image="myrepo/curl:1",
+        namespace="ns",
+        image_pull_policy="IfNotPresent",
+        node_selector={"disktype": "ssd"},
+        tolerations=[
+            {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+        ],
+    )
+    assert m["metadata"]["namespace"] == "ns"
+    container = m["spec"]["containers"][0]
+    assert container["image"] == "myrepo/curl:1"
+    assert container["imagePullPolicy"] == "IfNotPresent"
+    assert m["spec"]["nodeSelector"] == {"disktype": "ssd"}
+    assert m["spec"]["tolerations"][0]["key"] == "nvidia.com/gpu"

@@ -306,6 +306,26 @@ def resolve_storage_targets(config: SflowConfig, state: SflowState) -> SflowStat
     return state
 
 
+def _merge_image_key(task: Any) -> tuple[str, ...]:
+    """Container-image identity used to gate merging.
+
+    A merged pod runs ONE container (the leader operator's image), so only tasks
+    that would launch the SAME image may share it -- otherwise a follower's script
+    would silently run in the leader's image. Read the image(s) the task's operator
+    declares via ``container_images`` (operator or its config). Absent (non-container
+    operators / test doubles) -> empty key, i.e. no image constraint.
+    """
+    op = getattr(task, "operator", None)
+    for src in (op, getattr(op, "config", None)):
+        images = getattr(src, "container_images", None)
+        if callable(images):
+            try:
+                return tuple(sorted(str(i) for i in (images() or [])))
+            except Exception:  # noqa: BLE001 - defensive: never block planning
+                return ()
+    return ()
+
+
 def _plan_merge_groups(
     task_graph: TaskGraph, resource_placements: "Mapping[str, Any]"
 ) -> None:
@@ -313,7 +333,8 @@ def _plan_merge_groups(
 
     Runs at assembly time after resource placement. For each backend that opts in
     via ``merge_colocated_gpu_pods``, tasks with >0 GPUs assigned to exactly one
-    physical node are grouped by ``(backend, node)``. Groups with >=2 members
+    physical node are grouped by ``(backend, node, container-image)`` -- same node
+    AND same image, since a merged pod is one container. Groups with >=2 members
     become one merged pod owned by a deterministic leader (first member by name):
 
     * every member sees ALL union GPUs (``CUDA_VISIBLE_DEVICES``), with its own
@@ -329,7 +350,10 @@ def _plan_merge_groups(
     pod), so an intra-group completion dependency raises ``ValueError``. Multi-node
     GPU tasks and CPU-only tasks are never merged.
     """
-    groups: dict[tuple[str, str], list[str]] = {}
+    # Key: (backend, node, image). Node keeps co-located members together; image
+    # ensures we only merge tasks that share one container (a merged pod is one
+    # container). Multi-node GPU tasks and CPU-only infra are excluded below.
+    groups: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
     gpu_counts: dict[str, int] = {}
     for name, placement in resource_placements.items():
         backend = getattr(placement, "backend", None)
@@ -346,10 +370,13 @@ def _plan_merge_groups(
         # (etcd/nats/frontend) keep their own pods.
         if gpu_count <= 0 or len(assigned) != 1:
             continue
-        groups.setdefault((str(backend.name), assigned[0]), []).append(name)
+        image_key = _merge_image_key(task_graph.get_task(name))
+        groups.setdefault(
+            (str(backend.name), assigned[0], image_key), []
+        ).append(name)
         gpu_counts[name] = gpu_count
 
-    for (backend_name, node), members in groups.items():
+    for (backend_name, node, _image_key), members in groups.items():
         if len(members) < 2:
             continue
         members = sorted(members)
@@ -557,6 +584,7 @@ def build_task_graph(
         operator_config_type_adapter,
     )
     from sflow.core.probe import ProbeType
+    from sflow.core.probe_transport import ProbeTransport
     from sflow.plugins.probes import (
         HttpGetProbe,
         HttpPostProbe,
@@ -755,6 +783,7 @@ def build_task_graph(
         p_conf: Any,
         p_type: ProbeType,
         default_host: str | None = None,
+        default_transport: ProbeTransport | None = None,
     ):
         """
         Convert a ProbeConfig (from config schema) into a concrete Probe instance.
@@ -825,7 +854,13 @@ def build_task_graph(
                 )
             )
             on_node = getattr(tcp, "on_node", "first")
-            return TcpPortProbe(host=host, port=port, on_node=on_node, **common)
+            return TcpPortProbe(
+                host=host,
+                port=port,
+                on_node=on_node,
+                transport=default_transport,
+                **common,
+            )
 
         if getattr(p_conf, "http_get", None) is not None:
             http = p_conf.http_get
@@ -836,7 +871,10 @@ def build_task_graph(
                 else url_raw
             )
             return HttpGetProbe(
-                url=url, headers=getattr(http, "headers", None), **common
+                url=url,
+                headers=getattr(http, "headers", None),
+                transport=default_transport,
+                **common,
             )
 
         if getattr(p_conf, "http_post", None) is not None:
@@ -857,6 +895,7 @@ def build_task_graph(
                 url=url,
                 headers=getattr(http, "headers", None),
                 body=body,
+                transport=default_transport,
                 **common,
             )
 
@@ -1229,6 +1268,18 @@ def build_task_graph(
             except Exception:
                 default_probe_host = None
 
+            # Probe transport: backends whose driver host may not reach the
+            # workload network (e.g. Kubernetes) return an in-network transport
+            # so TCP/HTTP checks run from inside the cluster instead of the
+            # driver host. Non-remote backends return None -> driver-local.
+            probe_transport = None
+            try:
+                get_transport = getattr(backend, "probe_transport", None)
+                if callable(get_transport):
+                    probe_transport = get_transport()
+            except Exception:
+                probe_transport = None
+
             # For parallel replicated tasks, skip HTTP probes on non-first
             # replicas when the probe URL/body don't reference any per-replica
             # variables — the probes would send identical requests, creating
@@ -1277,6 +1328,7 @@ def build_task_graph(
                                 p_conf=p_conf,
                                 p_type=ProbeType.READINESS,
                                 default_host=default_probe_host,
+                                default_transport=probe_transport,
                             )
                         )
             failure_probe_configs = _probe_config_list(t_conf.probes.failure)
@@ -1308,6 +1360,7 @@ def build_task_graph(
                                 p_conf=p_conf,
                                 p_type=ProbeType.FAILURE,
                                 default_host=default_probe_host,
+                                default_transport=probe_transport,
                             )
                         )
         task.backend_name = backend.name

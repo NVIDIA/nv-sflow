@@ -12,6 +12,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Sequence
+from contextlib import suppress
 from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator, model_validator
@@ -29,12 +30,15 @@ from sflow.core.operator import Operator
 from sflow.logging import get_logger
 from sflow.plugins.operators._k8s_render import (
     DEFAULT_GPU_TOLERATION,
+    PROBE_POD_IMAGE_DEFAULT,
     SFLOW_ALLOC_LABEL,
     render_compute_domain_manifest,
+    render_probe_pod_manifest,
     render_reservation_pod_manifest,
     render_resource_claim_template,
 )
 from sflow.plugins.operators._k8s_shell import sanitize_name
+from sflow.plugins.backends._k8s_probe import K8sExecProbeTransport
 from sflow.plugins.backends._k8s_rdma import (
     RDMA_PROVIDER_KEYS,
     RdmaDetectContext,
@@ -180,38 +184,71 @@ class KubernetesDraConfig(BaseModel):
     rdma_match_attribute: Resolvable[str] = "resource.kubernetes.io/pcieRoot"
 
 
+class KubernetesEmptyDirConfig(BaseModel):
+    """An ephemeral, node-local scratch volume (Kubernetes ``emptyDir``).
+
+    Unlike a PVC, an ``emptyDir`` is created empty for each pod, is writable by
+    any container user (no PVC/NFS ownership or root-squash problems), and is
+    deleted when the pod is removed. It is the right choice for scratch that does
+    not need to persist across runs -- e.g. the JIT/kernel cache -- and, being a
+    real volume, does not count against the container image layer's storage.
+    """
+
+    # emptyDir backing: "" (default) uses the node's disk (ephemeral-storage);
+    # "Memory" uses a tmpfs (RAM-backed -- avoid for large kernel caches).
+    medium: Literal["", "Memory"] = ""
+    # Optional cap on the volume size (e.g. "50Gi"). None -> no explicit limit.
+    size_limit: Resolvable[str] | None = None
+
+
 class KubernetesVolumeConfig(BaseModel):
-    """A pre-existing PersistentVolumeClaim (PVC) to mount into task pods.
+    """A volume to mount into task pods: a pre-existing PVC or an ``emptyDir``.
 
     A backend ``volumes:`` entry is workflow-wide storage: it is mounted into
     EVERY task pod of this backend (as a pod volume + container volumeMount at
     ``mount_path``), regardless of whether a task's script references that path.
-    This is intentional -- a PVC is backend-level info and must be available to
-    all sflow tasks on the backend (e.g. a task that loads a model via discovery,
+    This is intentional -- it is backend-level info and must be available to all
+    sflow tasks on the backend (e.g. a task that loads a model via discovery,
     without ever naming the path, still needs it mounted).
 
-    A common use is cluster-resident data (e.g. a model on shared storage) reaching
-    pods without a node-local hostPath: declare the PVC + where it mounts, then point
-    an ``fs://`` artifact at a path under ``mount_path``. When an ``fs://`` artifact
-    path is covered by a declared PVC ``mount_path`` the PVC serves it, so the
-    per-artifact hostPath fallback is skipped -- that path matching governs ONLY the
-    hostPath fallback, never whether the PVC itself is mounted (it always is).
+    Set exactly one source:
 
-    The PVC itself (and its data) must already exist in the backend namespace --
-    sflow does not create or populate it.
+    * ``claim`` -- an existing PersistentVolumeClaim (the PVC + its data must
+      already exist in the backend namespace; sflow only references it). Common
+      for cluster-resident data (e.g. a model on shared storage): declare the PVC
+      + where it mounts, then point an ``fs://`` artifact at a path under
+      ``mount_path``. When an ``fs://`` artifact path is covered by a declared PVC
+      ``mount_path`` the PVC serves it, so the per-artifact hostPath fallback is
+      skipped -- that path matching governs ONLY the hostPath fallback, never
+      whether the PVC itself is mounted (it always is).
+    * ``empty_dir`` -- a per-pod ephemeral scratch volume (see
+      :class:`KubernetesEmptyDirConfig`). Writable by any container user; ideal
+      for a JIT/kernel cache that need not persist across runs.
     """
 
     # Pod volume name (DNS-1123); also the key linking volume <-> volumeMount.
     name: str
-    # Name of the existing PersistentVolumeClaim (spec.volumes[].pvc.claimName).
-    claim: Resolvable[str]
-    # Absolute path the PVC is mounted at inside each task pod.
+    # Name of an existing PersistentVolumeClaim (spec.volumes[].pvc.claimName).
+    # Mutually exclusive with ``empty_dir``.
+    claim: Resolvable[str] | None = None
+    # An ephemeral scratch volume instead of a PVC. Mutually exclusive with ``claim``.
+    empty_dir: KubernetesEmptyDirConfig | None = None
+    # Absolute path the volume is mounted at inside each task pod.
     mount_path: Resolvable[str]
-    # Optional path within the PVC to mount (volumeMount.subPath).
+    # Optional path within the volume to mount (volumeMount.subPath).
     sub_path: Resolvable[str] | None = None
-    # Mount read-only (default: True -- model/data PVCs are typically read-only and
-    # this is required to share a single PVC across pods on multiple nodes).
-    read_only: bool = True
+    # Mount read-only. Default (None) resolves per source: PVCs default read-only
+    # (model/data are typically read-only, and this is required to share one PVC
+    # across pods on multiple nodes), while an emptyDir defaults writable (that is
+    # the point of scratch). Set explicitly to override.
+    read_only: bool | None = None
+    # Fix the classic "subPath created root-owned -> non-root pod can't write it"
+    # gotcha: inject a root initContainer that ``mkdir -p`` + ``chmod 0777`` the
+    # mounted path (the subPath dir, or the mount root if no sub_path) before the
+    # workload runs. Best-effort -- on a root-squashed / read-only backing volume
+    # it cannot help (nothing can, from in-cluster). Requires ``read_only: false``
+    # and a PVC ``claim`` (an emptyDir is already writable).
+    ensure_writable: bool = False
 
     @field_validator("mount_path")
     @classmethod
@@ -220,6 +257,32 @@ class KubernetesVolumeConfig(BaseModel):
         if isinstance(v, str) and "${{" not in v and not v.startswith("/"):
             raise ValueError(f"volume mount_path must be absolute, got: {v!r}")
         return v
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "KubernetesVolumeConfig":
+        if (self.claim is None) == (self.empty_dir is None):
+            raise ValueError(
+                f"kubernetes volume '{self.name}' must set exactly one of "
+                "'claim' or 'empty_dir'"
+            )
+        if self.ensure_writable:
+            if self.empty_dir is not None:
+                raise ValueError(
+                    f"kubernetes volume '{self.name}': ensure_writable applies to "
+                    "PVC volumes only (an emptyDir is already writable)"
+                )
+            if self.effective_read_only():
+                raise ValueError(
+                    f"kubernetes volume '{self.name}': ensure_writable requires "
+                    "read_only: false"
+                )
+        return self
+
+    def effective_read_only(self) -> bool:
+        """Resolve the read-only default per source (PVC=True, emptyDir=False)."""
+        if self.read_only is not None:
+            return self.read_only
+        return self.empty_dir is None
 
 
 class KubernetesReservationConfig(BaseModel):
@@ -236,6 +299,12 @@ class KubernetesBackendConfig(BackendConfig):
     # pods use the fixed internal sleeper image (RESERVATION_POD_IMAGE).
     namespace: Resolvable[str] | None = None
     image_pull_policy: Resolvable[str] | None = None
+    # Image for the per-allocation probe pod that runs in-cluster TCP/HTTP
+    # readiness/failure checks on the driver's behalf (see _k8s_probe). It only
+    # needs `curl`. Override for air-gapped/mirror registries. In-cluster probing
+    # is on by default for the k8s backend; set env SFLOW_K8S_PROBE_VIA_POD=0 to
+    # disable it and probe directly from the sflow driver host instead.
+    probe_pod_image: Resolvable[str] = PROBE_POD_IMAGE_DEFAULT
     nodes: Resolvable[int] = 1
     extra_args: list[Resolvable[str]] | None = None
     # Node selector applied to all pods created under this backend.
@@ -341,6 +410,18 @@ class KubernetesBackend(Backend):
             if config.image_pull_policy is not None
             else None
         )
+        self._probe_pod_image = (
+            str(config.probe_pod_image)
+            if config.probe_pod_image is not None
+            else PROBE_POD_IMAGE_DEFAULT
+        )
+        # Per-allocation probe pod. Created lazily on the first TCP/HTTP probe
+        # (see _kickoff_probe_pod), so probe-less / log_watch-only workflows never
+        # create one. ``_probe_pod_name`` stays None until it exists (or when
+        # in-cluster probing is disabled); ``_probe_pod_task`` is the in-flight
+        # creation task.
+        self._probe_pod_name: str | None = None
+        self._probe_pod_task: "asyncio.Task[None] | None" = None
         self._nodes = int(config.nodes) if config.nodes is not None else 1
         self._gpu_per_node = (
             int(config.gpus_per_node) if config.gpus_per_node is not None else None
@@ -651,18 +732,28 @@ class KubernetesBackend(Backend):
 
     @property
     def volumes(self) -> list[dict[str, Any]]:
-        """PVC mounts (resolved) injected into task pods by the operator."""
+        """Volume mounts (resolved) injected into task pods by the operator."""
         out: list[dict[str, Any]] = []
         for v in self._volumes:
-            out.append(
-                {
-                    "name": str(v.name),
-                    "claim": str(v.claim),
-                    "mount_path": str(v.mount_path),
-                    "sub_path": str(v.sub_path) if v.sub_path is not None else None,
-                    "read_only": bool(v.read_only),
+            entry: dict[str, Any] = {
+                "name": str(v.name),
+                "mount_path": str(v.mount_path),
+                "sub_path": str(v.sub_path) if v.sub_path is not None else None,
+                "read_only": v.effective_read_only(),
+            }
+            if v.empty_dir is not None:
+                entry["empty_dir"] = {
+                    "medium": str(v.empty_dir.medium or ""),
+                    "size_limit": (
+                        str(v.empty_dir.size_limit)
+                        if v.empty_dir.size_limit is not None
+                        else None
+                    ),
                 }
-            )
+            else:
+                entry["claim"] = str(v.claim)
+                entry["ensure_writable"] = bool(v.ensure_writable)
+            out.append(entry)
         return out
 
     @property
@@ -717,6 +808,134 @@ class KubernetesBackend(Backend):
                 f"Failed to create reservation {kind} '{name}': "
                 f"{stderr.decode(errors='replace').strip()}"
             )
+
+    # ------------------------------------------------------------------
+    # In-cluster probe pod (see _k8s_probe.K8sExecProbeTransport)
+    # ------------------------------------------------------------------
+
+    def _probe_via_pod_enabled(self) -> bool:
+        """Whether TCP/HTTP probes route through the in-cluster probe pod.
+
+        On by default; ``SFLOW_K8S_PROBE_VIA_POD=0`` (or false/no/off) disables
+        it so probes run directly from the sflow driver host instead.
+        """
+        val = os.environ.get("SFLOW_K8S_PROBE_VIA_POD")
+        if val is None:
+            return True
+        return val.strip().lower() not in ("0", "false", "no", "off", "")
+
+    def _kickoff_probe_pod(self) -> None:
+        """Start background creation of the probe pod on first network-probe use.
+
+        Lazy on purpose: a workflow with no TCP/HTTP probes (e.g. log_watch-only
+        or probe-less batch jobs) never creates the pod. Idempotent -- the pod is
+        created at most once per allocation. Once created it lives until
+        ``release()`` (like the task pods it probes), which is the window during
+        which any of the DAG's network probes may run; an individual readiness
+        probe still "ends" as usual once it triggers (it just stops running curl).
+        """
+        if not self._probe_via_pod_enabled():
+            return
+        if self._probe_pod_name is not None:
+            return
+        if self._probe_pod_task is not None and not self._probe_pod_task.done():
+            return
+        self._probe_pod_task = asyncio.ensure_future(self._create_probe_pod())
+
+    async def _create_probe_pod(self) -> None:
+        """Apply the probe pod for this allocation (best-effort; never fatal)."""
+        alloc_id = (
+            getattr(self.allocation, "allocation_id", None) or self._pending_alloc_id
+        )
+        if not alloc_id:
+            return
+        pod_name = f"sflow-probe-{sanitize_name(self.name)[:12]}-{alloc_id}"
+        try:
+            await self._apply_manifest(
+                render_probe_pod_manifest(
+                    pod_name=pod_name,
+                    allocation_id=alloc_id,
+                    image=self._probe_pod_image,
+                    namespace=self._namespace,
+                    image_pull_policy=self._image_pull_policy,
+                    node_selector=self._node_selector,
+                    tolerations=self._effective_tolerations(),
+                )
+            )
+        except Exception as e:
+            _logger.warning(
+                "Kubernetes backend '%s': could not create probe pod (%s); "
+                "TCP/HTTP probes will keep retrying until it exists.",
+                self.name,
+                e,
+            )
+            return
+        self._probe_pod_name = pod_name
+        _logger.info(
+            "Kubernetes backend '%s': created in-cluster probe pod '%s' for "
+            "TCP/HTTP probes.",
+            self.name,
+            pod_name,
+        )
+
+    async def _await_probe_pod_task(self) -> None:
+        """Let any in-flight probe-pod creation finish before release() reaps it.
+
+        Guarantees create-then-delete ordering: if a probe pod is still being
+        applied when the allocation is released, wait for the apply to land so the
+        label-based delete in ``release()`` reliably removes it (no orphan).
+        """
+        task = self._probe_pod_task
+        self._probe_pod_task = None
+        if task is not None and not task.done():
+            with suppress(Exception):
+                await task
+
+    async def _exec_in_probe_pod(
+        self, argv: list[str], stdin: bytes | None = None
+    ) -> tuple[int, str, str]:
+        """Run ``argv`` inside the probe pod via ``kubectl exec`` (stdin optional).
+
+        Creates the probe pod on first use; until it is up, returns a non-zero
+        result so the probe simply retries (readiness stays not-ready and a
+        failure probe stays not-failed rather than spuriously firing).
+        """
+        pod = self._probe_pod_name
+        if not pod:
+            self._kickoff_probe_pod()
+            return (1, "", "probe pod not ready")
+        exec_args = ["exec"]
+        if stdin is not None:
+            exec_args.append("-i")
+        exec_args += [pod, *self._ns_args(), "--", *argv]
+        if stdin is None:
+            return await self._kubectl(exec_args)
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            *self._global_args(),
+            *exec_args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(stdin)
+        return (
+            proc.returncode,
+            out.decode(errors="replace").strip(),
+            err.decode(errors="replace").strip(),
+        )
+
+    def probe_transport(self) -> "K8sExecProbeTransport | None":
+        """In-cluster probe transport, or None to probe from the driver host.
+
+        The transport exists whenever in-cluster probing is enabled; the probe
+        pod itself is created lazily on the first TCP/HTTP check (see
+        ``_exec_in_probe_pod``), so probe-less / log_watch-only workflows never
+        create one.
+        """
+        if not self._probe_via_pod_enabled():
+            return None
+        return K8sExecProbeTransport(exec_fn=self._exec_in_probe_pod)
 
     def _reservation_retries(self) -> int:
         """Poll attempts for reservation readiness, derived from the timeout."""
@@ -1616,11 +1835,18 @@ class KubernetesBackend(Backend):
         await asyncio.gather(*deletions, return_exceptions=True)
 
     async def release(self, allocation: Allocation) -> None:
+        # Let any in-flight probe-pod creation finish so the label-based delete
+        # below reliably reaps it (avoids a create-after-delete orphan).
+        await self._await_probe_pod_task()
         if not allocation.allocation_id:
             return
         await self._release_alloc(allocation.allocation_id)
 
     def emergency_release(self, allocation: Allocation) -> None:
+        # Best-effort: stop any in-flight probe-pod creation; the label-based
+        # pod delete below reaps a probe pod that was already applied.
+        if self._probe_pod_task is not None and not self._probe_pod_task.done():
+            self._probe_pod_task.cancel()
         alloc_id = self._pending_alloc_id or getattr(allocation, "allocation_id", None)
         if not alloc_id:
             return
@@ -1825,14 +2051,31 @@ class KubernetesBackend(Backend):
             volumes = [
                 KubernetesVolumeConfig(
                     name=v.name,
-                    claim=str(resolver.resolve(v.claim, ctx)),
+                    claim=(
+                        str(resolver.resolve(v.claim, ctx))
+                        if v.claim is not None
+                        else None
+                    ),
+                    empty_dir=(
+                        KubernetesEmptyDirConfig(
+                            medium=v.empty_dir.medium,
+                            size_limit=(
+                                str(resolver.resolve(v.empty_dir.size_limit, ctx))
+                                if v.empty_dir.size_limit is not None
+                                else None
+                            ),
+                        )
+                        if v.empty_dir is not None
+                        else None
+                    ),
                     mount_path=str(resolver.resolve(v.mount_path, ctx)),
                     sub_path=(
                         str(resolver.resolve(v.sub_path, ctx))
                         if v.sub_path is not None
                         else None
                     ),
-                    read_only=bool(v.read_only),
+                    read_only=v.read_only,
+                    ensure_writable=v.ensure_writable,
                 )
                 for v in conf.volumes
             ]

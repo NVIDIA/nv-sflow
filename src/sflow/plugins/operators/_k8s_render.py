@@ -36,6 +36,10 @@ SFLOW_TASK_LABEL = "sflow.ai/task"
 # etcd/nats/frontend overlapping on the head node alongside its placeholder).
 SFLOW_ROLE_LABEL = "sflow.ai/role"
 RESERVATION_ROLE = "reservation"
+# Role for the per-allocation helper pod that runs in-cluster readiness/failure
+# network probes (TCP/HTTP) on the sflow driver's behalf, so the checks reach the
+# workload's node/pod IPs from inside the cluster network.
+PROBE_ROLE = "probe"
 
 # Standard node label carrying the node's hostname; the placement primitive for
 # pinning pods onto reserved nodes (nodeSelector / nodeAffinity / anti-affinity).
@@ -63,6 +67,20 @@ COMPUTE_DOMAIN_CLAIM_NAME = "compute-domain-channel"
 # alpine-based (~13MB) and ships the shell + sleep the placeholder command uses.
 RESERVATION_POD_IMAGE = "bash:5"
 
+# Default image for the probe pod. It only needs `curl` (used for both the TCP
+# connect check and HTTP GET/POST). Overridable per-backend via
+# ``probe_pod_image`` for air-gapped/mirror registries.
+PROBE_POD_IMAGE_DEFAULT = "curlimages/curl:latest"
+
+# Idle command for the probe pod. Uses a bounded ``sleep`` loop rather than
+# ``sleep infinity`` so it works on busybox-only images (e.g. curlimages/curl);
+# the TERM/INT trap lets ``kubectl delete`` reap it promptly.
+_PROBE_SLEEPER_CMD = [
+    "sh",
+    "-c",
+    "trap 'exit 0' TERM INT; while true; do sleep 3600 & wait $!; done",
+]
+
 # Where the task script ConfigMap is mounted, and the entrypoint file name.
 SFLOW_SCRIPT_DIR = "/sflow"
 SFLOW_ENTRYPOINT_FILE = "entrypoint.sh"
@@ -77,6 +95,9 @@ SFLOW_ENTRYPOINT_PATH = f"{SFLOW_SCRIPT_DIR}/{SFLOW_ENTRYPOINT_FILE}"
 MERGE_MUX_OPEN = "[[sflow-mux:"
 MERGE_MUX_CLOSE = "]] "
 _SCRIPT_VOLUME_NAME = "sflow-scripts"
+# Where the ensure_writable initContainer mounts each target volume's ROOT (no
+# subPath) so it can mkdir + chmod the workload's subPath dir writable.
+_ENSURE_WRITABLE_DIR = "/sflow-ensure-writable"
 # Volume name for inline file:// artifacts injected as a ConfigMap. Each artifact
 # is mounted (read-only, via subPath) at its resolved in-task path so task scripts
 # referencing ``${{ artifacts.NAME.path }}`` find the file inside the pod.
@@ -421,6 +442,59 @@ def render_reservation_pod_manifest(
     return {"apiVersion": "v1", "kind": "Pod", "metadata": metadata, "spec": pod_spec}
 
 
+def render_probe_pod_manifest(
+    *,
+    pod_name: str,
+    allocation_id: str,
+    image: str = PROBE_POD_IMAGE_DEFAULT,
+    namespace: str | None = None,
+    image_pull_policy: str | None = None,
+    node_selector: Mapping[str, str] | None = None,
+    tolerations: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Render a lightweight helper Pod that runs in-cluster network probes.
+
+    The sflow driver ``kubectl exec``s ``curl`` inside this pod to run TCP/HTTP
+    readiness/failure checks, so probes reach the workload's node/pod IPs from
+    *inside* the cluster network -- which the driver host itself may not be able
+    to route to. ``kubectl exec`` tunnels through the API server, so the driver
+    needs no direct pod-network access.
+
+    The pod holds no GPUs and carries no scheduling affinity: it only needs to
+    land on the cluster pod network. ``tolerations`` (and ``node_selector``) are
+    inherited from the backend so it can still schedule on tainted/selected
+    nodes. It is labeled with the allocation id so ``release()`` /
+    ``emergency_release()`` tear it down with the rest of the allocation.
+    """
+    container: dict[str, Any] = {
+        "name": "probe",
+        "image": image,
+        "command": list(_PROBE_SLEEPER_CMD),
+    }
+    if image_pull_policy:
+        container["imagePullPolicy"] = image_pull_policy
+
+    pod_spec: dict[str, Any] = {
+        # Long-lived helper: auto-recover if the container ever crashes so probes
+        # keep working for the whole allocation (unlike short-lived reservation
+        # pods, which use Never because they are deleted on the GPU handoff).
+        "restartPolicy": "Always",
+        "terminationGracePeriodSeconds": _RESERVATION_TERMINATION_GRACE_SECONDS,
+        "containers": [container],
+    }
+    if node_selector:
+        pod_spec["nodeSelector"] = dict(node_selector)
+    if tolerations:
+        pod_spec["tolerations"] = [dict(t) for t in tolerations]
+
+    metadata = _manifest_metadata(
+        pod_name,
+        namespace,
+        labels={SFLOW_ALLOC_LABEL: allocation_id, SFLOW_ROLE_LABEL: PROBE_ROLE},
+    )
+    return {"apiVersion": "v1", "kind": "Pod", "metadata": metadata, "spec": pod_spec}
+
+
 def render_task_pod(
     *,
     pod_name: str,
@@ -542,7 +616,16 @@ def render_task_pod(
     # mounts of the node-installed dirs, read-only at their canonical container paths.
     for idx, (host_path, mount_path) in enumerate(rdma_lib_mounts):
         vol_name = f"sflow-rdma-lib-{idx}"
-        volumes.append({"name": vol_name, "hostPath": {"path": host_path}})
+        # DirectoryOrCreate: the GKE gIB libs only exist if the `nccl-rdma-installer`
+        # DaemonSet is deployed (not a default GKE path). Tolerate its absence -- the
+        # pod still starts and the in-pod `[ -f set_nccl_env.sh ]` guard skips the
+        # gIB tuning, so NCCL falls back to its built-in IB transport.
+        volumes.append(
+            {
+                "name": vol_name,
+                "hostPath": {"path": host_path, "type": "DirectoryOrCreate"},
+            }
+        )
         volume_mounts.append(
             {"name": vol_name, "mountPath": mount_path, "readOnly": True}
         )
@@ -558,20 +641,49 @@ def render_task_pod(
             {"name": vol_name, "hostPath": {"path": host_path, "type": "Directory"}}
         )
         volume_mounts.append({"name": vol_name, "mountPath": host_path})
-    # Pre-existing PVCs (e.g. shared model storage). The claim + data must already
-    # exist in the namespace; sflow only references it.
+    # Backend-declared volumes: a pre-existing PVC (shared model storage; the claim
+    # + data must already exist -- sflow only references it) or an ephemeral,
+    # per-pod emptyDir (writable scratch, e.g. a JIT/kernel cache).
+    # ``ensure_writable`` PVCs also get a root initContainer (built below) that
+    # chmods the mounted path so a non-root workload can write a root-owned subPath.
+    ensure_writable_mounts: list[dict[str, Any]] = []
+    ensure_writable_cmds: list[str] = []
     for pvc in pvc_mounts:
         vol_name = str(pvc["name"])
         read_only = bool(pvc.get("read_only", True))
-        volumes.append(
-            {
-                "name": vol_name,
-                "persistentVolumeClaim": {
-                    "claimName": str(pvc["claim"]),
-                    "readOnly": read_only,
-                },
-            }
-        )
+        empty_dir = pvc.get("empty_dir")
+        if empty_dir is not None:
+            ed_spec: dict[str, Any] = {}
+            medium = empty_dir.get("medium")
+            if medium:
+                ed_spec["medium"] = str(medium)
+            size_limit = empty_dir.get("size_limit")
+            if size_limit:
+                ed_spec["sizeLimit"] = str(size_limit)
+            volumes.append({"name": vol_name, "emptyDir": ed_spec})
+        else:
+            volumes.append(
+                {
+                    "name": vol_name,
+                    "persistentVolumeClaim": {
+                        "claimName": str(pvc["claim"]),
+                        "readOnly": read_only,
+                    },
+                }
+            )
+            if pvc.get("ensure_writable") and not read_only:
+                # Mount the volume ROOT (no subPath) in a root initContainer and
+                # create + world-write the target so the (non-root) workload can
+                # write a subPath dir the kubelet would otherwise create root-owned.
+                init_root = f"{_ENSURE_WRITABLE_DIR}/{vol_name}"
+                sub = pvc.get("sub_path")
+                target = f"{init_root}/{sub}" if sub else init_root
+                ensure_writable_mounts.append(
+                    {"name": vol_name, "mountPath": init_root}
+                )
+                ensure_writable_cmds.append(
+                    f"mkdir -p '{target}' && chmod 0777 '{target}' || true"
+                )
         mount: dict[str, Any] = {
             "name": vol_name,
             "mountPath": str(pvc["mount_path"]),
@@ -648,6 +760,20 @@ def render_task_pod(
         "containers": [container],
         "volumes": volumes,
     }
+    # ensure_writable PVCs: a root initContainer that chmods the mounted path so a
+    # non-root workload can write a subPath the kubelet would create root-owned.
+    # Reuses the task image (already pulled) and runs as root; best-effort.
+    if ensure_writable_cmds:
+        init_container: dict[str, Any] = {
+            "name": "sflow-ensure-writable",
+            "image": image,
+            "command": ["sh", "-c", "; ".join(ensure_writable_cmds)],
+            "securityContext": {"runAsUser": 0, "runAsGroup": 0},
+            "volumeMounts": ensure_writable_mounts,
+        }
+        if image_pull_policy:
+            init_container["imagePullPolicy"] = image_pull_policy
+        pod_spec["initContainers"] = [init_container]
     if pod_claims:
         pod_spec["resourceClaims"] = pod_claims
     if host_network:

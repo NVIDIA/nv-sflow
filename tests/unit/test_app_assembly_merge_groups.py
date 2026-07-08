@@ -48,18 +48,22 @@ class _FakePlacement:
 
 
 class _RecordingOperator:
-    def __init__(self):
+    def __init__(self, image=None):
         self.merge_call = None
+        self._image = image
+
+    def container_images(self):
+        return [self._image] if self._image else []
 
     def apply_merge_group(self, *, members, union_gpus):
         self.merge_call = (list(members), union_gpus)
 
 
-def _task(name: str) -> Task:
+def _task(name: str, image=None) -> Task:
     return Task(
         name=name,
         logger=logging.getLogger(f"test.{name}"),
-        operator=_RecordingOperator(),
+        operator=_RecordingOperator(image),
         status=TaskStatus.INITIATED,
     )
 
@@ -68,6 +72,13 @@ def _graph(names):
     tg = TaskGraph()
     for n in names:
         tg.dag.add_node(n, _task(n))
+    return tg
+
+
+def _graph_with_images(name_to_image):
+    tg = TaskGraph()
+    for n, img in name_to_image.items():
+        tg.dag.add_node(n, _task(n, image=img))
     return tg
 
 
@@ -203,6 +214,34 @@ def test_different_nodes_are_separate_groups():
     _plan_merge_groups(tg, placements)
     assert tg.get_task("a").is_merge_leader is False
     assert tg.get_task("b").is_merge_leader is False
+
+
+def test_no_merge_when_container_images_differ():
+    # A merged pod is a single container, so co-located tasks that would launch
+    # DIFFERENT images must NOT be merged (a follower would otherwise silently run
+    # in the leader's image).
+    tg = _graph_with_images({"decode": "img-a:1", "prefill": "img-b:1"})
+    be = _FakeBackend("k8s")
+    placements = {
+        "decode": _FakePlacement(be, ["node-a"], 4),
+        "prefill": _FakePlacement(be, ["node-a"], 2),
+    }
+    _plan_merge_groups(tg, placements)
+    assert tg.get_task("decode").is_merge_leader is False
+    assert tg.get_task("prefill").is_merge_follower is False
+
+
+def test_merge_when_container_images_match():
+    # Same node AND same image -> merges into one pod as before.
+    tg = _graph_with_images({"decode": "img-a:1", "prefill": "img-a:1"})
+    be = _FakeBackend("k8s")
+    placements = {
+        "decode": _FakePlacement(be, ["node-a"], 4),
+        "prefill": _FakePlacement(be, ["node-a"], 2),
+    }
+    _plan_merge_groups(tg, placements)
+    assert tg.get_task("decode").is_merge_leader is True
+    assert tg.get_task("prefill").merge_leader == "decode"
 
 
 def test_intra_group_completion_dependency_raises():

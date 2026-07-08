@@ -129,6 +129,30 @@ def test_device_plugin_renders_limit_no_claim():
 
 
 # ---------------------------------------------------------------------------
+# NVIDIA driver discoverability (libcuda.so.1) on every GPU pod
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_pod_prepends_nvidia_driver_to_ld_library_path():
+    # GKE bind-mounts the host driver into /usr/local/nvidia but does not add it to
+    # the loader path. Without this, a single-node GPU pod can't load libcuda.so.1
+    # and vLLM/torch fail with "Failed to infer device type". Applies to every GPU
+    # pod, not just multi-node RDMA ones.
+    manifest, _ = _build(_backend("device_plugin", 8), ["node-0"], gpu_count=4)
+    entry = _entrypoint(manifest)
+    assert "export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}" in entry
+    assert "export PATH=/usr/local/nvidia/bin:${PATH:-}" in entry
+    # The preamble runs before the task's own script.
+    assert entry.index("/usr/local/nvidia/lib64") < entry.index("run")
+
+
+def test_cpu_only_pod_has_no_nvidia_driver_preamble():
+    # GPU-less pods (frontend/etcd/nats) must not get the driver env.
+    manifest, _ = _build(_backend("device_plugin", 8), ["node-0"], gpu_count=None)
+    assert "/usr/local/nvidia" not in _entrypoint(manifest)
+
+
+# ---------------------------------------------------------------------------
 # multi-node pod set + env wiring
 # ---------------------------------------------------------------------------
 
@@ -164,7 +188,9 @@ def test_script_mounted_via_configmap_and_tolerations_present():
     manifest, _ = _build(_backend("dra", 8), ["node-0"], gpu_count=2,
                          script=["echo hi", "python run.py"])
     cm = [i for i in manifest["items"] if i["kind"] == "ConfigMap"][0]
-    assert cm["data"]["entrypoint.sh"] == "echo hi\npython run.py"
+    # The task's script is mounted as the entrypoint (a GPU pod also gets the
+    # NVIDIA driver preamble prepended, so match the tail rather than the whole).
+    assert cm["data"]["entrypoint.sh"].endswith("echo hi\npython run.py")
     pod = _pods(manifest)[0]
     assert pod["spec"]["containers"][0]["command"] == ["bash", "-l", "/sflow/entrypoint.sh"]
     vols = pod["spec"]["volumes"][0]
@@ -911,6 +937,21 @@ def test_gke_keeps_static_pin_and_no_runtime_affinity_preamble():
     assert "_sflow_rdma_setup" not in _entrypoint(manifest)  # no affinity preamble
 
 
+def test_rdma_full_node_pod_is_not_ib_pinned():
+    # A pod that owns ALL the node's NICs is left UNPINNED (NCCL auto-selects).
+    # Force-pinning every HCA without the GKE gIB NCCL tuning drove an unstable
+    # all-NIC RDMA config that reset the node; only partial-node pods are pinned.
+    manifest, _ = _build(
+        _rdma_backend(), ["node-0"], gpu_count=8,
+        cuda_visible="0,1,2,3,4,5,6,7",
+    )
+    pod = _pods(manifest)[0]
+    assert _rdma_nic_indices(pod) == [0, 1, 2, 3, 4, 5, 6, 7]  # all node NICs granted
+    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0].get("env", [])}
+    assert "NCCL_IB_HCA" not in env
+    assert "UCX_NET_DEVICES" not in env
+
+
 # ---------------------------------------------------------------------------
 # Fail-fast on unrecoverable pod-start states (Unschedulable / ImagePullBackOff)
 # ---------------------------------------------------------------------------
@@ -1224,6 +1265,32 @@ def test_merge_pod_configmap_has_launcher_and_member_scripts():
     assert "_sflow_run prefill 4,5 /sflow/merge_prefill.sh" in launcher
     assert "[[sflow-mux:" in launcher
     assert 'export CUDA_VISIBLE_DEVICES="$_cvd"' in launcher
+
+
+def test_merge_pod_launcher_prepends_nvidia_driver_to_ld_library_path():
+    # The union-GPU merge pod also needs the driver on LD_LIBRARY_PATH. The launcher
+    # exports it once in the parent shell (inherited by every member subshell),
+    # before any member starts.
+    manifest, _, _ = _merged_build(_backend("device_plugin", 8))
+    launcher = _entrypoint(manifest)
+    assert "export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}" in launcher
+    assert "export PATH=/usr/local/nvidia/bin:${PATH:-}" in launcher
+    assert launcher.index("/usr/local/nvidia/lib64") < launcher.index("_sflow_run decode")
+
+
+def test_merge_pod_rdma_exposes_all_node_nics_and_no_ib_pin():
+    # A merged pod is the only GPU pod on its node, so it requests EVERY node RDMA
+    # NIC (not a union-sized window) and does NOT build-time pin NCCL_IB_HCA -- NCCL
+    # and UCX auto-select across all exposed NICs. IPC_LOCK is still granted so verbs
+    # memory can be pinned. (_rdma_backend advertises 8 NICs; the merge union is 6.)
+    manifest, _, _ = _merged_build(_rdma_backend())
+    container = _pods(manifest)[0]["spec"]["containers"][0]
+    assert _rdma_nic_indices(_pods(manifest)[0]) == [0, 1, 2, 3, 4, 5, 6, 7]
+    env = {e["name"]: e["value"] for e in container.get("env", [])}
+    assert "NCCL_IB_HCA" not in env
+    assert "UCX_NET_DEVICES" not in env
+    caps = container["securityContext"]["capabilities"]["add"]
+    assert "IPC_LOCK" in caps
 
 
 def test_merge_pod_per_member_env_secrets_not_envfrom():

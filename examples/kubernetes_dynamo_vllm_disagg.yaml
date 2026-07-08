@@ -49,17 +49,17 @@ variables:
     description: "Number of nodes"
     value: 1
 
-  # --- Persistent kernel/JIT cache (reused across runs) ---
+  # --- Kernel/JIT cache (persisted across runs on a PVC) ---
   # DeepGEMM / DeepEP / Triton / torch.compile JIT-compile kernels on first use,
   # which is slow at every startup. Persisting them on a PVC lets later runs reuse
-  # the compiled kernels instead of recompiling. The GPU worker scripts point the
-  # cache env vars (DG_JIT_CACHE_DIR / EP_JIT_CACHE_DIR / TRITON_CACHE_DIR / ...) at
-  # KERNEL_CACHE_DIR, backed by the `kernel-cache` PVC volume (see backend below).
+  # the compiled kernels. The GPU worker scripts point the cache env vars
+  # (DG_JIT_CACHE_DIR / EP_JIT_CACHE_DIR / TRITON_CACHE_DIR / ...) at
+  # KERNEL_CACHE_DIR, backed by the `kernel-cache` volume (see backend below).
   KERNEL_CACHE_DIR:
-    description: "In-pod mount path for the persistent kernel/JIT cache"
+    description: "In-pod mount path for the kernel/JIT cache"
     value: /cache
   CACHE_PVC_CLAIM:
-    description: "RWX PVC that stores the kernel cache (defaults to the model PVC; set a dedicated RWX cache PVC if you have one)"
+    description: "Writable RWX PVC that stores the kernel cache (defaults to the model PVC; its 'sflow-kernel-cache' subdir must be writable by the container user -- see the volume comment)"
     value: ${{ variables.MODEL_PVC_CLAIM }}
 
   # Model Configuration
@@ -286,15 +286,21 @@ backends:
         claim: ${{ variables.MODEL_PVC_CLAIM }}
         mount_path: /models
         read_only: true
-      # Writable cache PVC: persists the JIT/kernel cache (DeepGEMM/DeepEP/Triton/
-      # torch.compile) across runs so kernels are compiled once and then reused.
-      # Defaults to the model PVC under a `sflow-kernel-cache` sub_path; must be RWX
-      # so all worker pods (incl. multi-node) can share it. Mounted read-write.
+      # Persistent JIT/kernel cache on a writable RWX PVC (kernels compiled once,
+      # reused on later runs). Defaults to the model PVC under a `sflow-kernel-cache`
+      # subPath, mounted read-write. `ensure_writable: true` injects a root
+      # initContainer that chmods the subPath so the (non-root) workload can write it
+      # -- otherwise a kubelet-created subPath is root-owned and non-writable. It is
+      # best-effort: on a root-squashed/read-only backing volume the worker scripts
+      # still fall back to an ephemeral node-local cache (no persistence) rather than
+      # failing. For a purely ephemeral cache, replace the four lines below with
+      # `empty_dir: {}`.
       - name: kernel-cache
         claim: ${{ variables.CACHE_PVC_CLAIM }}
         mount_path: ${{ variables.KERNEL_CACHE_DIR }}
         sub_path: sflow-kernel-cache
         read_only: false
+        ensure_writable: true
     reservation:
       timeout: 1200
 

@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from sflow.core.probe import Probe, ProbeStatus, ProbeTimeoutError, ProbeType
-from sflow.plugins.probes import LogWatchProbe, TcpPortProbe
+from sflow.core.probe_transport import LocalProbeTransport, ProbeTransport
+from sflow.plugins.probes import (
+    HttpGetProbe,
+    HttpPostProbe,
+    LogWatchProbe,
+    TcpPortProbe,
+)
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
 from sflow.core.task import Task
 
@@ -251,7 +257,7 @@ def test_tcp_port_probe_on_node_first_passes_when_port_open():
         timeout=1,
     )
     mock_open = AsyncMock(return_value=_mock_connection())
-    with patch("sflow.plugins.probes.tcp_port.asyncio.open_connection", mock_open):
+    with patch("sflow.core.probe_transport.asyncio.open_connection", mock_open):
         result = asyncio.run(p.check(t))
     assert result is True
     mock_open.assert_called_once_with("10.0.0.1", 8000)
@@ -273,7 +279,7 @@ def test_tcp_port_probe_on_node_first_fails_when_port_closed():
         timeout=1,
     )
     with patch(
-        "sflow.plugins.probes.tcp_port.asyncio.open_connection",
+        "sflow.core.probe_transport.asyncio.open_connection",
         AsyncMock(side_effect=ConnectionRefusedError()),
     ):
         result = asyncio.run(p.check(t))
@@ -297,7 +303,7 @@ def test_tcp_port_probe_on_node_each_passes_when_all_ports_open():
         timeout=1,
     )
     mock_open = AsyncMock(return_value=_mock_connection())
-    with patch("sflow.plugins.probes.tcp_port.asyncio.open_connection", mock_open):
+    with patch("sflow.core.probe_transport.asyncio.open_connection", mock_open):
         result = asyncio.run(p.check(t))
     assert result is True
     assert mock_open.call_count == 3
@@ -333,7 +339,7 @@ def test_tcp_port_probe_on_node_each_fails_when_one_port_closed():
         return _mock_connection()
 
     with patch(
-        "sflow.plugins.probes.tcp_port.asyncio.open_connection",
+        "sflow.core.probe_transport.asyncio.open_connection",
         side_effect=open_connection_second_fails,
     ):
         result = asyncio.run(p.check(t))
@@ -357,7 +363,7 @@ def test_tcp_port_probe_on_node_each_fallback_when_no_assigned_ips():
         timeout=1,
     )
     mock_open = AsyncMock(return_value=_mock_connection())
-    with patch("sflow.plugins.probes.tcp_port.asyncio.open_connection", mock_open):
+    with patch("sflow.core.probe_transport.asyncio.open_connection", mock_open):
         result = asyncio.run(p.check(t))
     assert result is True
     mock_open.assert_called_once_with("127.0.0.1", 8000)
@@ -517,3 +523,136 @@ def test_effective_check_timeout_falls_back_to_interval():
         type=ProbeType.READINESS, each_check_timeout=30, interval=0
     )
     assert p3.effective_check_timeout == 30
+
+
+# ---------------------------------------------------------------------------
+# Probe transport delegation (TCP/HTTP probes route I/O through a transport)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTransport(ProbeTransport):
+    def __init__(self, *, tcp_result=True, http_status=200):
+        self.tcp_calls: list[tuple] = []
+        self.http_calls: list[dict] = []
+        self._tcp_result = tcp_result
+        self._http_status = http_status
+
+    async def tcp_connect(self, host, port, timeout):
+        self.tcp_calls.append((host, port, timeout))
+        if callable(self._tcp_result):
+            return self._tcp_result(host, port)
+        return self._tcp_result
+
+    async def http_request(self, *, method, url, headers, body, timeout):
+        self.http_calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers or {}),
+                "body": body,
+                "timeout": timeout,
+            }
+        )
+        return self._http_status
+
+
+def _probe_task():
+    return Task(
+        name="svc",
+        logger=_DummyLogger(),  # type: ignore[arg-type]
+        operator=BashOperator(BashOperatorConfig(name="bash")),
+    )
+
+
+def test_tcp_probe_delegates_to_transport_first():
+    ft = _FakeTransport(tcp_result=True)
+    p = TcpPortProbe(
+        host="10.0.0.1", port=8000, type=ProbeType.READINESS, transport=ft, interval=0
+    )
+    assert asyncio.run(p.check(_probe_task())) is True
+    assert ft.tcp_calls == [("10.0.0.1", 8000, p.effective_check_timeout)]
+
+
+def test_tcp_probe_each_iterates_assigned_ips_and_stops_on_failure():
+    seen: list[str] = []
+
+    def result(host, port):
+        seen.append(host)
+        return host != "10.0.0.3"  # fail on the second host
+
+    ft = _FakeTransport(tcp_result=result)
+    p = TcpPortProbe(
+        host="ignored",
+        port=9,
+        on_node="each",
+        type=ProbeType.READINESS,
+        transport=ft,
+        interval=0,
+    )
+    t = _probe_task()
+    t.envs["SFLOW_TASK_ASSIGNED_NODE_IPS"] = "10.0.0.1,10.0.0.3,10.0.0.9"
+    assert asyncio.run(p.check(t)) is False
+    assert seen == ["10.0.0.1", "10.0.0.3"]
+
+
+def test_http_get_probe_delegates_and_maps_status():
+    ft = _FakeTransport(http_status=200)
+    p = HttpGetProbe(
+        url="http://svc/health",
+        headers={"A": "b"},
+        type=ProbeType.READINESS,
+        transport=ft,
+        interval=0,
+    )
+    assert asyncio.run(p.check(_probe_task())) is True
+    call = ft.http_calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://svc/health"
+    assert call["headers"] == {"A": "b"}
+    assert call["body"] is None
+
+
+def test_http_get_probe_non_success_status_is_false():
+    ft = _FakeTransport(http_status=500)
+    p = HttpGetProbe(
+        url="http://svc", type=ProbeType.READINESS, transport=ft, interval=0
+    )
+    assert asyncio.run(p.check(_probe_task())) is False
+
+
+def test_http_get_probe_none_status_is_false():
+    ft = _FakeTransport(http_status=None)
+    p = HttpGetProbe(
+        url="http://svc", type=ProbeType.READINESS, transport=ft, interval=0
+    )
+    assert asyncio.run(p.check(_probe_task())) is False
+
+
+def test_http_post_probe_passes_body():
+    ft = _FakeTransport(http_status=204)
+    p = HttpPostProbe(
+        url="http://svc/v1",
+        body="{}",
+        type=ProbeType.READINESS,
+        transport=ft,
+        interval=0,
+    )
+    assert asyncio.run(p.check(_probe_task())) is True
+    call = ft.http_calls[0]
+    assert call["method"] == "POST"
+    assert call["body"] == "{}"
+
+
+def test_probes_default_to_local_transport():
+    assert isinstance(
+        TcpPortProbe(host="127.0.0.1", port=1, type=ProbeType.READINESS)._transport,
+        LocalProbeTransport,
+    )
+    assert isinstance(
+        HttpGetProbe(url="http://x", type=ProbeType.READINESS)._transport,
+        LocalProbeTransport,
+    )
+    assert isinstance(
+        HttpPostProbe(url="http://x", type=ProbeType.READINESS)._transport,
+        LocalProbeTransport,
+    )

@@ -3,12 +3,15 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from sflow.logging import get_logger
 
 from .compute_node import ComputeNode
 from .operator import Operator
+
+if TYPE_CHECKING:
+    from .probe_transport import ProbeTransport
 
 _logger = get_logger(__name__)
 
@@ -121,6 +124,16 @@ class Backend(ABC):
     def dry_run_details(self) -> list[tuple[str, str]]:
         """Return backend-specific config details for dry-run summaries."""
         return []
+
+    def probe_transport(self) -> "ProbeTransport | None":
+        """Transport used to run this backend's network probes, or None.
+
+        Returning None (the default) means TCP/HTTP probes run directly from the
+        sflow driver host. Backends whose driver host may not reach the workload
+        network (e.g. Kubernetes) override this to run the checks from inside the
+        backend's network instead.
+        """
+        return None
 
     @abstractmethod
     async def allocate(self) -> Allocation:

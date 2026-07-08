@@ -53,7 +53,8 @@ def test_volumes_property_normalizes_pvc_config():
     ]))
     vols = backend.volumes
     assert vols[0] == {"name": "model-store", "claim": "model-pvc",
-                       "mount_path": "/models", "sub_path": None, "read_only": True}
+                       "mount_path": "/models", "sub_path": None, "read_only": True,
+                       "ensure_writable": False}
     assert vols[1]["sub_path"] == "out" and vols[1]["read_only"] is False
 
 
@@ -66,6 +67,103 @@ def test_volume_mount_path_must_be_absolute():
 
     with pytest.raises(pydantic.ValidationError):
         _cfg(volumes=[{"name": "v", "claim": "c", "mount_path": "relative/path"}])
+
+
+def test_volume_pvc_defaults_read_only_true():
+    be = KubernetesBackend(
+        _cfg(volumes=[{"name": "m", "claim": "model-pvc", "mount_path": "/models"}])
+    )
+    vol = be.volumes[0]
+    assert vol["claim"] == "model-pvc"
+    assert vol["read_only"] is True  # PVCs default read-only
+    assert "empty_dir" not in vol
+
+
+def test_volume_emptydir_defaults_writable():
+    be = KubernetesBackend(
+        _cfg(volumes=[{"name": "kernel-cache", "empty_dir": {}, "mount_path": "/cache"}])
+    )
+    vol = be.volumes[0]
+    assert vol["name"] == "kernel-cache"
+    assert vol["mount_path"] == "/cache"
+    assert vol["empty_dir"] == {"medium": "", "size_limit": None}
+    assert "claim" not in vol
+    assert vol["read_only"] is False  # emptyDir scratch defaults writable
+
+
+def test_volume_emptydir_medium_and_size_limit():
+    be = KubernetesBackend(
+        _cfg(
+            volumes=[
+                {
+                    "name": "c",
+                    "empty_dir": {"medium": "Memory", "size_limit": "10Gi"},
+                    "mount_path": "/cache",
+                }
+            ]
+        )
+    )
+    assert be.volumes[0]["empty_dir"] == {"medium": "Memory", "size_limit": "10Gi"}
+
+
+def test_volume_requires_exactly_one_source():
+    import pydantic
+
+    # neither claim nor empty_dir
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(volumes=[{"name": "x", "mount_path": "/x"}])
+    # both claim and empty_dir
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(
+            volumes=[
+                {"name": "x", "claim": "c", "empty_dir": {}, "mount_path": "/x"}
+            ]
+        )
+
+
+def test_volume_ensure_writable_valid_on_writable_pvc():
+    be = KubernetesBackend(
+        _cfg(
+            volumes=[
+                {
+                    "name": "kernel-cache",
+                    "claim": "c",
+                    "mount_path": "/cache",
+                    "sub_path": "sflow-kernel-cache",
+                    "read_only": False,
+                    "ensure_writable": True,
+                }
+            ]
+        )
+    )
+    vol = be.volumes[0]
+    assert vol["ensure_writable"] is True
+    assert vol["read_only"] is False
+
+
+def test_volume_ensure_writable_requires_read_only_false():
+    import pydantic
+
+    # PVC read_only defaults to True -> ensure_writable is contradictory
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(
+            volumes=[
+                {"name": "c", "claim": "x", "mount_path": "/cache",
+                 "ensure_writable": True}
+            ]
+        )
+
+
+def test_volume_ensure_writable_rejected_on_emptydir():
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        _cfg(
+            volumes=[
+                {"name": "c", "empty_dir": {}, "mount_path": "/cache",
+                 "read_only": False, "ensure_writable": True}
+            ]
+        )
 
 
 def test_rdma_config_modes():
@@ -1254,12 +1352,18 @@ def _reserve(backend: KubernetesBackend) -> tuple[Allocation, list[dict]]:
     async def fake_detect(pod_names):
         return None
 
+    async def fake_probe_pod(alloc_id):
+        # The in-cluster probe pod has dedicated tests; keep reservation tests
+        # focused on the placeholder/task pods they assert on.
+        return None
+
     with (
         mock.patch.object(backend, "_apply_manifest", side_effect=fake_apply),
         mock.patch.object(backend, "_wait_for_pod_scheduled", side_effect=fake_wait),
         mock.patch.object(backend, "_node_internal_ip", side_effect=fake_internal),
         mock.patch.object(backend, "_detect_network_env", side_effect=fake_detect),
         mock.patch.object(backend, "_detect_nvlink_scope", return_value="off"),
+        mock.patch.object(backend, "_create_probe_pod", side_effect=fake_probe_pod),
     ):
         allocation = asyncio.run(backend.allocate())
     return allocation, applied
@@ -1560,3 +1664,123 @@ def test_allocate_releases_reservation_on_cancel():
 
     assert len(released) == 1
     assert backend._pending_alloc_id is None
+
+
+# ---------------------------------------------------------------------------
+# In-cluster probe pod
+# ---------------------------------------------------------------------------
+
+
+def test_probe_transport_enabled_returns_transport(monkeypatch):
+    # The transport exists whenever in-cluster probing is enabled -- the pod is
+    # created lazily on first use, not required up front.
+    monkeypatch.delenv("SFLOW_K8S_PROBE_VIA_POD", raising=False)
+    be = KubernetesBackend(_cfg())
+    assert be.probe_transport() is not None
+
+
+def test_probe_transport_disabled_by_env(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    be._probe_pod_name = "sflow-probe-k8s-abc"
+    monkeypatch.setenv("SFLOW_K8S_PROBE_VIA_POD", "0")
+    assert be.probe_transport() is None
+
+
+def test_create_probe_pod_applies_with_alloc_label(monkeypatch):
+    monkeypatch.delenv("SFLOW_K8S_PROBE_VIA_POD", raising=False)
+    be = KubernetesBackend(_cfg(namespace="ns"))
+    be._pending_alloc_id = "abc"
+    applied = []
+
+    async def fake_apply(manifest):
+        applied.append(manifest)
+
+    monkeypatch.setattr(be, "_apply_manifest", fake_apply)
+    asyncio.run(be._create_probe_pod())
+
+    assert be._probe_pod_name == "sflow-probe-k8s-abc"
+    assert applied
+    labels = applied[0]["metadata"]["labels"]
+    assert labels[k8s_mod.SFLOW_ALLOC_LABEL] == "abc"
+
+
+def test_create_probe_pod_noop_without_alloc_id(monkeypatch):
+    be = KubernetesBackend(_cfg())
+
+    async def boom(manifest):
+        raise AssertionError("should not apply without an allocation id")
+
+    monkeypatch.setattr(be, "_apply_manifest", boom)
+    asyncio.run(be._create_probe_pod())
+    assert be._probe_pod_name is None
+
+
+def test_create_probe_pod_apply_failure_is_nonfatal(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    be._pending_alloc_id = "abc"
+
+    async def boom(manifest):
+        raise RuntimeError("apply failed")
+
+    monkeypatch.setattr(be, "_apply_manifest", boom)
+    asyncio.run(be._create_probe_pod())  # must not raise
+    assert be._probe_pod_name is None
+
+
+def test_kickoff_probe_pod_disabled_is_noop(monkeypatch):
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setenv("SFLOW_K8S_PROBE_VIA_POD", "0")
+    be._kickoff_probe_pod()
+    assert be._probe_pod_task is None
+
+
+def test_kickoff_probe_pod_is_idempotent(monkeypatch):
+    monkeypatch.delenv("SFLOW_K8S_PROBE_VIA_POD", raising=False)
+    be = KubernetesBackend(_cfg())
+    created = []
+
+    async def fake_create():
+        created.append(1)
+
+    monkeypatch.setattr(be, "_create_probe_pod", fake_create)
+
+    async def run():
+        be._kickoff_probe_pod()
+        first = be._probe_pod_task
+        be._kickoff_probe_pod()  # already in flight -> same task
+        assert be._probe_pod_task is first
+        await first
+
+    asyncio.run(run())
+    assert created == [1]
+
+
+def test_exec_in_probe_pod_builds_kubectl_exec_args(monkeypatch):
+    be = KubernetesBackend(_cfg(namespace="ns"))
+    be._probe_pod_name = "pp"
+    seen = {}
+
+    async def fake_kubectl(args):
+        seen["args"] = list(args)
+        return 0, "ok", ""
+
+    monkeypatch.setattr(be, "_kubectl", fake_kubectl)
+    rc, out, _err = asyncio.run(be._exec_in_probe_pod(["curl", "http://x"]))
+    assert rc == 0 and out == "ok"
+    args = seen["args"]
+    assert args[0] == "exec"
+    assert "pp" in args
+    assert args[-2:] == ["curl", "http://x"]
+    assert "--namespace" in args and "ns" in args
+    assert "-i" not in args  # no stdin -> no -i
+
+
+def test_exec_in_probe_pod_without_pod_kicks_off_creation_and_reports_not_ready(
+    monkeypatch,
+):
+    be = KubernetesBackend(_cfg())
+    calls = []
+    monkeypatch.setattr(be, "_kickoff_probe_pod", lambda: calls.append(1))
+    rc, _out, _err = asyncio.run(be._exec_in_probe_pod(["curl"]))
+    assert rc == 1
+    assert calls == [1]  # first use triggers lazy creation

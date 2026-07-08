@@ -3,23 +3,10 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Literal
 
 from sflow.core.probe import Probe, ProbeType
-
-
-async def _check_one(host: str, port: int) -> bool:
-    try:
-        reader, writer = await asyncio.open_connection(host, port)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return True
-    except Exception:
-        return False
+from sflow.core.probe_transport import ProbeTransport, default_probe_transport
 
 
 class TcpPortProbe(Probe):
@@ -27,6 +14,10 @@ class TcpPortProbe(Probe):
     TCP port probe. on_node: "first" = condition met when port is open on the
     first assigned node; "each" = condition met when port is open on every
     assigned node.
+
+    The actual connection is delegated to a :class:`ProbeTransport` so the check
+    can run either from the sflow driver host (default) or from inside a remote
+    backend's network (e.g. a Kubernetes probe pod).
     """
 
     def __init__(
@@ -36,23 +27,26 @@ class TcpPortProbe(Probe):
         port: int,
         on_node: Literal["first", "each"] = "first",
         type: ProbeType,
+        transport: ProbeTransport | None = None,
         **kwargs,
     ):
         super().__init__(type=type, **kwargs)
         self._host = str(host)
         self._port = int(port)
         self._on_node = on_node
+        self._transport = transport or default_probe_transport()
 
     async def check(self, task) -> bool:  # type: ignore[override]
+        timeout = self.effective_check_timeout
         if self._on_node == "first":
-            return await _check_one(self._host, self._port)
+            return await self._transport.tcp_connect(self._host, self._port, timeout)
 
         # each: require port open on every node assigned to this task
         ips_raw = task.envs.get("SFLOW_TASK_ASSIGNED_NODE_IPS", "").strip()
         hosts = [h.strip() for h in ips_raw.split(",") if h.strip()]
         if not hosts:
-            return await _check_one(self._host, self._port)
+            return await self._transport.tcp_connect(self._host, self._port, timeout)
         for host in hosts:
-            if not await _check_one(host, self._port):
+            if not await self._transport.tcp_connect(host, self._port, timeout):
                 return False
         return True

@@ -3,19 +3,11 @@
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
 from typing import Optional
-from urllib import request
 from urllib.parse import urlparse
 
 from sflow.core.probe import Probe, ProbeType
-
-
-@dataclass(frozen=True)
-class _HttpResponse:
-    status: int
-    body: bytes
+from sflow.core.probe_transport import ProbeTransport, default_probe_transport
 
 
 def _validate_http_url(url: str) -> None:
@@ -31,6 +23,10 @@ def _validate_http_url(url: str) -> None:
         raise ValueError(f"Invalid HTTP(S) URL for probe: {url!r}")
 
 
+def _status_ok(status: Optional[int]) -> bool:
+    return status is not None and 200 <= status < 400
+
+
 class HttpGetProbe(Probe):
     def __init__(
         self,
@@ -38,24 +34,24 @@ class HttpGetProbe(Probe):
         url: str,
         headers: Optional[dict[str, str]] = None,
         type: ProbeType,
+        transport: ProbeTransport | None = None,
         **kwargs,
     ):
         super().__init__(type=type, **kwargs)
         self._url = str(url)
         self._headers = dict(headers or {})
         _validate_http_url(self._url)
+        self._transport = transport or default_probe_transport()
 
     async def check(self, task) -> bool:  # type: ignore[override]
-        def _do() -> _HttpResponse:
-            req = request.Request(self._url, headers=self._headers, method="GET")
-            with request.urlopen(req, timeout=max(self.effective_check_timeout, 1)) as resp:  # nosec B310
-                return _HttpResponse(status=int(resp.status), body=resp.read())
-
-        try:
-            resp = await asyncio.to_thread(_do)
-            return 200 <= resp.status < 400
-        except Exception:
-            return False
+        status = await self._transport.http_request(
+            method="GET",
+            url=self._url,
+            headers=self._headers,
+            body=None,
+            timeout=self.effective_check_timeout,
+        )
+        return _status_ok(status)
 
 
 class HttpPostProbe(Probe):
@@ -66,6 +62,7 @@ class HttpPostProbe(Probe):
         body: str | None = None,
         headers: Optional[dict[str, str]] = None,
         type: ProbeType,
+        transport: ProbeTransport | None = None,
         **kwargs,
     ):
         super().__init__(type=type, **kwargs)
@@ -73,18 +70,14 @@ class HttpPostProbe(Probe):
         self._body = "" if body is None else str(body)
         self._headers = dict(headers or {})
         _validate_http_url(self._url)
+        self._transport = transport or default_probe_transport()
 
     async def check(self, task) -> bool:  # type: ignore[override]
-        def _do() -> _HttpResponse:
-            data = self._body.encode("utf-8")
-            headers = dict(self._headers)
-            headers.setdefault("Content-Type", "text/plain; charset=utf-8")
-            req = request.Request(self._url, data=data, headers=headers, method="POST")
-            with request.urlopen(req, timeout=max(self.effective_check_timeout, 1)) as resp:  # nosec B310
-                return _HttpResponse(status=int(resp.status), body=resp.read())
-
-        try:
-            resp = await asyncio.to_thread(_do)
-            return 200 <= resp.status < 400
-        except Exception:
-            return False
+        status = await self._transport.http_request(
+            method="POST",
+            url=self._url,
+            headers=self._headers,
+            body=self._body,
+            timeout=self.effective_check_timeout,
+        )
+        return _status_ok(status)

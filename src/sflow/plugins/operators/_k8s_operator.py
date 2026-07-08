@@ -434,16 +434,57 @@ class K8sContainerOperator(Operator):
                 resources.append(res)
         return resources, [hca for _res, hca in specs]
 
+    def _rdma_all_nics(self) -> tuple[list[str], list[str]]:
+        """Every node RDMA NIC as ``(resource_names, hca_names)`` -- for a pod that
+        owns its node (a merged co-located pod).
+
+        The per-pod NIC window (``_rdma_pod_nics``) exists only to keep several pods
+        sharing one node off each other's NICs. A merged pod is the single pod for
+        its co-located members, so there is nothing to carve against: expose all of
+        the node's NICs and let NCCL/UCX select. Resource names are de-duped and
+        empty ones (host-device provider grants verbs via a device mount, not a
+        resource) dropped; returns ``([], [])`` when the RDMA fast path is off.
+        """
+        if not self._rdma_enabled:
+            return [], []
+        resources: list[str] = []
+        seen: set[str] = set()
+        for res, _hca in self._rdma_nic_specs:
+            if res and res not in seen:
+                seen.add(res)
+                resources.append(res)
+        return resources, [hca for _res, hca in self._rdma_nic_specs]
+
+    def _gpu_driver_preamble(self, gpus: int) -> list[str]:
+        """Shell lines making the node's NVIDIA driver loadable in the container.
+
+        Device-plugin / NVIDIA-container-runtime setups (notably GKE) bind-mount
+        the host driver into ``/usr/local/nvidia`` but do NOT add it to the loader
+        path. Images that don't bake ``/usr/local/nvidia/lib64`` into
+        ``LD_LIBRARY_PATH`` then can't resolve ``libcuda.so.1`` -- vLLM/torch fail
+        with "Failed to infer device type" and ``nvidia-smi`` can't find
+        ``libnvidia-ml.so``. Every GPU pod needs this (single-node included), so it
+        is applied whenever the pod holds a GPU; the dir is prepended, preserving
+        the image's own entries. No-op for GPU-less pods (frontend, etcd, nats).
+        """
+        if gpus <= 0:
+            return []
+        return [
+            "export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}",
+            "export PATH=/usr/local/nvidia/bin:${PATH:-}",
+        ]
+
     def _gib_preamble(self, hcas: list[str]) -> list[str]:
         """Shell lines enabling GKE gIB NCCL (GPUDirect-RDMA) for a multi-node pod.
 
-        Prepends the node's NVIDIA driver libs to ``LD_LIBRARY_PATH``, sources
-        GKE's NCCL tuning, then re-pins ``NCCL_IB_HCA`` to this pod's granted NIC
-        subset (``set_nccl_env.sh`` otherwise selects all node NICs, which a
-        partial-node pod cannot access). UCX device selection is left to the library.
+        Sources GKE's NCCL tuning, then re-pins ``NCCL_IB_HCA`` to this pod's
+        granted NIC subset (``set_nccl_env.sh`` otherwise selects all node NICs,
+        which a partial-node pod cannot access). UCX device selection is left to
+        the library. The NVIDIA driver libs are put on ``LD_LIBRARY_PATH`` by
+        ``_gpu_driver_preamble`` (applied to every GPU pod), not here.
         """
         ib = ",".join(hcas)
-        lines = ["export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"]
+        lines: list[str] = []
         if self._rdma_nccl_env_script:
             lines.append(
                 f"[ -f {self._rdma_nccl_env_script} ] && "
@@ -456,6 +497,10 @@ class K8sContainerOperator(Operator):
         """The configured PVC whose mount_path is ``path_str`` or a parent of it."""
         p = Path(path_str)
         for vol in self._pvc_volumes:
+            # emptyDir volumes are ephemeral scratch, not a data source -- they
+            # must NOT suppress the hostPath fallback for an artifact path.
+            if vol.get("empty_dir") is not None:
+                continue
             mount_path = vol.get("mount_path")
             if not mount_path:
                 continue
@@ -637,8 +682,9 @@ class K8sContainerOperator(Operator):
         )
         tolerations = self._effective_tolerations()
 
-        # RDMA NIC slice sized to the union (the one container holds every GPU).
-        rdma_nic_resources, rdma_hcas = self._rdma_pod_nics(0, gpus=union_gpus)
+        # A merged pod is the only GPU pod on its node, so expose EVERY node NIC
+        # (no per-pod window to carve out) and let NCCL/UCX pick -- see _rdma_all_nics.
+        rdma_nic_resources, rdma_hcas = self._rdma_all_nics()
         dra_coalloc = bool(
             self._scheduling == "dra"
             and self._dra_rdma_device_class
@@ -647,11 +693,12 @@ class K8sContainerOperator(Operator):
         runtime_affinity = (
             bool(rdma_hcas) and self._rdma_runtime_affinity
         ) or dra_coalloc
-        # The RDMA affinity preamble runs once in the launcher's parent shell (its
-        # NCCL/UCX env is inherited by every member subshell).
-        preamble: list[str] = []
+        # Both preambles run once in the launcher's parent shell (their env is
+        # inherited by every member subshell): first make the node's NVIDIA driver
+        # loadable (libcuda.so.1) for the union GPUs, then the RDMA affinity setup.
+        preamble: list[str] = self._gpu_driver_preamble(union_gpus)
         if runtime_affinity:
-            preamble = build_rdma_affinity_preamble(
+            preamble = preamble + build_rdma_affinity_preamble(
                 self._network_env.get("SFLOW_PRIMARY_IFACE", "")
             )
 
@@ -739,8 +786,10 @@ class K8sContainerOperator(Operator):
 
         extra_env: dict[str, str] = {}
         extra_env.update(self._network_env)
-        if rdma_hcas and not runtime_affinity:
-            extra_env["NCCL_IB_HCA"] = ",".join(rdma_hcas)
+        # A merged pod is granted EVERY node NIC (see _rdma_all_nics), so there is no
+        # per-pod window to pin: leave NCCL_IB_HCA unset and let NCCL/UCX auto-select
+        # across all exposed NICs (matching how UCX device selection is always left
+        # to the library).
 
         items.append(
             render_task_pod(
@@ -907,6 +956,10 @@ class K8sContainerOperator(Operator):
                 )
                 + script
             )
+        # Make the node's NVIDIA driver loadable (libcuda.so.1) on every GPU pod,
+        # not just multi-node RDMA ones. Runs first so it precedes any RDMA/NCCL
+        # preamble above and the task script below.
+        script = self._gpu_driver_preamble(self._per_pod_gpus) + script
 
         # K8s-native artifact injection (file:// -> ConfigMap, fs:// -> PVC/hostPath).
         cm_data, file_mounts, host_path_mounts, pvc_mounts = self._artifact_injection(
@@ -957,11 +1010,19 @@ class K8sContainerOperator(Operator):
             # control interface (and expose SFLOW_* mirrors for explicit use). The
             # task script can still override any of these via `export`.
             extra_env.update(self._network_env)
-            # Per-pod RDMA devices override any backend-wide NCCL default so NCCL
-            # uses exactly the NICs this pod owns. Skipped when the runtime affinity
-            # preamble is active -- it selects (and verifies) the GPU-local NIC
-            # in-pod, so a build-time pin would only fight it. UCX is left unset.
-            if rdma_hcas and not runtime_affinity:
+            # Pin NCCL_IB_HCA only for a PARTIAL-node pod (one sharing the node with
+            # sibling pods) to keep it off the NICs granted to those siblings. A pod
+            # that owns ALL the node's NICs is left UNPINNED so NCCL auto-selects:
+            # force-pinning every node HCA WITHOUT the GKE gIB NCCL tuning
+            # (NCCL_NET=gIB + set_nccl_env.sh, only applied on the multi-node gIB
+            # path) drove an untuned all-NIC RDMA config that reset the node. Skipped
+            # under runtime affinity (the in-pod preamble pins instead); UCX is never
+            # pinned by the backend.
+            if (
+                rdma_hcas
+                and not runtime_affinity
+                and len(rdma_hcas) < len(self._rdma_nic_specs)
+            ):
                 extra_env["NCCL_IB_HCA"] = ",".join(rdma_hcas)
             if n > 1:
                 extra_env["SFLOW_TASK_NODE_INDEX"] = str(i)

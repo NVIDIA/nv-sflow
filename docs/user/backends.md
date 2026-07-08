@@ -322,6 +322,40 @@ pods, pod logs and nodes; plus the DRA `resourceclaimtemplates`/`deviceclasses`,
 (missing permission, wrong namespace, or unreachable cluster) instead of leaving pods stuck.
 Set `SFLOW_SKIP_K8S_PREFLIGHT=1` to bypass the check.
 
+### Readiness probes run in-cluster (probe pod)
+
+Network readiness/failure probes (`tcp_port`, `http_get`, `http_post`) target the workload's
+pod/node IPs. The machine running `sflow run` often cannot route to the cluster pod network,
+which would make those probes fail even though the service is healthy. To avoid this, the
+Kubernetes backend runs TCP/HTTP probes **from inside the cluster**: it creates one small
+per-allocation *probe pod* in the backend namespace, and the driver runs each check by
+`kubectl exec`-ing `curl` in that pod. `kubectl exec` tunnels through the API server, so the
+driver only needs the kube access it already has — no direct pod-network route.
+
+This is on by default and requires no configuration. Notes:
+
+- **Lifecycle.** The probe pod is created lazily on the **first** TCP/HTTP check and then
+  lives until the allocation is released (deleted with the rest of the allocation, since it is
+  labeled with it). A workflow with no network probes — e.g. `log_watch`-only or probe-less
+  batch jobs — never creates one. Individual readiness probes still stop once they trigger
+  (the shared pod just serves any remaining probes, including failure probes on `READY`
+  services, until the run ends).
+- The probe pod only needs `curl`. Its image defaults to `curlimages/curl:latest` and is
+  configurable per backend via `probe_pod_image` (point it at a mirror for air-gapped
+  registries). It inherits the backend `namespace`, `image_pull_policy`, `node_selector`, and
+  `tolerations`; it requests no GPUs.
+- `log_watch` probes are unaffected (they read the task's local `<task>.log`).
+- To disable in-cluster probing and probe directly from the `sflow run` host instead, set
+  `SFLOW_K8S_PROBE_VIA_POD=0`.
+
+```yaml
+backends:
+  - name: k8s_cluster
+    type: kubernetes
+    # Optional: override only for air-gapped/mirror registries.
+    probe_pod_image: my-registry.example.com/curlimages/curl:8.11.1
+```
+
 Kubernetes tasks do not automatically receive hostPath mounts for
 `SFLOW_WORKSPACE_DIR`, `SFLOW_OUTPUT_DIR`, `SFLOW_WORKFLOW_OUTPUT_DIR`, or
 `SFLOW_TASK_OUTPUT_DIR`. If environment forwarding is enabled, those variables
@@ -338,6 +372,51 @@ The task script is mounted into the pod from a ConfigMap and run as the entrypoi
 Environment variables are passed through a temporary Kubernetes Secret generated from an
 env-file (mounted via `envFrom`). This avoids leaking values into the `kubectl` argv, but the
 env-file format is line-oriented, so values with embedded newlines are not supported.
+
+### Volumes: PVCs and emptyDir
+
+Backend-wide `volumes:` are mounted into **every** task pod of the backend (each becomes a pod
+volume + a container `volumeMount` at `mount_path`). Set exactly one source per entry:
+
+- `claim:` — an existing `PersistentVolumeClaim` (the PVC and its data must already exist in the
+  namespace; sflow only references it). Use for shared data such as a model on RWX/ROX storage.
+  Defaults to **read-only**, which is also required to share one PVC across pods on multiple nodes.
+- `empty_dir:` — an ephemeral, per-pod scratch volume (Kubernetes `emptyDir`): writable by any
+  container user (no PVC/NFS ownership or root-squash issues), created empty per pod, and deleted
+  with the pod. Defaults to **writable**. Options: `medium: Memory` (tmpfs/RAM instead of node
+  disk — avoid for large caches) and `size_limit` (e.g. `50Gi`).
+
+A writable PVC entry (`read_only: false`) can also set `ensure_writable: true`. A `subPath` mount
+is created **root-owned** by the kubelet, so a non-root container can't write it; `ensure_writable`
+injects a small **root initContainer** that `mkdir -p` + `chmod 0777`s the mounted path (the subPath
+dir, or the mount root) before the workload runs. It's best-effort — on a root-squashed / read-only
+backing volume it can't help — but for a normal writable RWX PVC it makes a persistent cache "just
+work" without any manual `chmod`.
+
+```yaml
+volumes:
+  # Shared model store (read-only PVC).
+  - name: model-store
+    claim: my-model-pvc
+    mount_path: /models
+    read_only: true
+  # Writable scratch for a JIT/kernel cache (ephemeral; recompiled each run).
+  - name: kernel-cache
+    empty_dir: {}
+    mount_path: /cache
+  # ...or PERSIST the cache on a writable RWX PVC (kernels reused across runs):
+  # - name: kernel-cache
+  #   claim: my-rwx-cache-pvc
+  #   mount_path: /cache
+  #   sub_path: sflow-kernel-cache
+  #   read_only: false
+  #   ensure_writable: true   # fix the root-owned subPath so non-root can write
+```
+
+Why this matters: a `subPath` mount of a PVC is created **root-owned**, so a non-root container (or
+a root-squashed NFS export) often can't write it, and pod `fsGroup` is both ineffective on many NFS
+drivers and dangerous on a large shared model PVC (recursive chown). Use `empty_dir` for scratch
+that needn't persist, or a writable RWX PVC with `ensure_writable: true` for cross-run persistence.
 
 ### Operator: k8s
 
@@ -424,12 +503,24 @@ workflow:
 At allocation time the backend probes a reservation pod for the node's RDMA HCAs
 (e.g. `mlx5_0`) and routable interface, then runs an RDMA **provider chain** to
 decide how task GPU pods get verbs access. The matching provider grants the pods
-`CAP_IPC_LOCK` and sets `UCX_NET_DEVICES` / `NCCL_IB_HCA` (plus
-`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` on the routable NIC), so NIXL/UCX KV
-transfer and NCCL run over RDMA. Auto priority order:
+`CAP_IPC_LOCK` and pins the control interface (`NCCL_SOCKET_IFNAME` /
+`GLOO_SOCKET_IFNAME` on the routable NIC), so NIXL/UCX KV transfer and NCCL run
+over RDMA. **UCX device selection is always left to the library** (sflow never
+sets `UCX_NET_DEVICES`). `NCCL_IB_HCA` is pinned only for a *partial-node* pod
+(one that shares its node with sibling pods) to keep it off the NICs granted to
+those siblings; a pod that owns **all** the node's NICs (a merged/full-node pod)
+is left unpinned so NCCL auto-selects. Force-pinning every HCA without the GKE
+gIB NCCL tuning is avoided because it drove an unstable all-NIC RDMA config that
+reset the node. Auto priority order:
 
-- **GKE** — one `networking.gke.io.networks/rdma-N` extended resource per NIC,
-  plus the GKE gIB lib mounts + NCCL tuning for multi-node NCCL.
+- **GKE** — one `networking.gke.io.networks/rdma-N` extended resource per NIC.
+  For **multi-node** NCCL, sflow also hostPath-mounts the GKE gIB libs and sources
+  `set_nccl_env.sh` (which sets `NCCL_NET=gIB` + the RoCE tuning). This requires the
+  **`nccl-rdma-installer` DaemonSet** deployed on the cluster — it installs
+  `/home/kubernetes/bin/gib` (+ `/home/kubernetes/bin/nvidia/lib64`) and is **not** a
+  default GKE path. If the installer is absent, sflow tolerates it (the gIB source
+  is skipped via an `[ -f … ]` guard) and NCCL falls back to its built-in IB
+  transport over RoCE.
 - **shared device plugin** — a single shared `rdma/*` extended resource
   (k8s-rdma-shared-dev-plugin / NVIDIA Network Operator) grants access to the
   node's HCAs.

@@ -94,6 +94,11 @@ probes:
       body: '{"ping": true}'
 ```
 
+> **Kubernetes:** TCP/HTTP probes normally run from the `sflow run` host. On the Kubernetes
+> backend they run **from inside the cluster** (via a small per-allocation probe pod) so they
+> still work when the driver host cannot reach the pod network. This is automatic — see
+> [Readiness probes run in-cluster](backends.md#readiness-probes-run-in-cluster-probe-pod).
+
 ## Readiness: log watch probe (+ retries)
 
 `log_watch` scans a task's log file for a matching string.
