@@ -115,7 +115,7 @@ def test_packs_cuda_visible_devices_over_union_and_calls_operator():
     leader = tg.get_task("decode")
     follower = tg.get_task("prefill")
     # Every member sees ALL 6 union GPUs, with its OWN slice first (so cross-member
-    # cuda_ipc/NVLink P2P works); a single-GPU visibility would force TCP.
+    # cuda_ipc/NVLink P2P works); a single-GPU visibility would force IB.
     assert leader.merge_cuda_visible_devices == "0,1,2,3,4,5"
     assert follower.merge_cuda_visible_devices == "4,5,0,1,2,3"
     # The leader operator is handed the ordered member Task objects + union GPUs.
@@ -126,7 +126,7 @@ def test_packs_cuda_visible_devices_over_union_and_calls_operator():
 
 def test_every_member_sees_all_union_gpus_own_first():
     # Regression: a single-GPU-per-member CUDA_VISIBLE_DEVICES hides peer GPUs and
-    # blocks cross-member cuda_ipc/NVLink (UCX falls back to TCP). Each member must
+    # blocks cross-member cuda_ipc/NVLink (UCX falls back to IB). Each member must
     # see ALL union GPUs, with its own listed first.
     names = ["decode_0", "decode_1", "decode_2", "prefill_0"]
     tg = _graph(names)

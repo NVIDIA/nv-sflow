@@ -655,8 +655,8 @@ class KubernetesBackend(Backend):
         ``resource_name`` is ``""`` for the host-device provider (no extended
         resource; access via the hostPath device mount). The operator requests a
         per-pod slice (sized to the pod's GPU count) and de-dups the non-empty
-        resources, setting a matching ``NCCL_IB_HCA`` when build-time pinning is
-        used. UCX is never pinned by the backend.
+        resources. NIC *selection* (``NCCL_IB_HCA`` / UCX) is left to the libraries;
+        the backend never pins it.
         """
         return list(self._rdma_plan.nic_specs)
 
@@ -1673,15 +1673,76 @@ class KubernetesBackend(Backend):
         # request RDMA. The per-pod NIC slice + device grants are applied by the
         # operator from the resulting plan.
         node_name, allocatable = await self._node_allocatable(pod_names[0])
+        # gIB installer presence gates the GKE lib mounts (see RdmaDetectContext):
+        # its host paths include the driver dir (/usr/local/nvidia), so mounting
+        # them when absent would mask libcuda.so.1. Only probe when the node
+        # advertises GKE RDMA NICs and the provider chain may pick GKE.
+        gib_installed = False
+        gke_rdma = any(
+            "networking.gke.io.networks/rdma-" in str(k) for k in allocatable
+        )
+        if gke_rdma and self._rdma_forced in (None, "gke"):
+            gib_installed = await self._gib_installer_present(node_name)
         ctx = RdmaDetectContext(
             node_name=node_name,
             node_allocatable=allocatable,
             hcas=hcas,
             primary_iface=primary_iface,
             host_network=self._host_network,
+            gib_installed=gib_installed,
         )
         self._rdma_plan = detect_rdma(ctx, forced=self._rdma_forced)
+        if self._rdma_plan.enabled and self._rdma_plan.provider == "gke" and not gib_installed:
+            self._warn_gib_installer_absent()
         self._log_rdma_plan(hcas, primary_iface)
+
+    async def _gib_installer_present(self, node_name: str = "") -> bool:
+        """True if the GKE gIB installer (``nccl-rdma-installer`` DaemonSet) has a
+        Running pod ON ``node_name`` -- a per-node proxy for its host paths
+        (``/home/kubernetes/bin/gib`` + ``/home/kubernetes/bin/nvidia``) existing on
+        the scheduling node.
+
+        Checking the specific node (not merely that the DaemonSet exists somewhere in
+        the cluster) avoids a false positive during a partial/rolling install: a node
+        that has not yet received the installer would otherwise get ``type: Directory``
+        gIB mounts that fail to schedule. Best-effort: any probe failure (permissions,
+        exec error, no node name) returns False, so sflow omits the lib mounts rather
+        than risk masking the driver path. Falls back to a cluster-wide check when the
+        scheduling node is unknown."""
+        fields = "status.phase=Running"
+        if node_name:
+            fields += f",spec.nodeName={node_name}"
+        try:
+            rc, out, _err = await self._kubectl(
+                [
+                    "get",
+                    "pods",
+                    "-n",
+                    "kube-system",
+                    "--field-selector",
+                    fields,
+                    "-o",
+                    "jsonpath={.items[*].metadata.name}",
+                ]
+            )
+        except Exception:  # never let a best-effort probe break allocation
+            return False
+        return rc == 0 and "nccl-rdma-installer" in out
+
+    def _warn_gib_installer_absent(self) -> None:
+        """Hint that GKE RDMA is active but the gIB installer is not on the node."""
+        _logger.warning(
+            "Kubernetes backend '%s': GKE GPUDirect-RDMA is active but no running "
+            "'nccl-rdma-installer' pod was found on the scheduling node, so "
+            "'/home/kubernetes/bin/gib' + the gIB NCCL tuning (NCCL_NET=gIB / "
+            "set_nccl_env.sh) are absent. sflow will NOT mount the gIB libs (mounting "
+            "the missing driver path /usr/local/nvidia would mask libcuda.so.1), and "
+            "multi-node NCCL runs over the untuned built-in IB transport (single-node "
+            "RDMA is unaffected). For tuned GPUDirect-RDMA, deploy the installer: "
+            "kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/"
+            "container-engine-accelerators/master/gpudirect-rdma/nccl-rdma-installer.yaml",
+            self.name,
+        )
 
     def _log_rdma_plan(self, hcas: list[str], primary_iface: str) -> None:
         """Emit one informative line about the resolved RDMA plan."""

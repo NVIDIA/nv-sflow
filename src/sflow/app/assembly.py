@@ -399,7 +399,8 @@ def _plan_merge_groups(
         # slice FIRST so the workload uses that as cuda:0 / its local rank. Exposing
         # the peers' GPUs (not just its own) is what lets cross-member cuda_ipc /
         # NVLink P2P work -- a single-GPU-per-member CUDA_VISIBLE_DEVICES hides the
-        # peers and forces UCX/NIXL onto TCP, defeating the point of merging.
+        # peers and forces UCX/NIXL KV transfer onto IB, defeating the point of
+        # merging (co-locating so KV transfer rides NVLink/NVSwitch, esp. MNNVL).
         union_gpus = sum(gpu_counts[m] for m in members)
         start = 0
         member_tasks: list[Task] = []

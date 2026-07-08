@@ -616,14 +616,15 @@ def render_task_pod(
     # mounts of the node-installed dirs, read-only at their canonical container paths.
     for idx, (host_path, mount_path) in enumerate(rdma_lib_mounts):
         vol_name = f"sflow-rdma-lib-{idx}"
-        # DirectoryOrCreate: the GKE gIB libs only exist if the `nccl-rdma-installer`
-        # DaemonSet is deployed (not a default GKE path). Tolerate its absence -- the
-        # pod still starts and the in-pod `[ -f set_nccl_env.sh ]` guard skips the
-        # gIB tuning, so NCCL falls back to its built-in IB transport.
+        # type: Directory (require existence). These mounts are emitted ONLY when the
+        # gIB installer is detected (see GkeRdmaProvider), so the host paths exist.
+        # NEVER DirectoryOrCreate: one path is /home/kubernetes/bin/nvidia ->
+        # /usr/local/nvidia (the driver); creating an empty dir there would mask
+        # libcuda.so.1 and break CUDA in the container.
         volumes.append(
             {
                 "name": vol_name,
-                "hostPath": {"path": host_path, "type": "DirectoryOrCreate"},
+                "hostPath": {"path": host_path, "type": "Directory"},
             }
         )
         volume_mounts.append(

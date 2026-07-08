@@ -402,13 +402,12 @@ class K8sContainerOperator(Operator):
     ) -> tuple[list[str], list[str]]:
         """Per-pod RDMA NIC slice as ``(resource_names, hca_names)``.
 
-        Assigns ``per_pod_gpus`` of the node's RDMA NICs starting at this pod's
-        node-local GPU slot (``gpu_slot_start``), so the NIC window lines up with
-        the GPUs the pod occupies. Because the planner packs co-located pods onto
-        disjoint GPU slots (e.g. prefill 0-1 / 2-3, decode 4-7), their NIC windows
-        come out disjoint too -- and each NIC sits next to its GPU (mlx5_N next to
-        GPU N). The matching ``hca_names`` drive ``NCCL_IB_HCA`` when build-time
-        pinning applies. UCX device selection is left to the library. Returns
+        Assigns ``per_pod_gpus`` of the node's RDMA NIC *resources* starting at this
+        pod's node-local GPU slot (``gpu_slot_start``), so the requested NIC window
+        lines up with the GPUs the pod occupies (scheduling: co-located pods packed
+        onto disjoint GPU slots get disjoint NIC windows). The ``hca_names`` are
+        informational only (mirrored into ``SFLOW_RDMA_HCAS``); NIC *selection* is
+        left entirely to NCCL/gIB + UCX -- sflow never pins ``NCCL_IB_HCA``. Returns
         ``([], [])`` when the RDMA fast path is off or the task requests no GPUs.
         Extended-resource names are de-duped and empty ones
         (host-device provider, which grants access via a device mount not a
@@ -474,24 +473,29 @@ class K8sContainerOperator(Operator):
             "export PATH=/usr/local/nvidia/bin:${PATH:-}",
         ]
 
-    def _gib_preamble(self, hcas: list[str]) -> list[str]:
-        """Shell lines enabling GKE gIB NCCL (GPUDirect-RDMA) for a multi-node pod.
+    def _gib_preamble(self) -> list[str]:
+        """Shell lines wiring GKE gIB NCCL config for a GPU pod on a gIB cluster.
 
-        Sources GKE's NCCL tuning, then re-pins ``NCCL_IB_HCA`` to this pod's
-        granted NIC subset (``set_nccl_env.sh`` otherwise selects all node NICs,
-        which a partial-node pod cannot access). UCX device selection is left to
-        the library. The NVIDIA driver libs are put on ``LD_LIBRARY_PATH`` by
-        ``_gpu_driver_preamble`` (applied to every GPU pod), not here.
+        gIB is **workload-agnostic cluster infra**: whenever the installer is present
+        (``set_nccl_env.sh`` exists) its net + tuner plugins auto-load into every GPU
+        pod from the device-plugin driver dir and ABORT NCCL init unless
+        ``NCCL_CONF_FILE`` is set. So this sources ``set_nccl_env.sh`` (which sets it)
+        on EVERY GPU pod. When gIB is absent, emit NOTHING (NCCL uses its built-in
+        transport + auto-selection).
+
+        NIC selection is left ENTIRELY to NCCL/gIB (topology-aware, GPU-local) and UCX
+        -- sflow never pins ``NCCL_IB_HCA``. Correct GPU<->NIC pairing comes from the
+        pod owning the whole node (merged / full-node pods): every GPU's PCIe-local NIC
+        is then present, so the library pairs them without sflow's help. (A partial-node
+        pod cannot guarantee this -- the GPU device plugin picks the physical GPUs
+        independently of the NIC grant -- so co-located GPU tasks should be *merged*
+        into one full-node pod.) The NVIDIA driver libs go on ``LD_LIBRARY_PATH`` via
+        ``_gpu_driver_preamble``, not here.
         """
-        ib = ",".join(hcas)
-        lines: list[str] = []
-        if self._rdma_nccl_env_script:
-            lines.append(
-                f"[ -f {self._rdma_nccl_env_script} ] && "
-                f"source {self._rdma_nccl_env_script} || true"
-            )
-        lines.append(f"export NCCL_IB_HCA={ib}")
-        return lines
+        script = self._rdma_nccl_env_script
+        if not script:
+            return []
+        return [f"if [ -f {script} ]; then", f"  source {script}", "fi"]
 
     def _covering_pvc(self, path_str: str) -> dict[str, Any] | None:
         """The configured PVC whose mount_path is ``path_str`` or a parent of it."""
@@ -693,10 +697,17 @@ class K8sContainerOperator(Operator):
         runtime_affinity = (
             bool(rdma_hcas) and self._rdma_runtime_affinity
         ) or dra_coalloc
-        # Both preambles run once in the launcher's parent shell (their env is
-        # inherited by every member subshell): first make the node's NVIDIA driver
-        # loadable (libcuda.so.1) for the union GPUs, then the RDMA affinity setup.
+        # These run once in the launcher's parent shell (env inherited by every member
+        # subshell): first make the node's NVIDIA driver loadable (libcuda.so.1) for
+        # the union GPUs, then -- if the gIB installer is present (workload-agnostic
+        # infra; see the single-pod path) -- source set_nccl_env.sh so the auto-loaded
+        # gIB plugins are configured. A merged pod is always single-node, so no
+        # NCCL_IB_HCA pin. Then the RDMA affinity setup (non-GKE).
         preamble: list[str] = self._gpu_driver_preamble(union_gpus)
+        merged_rdma_lib_mounts: list[tuple[str, str]] = []
+        if union_gpus > 0 and self._rdma_lib_mounts:
+            merged_rdma_lib_mounts = self._rdma_lib_mounts
+            preamble = preamble + self._gib_preamble()
         if runtime_affinity:
             preamble = preamble + build_rdma_affinity_preamble(
                 self._network_env.get("SFLOW_PRIMARY_IFACE", "")
@@ -824,7 +835,7 @@ class K8sContainerOperator(Operator):
                 rdma_host_device_paths=(
                     self._rdma_host_device_paths if rdma_hcas else []
                 ),
-                rdma_lib_mounts=[],
+                rdma_lib_mounts=merged_rdma_lib_mounts,
                 env_file_secrets=env_file_secrets,
             )
         )
@@ -937,15 +948,18 @@ class K8sContainerOperator(Operator):
         runtime_affinity = (
             bool(rdma_hcas) and self._rdma_runtime_affinity
         ) or dra_coalloc
-        # gIB (multi-node NCCL over RDMA) is enabled only when the task spans more
-        # than one node: with gpus_per_node GPUs per node, a GPU claim that needs
-        # node_count > 1 has cross-node NCCL collectives. Single-node TP stays on
-        # NVLink (no gIB needed). Mount the GKE gIB libs and prepend the NCCL setup.
+        # gIB setup is WORKLOAD-AGNOSTIC cluster infra: when the installer is present
+        # (the RDMA plan carries lib mounts + the NCCL env script), the gIB net +
+        # tuner plugins auto-load into EVERY GPU pod from the device-plugin driver dir
+        # (/usr/local/nvidia/lib64) and ABORT NCCL init if unconfigured. So mount the
+        # gIB config and source set_nccl_env.sh (-> NCCL_CONF_FILE) on every GPU pod,
+        # regardless of node count. NIC selection is left to NCCL/gIB + UCX (see
+        # _gib_preamble) -- sflow never pins NCCL_IB_HCA.
         script = list(script)
         rdma_lib_mounts: list[tuple[str, str]] = []
-        if n > 1 and rdma_hcas and self._rdma_lib_mounts:
+        if rdma_hcas and self._rdma_lib_mounts:
             rdma_lib_mounts = self._rdma_lib_mounts
-            script = self._gib_preamble(rdma_hcas) + script
+            script = self._gib_preamble() + script
         elif runtime_affinity:
             # Prepend the verified, topology-aware NIC selection (sets NCCL_IB_HCA
             # in-pod when explicit, or NCCL_IB_DISABLE on dead HCA). Takes over from
@@ -1010,20 +1024,12 @@ class K8sContainerOperator(Operator):
             # control interface (and expose SFLOW_* mirrors for explicit use). The
             # task script can still override any of these via `export`.
             extra_env.update(self._network_env)
-            # Pin NCCL_IB_HCA only for a PARTIAL-node pod (one sharing the node with
-            # sibling pods) to keep it off the NICs granted to those siblings. A pod
-            # that owns ALL the node's NICs is left UNPINNED so NCCL auto-selects:
-            # force-pinning every node HCA WITHOUT the GKE gIB NCCL tuning
-            # (NCCL_NET=gIB + set_nccl_env.sh, only applied on the multi-node gIB
-            # path) drove an untuned all-NIC RDMA config that reset the node. Skipped
-            # under runtime affinity (the in-pod preamble pins instead); UCX is never
-            # pinned by the backend.
-            if (
-                rdma_hcas
-                and not runtime_affinity
-                and len(rdma_hcas) < len(self._rdma_nic_specs)
-            ):
-                extra_env["NCCL_IB_HCA"] = ",".join(rdma_hcas)
+            # NIC selection (NCCL_IB_HCA) is deliberately NOT pinned by sflow: it is
+            # left to NCCL/gIB (topology-aware, GPU-local) and UCX, matching how UCX
+            # device selection is always left to the library. A grant-based pin can
+            # misalign a pod's GPUs onto far NICs (the GPU device plugin picks GPUs
+            # independently of the rdma-N grant), so correct pairing instead comes from
+            # owning the whole node (merged / full-node pods). See _gib_preamble.
             if n > 1:
                 extra_env["SFLOW_TASK_NODE_INDEX"] = str(i)
                 if self._assigned_node_ips:

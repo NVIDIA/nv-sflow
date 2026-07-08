@@ -91,6 +91,12 @@ class RdmaDetectContext:
     hcas: list[str]
     primary_iface: str
     host_network: bool
+    # Whether the GKE gIB stack (``nccl-rdma-installer`` DaemonSet) is deployed, so
+    # ``/home/kubernetes/bin/gib`` + the tuned NCCL env actually exist on the node.
+    # Gates the GKE provider's lib mounts: mounting those host paths when absent
+    # would (with DirectoryOrCreate) create empty dirs that MASK the driver at
+    # ``/usr/local/nvidia``. When False, no lib mounts + no NCCL tuning are emitted.
+    gib_installed: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,13 @@ class GkeRdmaProvider(RdmaProvider):
         nic_specs = tuple(
             (resource, f"mlx5_{idx}") for idx, resource in self._indexed(ctx)
         )
+        # Only mount the gIB libs + wire the NCCL tuning when the installer is
+        # actually deployed. The lib mounts include ``/home/kubernetes/bin/nvidia``
+        # -> ``/usr/local/nvidia`` (the driver path); bind-mounting a non-existent
+        # host dir there would mask ``libcuda.so.1``. So when gIB is absent, request
+        # NO lib mounts and leave NCCL on its built-in IB transport (still RoCE).
+        lib_mounts = GKE_RDMA_LIB_MOUNTS if ctx.gib_installed else ()
+        nccl_env_script = GKE_NCCL_ENV_SCRIPT if ctx.gib_installed else ""
         return RdmaPlan(
             provider=self.key,
             enabled=True,
@@ -190,8 +203,8 @@ class GkeRdmaProvider(RdmaProvider):
                 socket_iface=ctx.primary_iface, rdma_hcas=",".join(ctx.hcas)
             ),
             ipc_lock=True,
-            lib_mounts=GKE_RDMA_LIB_MOUNTS,
-            nccl_env_script=GKE_NCCL_ENV_SCRIPT,
+            lib_mounts=lib_mounts,
+            nccl_env_script=nccl_env_script,
         )
 
 
@@ -200,7 +213,9 @@ class SharedDevicePluginRdmaProvider(RdmaProvider):
 
     A single shared extended resource grants a pod verbs access to the node's
     HCAs. The pod requests the resource once (the operator de-dups); the detected
-    HCAs drive per-pod ``NCCL_IB_HCA`` when build-time pinning applies.
+    HCAs are informational (``SFLOW_RDMA_HCAS``) and, for this provider, may drive
+    the *runtime* affinity preamble's verified in-pod selection -- sflow never
+    build-time pins ``NCCL_IB_HCA``.
     """
 
     key = "shared_device_plugin"

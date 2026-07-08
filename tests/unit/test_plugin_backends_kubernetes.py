@@ -184,8 +184,13 @@ def test_rdma_invalid_string_rejected():
         _cfg(rdma="bogus")
 
 
-def _fake_kubectl(probe_out, *, node_json=None, node_name="node-a"):
-    """Fake ``_kubectl`` answering the RDMA exec probe + node-allocatable fetch."""
+def _fake_kubectl(probe_out, *, node_json=None, node_name="node-a", installer_pods=""):
+    """Fake ``_kubectl`` answering the RDMA exec probe + node-allocatable fetch.
+
+    ``installer_pods`` is the space-separated pod name list returned for the
+    per-node gIB-installer presence check (``get pods -n kube-system
+    --field-selector status.phase=Running,spec.nodeName=<node>``).
+    """
 
     async def _run(args):
         a = list(args)
@@ -195,6 +200,8 @@ def _fake_kubectl(probe_out, *, node_json=None, node_name="node-a"):
             return 0, node_name, ""
         if a[:2] == ["get", "node"]:
             return (0, node_json, "") if node_json is not None else (1, "", "")
+        if a[:2] == ["get", "pods"]:
+            return 0, installer_pods, ""
         return 0, "", ""
 
     return _run
@@ -283,7 +290,10 @@ def test_detect_network_env_gke_provider(monkeypatch):
     )
     monkeypatch.setattr(
         be, "_kubectl",
-        _fake_kubectl("HCA mlx5_0\nHCA mlx5_1\nIFACE eth0\n", node_json=node_json),
+        _fake_kubectl(
+            "HCA mlx5_0\nHCA mlx5_1\nIFACE eth0\n", node_json=node_json,
+            installer_pods="nccl-rdma-installer-abcde",  # gIB installer on node
+        ),
     )
     asyncio.run(be._detect_network_env(["res-0"]))
     assert be.rdma_enabled is True
@@ -292,7 +302,101 @@ def test_detect_network_env_gke_provider(monkeypatch):
         ("networking.gke.io.networks/rdma-1", "mlx5_1"),
     ]
     assert be.rdma_host_device_paths == []  # device plugin, no host mount
-    assert be.rdma_lib_mounts  # GKE gIB libs present
+    assert be.rdma_lib_mounts  # GKE gIB libs mounted (installer present)
+
+
+def _gke_node_json():
+    return json.dumps(
+        {"status": {"allocatable": {"networking.gke.io.networks/rdma-0": "1"}}}
+    )
+
+
+def test_gke_rdma_warns_when_gib_installer_absent(monkeypatch, caplog):
+    # GKE RDMA active but no `nccl-rdma-installer` DaemonSet -> warn that multi-node
+    # NCCL will use the untuned built-in IB transport (gIB tuning is absent).
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setattr(
+        be, "_kubectl",
+        _fake_kubectl(
+            "HCA mlx5_0\nIFACE eth0\n", node_json=_gke_node_json(),
+            installer_pods="anetd-xxxxx fluentbit-gke-yyyyy",  # no installer on node
+        ),
+    )
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._detect_network_env(["res-0"]))
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("nccl-rdma-installer" in m and "gIB" in m for m in msgs)
+    # Installer absent -> the gIB lib mounts are NOT emitted (never mask the driver
+    # path /usr/local/nvidia with an empty dir).
+    assert be.rdma_lib_mounts == []
+    assert be.rdma_nccl_env_script == ""
+    assert be.rdma_enabled is True  # RDMA NICs still granted (NCCL built-in IB)
+
+
+def test_gke_rdma_no_warn_when_gib_installer_present(monkeypatch, caplog):
+    # Installer present -> no gIB warning.
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setattr(
+        be, "_kubectl",
+        _fake_kubectl(
+            "HCA mlx5_0\nIFACE eth0\n", node_json=_gke_node_json(),
+            installer_pods="nvidia-gpu-device-plugin-zzzzz nccl-rdma-installer-abcde",
+        ),
+    )
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._detect_network_env(["res-0"]))
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert not any("nccl-rdma-installer" in m for m in msgs)
+    # Installer present -> gIB libs mounted + NCCL tuning wired.
+    assert be.rdma_lib_mounts
+    assert be.rdma_nccl_env_script
+
+
+def test_gib_installer_probe_returns_false_on_kubectl_error(monkeypatch):
+    # The gIB probe is best-effort: any exec failure must return False so sflow
+    # omits the lib mounts (never risk masking the driver path) rather than raise.
+    be = KubernetesBackend(_cfg())
+
+    async def _boom(_args):
+        raise RuntimeError("kubectl exploded")
+
+    monkeypatch.setattr(be, "_kubectl", _boom)
+    assert asyncio.run(be._gib_installer_present()) is False
+
+
+def test_gib_installer_probe_returns_false_on_nonzero_rc(monkeypatch):
+    # A non-zero kubectl exit (e.g. RBAC denies listing DaemonSets) also yields
+    # False -- absence of proof is treated as "not installed".
+    be = KubernetesBackend(_cfg())
+
+    async def _denied(_args):
+        return 1, "", "forbidden"
+
+    monkeypatch.setattr(be, "_kubectl", _denied)
+    assert asyncio.run(be._gib_installer_present()) is False
+
+
+def test_gib_installer_probe_scopes_to_scheduling_node(monkeypatch):
+    # The probe must ask only about the specific scheduling node (per-node check),
+    # so a partial rollout that has not reached this node reads as "not installed"
+    # instead of a cluster-wide false positive.
+    seen: dict[str, list[str]] = {}
+
+    async def _capture(args):
+        a = list(args)
+        if a[:2] == ["get", "pods"]:
+            seen["args"] = a
+        return 0, "nccl-rdma-installer-abcde", ""
+
+    be = KubernetesBackend(_cfg())
+    monkeypatch.setattr(be, "_kubectl", _capture)
+    assert asyncio.run(be._gib_installer_present("node-7")) is True
+    joined = " ".join(seen["args"])
+    assert "--field-selector" in seen["args"]
+    assert "spec.nodeName=node-7" in joined
+    assert "status.phase=Running" in joined
 
 
 def test_detect_network_env_shared_device_plugin_provider(monkeypatch):

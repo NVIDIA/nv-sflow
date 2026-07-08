@@ -113,6 +113,9 @@ variables:
   EXTRA_AGG_ARGS:
     description: "Extra aggregated server arguments"
     value: ""
+  NET_DEBUG:
+    description: "Log NCCL/UCX transport selection (1=on, 0=off) to verify RDMA vs TCP"
+    value: "1"
 
   # Benchmark Configuration
   ISL:
@@ -303,11 +306,12 @@ workflow:
         - env | grep TLLM
         - env | grep UCX
         - unset UCX_TLS
-        # DEBUG (temporary): log the NCCL/UCX transport to confirm RDMA vs TCP.
-        # Look for UCX rc_mlx5/dc_mlx5 (RDMA) vs tcp, and NCCL NET/IB vs NET/Socket.
-        # - export UCX_LOG_LEVEL=info
-        # - export NCCL_DEBUG=INFO
-        # - export NCCL_DEBUG_SUBSYS=NET
+        - >
+          if [ "${NET_DEBUG}" == "1" ]; then
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=GRAPH,NET
+            export UCX_LOG_LEVEL=info
+          fi
         # Single-node aggregated worker: dynamo.trtllm handles intra-node tensor
         # parallelism itself (no Ray/MPI launcher). The engine is configured by the
         # ConfigMap-injected AGG_CONFIG passed via --extra-engine-args.

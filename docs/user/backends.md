@@ -505,22 +505,35 @@ At allocation time the backend probes a reservation pod for the node's RDMA HCAs
 decide how task GPU pods get verbs access. The matching provider grants the pods
 `CAP_IPC_LOCK` and pins the control interface (`NCCL_SOCKET_IFNAME` /
 `GLOO_SOCKET_IFNAME` on the routable NIC), so NIXL/UCX KV transfer and NCCL run
-over RDMA. **UCX device selection is always left to the library** (sflow never
-sets `UCX_NET_DEVICES`). `NCCL_IB_HCA` is pinned only for a *partial-node* pod
-(one that shares its node with sibling pods) to keep it off the NICs granted to
-those siblings; a pod that owns **all** the node's NICs (a merged/full-node pod)
-is left unpinned so NCCL auto-selects. Force-pinning every HCA without the GKE
-gIB NCCL tuning is avoided because it drove an unstable all-NIC RDMA config that
-reset the node. Auto priority order:
+over RDMA. **NIC device selection is always left to the libraries** — sflow sets
+neither `UCX_NET_DEVICES` nor `NCCL_IB_HCA`. NCCL/gIB and UCX pick each GPU's
+PCIe-local NIC by topology; sflow's job is only to make sure the pod *owns* those
+NICs. That ownership is guaranteed by a pod holding the **whole node** (a
+merged/full-node pod). A *partial-node* pod (one sharing its node) cannot guarantee
+it — the GPU device plugin picks the physical GPUs independently of the `rdma-N`
+grant, so they can land on the opposite PCIe side — which is why co-located GPU
+tasks are **merged into one full-node pod** (the default). Auto priority order:
 
 - **GKE** — one `networking.gke.io.networks/rdma-N` extended resource per NIC.
-  For **multi-node** NCCL, sflow also hostPath-mounts the GKE gIB libs and sources
-  `set_nccl_env.sh` (which sets `NCCL_NET=gIB` + the RoCE tuning). This requires the
-  **`nccl-rdma-installer` DaemonSet** deployed on the cluster — it installs
-  `/home/kubernetes/bin/gib` (+ `/home/kubernetes/bin/nvidia/lib64`) and is **not** a
-  default GKE path. If the installer is absent, sflow tolerates it (the gIB source
-  is skipped via an `[ -f … ]` guard) and NCCL falls back to its built-in IB
-  transport over RoCE.
+  GKE gIB (GPUDirect-RDMA NCCL) requires the **`nccl-rdma-installer` DaemonSet**
+  deployed on the cluster — it installs `/home/kubernetes/bin/gib` and drops the gIB
+  NCCL plugins (net + tuner) into `/home/kubernetes/bin/nvidia/lib64`; it is **not** a
+  default GKE path. sflow **probes for the installer** during reservation and treats
+  gIB as **workload-agnostic cluster infra**: because the device plugin injects that
+  driver dir into `/usr/local/nvidia/lib64` on **every** GPU pod, NCCL auto-loads the
+  gIB plugins everywhere — and they **abort NCCL init** unless `NCCL_CONF_FILE` is set
+  (via `set_nccl_env.sh`). So whenever the installer is detected, sflow mounts the gIB
+  libs and sources `set_nccl_env.sh` on **every** GPU pod (single-node, merged, and
+  multi-node) — not gated on node count. The mounts include `/home/kubernetes/bin/nvidia`
+  → `/usr/local/nvidia` (the driver path), so bind-mounting a missing host dir there
+  would mask `libcuda.so.1`; they therefore use hostPath `type: Directory` (require
+  existence). If the installer is absent, sflow logs a one-line hint, emits **no** lib
+  mounts / gIB config, and NCCL falls back to its built-in IB transport over RoCE.
+
+  sflow **never pins `NCCL_IB_HCA`** — NIC selection is left to NCCL/gIB (which pairs
+  each GPU with its PCIe-local NIC). Correct pairing comes from the pod owning the
+  whole node (merged / full-node); a grant-based pin could otherwise force a pod's
+  GPUs onto far NICs, since the GPU and RDMA device plugins choose independently.
 - **shared device plugin** — a single shared `rdma/*` extended resource
   (k8s-rdma-shared-dev-plugin / NVIDIA Network Operator) grants access to the
   node's HCAs.
@@ -545,19 +558,20 @@ of degrading to TCP). sflow addresses this two ways:
   before the workload, controlled by the `SFLOW_RDMA_AFFINITY` pod env:
   - `auto` (default) — **expose every NIC and let the libraries choose.** Leaves
     `NCCL_IB_HCA` unset (NCCL needs every rank to see every NIC to compute a
-    consistent topology-aware solution) and sets `UCX_NET_DEVICES=all` +
-    `UCX_MAX_RNDV_RAILS=1` so UCX/NIXL use each GPU's closest NIC (implicit
-    GPUDirect RDMA). This is NVIDIA's recommended setup and needs no per-GPU
-    mapping from sflow.
+    consistent topology-aware solution) and leaves `UCX_NET_DEVICES` unset (sflow
+    never pins UCX devices), setting only `UCX_MAX_RNDV_RAILS=1` so UCX/NIXL keep
+    each GPU transfer on its single closest NIC (implicit GPUDirect RDMA). This is
+    NVIDIA's recommended setup and needs no per-GPU mapping from sflow.
   - `explicit` — pin each GPU to the NIC on its PCIe root (`nvidia-smi` bus id →
     sysfs `pcieRoot`). Use when auto-detection mispairs because sysfs distance
     isn't representative (e.g. GB300 Data-Direct sub-interfaces, SR-IOV VFs).
   - `off` — inject nothing; the recipe controls device selection.
 
   In all modes the preamble first verifies RDMA is usable in the pod (`rdma_cm` +
-  a verbs node + an `ACTIVE` port); if not, it pins the routable TCP interface and
-  sets `NCCL_IB_DISABLE=1`, so the workload always comes up instead of aborting on
-  a dead HCA.
+  a verbs node + an `ACTIVE` port); if not, it forces NCCL onto sockets
+  (`NCCL_IB_DISABLE=1`, `NCCL_IB_HCA` unset) and leaves UCX alone so it can still
+  pick `cuda_ipc`/NVLink on co-located pods, so the workload always comes up
+  instead of aborting on a dead HCA.
 - **DRA topology co-allocation (`scheduling: dra`, opt-in).** Set
   `dra.rdma_device_class` to co-request a NIC in the *same* `ResourceClaim` as
   the GPU with a `matchAttribute` constraint (default

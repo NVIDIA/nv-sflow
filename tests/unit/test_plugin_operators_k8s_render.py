@@ -391,10 +391,12 @@ def test_task_pod_rdma_host_device_mount_and_ipc_lock():
     assert sc["capabilities"]["add"] == ["IPC_LOCK"]
 
 
-def test_task_pod_rdma_lib_mounts_tolerate_missing_installer():
-    # GKE gIB libs exist only if the `nccl-rdma-installer` DaemonSet is deployed
-    # (not a default GKE path), so the hostPath must be DirectoryOrCreate -- a
-    # missing installer must not fail the pod (NCCL then uses its built-in IB).
+def test_task_pod_rdma_lib_mounts_require_existing_host_path():
+    # Lib mounts are emitted ONLY when the gIB installer is detected (so the host
+    # paths exist); the hostPath type must be `Directory` (require existence), never
+    # DirectoryOrCreate -- creating an empty dir at /usr/local/nvidia would mask the
+    # driver (libcuda.so.1). A genuinely-missing path should fail the pod loudly, not
+    # silently mask a critical mount.
     m = render_task_pod(
         pod_name="t", image="img:1", configmap_name="t-cfg",
         rdma_lib_mounts=[("/home/kubernetes/bin/gib", "/usr/local/gib")],
@@ -405,7 +407,7 @@ def test_task_pod_rdma_lib_mounts_tolerate_missing_installer():
         if v.get("hostPath", {}).get("path") == "/home/kubernetes/bin/gib"
     ]
     assert gib and gib[0]["hostPath"] == {
-        "path": "/home/kubernetes/bin/gib", "type": "DirectoryOrCreate"
+        "path": "/home/kubernetes/bin/gib", "type": "Directory"
     }
     mount = [
         mt for mt in spec["containers"][0]["volumeMounts"]

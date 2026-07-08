@@ -146,6 +146,9 @@ variables:
   EXTRA_DECODE_ARGS:
     description: "Extra decode arguments"
     value: ""
+  NET_DEBUG:
+    description: "Log NCCL/UCX transport selection (1=on, 0=off) to verify RDMA vs TCP"
+    value: "1"
 
   # Benchmark Configuration
   ISL:
@@ -374,11 +377,12 @@ workflow:
         # - export NCCL_IB_MERGE_NICS=0
         # - export LD_LIBRARY_PATH=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
         
-        # DEBUG (temporary): log the KV-transfer/NCCL transport to confirm RDMA vs TCP.
-        # Look for UCX rc_mlx5/dc_mlx5 (RDMA) vs tcp, and NCCL NET/IB vs NET/Socket. Remove after.
-        # - export UCX_LOG_LEVEL=info
-        # - export NCCL_DEBUG=INFO
-        # - export NCCL_DEBUG_SUBSYS=NET
+        - >
+          if [ "${NET_DEBUG}" == "1" ]; then
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=GRAPH,NET
+            export UCX_LOG_LEVEL=info
+          fi
         - >
           python3 -m dynamo.trtllm
           --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
@@ -429,11 +433,12 @@ workflow:
         # - export NCCL_IB_MERGE_NICS=0
         # - export LD_LIBRARY_PATH=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
 
-        # DEBUG (temporary): log the KV-transfer/NCCL transport to confirm RDMA vs TCP.
-        # Look for UCX rc_mlx5/dc_mlx5 (RDMA) vs tcp, and NCCL NET/IB vs NET/Socket. Remove after.
-        # - export UCX_LOG_LEVEL=info
-        # - export NCCL_DEBUG=INFO
-        # - export NCCL_DEBUG_SUBSYS=NET
+        - >
+          if [ "${NET_DEBUG}" == "1" ]; then
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=GRAPH,NET
+            export UCX_LOG_LEVEL=info
+          fi
         - >
           python3 -m dynamo.trtllm
           --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}

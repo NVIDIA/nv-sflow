@@ -888,8 +888,10 @@ def test_rdma_nic_window_aligns_to_node_local_gpu_slot():
     )
     pod = _pods(manifest)[0]
     assert _rdma_nic_indices(pod) == [4, 5, 6, 7]
-    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0]["env"]}
-    assert env["NCCL_IB_HCA"] == "mlx5_4,mlx5_5,mlx5_6,mlx5_7"
+    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0].get("env", [])}
+    # NIC *resources* are aligned to the GPU slot, but NIC *selection* is left to
+    # NCCL/gIB -- sflow never pins NCCL_IB_HCA.
+    assert "NCCL_IB_HCA" not in env
     assert "UCX_NET_DEVICES" not in env
 
 
@@ -922,16 +924,16 @@ def test_rdma_nic_window_falls_back_to_replica_index_without_gpu_slot():
     assert _rdma_nic_indices(_pods(manifest)[0]) == [2, 3]
 
 
-def test_gke_keeps_static_pin_and_no_runtime_affinity_preamble():
-    # GKE grants a fixed per-pod NIC subset (allow_runtime_affinity=False), so it
-    # must keep the build-time per-pod pin and must NOT get the expose-all runtime
-    # affinity preamble (which assumes the pod can see every node HCA).
+def test_gke_no_ib_pin_and_no_runtime_affinity_preamble():
+    # GKE leaves NIC selection to NCCL/gIB (allow_runtime_affinity=False): NO
+    # build-time NCCL_IB_HCA pin and NO expose-all runtime affinity preamble. It still
+    # requests the GPU-aligned per-pod NIC window (rdma-4..7) for scheduling.
     manifest, _ = _build(
         _rdma_backend(), ["node-0"], gpu_count=4, cuda_visible="4,5,6,7"
     )
     pod = _pods(manifest)[0]
-    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0]["env"]}
-    assert env["NCCL_IB_HCA"] == "mlx5_4,mlx5_5,mlx5_6,mlx5_7"  # static pin kept
+    env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0].get("env", [])}
+    assert "NCCL_IB_HCA" not in env  # not pinned -> library auto-selects
     assert "UCX_NET_DEVICES" not in env
     assert _rdma_nic_indices(pod) == [4, 5, 6, 7]
     assert "_sflow_rdma_setup" not in _entrypoint(manifest)  # no affinity preamble
@@ -948,6 +950,142 @@ def test_rdma_full_node_pod_is_not_ib_pinned():
     pod = _pods(manifest)[0]
     assert _rdma_nic_indices(pod) == [0, 1, 2, 3, 4, 5, 6, 7]  # all node NICs granted
     env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0].get("env", [])}
+    assert "NCCL_IB_HCA" not in env
+    assert "UCX_NET_DEVICES" not in env
+
+
+def _rdma_multinode_backend(gpus_per_node=8, nics=8, nodes=2, gib=True):
+    """A multi-node GKE RDMA backend (triggers the gIB preamble on n>1 pods).
+
+    ``gib=False`` models a GKE cluster WITHOUT the ``nccl-rdma-installer`` DaemonSet:
+    the provider grants the NICs but emits no lib mounts / NCCL tuning script.
+    """
+    from sflow.plugins.backends._k8s_rdma import (
+        GKE_NCCL_ENV_SCRIPT,
+        GKE_RDMA_LIB_MOUNTS,
+    )
+
+    be = _backend("device_plugin", gpus_per_node, nodes=nodes)
+    be._rdma_plan = RdmaPlan(
+        provider="gke",
+        enabled=True,
+        nic_specs=tuple(
+            (f"networking.gke.io.networks/rdma-{i}", f"mlx5_{i}") for i in range(nics)
+        ),
+        ipc_lock=True,
+        lib_mounts=GKE_RDMA_LIB_MOUNTS if gib else (),
+        nccl_env_script=GKE_NCCL_ENV_SCRIPT if gib else "",
+    )
+    return be
+
+
+def test_multinode_gib_full_node_no_untuned_ib_pin():
+    # TP16 across 2 nodes (8 GPUs/node = full node per node): the gIB preamble
+    # sources set_nccl_env.sh ONLY if present and must NOT emit an untuned
+    # `NCCL_IB_HCA=<all HCAs>` pin (that all-NIC config reset the node). A full-node
+    # pod is never pinned; NCCL/gIB auto-select.
+    manifest, _ = _build(
+        _rdma_multinode_backend(), ["node-0", "node-1"], gpu_count=16,
+    )
+    entry = _entrypoint(manifest)
+    assert "if [ -f /usr/local/gib/scripts/set_nccl_env.sh ]; then" in entry
+    assert "source /usr/local/gib/scripts/set_nccl_env.sh" in entry
+    # No unguarded (untuned) source form, and no NCCL_IB_HCA pin at all.
+    assert "] && source /usr/local/gib" not in entry
+    assert "NCCL_IB_HCA" not in entry
+
+
+def test_multinode_gib_partial_node_sources_config_no_pin():
+    # A partial-node multi-node pod sources the gIB config but is NEVER NIC-pinned:
+    # NIC selection is left to NCCL/gIB (topology-aware). sflow never pins NCCL_IB_HCA.
+    manifest, _ = _build(
+        _rdma_multinode_backend(), ["node-0", "node-1"], gpu_count=8,
+        cuda_visible="0,1,2,3",
+    )
+    entry = _entrypoint(manifest)
+    assert "source /usr/local/gib/scripts/set_nccl_env.sh" in entry
+    assert "NCCL_IB_HCA" not in entry
+
+
+def test_singlenode_gib_sources_config_workload_agnostic():
+    # gIB is workload-agnostic infra: a SINGLE-node GKE pod still sources
+    # set_nccl_env.sh (-> NCCL_CONF_FILE) so the cluster-wide auto-loaded gIB tuner is
+    # configured and NCCL init doesn't abort. No NCCL_IB_HCA pin (single-node uses
+    # NVLink, not cross-node NCCL), and the gIB config dir is mounted.
+    manifest, _ = _build(
+        _rdma_multinode_backend(), ["node-0"], gpu_count=8,
+        cuda_visible="0,1,2,3,4,5,6,7",
+    )
+    entry = _entrypoint(manifest)
+    assert "source /usr/local/gib/scripts/set_nccl_env.sh" in entry
+    assert "NCCL_IB_HCA" not in entry  # single-node -> no pin
+    vols = {
+        v.get("hostPath", {}).get("path")
+        for v in _pods(manifest)[0]["spec"]["volumes"]
+    }
+    assert "/home/kubernetes/bin/gib" in vols  # gIB config mounted
+
+
+def test_singlenode_partial_gib_sources_config_but_no_pin():
+    # A single-node partial-node pod (4 of 8 GPUs, e.g. two workers packed per node)
+    # still sources the gIB config but is NOT NIC-pinned: the pin is only for
+    # cross-node NCCL; single-node collectives use NVLink.
+    manifest, _ = _build(
+        _rdma_multinode_backend(), ["node-0"], gpu_count=4, cuda_visible="0,1,2,3",
+    )
+    entry = _entrypoint(manifest)
+    assert "source /usr/local/gib/scripts/set_nccl_env.sh" in entry
+    assert "NCCL_IB_HCA" not in entry
+
+
+def test_singlenode_without_gib_no_gib_preamble():
+    # No gIB installer -> nothing auto-loads -> no gIB source line and no gIB mounts.
+    manifest, _ = _build(
+        _rdma_multinode_backend(gib=False), ["node-0"], gpu_count=8,
+        cuda_visible="0,1,2,3,4,5,6,7",
+    )
+    entry = _entrypoint(manifest)
+    assert "set_nccl_env.sh" not in entry
+    vols = {
+        v.get("hostPath", {}).get("path")
+        for v in _pods(manifest)[0]["spec"]["volumes"]
+    }
+    assert "/home/kubernetes/bin/gib" not in vols
+
+
+def test_multinode_no_gib_full_node_emits_no_nccl_env_at_all():
+    # Multi-node GKE WITHOUT the gIB installer (no lib mounts / no NCCL tuning): the
+    # gIB preamble must be omitted entirely and a full-node pod must NOT be pinned --
+    # neither in the entrypoint nor the pod env. NCCL falls back to its built-in IB
+    # transport and auto-selects across every granted NIC.
+    manifest, _ = _build(
+        _rdma_multinode_backend(gib=False), ["node-0", "node-1"], gpu_count=16,
+    )
+    entry = _entrypoint(manifest)
+    assert "set_nccl_env.sh" not in entry  # no gIB source line
+    assert "NCCL_IB_HCA" not in entry
+    env = {
+        e["name"]: e["value"]
+        for e in _pods(manifest)[0]["spec"]["containers"][0].get("env", [])
+    }
+    assert "NCCL_IB_HCA" not in env  # full-node pod is never pinned
+    assert "UCX_NET_DEVICES" not in env
+
+
+def test_multinode_no_gib_partial_node_no_pin():
+    # Multi-node GKE WITHOUT gIB, partial-node pod (4 of 8 GPUs/node): no gIB preamble
+    # and -- like every path -- NO NCCL_IB_HCA pin. NIC selection is left to NCCL's
+    # built-in IB transport; UCX is never pinned either.
+    manifest, _ = _build(
+        _rdma_multinode_backend(gib=False), ["node-0", "node-1"], gpu_count=8,
+        cuda_visible="0,1,2,3",
+    )
+    entry = _entrypoint(manifest)
+    assert "set_nccl_env.sh" not in entry  # no gIB preamble
+    env = {
+        e["name"]: e["value"]
+        for e in _pods(manifest)[0]["spec"]["containers"][0].get("env", [])
+    }
     assert "NCCL_IB_HCA" not in env
     assert "UCX_NET_DEVICES" not in env
 
@@ -1225,6 +1363,20 @@ def _merged_build(backend, *, scheduling_gpu=True):
     body = after.split("\n" + _MARK, 1)[0]
     manifest = json.loads(body.split("\n", 1)[1])
     return manifest, shell, op
+
+
+def test_merged_gib_pod_sources_config():
+    # A merged pod is single-node but still on a gIB cluster, so its launcher must
+    # source the gIB config once (env inherited by every member) or the members'
+    # auto-loaded gIB plugins abort NCCL init. No NCCL_IB_HCA pin (single-node).
+    manifest, shell, _ = _merged_build(_rdma_multinode_backend())
+    assert "source /usr/local/gib/scripts/set_nccl_env.sh" in shell
+    assert "NCCL_IB_HCA" not in shell
+    vols = {
+        v.get("hostPath", {}).get("path")
+        for v in _pods(manifest)[0]["spec"]["volumes"]
+    }
+    assert "/home/kubernetes/bin/gib" in vols
 
 
 def test_merge_pod_single_pod_with_union_gpus():

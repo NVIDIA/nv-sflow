@@ -16,13 +16,21 @@ from sflow.plugins.backends._k8s_rdma import (
 )
 
 
-def _ctx(*, hcas=("mlx5_0", "mlx5_1"), iface="eth0", host_network=True, allocatable=None):
+def _ctx(
+    *,
+    hcas=("mlx5_0", "mlx5_1"),
+    iface="eth0",
+    host_network=True,
+    allocatable=None,
+    gib_installed=False,
+):
     return RdmaDetectContext(
         node_name="node-a",
         node_allocatable=allocatable or {},
         hcas=list(hcas),
         primary_iface=iface,
         host_network=host_network,
+        gib_installed=gib_installed,
     )
 
 
@@ -65,7 +73,9 @@ class TestGkeProvider:
         assert p.applies(_ctx(hcas=(), allocatable=self._alloc)) is False
 
     def test_build_plan_sorts_nics_and_maps_mlx5(self):
-        plan = GkeRdmaProvider().build_plan(_ctx(allocatable=self._alloc))
+        plan = GkeRdmaProvider().build_plan(
+            _ctx(allocatable=self._alloc, gib_installed=True)
+        )
         assert plan.provider == "gke" and plan.enabled
         assert plan.nic_specs == (
             ("networking.gke.io.networks/rdma-0", "mlx5_0"),
@@ -73,6 +83,19 @@ class TestGkeProvider:
         )
         assert plan.ipc_lock and plan.lib_mounts and plan.nccl_env_script
         assert plan.host_device_paths == ()
+
+    def test_build_plan_omits_lib_mounts_when_gib_absent(self):
+        # No installer -> no lib mounts + no NCCL tuning: mounting the driver path
+        # /usr/local/nvidia from a missing host dir would mask libcuda.so.1. NICs
+        # are still granted (NCCL uses its built-in IB transport over RoCE).
+        plan = GkeRdmaProvider().build_plan(
+            _ctx(allocatable=self._alloc, gib_installed=False)
+        )
+        assert plan.provider == "gke" and plan.enabled
+        assert plan.nic_specs  # NICs still granted
+        assert plan.ipc_lock
+        assert plan.lib_mounts == ()
+        assert plan.nccl_env_script == ""
 
 
 class TestSharedDevicePluginProvider:
