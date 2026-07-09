@@ -25,12 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import shlex
 import shutil
+import signal
 import sys
 from collections.abc import Awaitable, Mapping, Sequence
-from typing import Any
 
 from sflow.core.command import Command
 from sflow.core.launcher import _strip_ansi
@@ -38,13 +37,6 @@ from sflow.logging import SFLOW_TASK_STREAM_ATTR, get_logger
 from sflow.plugins.operators._k8s_render import MERGE_MUX_CLOSE, MERGE_MUX_OPEN
 
 _logger = get_logger(__name__)
-
-# Matches one merge-pod launcher line: "[[sflow-mux:<task>]] <body>". The tag is
-# emitted by _k8s_shell.merged_launcher_lines; both sides share MERGE_MUX_* so the
-# literal never drifts. Group 1 = task name, group 2 = the original line body.
-_MUX_RE = re.compile(
-    "^" + re.escape(MERGE_MUX_OPEN) + r"([^\]]+)" + re.escape(MERGE_MUX_CLOSE) + "(.*)$"
-)
 
 # Seconds between pod-phase polls (the authoritative completion signal).
 PHASE_POLL_INTERVAL = 2.0
@@ -89,6 +81,43 @@ async def get_pod_phase(
         global_args=global_args,
     )
     return out if rc == 0 else ""
+
+
+async def _pod_terminal_status(
+    pod_ref: str, *, global_args: Sequence[str], ns_args: Sequence[str]
+) -> tuple[str, bool, bool]:
+    """One kubectl call -> ``(phase, container_done, container_failed)``.
+
+    ``container_done`` is True once the pod's app container(s) have all TERMINATED
+    (none still ``running`` or ``waiting``) -- the TRUE "work finished" signal, which
+    can PRECEDE the pod ``.status.phase`` flip because kubelet/API status propagation
+    lags container exit. ``container_failed`` is True when any terminated container
+    exited non-zero. ``phase`` is ``""`` (and both flags False) when the pod is gone
+    or unreadable. The four fields come back ``|``-separated in a single query so a
+    watch tick stays one kubectl call.
+    """
+    jsonpath = (
+        "{.status.phase}|"
+        "{.status.containerStatuses[*].state.running.startedAt}|"
+        "{.status.containerStatuses[*].state.waiting.reason}|"
+        "{.status.containerStatuses[*].state.terminated.exitCode}"
+    )
+    rc, out, _ = await run_kubectl(
+        ["get", pod_ref, *ns_args, "-o", f"jsonpath={jsonpath}"],
+        global_args=global_args,
+    )
+    if rc != 0:
+        return "", False, False
+    phase, running, waiting, exit_codes = (
+        p.strip() for p in (out.split("|") + ["", "", "", ""])[:4]
+    )
+    codes = exit_codes.split()
+    # sflow pods are single-container, so "no container still running/waiting" is a
+    # safe "work finished" signal. If a sidecar/init container is ever added, this
+    # would need to key on the main container's status instead of the pod-wide set.
+    container_done = bool(codes) and not running and not waiting
+    container_failed = any(c != "0" for c in codes)
+    return phase, container_done, container_failed
 
 
 async def format_pod_start_note(
@@ -136,17 +165,36 @@ async def watch_until_terminal(
     ns_args: Sequence[str],
     interval: float = PHASE_POLL_INTERVAL,
 ) -> str:
-    """Poll the pod phase until it is terminal or gone; return the final phase.
+    """Poll until the pod is terminal or gone; return the final (real/derived) phase.
 
     Returns ``Succeeded``/``Failed`` once the pod reaches it, or ``""`` if the pod
     disappears (deleted out from under us) for two consecutive polls. This is what
     lets the driver break the lagging log stream the instant the pod is done.
+
+    The pod ``.status.phase`` flip can LAG the container actually exiting (kubelet /
+    API status propagation), so this ALSO treats the pod as terminal the moment its
+    container(s) have terminated -- deriving the phase from the container exit code --
+    instead of waiting the phase out. That keeps completion (and the workflow
+    teardown that stops sibling services) aligned to the TRUE container status rather
+    than the laggy phase. Pods are ``restartPolicy: Never``, so a terminated
+    container stays terminated (no restart flap to race).
     """
     missing = 0
     while True:
-        phase = await get_pod_phase(pod_ref, global_args=global_args, ns_args=ns_args)
+        phase, container_done, container_failed = await _pod_terminal_status(
+            pod_ref, global_args=global_args, ns_args=ns_args
+        )
         if phase in _TERMINAL_PHASES:
             return phase
+        if container_done:
+            derived = "Failed" if container_failed else "Succeeded"
+            # Container(s) exited but the pod phase has not flipped yet: complete now
+            # on the true status instead of waiting out the phase-propagation lag.
+            _logger.info(
+                f"{pod_ref}: container terminated (pod phase={phase or '?'}); "
+                f"completing as {derived} without waiting for the phase to flip"
+            )
+            return derived
         if not phase:
             missing += 1
             if missing >= _GONE_POLLS:
@@ -277,120 +325,104 @@ async def start_pod_log_file_stream(
     return await asyncio.create_subprocess_exec("bash", "-c", shell)
 
 
-async def _demux_stream(
-    proc: asyncio.subprocess.Process,
-    tag_paths: Mapping[str, str],
-    default_path: str,
-    *,
-    console_label: str = "",
-) -> None:
-    """Read ``proc`` stdout line by line, routing each line to a per-task file.
+def _demux_awk_command(tag_paths: Mapping[str, str], default_path: str) -> str:
+    """The ``awk`` invocation that splits a merged stream into per-task files.
 
-    A merge-pod runs several members' scripts in one container, each line tagged
-    ``[[sflow-mux:<task>]] `` by the launcher. Lines whose tag names a known member
-    are written (untagged) to that member's ``<task>.log``; everything else (apply
-    diagnostics, the RDMA preamble, unknown tags) goes to ``default_path`` (the
-    leader's log). Files are opened lazily and appended to, mirroring the offloaded
-    single-pod stream. Best-effort per line so one bad line never drops the stream.
+    Emits ``awk -v ... '<program>'`` that, for each stdin line, routes a
+    ``[[sflow-mux:<task>]] `` line to that member's ``<task>.log`` (tag stripped,
+    appended) when ``<task>`` is a known member, and every other (pod-level /
+    unknown-tag) line VERBATIM to ``default_path`` (the leader's log). It appends
+    (``>>``) so the leader file's apply-diagnostics prefix is preserved, and
+    ``fflush``es each write so the decoupled console tailer sees lines promptly.
 
-    When ``console_label`` is set and stdout is a TTY, each line is ALSO echoed to
-    the console/TUI tagged ``[<task>] `` -- the member's own task name for tagged
-    lines, else ``console_label`` (the leader) for pod-level lines -- so the
-    interleaved output of the merged members is attributable live. The on-disk
-    ``<task>.log`` files stay clean (the mux tag is stripped, no console prefix).
+    The tag literals, member names and file paths are passed as ``-v`` variables
+    (shell-quoted) so the awk *program* is a fixed literal -- no manifest/path text
+    is spliced into the program. Runs entirely in the offloaded child shell, so the
+    sflow driver's event loop is never in the per-line byte path (the whole point of
+    the offload -- see :func:`start_pod_log_demux_stream`).
     """
-    files: dict[str, Any] = {}
-    echo_console = bool(console_label) and _console_active()
-
-    def _fh(path: str):
-        fh = files.get(path)
-        if fh is None:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            fh = open(path, "ab")  # noqa: SIM115 -- closed in finally
-            files[path] = fh
-        return fh
-
-    assert proc.stdout is not None
-    try:
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                break
-            text = raw.decode("utf-8", errors="replace")
-            stripped = text.rstrip("\n")
-            m = _MUX_RE.match(stripped)
-            if m and m.group(1) in tag_paths:
-                name = m.group(1)
-                path = tag_paths[name]
-                line_body = m.group(2)
-                body = (line_body + "\n").encode("utf-8")
-            else:
-                name = console_label
-                path = default_path
-                line_body = stripped
-                body = text.encode("utf-8")
-            try:
-                fh = _fh(path)
-                fh.write(body)
-                fh.flush()
-            except OSError:
-                pass
-            if echo_console:
-                clean = _strip_ansi(line_body).rstrip()
-                if clean:
-                    # Tag each merged member's line with its task name so the
-                    # interleaved TUI/console output is readable.
-                    _logger.info(
-                        f"[{name}] {clean}",
-                        extra={SFLOW_TASK_STREAM_ATTR: True},
-                    )
-    finally:
-        for fh in files.values():
-            try:
-                fh.close()
-            except OSError:
-                pass
+    vargs = [
+        "-v", f"o={shlex.quote(MERGE_MUX_OPEN)}",
+        "-v", f"c={shlex.quote(MERGE_MUX_CLOSE)}",
+        "-v", f"dflt={shlex.quote(default_path)}",
+    ]
+    assigns = ""
+    for idx, (name, path) in enumerate(tag_paths.items()):
+        vargs += [
+            "-v", f"n{idx}={shlex.quote(str(name))}",
+            "-v", f"f{idx}={shlex.quote(str(path))}",
+        ]
+        assigns += f"p[n{idx}]=f{idx};"
+    program = (
+        "BEGIN{ol=length(o);cl=length(c);" + assigns + "}"
+        "{if(substr($0,1,ol)==o){r=substr($0,ol+1);i=index(r,c);"
+        "if(i>0){n=substr(r,1,i-1);b=substr(r,i+cl);"
+        "if(n in p){print b >> (p[n]);fflush(p[n]);next}}}"
+        "print $0 >> (dflt);fflush(dflt)}"
+    )
+    return "awk " + " ".join(vargs) + " " + shlex.quote(program)
 
 
-async def stream_and_demux_pod_log(
+async def start_pod_log_demux_stream(
     log_command: Command,
     *,
     tag_paths: Mapping[str, str],
     default_path: str,
-    console_label: str = "",
-) -> tuple[asyncio.subprocess.Process, asyncio.Future]:
-    """Start ``kubectl logs -f`` for a merge-pod and demux it into per-task files.
+) -> asyncio.subprocess.Process:
+    """Offload a merge-pod's ``kubectl logs -f`` + tag demux into a child shell.
 
-    Unlike the single-pod offload (a driver-free shell redirect), a merge-pod's one
-    container carries several members' logs, so the driver reads the stream and
-    splits it by the ``[[sflow-mux:<task>]] `` tag into each member's ``<task>.log``
-    (see :func:`_demux_stream`). ``console_label`` (the leader task) enables the
-    per-task-tagged console echo for the interleaved output. Returns the kubectl
-    process and the reader task; the caller drains/cancels the reader and terminates
-    the process on terminal / teardown. Best-effort dir creation.
+    A merge-pod's one container carries several members' logs, each line tagged
+    ``[[sflow-mux:<task>]] `` by the launcher. Unlike a single pod (a plain shell
+    redirect), the merged stream must be split per member -- but that split is done
+    by ``awk`` INSIDE the child shell (see :func:`_demux_awk_command`), so the sflow
+    driver's event loop is STILL never in the per-line byte path, mirroring
+    :func:`start_pod_log_file_stream`. This is what keeps the pod-status watches (and
+    hence the early cut-over on terminal) responsive under a chatty merged server --
+    the driver reading every line itself is what previously starved them. A decoupled
+    tailer echoes each member's ``<task>.log`` to the console.
+
+    The pipeline runs in a new session (``start_new_session=True``) so the whole
+    thing (kubectl + awk) can be stopped as one process group on terminal / teardown
+    (see :func:`terminate_process` ``kill_group``). Best-effort dir creation.
     """
-    parent = os.path.dirname(default_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    proc = await asyncio.create_subprocess_exec(
-        *[str(a) for a in log_command.as_list()],
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+    for path in (default_path, *tag_paths.values()):
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    argv = " ".join(shlex.quote(str(a)) for a in log_command.as_list())
+    # kubectl's own stderr (e.g. "pod deleted" on teardown) is noise -> /dev/null;
+    # awk writes straight to the per-task files, so the pipeline's stdout is empty.
+    shell = f"{argv} 2>/dev/null | {_demux_awk_command(tag_paths, default_path)}"
+    return await asyncio.create_subprocess_exec(
+        "bash", "-c", shell, start_new_session=True
     )
-    reader = asyncio.ensure_future(
-        _demux_stream(proc, tag_paths, default_path, console_label=console_label)
-    )
-    return proc, reader
 
 
-async def terminate_process(proc: asyncio.subprocess.Process) -> None:
-    """Best-effort stop a side-channel subprocess (the log stream), SIGTERM->SIGKILL."""
+async def terminate_process(
+    proc: asyncio.subprocess.Process, *, kill_group: bool = False
+) -> None:
+    """Best-effort stop a side-channel subprocess (the log stream), SIGTERM->SIGKILL.
+
+    ``kill_group`` signals the whole process group instead of just ``proc`` -- used
+    for the merge-pod demux pipeline (``kubectl | awk``), started in its own session,
+    so one signal stops both stages. The single-pod redirect ``exec``s kubectl in
+    place (one process), so its default single-process terminate is enough.
+    """
     if proc.returncode is not None:
         return
+
+    def _signal(sig: int) -> None:
+        # Group signal targets the pipeline's session leader group (kubectl + awk);
+        # os.getpgid == proc.pid here since it was started in a new session.
+        if kill_group:
+            os.killpg(os.getpgid(proc.pid), sig)
+        elif sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+
     try:
-        proc.terminate()
+        _signal(signal.SIGTERM)
     except ProcessLookupError:
         return
     except Exception:
@@ -401,7 +433,7 @@ async def terminate_process(proc: asyncio.subprocess.Process) -> None:
     except Exception:
         pass
     try:
-        proc.kill()
+        _signal(signal.SIGKILL)
     except ProcessLookupError:
         return
     except Exception:
@@ -501,6 +533,114 @@ async def finalize_complete_log(
                 pass
 
 
+async def _dump_pod_log_raw(
+    pod_ref: str,
+    dest_path: str,
+    *,
+    global_args: Sequence[str],
+    ns_args: Sequence[str],
+) -> bool:
+    """One-shot ``kubectl logs <pod>`` (no ``-f``, NO ``--prefix``) -> ``dest_path``.
+
+    The merge-pod re-fetch: like :func:`_dump_pod_log` it reads the node's whole
+    container log (complete, not behind the interrupted follow) with
+    ``--all-containers`` (matching the live stream in :func:`build_log_stream_command`
+    so the rebuilt log covers exactly what the follow saw), but WITHOUT ``--prefix``
+    so each line still begins with its ``[[sflow-mux:<task>]] `` tag -- the splitter
+    keys on that tag to rebuild the per-member files. Returns False on non-zero exit
+    (e.g. the pod was deleted) so the caller keeps the live content.
+    """
+    with open(dest_path, "wb") as fh:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            *[str(a) for a in global_args],
+            "logs",
+            pod_ref,
+            *[str(a) for a in ns_args],
+            "--all-containers",
+            stdout=fh,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await proc.wait()
+    return rc == 0
+
+
+async def finalize_merged_complete_log(
+    pod_ref: str,
+    *,
+    tag_paths: Mapping[str, str],
+    default_path: str,
+    prefix_size: int,
+    phase: str,
+    global_args: Sequence[str],
+    ns_args: Sequence[str],
+) -> None:
+    """Rebuild every merged member's ``<task>.log`` from the pod's COMPLETE log.
+
+    The merge-pod analogue of :func:`finalize_complete_log`: the offloaded live
+    demux (``kubectl logs -f | awk``) is interrupted the instant the pod is terminal,
+    so the per-member files may be missing the tail the follow had not yet delivered.
+    This re-fetches the pod's whole container log with a one-shot ``kubectl logs``
+    (complete, not behind) and re-runs the SAME awk splitter over it (single source
+    of truth for the routing) into temp files -- the leader/default file seeded with
+    its preserved apply-diagnostics prefix -- then atomically renames each into place.
+    Post-run readers (probes + output/result parsing) therefore get each member's
+    complete log with no duplication, matching the single-pod guarantee.
+
+    Only runs when the pod reached a real terminal phase (so it is re-fetchable); if
+    the re-fetch or the re-demux fails, the live-streamed content is kept as-is (never
+    wiped for a partial rebuild). Best-effort: never raises.
+    """
+    if phase not in ("Succeeded", "Failed"):
+        return
+    dump = f"{default_path}.merged.dump"
+    tmp_tag_paths = {name: f"{p}.merged.final" for name, p in tag_paths.items()}
+    tmp_default = f"{default_path}.merged.final"
+    temps = set(tmp_tag_paths.values()) | {tmp_default}
+    try:
+        if not await _dump_pod_log_raw(
+            pod_ref, dump, global_args=global_args, ns_args=ns_args
+        ):
+            return  # keep the live content rather than a partial rebuild
+        # Seed the leader/default temp with the preserved apply-diagnostics prefix,
+        # and start every member temp fresh, so the awk splitter (which appends)
+        # rebuilds each file exactly once with no stale/duplicated content.
+        prefix = b""
+        if prefix_size > 0:
+            try:
+                with open(default_path, "rb") as f:
+                    prefix = f.read(prefix_size)
+            except OSError:
+                prefix = b""
+        with open(tmp_default, "wb") as f:
+            f.write(prefix)
+        for tmp in tmp_tag_paths.values():
+            if tmp != tmp_default:
+                open(tmp, "wb").close()
+        # Re-demux the COMPLETE dump with the same splitter (reads the dump file
+        # operand, appends into the temps). No console echo -- this is disk only.
+        cmd = _demux_awk_command(tmp_tag_paths, tmp_default) + f" {shlex.quote(dump)}"
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        if await proc.wait() != 0:
+            return  # keep the live content
+        os.replace(tmp_default, default_path)
+        for name, tmp in tmp_tag_paths.items():
+            if tmp != tmp_default:
+                os.replace(tmp, tag_paths[name])
+    except Exception:
+        pass
+    finally:
+        for path in (dump, *temps):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def _console_active() -> bool:
     try:
         return bool(sys.stdout.isatty())
@@ -508,7 +648,9 @@ def _console_active() -> bool:
         return False
 
 
-async def tail_file_to_console(path: str, *, task_name: str) -> None:
+async def tail_file_to_console(
+    path: str, *, task_name: str, line_prefix: str = ""
+) -> None:
     """Echo new lines of ``path`` to the console (TTY only), decoupled from the writer.
 
     Reads only content appended after it starts (so it doesn't re-print the apply
@@ -517,9 +659,11 @@ async def tail_file_to_console(path: str, *, task_name: str) -> None:
     the event loop through the console path (dropped lines remain in the file).
     Runs until cancelled (on pod terminal or workflow end).
 
-    Lines are echoed as-is: ``kubectl logs --prefix`` already tags every line with
-    its ``[pod/<pod>/<container>]`` source, so the tailer does NOT add sflow's
-    ``[task]`` console prefix (that would double up and lengthen every line)."""
+    ``line_prefix`` is prepended to each echoed line. It is empty for a single pod
+    (``kubectl logs --prefix`` already tags every line with its
+    ``[pod/<pod>/<container>]`` source, so adding one would double up); a merge-pod
+    member passes ``"[<task>] "`` because its demuxed ``<task>.log`` carries no
+    kubectl prefix, so the tag is what keeps the interleaved members attributable."""
     if not _console_active():
         return
     # Start at the current end of file: apply diagnostics were already streamed to
@@ -552,8 +696,9 @@ async def tail_file_to_console(path: str, *, task_name: str) -> None:
             for raw in lines:
                 text = _strip_ansi(raw.decode("utf-8", errors="replace")).rstrip()
                 if text:
-                    # No [task] prefix: the line already carries its [pod/...] tag.
-                    _logger.info(text, extra={SFLOW_TASK_STREAM_ATTR: True})
+                    _logger.info(
+                        f"{line_prefix}{text}", extra={SFLOW_TASK_STREAM_ATTR: True}
+                    )
             if dropped:
                 _logger.info(
                     f"[{task_name}] ... ({dropped} console lines omitted; full log "

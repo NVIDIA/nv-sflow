@@ -363,6 +363,12 @@ if true; then
             grep -F -- 'id=kubernetes' \"$KUBERNETES_APPLY_LAUNCH_LOG\" && \
             grep -F -- 'operator: k8s' \"$KUBERNETES_APPLY_LAUNCH_LOG\" && \
             grep -F -- 'Dry-run complete: k8s_apply_validate' \"$KUBERNETES_APPLY_LAUNCH_LOG\""
+    KUBERNETES_LOG_OFFLOAD_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_log_offload_smoke.log"
+    run_check "dry-run kubernetes_log_offload_smoke merges GPU replicas via k8s operator" \
+        bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_log_offload_smoke.yaml\" --dry-run --verbose > \"$KUBERNETES_LOG_OFFLOAD_LOG\" 2>&1 && \
+            grep -F -- 'id=kubernetes' \"$KUBERNETES_LOG_OFFLOAD_LOG\" && \
+            grep -F -- 'operator: k8s' \"$KUBERNETES_LOG_OFFLOAD_LOG\" && \
+            grep -F -- 'Dry-run complete: k8s_log_offload_smoke' \"$KUBERNETES_LOG_OFFLOAD_LOG\""
 
     # -- sflow run --dry-run: native Kubernetes Dynamo recipes (vLLM / SGLang /
     #    TRT-LLM, agg + disagg). Each plans on the kubernetes backend and renders

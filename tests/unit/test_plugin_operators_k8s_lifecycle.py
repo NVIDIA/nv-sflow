@@ -10,6 +10,9 @@ faked out so no cluster is needed)."""
 
 import asyncio
 import logging
+import shutil
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,6 +66,74 @@ def test_watch_until_terminal_returns_empty_when_pod_gone(monkeypatch):
         life.watch_until_terminal("pod/t", global_args=[], ns_args=[], interval=0)
     )
     assert phase == ""
+
+
+def test_watch_until_terminal_completes_on_container_exit_when_phase_lags(monkeypatch):
+    # The pod phase still reads "Running" but the container has already terminated
+    # (exit 0): the phase lags container exit, so watch must complete NOW on the true
+    # container status instead of waiting out the lag. (combined jsonpath:
+    # phase|running|waiting|exitcodes)
+    async def fake(args, *, global_args=()):
+        return (0, "Running|||0", "")
+
+    monkeypatch.setattr(life, "run_kubectl", fake)
+    phase = asyncio.run(
+        life.watch_until_terminal("pod/t", global_args=[], ns_args=[], interval=0)
+    )
+    assert phase == "Succeeded"
+
+
+def test_watch_until_terminal_derives_failed_from_container_exit(monkeypatch):
+    async def fake(args, *, global_args=()):
+        return (0, "Running|||137", "")  # container terminated non-zero, phase lag
+
+    monkeypatch.setattr(life, "run_kubectl", fake)
+    phase = asyncio.run(
+        life.watch_until_terminal("pod/t", global_args=[], ns_args=[], interval=0)
+    )
+    assert phase == "Failed"
+
+
+def test_watch_until_terminal_still_running_container_not_done(monkeypatch):
+    # A genuinely running container (running.startedAt present, no exit code) must
+    # NOT be treated as terminal -- only phase transition or container exit ends it.
+    phases = iter(["Running|2026-01-01T00:00:00Z||", "Succeeded|||0"])
+
+    async def fake(args, *, global_args=()):
+        return (0, next(phases), "")
+
+    monkeypatch.setattr(life, "run_kubectl", fake)
+    phase = asyncio.run(
+        life.watch_until_terminal("pod/t", global_args=[], ns_args=[], interval=0)
+    )
+    assert phase == "Succeeded"  # completed on the phase flip, not the running poll
+
+
+def test_pod_terminal_status_parses_combined_fields(monkeypatch):
+    cases = {
+        "Running|2026-01-01T00:00:00Z||": ("Running", False, False),  # running
+        "Running|||0": ("Running", True, False),  # terminated ok, phase lagging
+        "Running|||137": ("Running", True, True),  # terminated non-zero
+        "Succeeded|||0": ("Succeeded", True, False),  # terminal phase + exit
+        "Pending|||": ("Pending", False, False),  # nothing started yet
+    }
+    for out, expected in cases.items():
+        async def fake(args, *, global_args=(), _out=out):
+            return (0, _out, "")
+
+        monkeypatch.setattr(life, "run_kubectl", fake)
+        got = asyncio.run(
+            life._pod_terminal_status("pod/t", global_args=[], ns_args=[])
+        )
+        assert got == expected, out
+
+    async def gone(args, *, global_args=()):
+        return (1, "", "NotFound")
+
+    monkeypatch.setattr(life, "run_kubectl", gone)
+    assert asyncio.run(
+        life._pod_terminal_status("pod/t", global_args=[], ns_args=[])
+    ) == ("", False, False)
 
 
 def test_pod_exit_code_reads_terminated_exit_code(monkeypatch):
@@ -321,7 +392,7 @@ def test_execute_clears_status_note_after_startup(monkeypatch, tmp_path):
     async def _watch(pod_ref, **kw):
         return "Succeeded"
 
-    async def _term(p):
+    async def _term(p, *, kill_group=False):
         pass
 
     async def _finalize(*a, **k):
@@ -405,7 +476,7 @@ def test_execute_offloads_stream_and_stops_on_terminal(monkeypatch, tmp_path):
         events.append(("watch", pod_ref))
         return "Succeeded"
 
-    async def fake_terminate(p):
+    async def fake_terminate(p, *, kill_group=False):
         events.append(("terminate",))
 
     async def fake_finalize(pod_refs, dest, *, prefix_size, phases, **kw):
@@ -491,7 +562,7 @@ def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
             worker_cancelled["v"] = True
             raise
 
-    async def fake_terminate(p):
+    async def fake_terminate(p, *, kill_group=False):
         pass
 
     async def fake_exit(pod_ref, *, phase="", **kw):
@@ -548,7 +619,7 @@ def test_run_pod_stream_status_authoritative_interrupts_stream(monkeypatch, tmp_
         await release.wait()  # pod stays "running" until released
         return "Failed"
 
-    async def fake_terminate(p):
+    async def fake_terminate(p, *, kill_group=False):
         terminated.append(True)
 
     async def fake_exit(pod_ref, *, phase="", **kw):
@@ -841,7 +912,7 @@ def test_run_pod_stream_cancel_interrupts_stream_without_finalize(monkeypatch, t
         started.set()
         await asyncio.sleep(3600)  # never terminal (long-lived service)
 
-    async def fake_terminate(p):
+    async def fake_terminate(p, *, kill_group=False):
         terminated.append(True)
 
     async def fake_finalize(*a, **k):
@@ -865,135 +936,389 @@ def test_run_pod_stream_cancel_interrupts_stream_without_finalize(monkeypatch, t
 
 
 # ---------------------------------------------------------------------------
-# Merge-pod log demux: one container stream -> per-task <task>.log files
+# Merge-pod log demux: OFFLOADED to a child shell (awk), so the sflow driver's
+# event loop is never in the per-line path (mirrors the single-pod redirect).
 # ---------------------------------------------------------------------------
 
 
-class _FakeStdout:
-    def __init__(self, lines):
-        self._lines = list(lines)
-
-    async def readline(self):
-        return self._lines.pop(0) if self._lines else b""
-
-
-class _FakeStreamProc:
-    def __init__(self, lines):
-        self.stdout = _FakeStdout(lines)
+def _merge_member(name, out_dir, *, cvd="0"):
+    return SimpleNamespace(
+        name=name,
+        base_name="decode_server",
+        script=["echo hi"],
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(out_dir)},
+        merge_cuda_visible_devices=cvd,
+    )
 
 
-def test_demux_stream_routes_tagged_lines_to_per_task_files(tmp_path):
+def _merge_op_and_plan(tmp_path, names):
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend(gpus_per_node=8), assigned_nodes=["node-0"],
+        artifacts=[], gpu_count=4,
+    )
+    op.apply_merge_group(
+        members=[_merge_member(n, tmp_path / n) for n in names], union_gpus=4
+    )
+    plan = op._build_execution_plan(
+        task_name=names[0], script=["echo hi"],
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path / names[0])},
+    )
+    return op, plan
+
+
+@pytest.mark.skipif(shutil.which("awk") is None, reason="awk not available")
+def test_demux_awk_command_routes_tagged_untagged_and_unknown(tmp_path, fake_process):
+    # The offloaded demux is a real awk program; run it end-to-end to prove it
+    # routes each [[sflow-mux:<task>]] line to that member's file (tag stripped) and
+    # everything else (untagged + unknown-member tags) verbatim to the leader log.
+    fake_process.allow_unregistered(True)  # run the real awk
     decode = tmp_path / "decode.log"
     prefill = tmp_path / "prefill.log"
-    default = tmp_path / "leader.log"
-    proc = _FakeStreamProc(
-        [
-            b"[[sflow-mux:decode]] hello from decode\n",
-            b"[[sflow-mux:prefill]] hello from prefill\n",
-            b"untagged apply diagnostics\n",
-            b"[[sflow-mux:unknown]] no such member\n",
-            b"[[sflow-mux:decode]] second decode line\n",
-        ]
+    leader = tmp_path / "leader.log"
+    cmd = life._demux_awk_command(
+        {"decode": str(decode), "prefill": str(prefill)}, str(leader)
     )
-    asyncio.run(
-        life._demux_stream(
-            proc,
-            {"decode": str(decode), "prefill": str(prefill)},
-            str(default),
-        )
+    stream = (
+        "[[sflow-mux:decode]] hello from decode\n"
+        "[[sflow-mux:prefill]] hello from prefill\n"
+        "untagged apply diagnostics\n"
+        "[[sflow-mux:unknown]] no such member\n"
+        "[[sflow-mux:decode]] second decode line\n"
     )
-    # Tagged lines land (untagged) in their member's log.
+    subprocess.run(cmd, shell=True, input=stream, text=True, check=True)
     assert decode.read_text() == "hello from decode\nsecond decode line\n"
     assert prefill.read_text() == "hello from prefill\n"
-    # Untagged + unknown-tag lines fall back to the leader/default log verbatim.
-    default_text = default.read_text()
-    assert "untagged apply diagnostics\n" in default_text
-    assert "[[sflow-mux:unknown]] no such member\n" in default_text
+    leader_text = leader.read_text()
+    assert "untagged apply diagnostics\n" in leader_text
+    # An unknown member tag is not routed -> kept verbatim in the leader log.
+    assert "[[sflow-mux:unknown]] no such member\n" in leader_text
 
 
-def test_demux_stream_echoes_console_with_task_prefix(tmp_path, monkeypatch):
-    # On a TTY, each merged member's line is echoed tagged with its task name so
-    # the interleaved console/TUI output is attributable; the on-disk files stay
-    # clean (tag stripped, no console prefix).
+@pytest.mark.skipif(shutil.which("awk") is None, reason="awk not available")
+def test_demux_awk_command_appends_preserving_leader_prefix(tmp_path, fake_process):
+    # awk appends (>>), so the leader log's pre-existing apply-diagnostics prefix is
+    # preserved (not truncated) when the demux starts writing pod-level lines.
+    fake_process.allow_unregistered(True)  # run the real awk
+    leader = tmp_path / "leader.log"
+    leader.write_text("apply-prefix-line\n")
     decode = tmp_path / "decode.log"
-    default = tmp_path / "leader.log"
-    proc = _FakeStreamProc(
-        [
-            b"[[sflow-mux:decode_server_1]] hello from decode_1\n",
-            b"pod-level startup line\n",
-        ]
+    cmd = life._demux_awk_command({"decode": str(decode)}, str(leader))
+    subprocess.run(
+        cmd, shell=True, text=True, check=True,
+        input="pod-level line\n[[sflow-mux:decode]] d\n",
     )
-    monkeypatch.setattr(life, "_console_active", lambda: True)
-    seen: list[str] = []
+    assert leader.read_text() == "apply-prefix-line\npod-level line\n"
+    assert decode.read_text() == "d\n"
 
-    class _Cap(logging.Handler):
-        def emit(self, record):
-            seen.append(record.getMessage())
 
-    handler = _Cap(level=logging.DEBUG)
-    prev_level = life._logger.level
-    life._logger.setLevel(logging.DEBUG)
-    life._logger.addHandler(handler)
-    try:
-        asyncio.run(
-            life._demux_stream(
-                proc,
-                {"decode_server_1": str(decode)},
-                str(default),
-                console_label="decode_server_0",
-            )
+def test_start_pod_log_demux_stream_offloads_pipeline(tmp_path, monkeypatch):
+    from sflow.plugins.operators._k8s_shell import build_log_stream_command
+
+    captured: dict = {}
+
+    class _P:
+        returncode = None
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _P()
+
+    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
+    decode = tmp_path / "d" / "decode.log"  # nested -> its dir must be created
+    leader = tmp_path / "leader.log"
+    cmd = build_log_stream_command("pod/m", ns_args=["--namespace", "ns"], prefix=False)
+    asyncio.run(
+        life.start_pod_log_demux_stream(
+            cmd, tag_paths={"decode": str(decode)}, default_path=str(leader)
         )
-    finally:
-        life._logger.removeHandler(handler)
-        life._logger.setLevel(prev_level)
+    )
+    assert captured["args"][0] == "bash" and captured["args"][1] == "-c"
+    shell = captured["args"][2]
+    # kubectl follows into an awk demuxer, all in the child shell (offloaded) -- the
+    # driver never reads the stream line by line.
+    assert "logs -f pod/m" in shell
+    assert "| awk " in shell
+    assert str(decode) in shell and str(leader) in shell
+    # New session so the whole kubectl|awk group can be signalled on teardown.
+    assert captured["kwargs"].get("start_new_session") is True
+    assert (tmp_path / "d").is_dir()  # best-effort mkdir of the member log dir
 
-    # Member line tagged with its own task; pod-level (untagged) line tagged leader.
-    assert "[decode_server_1] hello from decode_1" in seen
-    assert "[decode_server_0] pod-level startup line" in seen
-    # The per-task file keeps the clean body (no tag, no console prefix).
-    assert decode.read_text() == "hello from decode_1\n"
+
+def test_terminate_process_kill_group_signals_the_group(monkeypatch):
+    signals: list = []
+
+    class _P:
+        pid = 4321
+        returncode = None
+
+        async def wait(self):
+            self.returncode = -15
+            return self.returncode
+
+    monkeypatch.setattr(life.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        life.os, "killpg", lambda pgid, sig: signals.append((pgid, sig))
+    )
+    asyncio.run(life.terminate_process(_P(), kill_group=True))
+    assert signals == [(4321, life.signal.SIGTERM)]  # whole group, exited on SIGTERM
 
 
-def test_demux_stream_no_console_echo_without_label(tmp_path, monkeypatch):
-    # Without console_label, no console echo even on a TTY (files only).
-    decode = tmp_path / "decode.log"
-    default = tmp_path / "leader.log"
-    proc = _FakeStreamProc([b"[[sflow-mux:decode]] x\n"])
+def test_tail_file_to_console_applies_line_prefix(monkeypatch, tmp_path):
+    # A merge-pod member log carries no kubectl [pod/...] prefix, so the tailer tags
+    # each line with the member name to keep the interleaved output attributable.
     monkeypatch.setattr(life, "_console_active", lambda: True)
-    seen: list[str] = []
+    path = tmp_path / "decode_server_1.log"
+    path.write_text("")
+    captured: list = []
 
     class _Cap(logging.Handler):
         def emit(self, record):
-            seen.append(record.getMessage())
+            captured.append(record.getMessage())
 
-    handler = _Cap()
-    life._logger.addHandler(handler)
+    cap = _Cap()
+    life._logger.addHandler(cap)
+    old_level = life._logger.level
+    life._logger.setLevel(logging.INFO)
     try:
-        asyncio.run(life._demux_stream(proc, {"decode": str(decode)}, str(default)))
+        async def drive():
+            t = asyncio.ensure_future(
+                life.tail_file_to_console(
+                    str(path), task_name="decode_server_1",
+                    line_prefix="[decode_server_1] ",
+                )
+            )
+            await asyncio.sleep(0.05)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("token iter 1\n")
+            await asyncio.sleep(0.5)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+
+        asyncio.run(drive())
     finally:
-        life._logger.removeHandler(handler)
-    assert seen == []
-    assert decode.read_text() == "x\n"
+        life._logger.removeHandler(cap)
+        life._logger.setLevel(old_level)
+    assert "[decode_server_1] token iter 1" in "\n".join(captured)
 
 
-def test_stream_and_demux_pod_log_spawns_and_reads(tmp_path, monkeypatch):
-    decode = tmp_path / "decode.log"
-    default = tmp_path / "leader.log"
-    proc = _FakeStreamProc([b"[[sflow-mux:decode]] line\n"])
+def test_run_pod_stream_merge_uses_offloaded_demux_and_group_kill(monkeypatch, tmp_path):
+    op, plan = _merge_op_and_plan(tmp_path, ["decode_server_0", "decode_server_1"])
+    assert plan.merge_tag_paths  # a real merge plan
+    calls: dict = {}
+    proc = _FakeProc()
 
-    async def _fake_exec(*args, **kwargs):
+    async def fake_demux(log_command, *, tag_paths, default_path):
+        calls["tag_paths"] = dict(tag_paths)
         return proc
 
-    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", _fake_exec)
+    async def fake_watch(pod_ref, **kw):
+        return "Succeeded"
 
-    async def drive():
-        p, reader = await life.stream_and_demux_pod_log(
-            life.Command(exec="kubectl").add_arg("logs"),
-            tag_paths={"decode": str(decode)},
-            default_path=str(default),
+    async def fake_terminate(p, *, kill_group=False):
+        calls["terminated"] = (p is proc, kill_group)
+
+    async def fake_exit(pod_ref, *, phase="", **kw):
+        return 0
+
+    monkeypatch.setattr(life, "start_pod_log_demux_stream", fake_demux)
+    monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
+    monkeypatch.setattr(life, "terminate_process", fake_terminate)
+    monkeypatch.setattr(life, "pod_exit_code", fake_exit)
+
+    rc, phase = asyncio.run(op._run_pod_stream(plan=plan, index=0))
+    assert (rc, phase) == (0, "Succeeded")
+    # The demux is offloaded with every member's <task>.log as a routing target ...
+    assert set(calls["tag_paths"]) == {"decode_server_0", "decode_server_1"}
+    # ... and the kubectl|awk pipeline is stopped as a whole process group.
+    assert calls["terminated"] == (True, True)
+
+
+def test_execute_merge_tails_each_member_and_rebuilds_complete_logs(monkeypatch, tmp_path):
+    op, _ = _merge_op_and_plan(tmp_path, ["decode_server_0", "decode_server_1"])
+    events: list = []
+    proc = _FakeProc()
+
+    async def fake_demux(log_command, *, tag_paths, default_path):
+        events.append(("demux", tuple(sorted(tag_paths))))
+        return proc
+
+    async def fake_tail(path, *, task_name, line_prefix=""):
+        events.append(("tail", task_name, line_prefix))
+        await asyncio.sleep(3600)
+
+    async def fake_watch(pod_ref, **kw):
+        await asyncio.sleep(0)
+        return "Succeeded"
+
+    async def fake_terminate(p, *, kill_group=False):
+        events.append(("terminate", kill_group))
+
+    async def fake_merged_finalize(
+        pod_ref, *, tag_paths, default_path, prefix_size, phase, global_args, ns_args
+    ):
+        events.append(("merged_finalize", tuple(sorted(tag_paths)), phase))
+
+    async def fake_single_finalize(*a, **k):
+        events.append(("single_finalize",))
+
+    async def fake_exit(pod_ref, *, phase="", **kw):
+        return 0
+
+    async def fake_delete(refs, **kw):
+        events.append(("delete",))
+
+    monkeypatch.setattr(life, "start_pod_log_demux_stream", fake_demux)
+    monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
+    monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
+    monkeypatch.setattr(life, "terminate_process", fake_terminate)
+    monkeypatch.setattr(life, "finalize_merged_complete_log", fake_merged_finalize)
+    monkeypatch.setattr(life, "finalize_complete_log", fake_single_finalize)
+    monkeypatch.setattr(life, "pod_exit_code", fake_exit)
+    monkeypatch.setattr(life, "delete_objects", fake_delete)
+
+    rc = asyncio.run(
+        op.execute(
+            launcher=_FakeLauncher(), output_logger=None,
+            env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path / "decode_server_0")},
+            task_name="decode_server_0", script=["echo hi"],
         )
-        assert p is proc
-        await reader
+    )
+    assert rc == 0
+    # One decoupled console tailer per merged member, each tagged with its name.
+    tails = [e for e in events if e[0] == "tail"]
+    assert {t[1] for t in tails} == {"decode_server_0", "decode_server_1"}
+    assert all(t[2] == f"[{t[1]}] " for t in tails)
+    assert ("demux", ("decode_server_0", "decode_server_1")) in events
+    assert ("terminate", True) in events
+    # Merge guarantees complete logs by re-fetching + re-splitting the whole
+    # container log (finalize_merged_complete_log), just like the single-pod path;
+    # the single-pod finalize (one log per pod) is NOT used for a merge-pod.
+    assert (
+        "merged_finalize", ("decode_server_0", "decode_server_1"), "Succeeded"
+    ) in events
+    assert ("single_finalize",) not in events
 
-    asyncio.run(drive())
-    assert decode.read_text() == "line\n"
+
+def test_dump_pod_log_raw_omits_prefix_for_mux_tag(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    class _P:
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*args, stdout=None, stderr=None, **kw):
+        captured["args"] = [str(a) for a in args]
+        return _P()
+
+    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
+    ok = asyncio.run(
+        life._dump_pod_log_raw(
+            "pod/m", str(tmp_path / "dump.log"),
+            global_args=["--context", "c"], ns_args=["--namespace", "ns"],
+        )
+    )
+    assert ok is True
+    args = captured["args"]
+    assert args[0] == "kubectl" and "logs" in args and "pod/m" in args
+    # No --prefix: each line must keep its [[sflow-mux:<task>]] tag at line start.
+    assert "--prefix" not in args
+    # --all-containers mirrors the live stream so the rebuild covers the same lines.
+    assert "--all-containers" in args
+    assert "--context" in args and "--namespace" in args
+
+
+@pytest.mark.skipif(shutil.which("awk") is None, reason="awk not available")
+def test_finalize_merged_complete_log_rebuilds_from_complete_dump(
+    tmp_path, monkeypatch, fake_process
+):
+    fake_process.allow_unregistered(True)  # the re-split runs the real awk
+    (tmp_path / "decode_server_0").mkdir()
+    (tmp_path / "decode_server_1").mkdir()
+    leader = tmp_path / "decode_server_0" / "decode_server_0.log"
+    member1 = tmp_path / "decode_server_1" / "decode_server_1.log"
+    tag_paths = {"decode_server_0": str(leader), "decode_server_1": str(member1)}
+    # Mid-run: leader has the apply prefix + a partial live tail; member1 partial.
+    apply_prefix = b"2026 - sflow.task.decode_server_0 - INFO - apply-diag\n"
+    leader.write_bytes(apply_prefix + b"partial pod-level (behind)\n")
+    member1.write_bytes(b"partial member1 (behind)\n")
+
+    complete = (
+        "[[sflow-mux:decode_server_0]] leader line 1\n"
+        "pod-level line\n"
+        "[[sflow-mux:decode_server_1]] member1 line 1\n"
+        "[[sflow-mux:decode_server_0]] leader line 2\n"
+        "[[sflow-mux:decode_server_1]] member1 line 2\n"
+    )
+
+    async def fake_dump(pod_ref, dest_path, *, global_args, ns_args):
+        with open(dest_path, "w", encoding="utf-8") as f:
+            f.write(complete)
+        return True
+
+    monkeypatch.setattr(life, "_dump_pod_log_raw", fake_dump)
+    asyncio.run(
+        life.finalize_merged_complete_log(
+            "pod/merged", tag_paths=tag_paths, default_path=str(leader),
+            prefix_size=len(apply_prefix), phase="Succeeded",
+            global_args=[], ns_args=[],
+        )
+    )
+    # Leader = preserved apply prefix + its tagged lines + pod-level (untagged),
+    # rebuilt complete from the dump (the partial live tail is replaced, no dupes).
+    assert leader.read_text() == (
+        apply_prefix.decode()
+        + "leader line 1\npod-level line\nleader line 2\n"
+    )
+    # Member1 = its complete tagged lines only (partial live content replaced).
+    assert member1.read_text() == "member1 line 1\nmember1 line 2\n"
+    # Temp dump/rebuild files are cleaned up.
+    assert not list(tmp_path.glob("**/*.merged.*"))
+
+
+def test_finalize_merged_complete_log_keeps_live_on_dump_failure(tmp_path, monkeypatch):
+    leader = tmp_path / "a" / "leader.log"
+    member = tmp_path / "b" / "member.log"
+    leader.parent.mkdir()
+    member.parent.mkdir()
+    leader.write_bytes(b"live-leader\n")
+    member.write_bytes(b"live-member\n")
+
+    async def fake_dump(pod_ref, dest_path, *, global_args, ns_args):
+        with open(dest_path, "w", encoding="utf-8") as f:
+            f.write("partial")  # a dump file was created ...
+        return False  # ... but the re-fetch failed
+
+    monkeypatch.setattr(life, "_dump_pod_log_raw", fake_dump)
+    asyncio.run(
+        life.finalize_merged_complete_log(
+            "pod/m", tag_paths={"a": str(leader), "b": str(member)},
+            default_path=str(leader), prefix_size=0, phase="Succeeded",
+            global_args=[], ns_args=[],
+        )
+    )
+    # Live content is kept as-is (never wiped for a partial rebuild) ...
+    assert leader.read_bytes() == b"live-leader\n"
+    assert member.read_bytes() == b"live-member\n"
+    assert not list(tmp_path.glob("**/*.merged.*"))  # ... and the temp dump cleaned
+
+
+def test_finalize_merged_complete_log_skips_when_not_terminal(tmp_path, monkeypatch):
+    calls: list = []
+
+    async def fake_dump(*a, **k):
+        calls.append(a)
+        return True
+
+    monkeypatch.setattr(life, "_dump_pod_log_raw", fake_dump)
+    leader = tmp_path / "leader.log"
+    leader.write_bytes(b"live\n")
+    asyncio.run(
+        life.finalize_merged_complete_log(
+            "pod/m", tag_paths={"m": str(leader)}, default_path=str(leader),
+            prefix_size=0, phase="", global_args=[], ns_args=[],
+        )
+    )
+    assert calls == []  # not terminal -> not re-fetchable -> no dump attempted
+    assert leader.read_bytes() == b"live\n"  # untouched

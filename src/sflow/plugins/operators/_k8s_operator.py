@@ -84,13 +84,14 @@ class _K8sExecPlan:
     global_args: list[str] = field(default_factory=list)
     ns_args: list[str] = field(default_factory=list)
     # Merge-pod mode: when set, the single pod runs several members' scripts and
-    # its one (unprefixed) log stream is demuxed into these per-task ``<task>.log``
-    # files (task name -> path). ``merge_launcher_env`` is the prefix-namespaced env
-    # the apply command reads to build each member's isolated env Secret.
+    # its one (unprefixed) log stream is demuxed -- in the offloaded child shell, not
+    # the driver -- into these per-task ``<task>.log`` files (task name -> path).
+    # ``merge_launcher_env`` is the prefix-namespaced env the apply command reads to
+    # build each member's isolated env Secret.
     merge_tag_paths: dict[str, str] | None = None
     merge_launcher_env: dict[str, str] | None = None
     # Leader task name used to tag pod-level (untagged) merge lines in the console
-    # echo; per-member lines are tagged with their own task name by the demuxer.
+    # echo; per-member lines are tagged with their own task name by their tailer.
     merge_console_label: str | None = None
 
 
@@ -1241,7 +1242,7 @@ class K8sContainerOperator(Operator):
         plan = self._build_execution_plan(
             task_name=task_name, script=list(script), envs=dict(env)
         )
-        tailer: asyncio.Future | None = None
+        tailers: list[asyncio.Future] = []
         # Live sub-status: while the apply step waits for the pod(s) to start, poll
         # their phase/reason and surface it (e.g. "Pending: Unschedulable") next to
         # the RUNNING task status. Cancelled once startup is over (below).
@@ -1285,15 +1286,43 @@ class K8sContainerOperator(Operator):
                     apply_prefix_size = os.path.getsize(plan.task_log_path)
                 except OSError:
                     apply_prefix_size = 0
-            # One decoupled console tailer per task, reading the offloaded
-            # <task>.log (TTY only). It is independent of the file writers. Skipped
-            # for merge-pods: their demuxer already echoes every member's line to
-            # the console tagged with its task name (tailing the leader log too
-            # would double-print the leader's lines).
-            if plan.task_log_path and not plan.merge_tag_paths:
-                tailer = asyncio.ensure_future(
-                    k8s_lifecycle.tail_file_to_console(
-                        plan.task_log_path, task_name=task_name
+            # Decoupled console tailer(s), reading the offloaded log file(s) from
+            # disk (TTY only) -- independent of the file writers so a chatty pod can
+            # never re-saturate the event loop via the console path. A single pod
+            # gets one tailer on <task>.log (kubectl --prefix already tags each
+            # line). A merge-pod gets one tailer per member's <task>.log tagged with
+            # the member name (the offloaded demux strips the mux tag and writes no
+            # kubectl prefix), plus the leader/default log for any pod-level lines.
+            if plan.merge_tag_paths:
+                tailed: set[str] = set()
+                for member_name, member_path in plan.merge_tag_paths.items():
+                    tailed.add(member_path)
+                    tailers.append(
+                        asyncio.ensure_future(
+                            k8s_lifecycle.tail_file_to_console(
+                                member_path,
+                                task_name=member_name,
+                                line_prefix=f"[{member_name}] ",
+                            )
+                        )
+                    )
+                if plan.task_log_path and plan.task_log_path not in tailed:
+                    label = plan.merge_console_label or task_name
+                    tailers.append(
+                        asyncio.ensure_future(
+                            k8s_lifecycle.tail_file_to_console(
+                                plan.task_log_path,
+                                task_name=label,
+                                line_prefix=f"[{label}] ",
+                            )
+                        )
+                    )
+            elif plan.task_log_path:
+                tailers.append(
+                    asyncio.ensure_future(
+                        k8s_lifecycle.tail_file_to_console(
+                            plan.task_log_path, task_name=task_name
+                        )
                     )
                 )
             # Watch every pod, but fail the task as a whole the instant any pod
@@ -1309,17 +1338,30 @@ class K8sContainerOperator(Operator):
             # Cancelled peers have no result -> "" phase (skips their log re-fetch).
             phases = [r[1] if r is not None else "" for r in results]
             # All pods are terminal and their live streams are cut. Stop the
-            # console tailer, then re-fetch every pod's COMPLETE log and rename it
+            # console tailer(s), then re-fetch every pod's COMPLETE log and rename it
             # into <task>.log -- so the on-disk log is complete (ground truth) for
             # the probes + output/result parsing the orchestrator runs next.
-            if tailer is not None:
-                tailer.cancel()
-                await asyncio.gather(tailer, return_exceptions=True)
-                tailer = None
-            # Merge-pods stream through a driver-side demux (per line, flushed) into
-            # per-task logs, so there is no single container log to re-fetch/rebuild;
-            # skip the one-shot finalize (which assumes one log per pod).
-            if plan.task_log_path and not plan.merge_tag_paths:
+            if tailers:
+                for t in tailers:
+                    t.cancel()
+                await asyncio.gather(*tailers, return_exceptions=True)
+                tailers = []
+            # Guarantee the on-disk log is complete (the live follow was cut on
+            # terminal): re-fetch the pod's whole container log and rebuild <task>.log.
+            # Single pod -> one log per pod (finalize_complete_log). Merge-pod -> one
+            # container log carrying every member, re-split by the mux tag into each
+            # member's <task>.log (finalize_merged_complete_log). Same guarantee both.
+            if plan.merge_tag_paths and plan.task_log_path:
+                await k8s_lifecycle.finalize_merged_complete_log(
+                    plan.pod_refs[0],
+                    tag_paths=plan.merge_tag_paths,
+                    default_path=plan.task_log_path,
+                    prefix_size=apply_prefix_size,
+                    phase=phases[0] if phases else "",
+                    global_args=plan.global_args,
+                    ns_args=plan.ns_args,
+                )
+            elif plan.task_log_path:
                 await k8s_lifecycle.finalize_complete_log(
                     plan.pod_refs,
                     plan.task_log_path,
@@ -1334,10 +1376,11 @@ class K8sContainerOperator(Operator):
             if note_poller is not None:
                 note_poller.cancel()
                 await asyncio.gather(note_poller, return_exceptions=True)
-            if tailer is not None and not tailer.done():
-                tailer.cancel()
-            if tailer is not None:
-                await asyncio.gather(tailer, return_exceptions=True)
+            for t in tailers:
+                if not t.done():
+                    t.cancel()
+            if tailers:
+                await asyncio.gather(*tailers, return_exceptions=True)
             await k8s_lifecycle.delete_objects(
                 plan.cleanup_refs, global_args=plan.global_args, ns_args=plan.ns_args
             )
@@ -1350,26 +1393,29 @@ class K8sContainerOperator(Operator):
         The pod phase (``watch_until_terminal``) is authoritative -- it, not the log
         stream, decides when the task is done -- so the DAG/status stays the single
         source of truth and a dropped stream never completes or fails a running task.
-        ``kubectl logs -f`` is redirected straight to the file (driver-free); it is
-        interrupted the moment the pod is terminal, or on teardown (cancellation) via
-        the ``finally``. For a long-lived READY service the watch never returns, so
-        the task stays alive until the orchestrator cancels it at workflow end.
+        The log stream is OFFLOADED to a child shell (a plain redirect for a single
+        pod; ``kubectl | awk`` tag-demux for a merge-pod), so the driver's event loop
+        is never in the per-line path and its status watches stay responsive. The
+        stream is interrupted the moment the pod is terminal, or on teardown
+        (cancellation) via the ``finally``. For a long-lived READY service the watch
+        never returns, so the task stays alive until the orchestrator cancels it at
+        workflow end.
 
         Returns ``(exit_code, final_phase)``; the caller (``execute``) uses the phases
         to re-fetch the complete on-disk log once all pods are terminal.
         """
         pod_ref = plan.pod_refs[index]
+        is_merge = bool(plan.merge_tag_paths and plan.task_log_path)
         stream_proc = None
-        demux_reader: asyncio.Future | None = None
-        if plan.merge_tag_paths and plan.task_log_path:
-            # Merge-pod: one container carries several members' logs; the driver
-            # reads the stream and splits it by the [[sflow-mux:<task>]] tag into
-            # each member's <task>.log (instead of a driver-free shell redirect).
-            stream_proc, demux_reader = await k8s_lifecycle.stream_and_demux_pod_log(
+        if is_merge:
+            # Merge-pod: one container carries several members' logs; the tag demux
+            # runs in the offloaded child shell (awk), splitting the stream into each
+            # member's <task>.log on disk -- the driver stays out of the per-line path
+            # exactly as the single-pod redirect does.
+            stream_proc = await k8s_lifecycle.start_pod_log_demux_stream(
                 plan.log_stream_commands[index],
                 tag_paths=plan.merge_tag_paths,
                 default_path=plan.task_log_path,
-                console_label=plan.merge_console_label or "",
             )
         elif plan.task_log_path:
             stream_proc = await k8s_lifecycle.start_pod_log_file_stream(
@@ -1380,23 +1426,17 @@ class K8sContainerOperator(Operator):
             final_phase = await k8s_lifecycle.watch_until_terminal(
                 pod_ref, global_args=plan.global_args, ns_args=plan.ns_args
             )
-            # Terminal: `kubectl logs -f` EOFs on its own; let the demux drain the
-            # tail into the per-task files before we stop (bounded).
-            if demux_reader is not None:
-                try:
-                    await asyncio.wait_for(demux_reader, timeout=10)
-                except (asyncio.TimeoutError, Exception):
-                    pass
         finally:
-            # The log is a side channel: interrupt it on terminal / teardown.
-            if demux_reader is not None and not demux_reader.done():
-                demux_reader.cancel()
-                try:
-                    await demux_reader
-                except BaseException:
-                    pass
+            # The log is a side channel: interrupt it the instant the pod is terminal
+            # (or on teardown) -- the on-disk log is made complete afterwards by the
+            # one-shot re-fetch in execute (finalize_complete_log for a single pod,
+            # finalize_merged_complete_log for a merge-pod), so cutting the follow
+            # here never loses the tail. The merge pipeline is a process group
+            # (kubectl + awk) -> signal the whole group.
             if stream_proc is not None:
-                await k8s_lifecycle.terminate_process(stream_proc)
+                await k8s_lifecycle.terminate_process(
+                    stream_proc, kill_group=is_merge
+                )
         exit_code = await k8s_lifecycle.pod_exit_code(
             pod_ref,
             global_args=plan.global_args,
