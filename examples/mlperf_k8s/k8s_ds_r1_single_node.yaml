@@ -182,6 +182,14 @@ artifacts:
         enable_balance: true
         batching_wait_iters: 10
         timeout_iters: 500
+  # Node-local SSD copy of the model (staged on each GPU node under the ephemeral SSD by a
+  # model-cache job). As an fs:// artifact NOT covered by a PVC, sflow hostPath-mounts this
+  # path into the server pods at the SAME path. The controller can't stat a node-local path,
+  # so the hostPath type is left empty (lenient) -- the pod still starts on a node without
+  # the copy, and the server script falls back to the PVC model (MODEL_PATH) at runtime.
+  # Loading ~340GB of weights from local NVMe is far faster than from the NFS PVC.
+  - name: NODE_LOCAL_MODEL
+    uri: fs:///mnt/stateful_partition/kube-ephemeral-ssd/model-cache/DeepSeek-R1-NVFP4-v2
 
 operators:
   - name: test_container
@@ -246,12 +254,25 @@ workflow:
         - export PORT=$(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX:-0} ))
         # No trtllm-llmapi-launch: the pod owns all 8 GPUs and trtllm-serve spawns its
         # own TP/EP workers across them.
+        - |
+          # Prefer the node-local SSD copy of the model over the NFS PVC (fast weight load).
+          # Referencing the fs:// NODE_LOCAL_MODEL artifact path makes sflow hostPath-mount the
+          # node-local model dir into this pod (lenient empty hostPath type). Fall back to the
+          # PVC model (MODEL_PATH) when the node-local copy is not staged on the node. All
+          # server pods run this same script text, so every pod gets the mount; the leader's
+          # chosen path is passed to trtllm-serve as an argv, so all MPI ranks load the same.
+          NODE_LOCAL_MODEL="${{ artifacts.NODE_LOCAL_MODEL.path }}"
+          if [ -f "${NODE_LOCAL_MODEL}/config.json" ]; then
+            SERVE_MODEL="${NODE_LOCAL_MODEL}"; echo "[server] model source: node-local SSD (${SERVE_MODEL})"
+          else
+            SERVE_MODEL="${{ variables.MODEL_PATH }}"; echo "[server] model source: PVC (${SERVE_MODEL}); node-local copy absent"
+          fi
         - >
           NSYS_CMD="";
           if [ "${{ variables.COLLECT_NSYS }}" = "1" ]; then
             NSYS_CMD="/usr/local/bin/nsys profile --force-overwrite=true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace=node --capture-range-end=stop --gpu-metrics-devices=all --wait=all --output ${SFLOW_TASK_OUTPUT_DIR}/nsys_profile-dp${SFLOW_REPLICA_INDEX:-0}";
           fi;
-          ${NSYS_CMD} trtllm-serve ${{ variables.MODEL_PATH }}
+          ${NSYS_CMD} trtllm-serve "${SERVE_MODEL}"
           --host 0.0.0.0
           --port ${PORT}
           --extra_llm_api_options ${{ artifacts.TRTLLM_YAML.path }}
@@ -297,7 +318,20 @@ workflow:
         # The harness loads its tokenizer from the deepseek-r1 checkpoint (its model_path);
         # point that at the real on-PVC model dir (has tokenizer.json) so it isn't the
         # non-existent MODEL_DIR/deepseek-r1/fp4-quantized-modelopt/... default.
-        - export DEEPSEEK_R1_CHECKPOINT_PATH=${{ variables.MODEL_PATH }}
+        - |
+          # Prefer the node-local SSD copy of the model over the NFS PVC (fast weight load).
+          # Referencing the fs:// NODE_LOCAL_MODEL artifact path makes sflow hostPath-mount the
+          # node-local model dir into this pod (lenient empty hostPath type). Fall back to the
+          # PVC model (MODEL_PATH) when the node-local copy is not staged on the node. All
+          # server pods run this same script text, so every pod gets the mount; the leader's
+          # chosen path is passed to trtllm-serve as an argv, so all MPI ranks load the same.
+          NODE_LOCAL_MODEL="${{ artifacts.NODE_LOCAL_MODEL.path }}"
+          if [ -f "${NODE_LOCAL_MODEL}/config.json" ]; then
+            SERVE_MODEL="${NODE_LOCAL_MODEL}"; echo "[server] model source: node-local SSD (${SERVE_MODEL})"
+          else
+            SERVE_MODEL="${{ variables.MODEL_PATH }}"; echo "[server] model source: PVC (${SERVE_MODEL}); node-local copy absent"
+          fi
+        - export DEEPSEEK_R1_CHECKPOINT_PATH="${SERVE_MODEL}"
         # Fast smoke test (SMOKE=1): harness.py reads these to shrink the query count +
         # output length so a run finishes in minutes (NOT a valid MLPerf result).
         - export MLPERF_SMOKE=${{ variables.SMOKE }}
@@ -309,20 +343,12 @@ workflow:
         - export BUILD_DIR=${{ variables.HARNESS_BUILD_DIR }}
         - cd ${{ variables.WORK_DIR }}
         - pip install -e ".[llm]" -q --no-build-isolation
-        # The harness runs on the LAST reserved node; the DP_MULTIPLICITY servers occupy
-        # every node before it. With DP_MULTIPLICITY>1 the replicas spread across those
-        # nodes (distinct node IPs), so a single HOST_IP + port shift is WRONG -- the IP
-        # must shift per replica too. Build the server node IP list from the allocation
-        # EXCLUDING the harness node (nodes[:-1]), then map each replica to its node:
-        # replica i lives on server node i/REPLICAS_PER_NODE (REPLICAS_PER_NODE =
-        # GPUS_PER_NODE/GPUS_PER_DP_RANK) and listens on BASE_PORT+i (host_network ->
-        # pod IP == node IP).
+        # The harness runs on node 1, so its OWN node IP is NOT the server's. Target the
+        # server's node (reserved index 0) explicitly (host_network -> pod IP == node IP).
+        - export HOST_IP=${{ backends.k8s_cluster.nodes[0].ip_address }}
         - >
-          SERVER_NODE_IPS=(${{ backends.k8s_cluster.nodes[:-1] | map(attribute='ip_address') | join(' ') }});
-          REPLICAS_PER_NODE=$(( ${{ variables.GPUS_PER_NODE }} / ${{ variables.GPUS_PER_DP_RANK }} ));
-          [ "${REPLICAS_PER_NODE}" -ge 1 ] || REPLICAS_PER_NODE=1;
           SERVER_URLS=$(for i in $(seq 0 $(( ${{ variables.DP_MULTIPLICITY }} - 1 ))); do
-          echo "${SERVER_NODE_IPS[$(( i / REPLICAS_PER_NODE ))]}:$(( ${{ variables.BASE_PORT }} + i ))";
+          echo "${HOST_IP}:$(( ${{ variables.BASE_PORT }} + i ))";
           done | paste -sd,)
         - echo "Server URLs ${SERVER_URLS}"
         - |
