@@ -24,6 +24,17 @@ from sflow.core.task import Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
 
 
+@pytest.fixture(autouse=True)
+def _sflow_logs_propagate(monkeypatch):
+    # Other tests call the global ``configure_logging()``, which sets the parent
+    # ``sflow`` logger to ``propagate=False`` (it owns a Rich console handler).
+    # That stops assembly log records from reaching pytest's caplog handler
+    # (installed on the root logger), leaving ``caplog.records`` empty regardless
+    # of what the code logs. Force propagation for this module so caplog captures
+    # the assembly info/warning lines independent of test-execution order.
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+
+
 class _FakeBackend:
     def __init__(
         self,
@@ -349,8 +360,9 @@ def test_channel_contention_ignores_cpu_only_tasks(caplog):
 
 
 def test_hint_cross_node_node_scope_ib_down(caplog):
-    # Cross-node GPU placement on a node-scoped cluster with IB down -> no fast
-    # cross-node interconnect; recommend co-locating or enabling IB.
+    # Cross-node GPU placement, scope 'node', IB down, NO channel -> no fast
+    # cross-node interconnect; recommend co-locating or enabling IB, AND flag that
+    # an NVL72 rack may be mis-detected (point to dra.use_compute_domain_channel).
     be = _FakeBackend("k8s", nvlink_domain_scope="node", rdma_enabled=False)
     placements = {
         "prefill": _FakePlacement(be, ["node-a"], 4),
@@ -361,6 +373,28 @@ def test_hint_cross_node_node_scope_ib_down(caplog):
         _warn_interconnect_hints(placements)
     msgs = _warn_messages(caplog)
     assert any(("co-locate" in m.lower() or "IB" in m) for m in msgs)
+    # Clarity: acknowledge a possible NVL72 scope mis-detection + the fix.
+    assert any("use_compute_domain_channel" in m for m in msgs)
+
+
+def test_no_hint_node_scope_with_channel(caplog):
+    # Scope under-detected as 'node' (e.g. the ComputeDomain CRD is not readable
+    # under the caller's RBAC) but an IMEX channel IS configured -> the channel is
+    # the cross-node NVLink path, so emit NO misleading "slow TCP" hint.
+    be = _FakeBackend(
+        "k8s",
+        nvlink_domain_scope="node",
+        rdma_enabled=False,
+        compute_domain_channel="cd-k8s-perflab-hpcdl",
+    )
+    placements = {
+        "prefill": _FakePlacement(be, ["node-a"], 4),
+        "decode": _FakePlacement(be, ["node-b"], 4),
+    }
+    assembly_mod._logger.propagate = True
+    with caplog.at_level(logging.WARNING, logger="sflow.app.assembly"):
+        _warn_interconnect_hints(placements)
+    assert not _warn_messages(caplog)
 
 
 def test_hint_cross_node_rack_scope_no_channel(caplog):

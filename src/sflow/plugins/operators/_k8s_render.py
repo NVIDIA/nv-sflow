@@ -526,6 +526,7 @@ def render_task_pod(
     rdma_host_device_paths: Sequence[str] = (),
     rdma_lib_mounts: Sequence[tuple[str, str]] = (),
     env_file_secrets: Sequence[tuple[str, str]] = (),
+    run_as_root: bool = False,
 ) -> dict[str, Any]:
     """Render one task Pod manifest (dict) for ``kubectl apply``.
 
@@ -720,11 +721,20 @@ def render_task_pod(
         "command": ["bash", "-l", SFLOW_ENTRYPOINT_PATH],
         "volumeMounts": volume_mounts,
     }
-    # Scoped RDMA verbs access (no privileged): CAP_IPC_LOCK lets the libs pin
-    # memory for RDMA; the device nodes themselves come from a device plugin (via
+    # Container securityContext: optionally force root (runAsUser/Group=0) for
+    # images that default to a non-root user but whose workload needs root -- e.g.
+    # writing a root-owned NFS/ceph PVC or bootstrapping MPI/SSH (sshd host keys,
+    # /run/sshd, ~/.ssh). Plus scoped RDMA verbs access (no privileged): CAP_IPC_LOCK
+    # lets the libs pin memory for RDMA; device nodes come from a device plugin (via
     # the rdma NIC resource requests below) or the hostPath device mount above.
+    security_context: dict[str, Any] = {}
+    if run_as_root:
+        security_context["runAsUser"] = 0
+        security_context["runAsGroup"] = 0
     if rdma_ipc_lock:
-        container["securityContext"] = {"capabilities": {"add": ["IPC_LOCK"]}}
+        security_context["capabilities"] = {"add": ["IPC_LOCK"]}
+    if security_context:
+        container["securityContext"] = security_context
     if image_pull_policy:
         container["imagePullPolicy"] = image_pull_policy
     if env_secret_name:

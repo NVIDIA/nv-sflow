@@ -73,9 +73,12 @@ RdmaMode = Literal["auto", "off", "gke", "shared_device_plugin", "host_device"]
 # bool and already self-guards to >=2 co-located GPU tasks -- is unchanged.
 MergeMode = Literal["auto", "on", "off"]
 
-# NVLink-domain scope, which drives the interconnect priority order (NVLink -> IB ->
-# TCP). ``auto`` detects ``node`` vs ``rack`` from the cluster's GPU product +
-# ComputeDomain CRD presence (component 2); ``node``/``rack``/``off`` force it.
+# NVLink-domain scope. ``auto`` detects ``node`` vs ``rack`` from the cluster's GPU
+# product + ComputeDomain CRD presence (component 2); ``node``/``rack``/``off``
+# override that detection. The scope is advisory (it drives interconnect-priority
+# warnings + straddle validation) and, together with ``dra.nvlink_domain_label_key``,
+# gates the reservation-pod NVLink-domain co-location affinity -- see the
+# ``nvlink_domain`` field for exactly what it changes in the manifest.
 NvlinkDomain = Literal["auto", "node", "rack", "off"]
 
 
@@ -129,7 +132,10 @@ class KubernetesDraConfig(BaseModel):
     # handles cross nodes). Value is the CR's
     # spec.channel.resourceClaimTemplate.name, or `auto` (claim the sole existing
     # ComputeDomain when there is exactly one -- component 4), or `off`/empty/None
-    # (no claim). No ComputeDomain is created, so this needs no `computedomains`
+    # (no claim). If set to a ComputeDomain CR name by mistake, sflow best-effort
+    # auto-corrects it to that domain's channel template name (they usually differ,
+    # e.g. CR `iridium-k8s-perflab-hpcdl` -> template `cd-k8s-perflab-hpcdl`).
+    # No ComputeDomain is created, so this needs no `computedomains`
     # RBAC (only claiming an existing template). Works with any GPU scheduling
     # (device_plugin or dra). (Renamed from `compute_domain_channel`, still accepted
     # as a deprecated alias -- the recipe sets it via COMPUTE_DOMAIN_CHANNEL.)
@@ -333,9 +339,17 @@ class KubernetesBackendConfig(BackendConfig):
     # CPU-only infra (etcd/nats/frontend) stays in its own pod. Set "off"/False to
     # opt out. See docs/user/backends.md.
     merge_colocated_gpu_pods: MergeMode | bool = "auto"
-    # NVLink-domain scope driving the interconnect priority order (see NvlinkDomain).
-    # "auto" detects node|rack from the cluster (GPU product + ComputeDomain CRD);
-    # "node"/"rack"/"off" override. Best-effort/warn-only; never hard-fails.
+    # NVLink-domain scope override for auto-detection. "auto" (default) detects
+    # node|rack from the GPU product + ComputeDomain CRD; set "node"/"rack"/"off"
+    # when detection is wrong. What it actually changes:
+    #   * WITH dra.nvlink_domain_label_key on a MULTI-domain rack cluster, "rack"
+    #     gates a reservation-pod podAffinity (topologyKey = that label) that
+    #     co-locates a task's pods in ONE physical NVLink domain -- NO manifest
+    #     effect without the label key (single-domain clusters need none).
+    #   * selects the interconnect-priority hint warning + straddle validation.
+    # It does NOT itself pin NCCL/UCX transport or inject env: NCCL auto-detects
+    # MNNVL from the IMEX channel (dra.use_compute_domain_channel), not from this.
+    # Best-effort/warn-only; never hard-fails.
     nvlink_domain: NvlinkDomain = "auto"
     # GPU request mode (see SchedulingMode).
     scheduling: SchedulingMode = "dra"
@@ -533,14 +547,21 @@ class KubernetesBackend(Backend):
         """Apply CLI-level kube access (``KubectlConfig``) to this backend.
 
         Sets the global kubectl flags (``--kubeconfig`` / ``--context`` + any
-        passthroughs) used by every kubectl call, and overrides the namespace when
-        ``--kube-namespace`` was given. The recipe itself stays cluster-agnostic.
+        passthroughs) used by every kubectl call, overrides the namespace when
+        ``--kube-namespace`` was given, and merges any ``--kube-node-selector``
+        labels into this backend's node_selector (CLI wins on key conflicts). The
+        recipe itself stays cluster-agnostic.
         """
         self._kubeconfig = cfg.kubeconfig or None
         self._kube_context = cfg.context or None
         self._kubectl_extra_args = [str(a) for a in (cfg.extra_args or [])]
         if cfg.namespace:
             self._namespace = str(cfg.namespace)
+        cli_node_selector = getattr(cfg, "node_selector", None)
+        if cli_node_selector:
+            merged = dict(self._node_selector or {})
+            merged.update({str(k): str(v) for k, v in cli_node_selector.items()})
+            self._node_selector = merged
         # Generic `--extra-args` are fanned into every backend channel, so they also
         # land here as kubectl global flags. kubectl (unlike salloc/`docker run`)
         # rejects unknown globals, so a Slurm/docker-ism passed generically would
@@ -1470,14 +1491,26 @@ class KubernetesBackend(Backend):
         return result
 
     def _resolve_use_compute_domain_channel(self) -> None:
-        """Resolve ``use_compute_domain_channel: auto`` to the sole existing domain.
+        """Resolve/verify ``use_compute_domain_channel`` against existing domains.
 
-        No-op unless the config is ``auto`` and not already resolved. Exactly one
-        ComputeDomain -> claim its channel; zero -> skip + hint (admin must
-        provision one, or run intra-node); many -> skip + hint (ambiguous; name
-        one). Never claims a guessed/ambiguous domain. Best-effort (never raises).
+        - ``off``/empty/None -> nothing to claim (no detection).
+        - a named value -> verify it is a channel template name; if it is actually a
+          ComputeDomain *name*, auto-correct it to that domain's channel template
+          (see ``_verify_or_autocorrect_named_channel``).
+        - ``auto`` -> resolve to the sole usable ComputeDomain channel: exactly one
+          -> claim it; zero or an incomplete domain -> hint (admin must provision or
+          finish one, or run intra-node); many -> hint (ambiguous; name one). Never
+          claims a guessed/ambiguous domain.
+
+        Best-effort throughout (never raises).
         """
-        if self._use_compute_domain_channel_cfg != "auto":
+        cfg = self._use_compute_domain_channel_cfg
+        if cfg is None:
+            return  # off/empty: nothing to claim, nothing to detect
+        if cfg != "auto":
+            # A named channel: verify it, and auto-correct a ComputeDomain name to
+            # its channel template name (the common, confusing mistake).
+            self._verify_or_autocorrect_named_channel(cfg)
             return
         if self._compute_domain_channel is not None:
             return  # already resolved
@@ -1512,14 +1545,73 @@ class KubernetesBackend(Backend):
                 "(co-located prefill+decode over NVLink).",
                 self.name,
             )
-        else:
-            names = ", ".join(sorted(name for name, _ch in channels))
+        elif not channels:
+            names = ", ".join(sorted(name for name, _channel in domains))
             _logger.warning(
-                "Kubernetes backend '%s': 'use_compute_domain_channel: auto' is "
-                "ambiguous -- multiple ComputeDomains exist (%s). Name the one to "
-                "join via dra.use_compute_domain_channel; sflow will not guess.",
+                "Kubernetes backend '%s': 'use_compute_domain_channel: auto' found "
+                "ComputeDomain(s) with no usable channel template (%s). Wait for "
+                "spec.channel.resourceClaimTemplate.name to be populated, set an "
+                "explicit usable template name, or run intra-node; sflow will not "
+                "guess.",
                 self.name,
                 names,
+            )
+        else:
+            # Pair each ComputeDomain with its channel template so the user sets the
+            # RIGHT value: use_compute_domain_channel wants the channel TEMPLATE name
+            # (spec.channel.resourceClaimTemplate.name), NOT the ComputeDomain's own
+            # CR name. Naming the CR points the pod at a non-existent
+            # ResourceClaimTemplate -> it stays Pending with FailedResourceClaimCreation.
+            pairs = "; ".join(
+                f"ComputeDomain '{name}' -> template '{ch}'"
+                for name, ch in sorted(channels)
+            )
+            example = min(ch for _name, ch in channels)
+            _logger.warning(
+                "Kubernetes backend '%s': 'use_compute_domain_channel: auto' is "
+                "ambiguous -- multiple ComputeDomains exist (%s). Set "
+                "dra.use_compute_domain_channel to the channel TEMPLATE name "
+                "(spec.channel.resourceClaimTemplate.name), e.g. '%s' -- NOT the "
+                "ComputeDomain name; sflow will not guess.",
+                self.name,
+                pairs,
+                example,
+            )
+
+    def _verify_or_autocorrect_named_channel(self, value: str) -> None:
+        """Auto-correct a ComputeDomain *name* to its channel *template* name.
+
+        ``use_compute_domain_channel`` must be the channel template name
+        (``spec.channel.resourceClaimTemplate.name``). Users frequently set it to the
+        ComputeDomain's own CR name by mistake -> the pod then claims a non-existent
+        ResourceClaimTemplate and stays Pending (FailedResourceClaimCreation). When
+        the value matches a detected ComputeDomain name (and is not already a valid
+        template), rewrite it to that domain's channel template.
+
+        No-op when the value is already a channel template name. Best-effort: on
+        detection failure / no domains / no match, keep the value verbatim so
+        offline and no-RBAC clusters behave exactly as before.
+        """
+        try:
+            domains = self._detect_compute_domains()
+        except Exception:  # best-effort; keep the user's value verbatim
+            return
+        templates = {ch for _name, ch in domains if ch}
+        if not templates or value in templates:
+            return  # nothing detected, or already a valid template -> no-op
+        template_by_cd_name = {name: ch for name, ch in domains if ch}
+        template = template_by_cd_name.get(value)
+        if template and template != value:
+            self._compute_domain_channel = template
+            _logger.warning(
+                "Kubernetes backend '%s': dra.use_compute_domain_channel '%s' is a "
+                "ComputeDomain name, not a channel template -- auto-correcting to its "
+                "channel template '%s' (spec.channel.resourceClaimTemplate.name). Set "
+                "it to '%s' to silence this.",
+                self.name,
+                value,
+                template,
+                template,
             )
 
     # ------------------------------------------------------------------
@@ -2154,7 +2246,14 @@ class KubernetesBackend(Backend):
             extra_args=extra_args,
             include_nodes=include_nodes,
             exclude_nodes=exclude_nodes,
-            node_selector=conf.node_selector,
+            node_selector=(
+                {
+                    str(resolver.resolve(k, ctx)): str(resolver.resolve(v, ctx))
+                    for k, v in conf.node_selector.items()
+                }
+                if conf.node_selector
+                else None
+            ),
             host_network=bool(conf.host_network),
             host_ipc=bool(conf.host_ipc),
             # Pass the tri-state through unchanged -- coercing to bool() here would

@@ -363,12 +363,6 @@ if true; then
             grep -F -- 'id=kubernetes' \"$KUBERNETES_APPLY_LAUNCH_LOG\" && \
             grep -F -- 'operator: k8s' \"$KUBERNETES_APPLY_LAUNCH_LOG\" && \
             grep -F -- 'Dry-run complete: k8s_apply_validate' \"$KUBERNETES_APPLY_LAUNCH_LOG\""
-    KUBERNETES_LOG_OFFLOAD_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_log_offload_smoke.log"
-    run_check "dry-run kubernetes_log_offload_smoke merges GPU replicas via k8s operator" \
-        bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_log_offload_smoke.yaml\" --dry-run --verbose > \"$KUBERNETES_LOG_OFFLOAD_LOG\" 2>&1 && \
-            grep -F -- 'id=kubernetes' \"$KUBERNETES_LOG_OFFLOAD_LOG\" && \
-            grep -F -- 'operator: k8s' \"$KUBERNETES_LOG_OFFLOAD_LOG\" && \
-            grep -F -- 'Dry-run complete: k8s_log_offload_smoke' \"$KUBERNETES_LOG_OFFLOAD_LOG\""
 
     # -- sflow run --dry-run: native Kubernetes Dynamo recipes (vLLM / SGLang /
     #    TRT-LLM, agg + disagg). Each plans on the kubernetes backend and renders
@@ -393,13 +387,25 @@ if true; then
                 grep -F -- 'Dry-run complete: ${k8s_dynamo_workflow}' \"$k8s_dynamo_log\""
     done
 
+    # -- sflow run --dry-run: the standalone MLPerf-inference k8s recipe (heavily
+    #    parameterized but carries its own defaults). Preflight asserts it keeps
+    #    parsing + planning on the kubernetes backend as the recipe evolves. --
+    MLPERF_K8S_LOG="$BACKEND_AGNOSTIC_DIR/mlperf_k8s_standalone.log"
+    run_check "dry-run mlperf_k8s/k8s_standalone_sflow plans on the k8s operator" \
+        bash -c "sflow run \"$EXAMPLES_DIR/mlperf_k8s/k8s_standalone_sflow.yaml\" --dry-run --verbose > \"$MLPERF_K8S_LOG\" 2>&1 && \
+            grep -F -- 'id=kubernetes' \"$MLPERF_K8S_LOG\" && \
+            grep -F -- 'operator: k8s' \"$MLPERF_K8S_LOG\" && \
+            grep -F -- 'Dry-run complete: deepseek_r1_offline_ifb' \"$MLPERF_K8S_LOG\""
+
     # -- sflow run --dry-run: CLI backend extra-arg routing + kube access flags.
     #    Verifies the new flags reach the plan: --extra-salloc-args merges into the
-    #    Slurm backend, --kube-namespace overrides the k8s namespace, and a generic
+    #    Slurm backend, --kube-namespace overrides the k8s namespace,
+    #    --kube-node-selector merges into the k8s backend nodeSelector, and a generic
     #    --extra-args (Slurm-ism) routed to kubectl surfaces the misrouting warning. --
     CLI_FLAGS_DIR="$PREFLIGHT_DIR/cli_backend_flags"
     SALLOC_ARGS_LOG="$CLI_FLAGS_DIR/extra_salloc_args.log"
     KUBE_NS_LOG="$CLI_FLAGS_DIR/kube_namespace.log"
+    KUBE_NODE_SELECTOR_LOG="$CLI_FLAGS_DIR/kube_node_selector.log"
     KUBECTL_MISROUTE_LOG="$CLI_FLAGS_DIR/kubectl_misroute_warning.log"
     mkdir -p "$CLI_FLAGS_DIR"
     run_check "dry-run --extra-salloc-args merges into the Slurm backend" \
@@ -408,6 +414,9 @@ if true; then
     run_check "dry-run --kube-namespace overrides the kubernetes backend namespace" \
         bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_hello_world.yaml\" --dry-run --verbose --kube-namespace ns-override > \"$KUBE_NS_LOG\" 2>&1 && \
             grep -F -- 'namespace: ns-override' \"$KUBE_NS_LOG\""
+    run_check "dry-run --kube-node-selector merges into the kubernetes backend nodeSelector" \
+        bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_hello_world.yaml\" --dry-run --verbose --kube-node-selector tenant=gpu-pool,zone=z1 > \"$KUBE_NODE_SELECTOR_LOG\" 2>&1 && \
+            grep -F -- \"node_selector: {'tenant': 'gpu-pool', 'zone': 'z1'}\" \"$KUBE_NODE_SELECTOR_LOG\""
     run_check "dry-run generic --extra-args routed to kubectl warns about misrouting" \
         bash -c "sflow run \"$EXAMPLES_DIR/kubernetes_hello_world.yaml\" --dry-run -e --gpus-per-node=4 > \"$KUBECTL_MISROUTE_LOG\" 2>&1 && \
             grep -F -- 'applying generic --extra-args as kubectl' \"$KUBECTL_MISROUTE_LOG\""

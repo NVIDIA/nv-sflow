@@ -21,6 +21,7 @@ from sflow.cli._args import (
     EnableWorkflowMonitorOption,
     ExcludeNodesOption,
     IncludeNodesOption,
+    parse_key_value_args,
     split_list_arg,
 )
 from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
@@ -249,6 +250,17 @@ def run(
         typer.Option(
             "--kube-namespace",
             help="Override the namespace for all kubernetes backends.",
+        ),
+    ] = None,
+    kube_node_selector: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--kube-node-selector",
+            help="Node-selector label(s) (KEY=VALUE) for kubernetes backends, applied "
+            "as the pod nodeSelector + node-discovery selector (like kubectl -l). "
+            "Merges into and overrides the recipe's node_selector, so cluster/node-pool "
+            "identity (e.g. a 'tenant' label) stays out of the recipe. Accepts "
+            "comma-separated (--kube-node-selector k1=v1,k2=v2) and/or repeated flags.",
         ),
     ] = None,
     extra_kubectl_args: Annotated[
@@ -480,6 +492,9 @@ def run(
             kubeconfig=str(kubeconfig) if kubeconfig else None,
             context=kube_context,
             namespace=kube_namespace,
+            node_selector=parse_key_value_args(
+                kube_node_selector, flag="--kube-node-selector"
+            ),
             extra_args=kubectl_args,
             generic_extra_args=generic_kubectl_args,
         )

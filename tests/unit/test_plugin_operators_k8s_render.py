@@ -391,6 +391,35 @@ def test_task_pod_rdma_host_device_mount_and_ipc_lock():
     assert sc["capabilities"]["add"] == ["IPC_LOCK"]
 
 
+def test_task_pod_run_as_root_sets_security_context():
+    # run_as_root -> container runs as uid/gid 0, overriding an image whose default
+    # USER is non-root (so the workload can write a root-owned PVC / bootstrap sshd).
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg", run_as_root=True
+    )
+    sc = m["spec"]["containers"][0]["securityContext"]
+    assert sc["runAsUser"] == 0
+    assert sc["runAsGroup"] == 0
+
+
+def test_task_pod_run_as_root_merges_with_ipc_lock():
+    # run_as_root + RDMA IPC_LOCK coexist in one securityContext.
+    m = render_task_pod(
+        pod_name="t", image="img:1", configmap_name="t-cfg",
+        run_as_root=True, rdma_ipc_lock=True,
+    )
+    sc = m["spec"]["containers"][0]["securityContext"]
+    assert sc["runAsUser"] == 0
+    assert sc["capabilities"]["add"] == ["IPC_LOCK"]
+
+
+def test_task_pod_default_not_root():
+    # Default: no runAsUser override (use the image's own user) and no
+    # securityContext at all when nothing else requires one.
+    m = render_task_pod(pod_name="t", image="img:1", configmap_name="t-cfg")
+    assert "securityContext" not in m["spec"]["containers"][0]
+
+
 def test_task_pod_rdma_lib_mounts_require_existing_host_path():
     # Lib mounts are emitted ONLY when the gIB installer is detected (so the host
     # paths exist); the hostPath type must be `Directory` (require existence), never

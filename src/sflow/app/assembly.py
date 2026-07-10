@@ -506,8 +506,13 @@ def _warn_interconnect_hints(resource_placements: "Mapping[str, Any]") -> None:
     fast tier is not reachable, hint the framework/admin-owned piece sflow does not
     own (it never pins the transport):
 
-    * node-scoped NVLink + IB down -> no fast cross-node path; co-locate
-      prefill+decode per node (intra-node NVLink) or enable IB.
+    * a configured IMEX ComputeDomain channel (``dra.use_compute_domain_channel``)
+      IS the cross-node NVLink/MNNVL fast path, so it suppresses these hints -- and
+      avoids a false "no fast interconnect" warning when the NVLink scope is
+      under-detected as ``node`` (the CRD probe needs cluster RBAC).
+    * node-scoped NVLink + IB down + no channel -> no fast cross-node path; if it is
+      actually an NVL72 rack the scope may be mis-detected (set the channel);
+      otherwise co-locate prefill+decode per node (intra-node NVLink) or enable IB.
     * rack-scoped NVLink + no IMEX channel -> provide
       ``dra.use_compute_domain_channel`` (a name or ``auto``) for MNNVL; otherwise
       cross-node KV falls back to IB (if up) or slow TCP.
@@ -541,17 +546,28 @@ def _warn_interconnect_hints(resource_placements: "Mapping[str, Any]") -> None:
         scope = getattr(backend, "nvlink_domain_scope", None)
         rdma_enabled = bool(getattr(backend, "rdma_enabled", False))
         channel = getattr(backend, "compute_domain_channel", None)
+        if channel:
+            # A configured IMEX ComputeDomain channel IS the cross-node NVLink
+            # (MNNVL) fast path, so the transport is covered regardless of the
+            # detected scope -- and it suppresses the misleading "no fast
+            # interconnect" hint when scope was under-detected as 'node' (the
+            # ComputeDomain CRD probe needs cluster RBAC and reads 'node' when it
+            # is forbidden).
+            continue
         if scope == "node" and not rdma_enabled:
             _logger.warning(
-                "Kubernetes backend '%s': GPU tasks span %d nodes but the NVLink "
-                "domain is node-scoped and IB/RDMA is down -- there is no fast "
-                "cross-node interconnect, so cross-node KV transfer will use slow "
-                "TCP. Co-locate prefill+decode per node (intra-node NVLink) or "
-                "enable IB/RDMA.",
+                "Kubernetes backend '%s': GPU tasks span %d nodes, sflow detected "
+                "no cross-node NVLink (NVLink-domain scope 'node') and IB/RDMA is "
+                "down -- cross-node transfers would use slow TCP. If this IS a "
+                "GB200/GB300 NVL72 rack, the scope is likely mis-detected (the "
+                "ComputeDomain CRD probe needs cluster RBAC): set "
+                "dra.use_compute_domain_channel (and nvlink_domain: rack) to ride "
+                "cross-node NVLink/MNNVL. Otherwise co-locate the GPU tasks per node "
+                "(intra-node NVLink) or enable IB/RDMA.",
                 backend_name,
                 len(nodes),
             )
-        elif scope == "rack" and not channel:
+        elif scope == "rack":
             _logger.warning(
                 "Kubernetes backend '%s': GPU tasks span %d nodes on a rack-scoped "
                 "(MNNVL) cluster but no IMEX ComputeDomain channel is configured. "

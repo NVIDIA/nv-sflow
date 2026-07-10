@@ -649,14 +649,35 @@ def test_resolve_auto_channel_zero_domains_hints(monkeypatch, caplog):
     assert any("no existing ComputeDomain" in r.getMessage() for r in caplog.records)
 
 
+def test_resolve_auto_channel_missing_template_warns_without_raising(monkeypatch, caplog):
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="auto"))
+    )
+    # An incomplete ComputeDomain CR is detectable but cannot be claimed until its
+    # channel ResourceClaimTemplate is populated. Auto resolution must remain
+    # best-effort instead of calling min() on an empty template list.
+    monkeypatch.setattr(be, "_detect_compute_domains", lambda: [("incomplete-cd", "")])
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        be._resolve_use_compute_domain_channel()
+    assert be.compute_domain_channel is None
+    assert any(
+        "no usable channel template" in r.getMessage() for r in caplog.records
+    )
+
+
 def test_resolve_auto_channel_many_domains_hints(monkeypatch, caplog):
     be = KubernetesBackend(
         _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="auto"))
     )
+    # CR name and channel-template name differ (the real-world case): the hint must
+    # steer the user to the channel TEMPLATE name (cd-a / cd-b), not the
+    # ComputeDomain CR name (iridium-a / iridium-b) which is NOT a valid
+    # use_compute_domain_channel value.
     monkeypatch.setattr(
         be,
         "_detect_compute_domains",
-        lambda: [("cd-a", "cd-a-channel"), ("cd-b", "cd-b-channel")],
+        lambda: [("iridium-a", "cd-a"), ("iridium-b", "cd-b")],
     )
     monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
     with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
@@ -664,18 +685,78 @@ def test_resolve_auto_channel_many_domains_hints(monkeypatch, caplog):
     # Ambiguous -> never guess a domain.
     assert be.compute_domain_channel is None
     msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("cd-a" in m and "cd-b" in m for m in msgs)
+    # The hint must list the channel TEMPLATE names to choose from and say so, and
+    # must pair each with its ComputeDomain so the mapping is unambiguous.
+    assert any(
+        "cd-a" in m
+        and "cd-b" in m
+        and "iridium-a" in m
+        and "template" in m.lower()
+        for m in msgs
+    )
 
 
-def test_resolve_named_channel_is_noop(monkeypatch):
+def test_resolve_named_channel_valid_template_is_noop(monkeypatch, caplog):
+    # Value already IS a channel template name -> unchanged, no auto-correct warning.
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="cd-x"))
+    )
+    monkeypatch.setattr(be, "_detect_compute_domains", lambda: [("iridium-x", "cd-x")])
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        be._resolve_use_compute_domain_channel()
+    assert be.compute_domain_channel == "cd-x"
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_resolve_named_channel_autocorrects_computedomain_name(monkeypatch, caplog):
+    # User set the ComputeDomain CR name by mistake -> auto-corrected to its template.
+    be = KubernetesBackend(
+        _cfg(
+            dra=KubernetesDraConfig(
+                use_compute_domain_channel="iridium-k8s-perflab-hpcdl"
+            )
+        )
+    )
+    monkeypatch.setattr(
+        be,
+        "_detect_compute_domains",
+        lambda: [
+            ("iridium-k8s-perflab-hpcdl", "cd-k8s-perflab-hpcdl"),
+            ("iridium-perflab-hpcdl", "cd-perflab-hpcdl"),
+        ],
+    )
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.backends.kubernetes"):
+        be._resolve_use_compute_domain_channel()
+    # Mapped CR name -> the matching channel template (not the other domain's).
+    assert be.compute_domain_channel == "cd-k8s-perflab-hpcdl"
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        "iridium-k8s-perflab-hpcdl" in m and "cd-k8s-perflab-hpcdl" in m for m in msgs
+    )
+
+
+def test_resolve_named_channel_kept_when_undetectable(monkeypatch):
+    # Detection empty (no CRD / no RBAC / offline) -> keep the user's value verbatim.
+    be = KubernetesBackend(
+        _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="cd-named"))
+    )
+    monkeypatch.setattr(be, "_detect_compute_domains", lambda: [])
+    be._resolve_use_compute_domain_channel()
+    assert be.compute_domain_channel == "cd-named"
+
+
+def test_resolve_named_channel_survives_detection_error(monkeypatch):
+    # Detection blowing up must not raise and must keep the value verbatim.
     be = KubernetesBackend(
         _cfg(dra=KubernetesDraConfig(use_compute_domain_channel="cd-named"))
     )
 
-    def _boom():
-        raise AssertionError("must not detect for a named channel")
+    def _err():
+        raise RuntimeError("kubectl blew up")
 
-    monkeypatch.setattr(be, "_detect_compute_domains", _boom)
+    monkeypatch.setattr(be, "_detect_compute_domains", _err)
     be._resolve_use_compute_domain_channel()
     assert be.compute_domain_channel == "cd-named"
 
@@ -1212,6 +1293,26 @@ def test_apply_kubectl_config_global_args_and_namespace_override():
     assert details["kubectl_args"] == "['--insecure-skip-tls-verify']"
 
 
+def test_apply_kubectl_config_merges_node_selector():
+    # --kube-node-selector merges into the recipe's node_selector; CLI wins on conflict.
+    from sflow.core.kubectl_config import KubectlConfig
+
+    backend = KubernetesBackend(_cfg(node_selector={"tenant": "recipe", "zone": "z1"}))
+    backend.apply_kubectl_config(
+        KubectlConfig(node_selector={"tenant": "cli-wins", "pool": "gpu"})
+    )
+    assert backend.node_selector == {"tenant": "cli-wins", "zone": "z1", "pool": "gpu"}
+
+
+def test_apply_kubectl_config_node_selector_when_recipe_has_none():
+    # A recipe with no node_selector gets one purely from --kube-node-selector.
+    from sflow.core.kubectl_config import KubectlConfig
+
+    backend = KubernetesBackend(_cfg())
+    backend.apply_kubectl_config(KubectlConfig(node_selector={"tenant": "gpu-pool"}))
+    assert backend.node_selector == {"tenant": "gpu-pool"}
+
+
 def test_backend_reads_node_filters_from_config():
     backend = KubernetesBackend(
         _cfg(include_nodes=["want-1"], exclude_nodes=["bad-1", "bad-2"])
@@ -1591,6 +1692,22 @@ def test_use_compute_domain_channel_auto_not_claimed_until_resolved():
     # ...and `auto` never creates a domain (detection-only path).
     perms = backend._required_permissions()
     assert ("create", "computedomains.resource.nvidia.com", True) not in perms
+
+
+def test_resolve_config_resolves_node_selector_values():
+    # Regression: node_selector values must be run through the resolver so
+    # `${{ variables.X }}` (e.g. a --set NODE_TENANT) expands, like namespace/volumes.
+    class _Resolver:
+        def resolve(self, value, ctx):
+            if isinstance(value, str):
+                return value.replace("TENANT_EXPR", "my-tenant")
+            return value
+
+    conf = _cfg(node_selector={"tenant": "TENANT_EXPR"})
+    resolved = KubernetesBackend.resolve_config(
+        conf, resolver=_Resolver(), ctx={}, workflow_name="wf"
+    )
+    assert resolved.node_selector == {"tenant": "my-tenant"}
 
 
 def test_resolve_config_preserves_use_compute_domain_channel():

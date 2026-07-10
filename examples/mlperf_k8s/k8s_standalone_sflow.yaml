@@ -8,10 +8,12 @@ version: "0.1"
 # its env vars (trtllm-serve-ifb-dep8-env.yaml) INLINED -- so this recipe carries its own
 # engine config and does not read the separate yaml files or run_with_env.py from /work.
 #
-# Run it:
-#   sflow run \
-#     -f configs/deepseek_r1/B200-SXM-180GBx8/TRTLLM/Offline/k8s_standalone_sflow.yaml \
-#     --set K8S_NAMESPACE=... --set MODEL_PVC_CLAIM=...
+# Run it (supply your cluster-specific values via CLI -- none are hard-coded here):
+#   sflow run -f examples/mlperf_k8s/k8s_standalone_sflow.yaml \
+#     --kube-namespace <NAMESPACE> \
+#     --set MODEL_PVC_CLAIM=<PVC> --set MODEL_PATH=<PVC_MOUNT>/<model-dir> \
+#     --kube-node-selector tenant=<gpu-node-tenant> \
+#     --set COMPUTE_DOMAIN_CHANNEL=<imex-channel-template-or-auto>
 #
 # Requires ONE pre-existing RWX PVC (MODEL_PVC_CLAIM, e.g. deepseek-r1-model-nfs) that
 # holds the model, the nv_mlpinf work bundle, AND the preprocessed dataset. It is mounted
@@ -74,8 +76,8 @@ variables:
 
   # --- Model + benchmark identity (from deepseek_config_sflow.yaml) ---
   MODEL_PATH:
-    value: ${{ variables.PVC_MOUNT }}/DeepSeek-R1-NVFP4-v2
-    # value: ${{ variables.PVC_MOUNT }}/Qwen3-8B-FP8
+    description: "In-pod path to the served model directory -- a real subpath of the PVC mount (PVC_MOUNT/<model-dir>). Override via --set MODEL_PATH=..."
+    value: ${{ variables.PVC_MOUNT }}/models/Qwen3-8B-FP8
   PREPROCESSED_DATA_DIR:
     description: "In-pod dir with MLPerf preprocessed tensors; the harness reads <this>/deepseek-r1/{input_ids_padded,input_lens}.npy. Real subpath of the single PVC mount (PVC_MOUNT/preprocessed_data)."
     value: ${{ variables.PVC_MOUNT }}/preprocessed_data
@@ -126,16 +128,19 @@ variables:
   # --- Container image + Kubernetes backend (from k8s_env_sflow.yaml) ---
   CONTAINER_IMAGE:
     description: "Container image (NGC URL) with TRT-LLM + nv-mlpinf. Override via --set CONTAINER_IMAGE=..."
-    value: "nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86"
+    value: "nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-deepseek-v4-dev.1"
   K8S_NAMESPACE:
-    description: "Kubernetes namespace for all pods (must hold the PVC below)"
+    description: "Kubernetes namespace for all pods (must hold the PVC below). Override via --kube-namespace ... or --set K8S_NAMESPACE=..."
     value: mlperf-sflow
+  COMPUTE_DOMAIN_CHANNEL:
+    description: "IMEX ComputeDomain channel for cross-node MNNVL: the channel TEMPLATE name (spec.channel.resourceClaimTemplate.name), or 'auto' to claim the sole existing domain, or 'off'/empty for none. NOTE 'auto' is ambiguous on clusters with MULTIPLE ComputeDomains -- set the explicit template name there. Override via --set COMPUTE_DOMAIN_CHANNEL=..."
+    value: auto
   # A single pre-existing RWX PVC holds the model, the nv_mlpinf work bundle, and the
   # preprocessed dataset. It is mounted ONCE (read-write) at PVC_MOUNT; every path below
   # is just a real subpath inside it.
   MODEL_PVC_CLAIM:
     description: "PVC holding the model (MODEL_PATH), the nv_mlpinf work bundle (WORK_DIR), and preprocessed_data/"
-    value: deepseek-r1-model-nfs
+    value: shared-storage
   PVC_MOUNT:
     description: "In-pod path where MODEL_PVC_CLAIM (the whole PVC) is mounted read-write, exactly once."
     value: /home/mlperf_inference_storage
@@ -147,7 +152,7 @@ variables:
     value: ${{ variables.PVC_MOUNT }}/${{ variables.BUNDLE_SUBPATH }}
   GPUS_PER_NODE:
     type: integer
-    value: 8
+    value: 4
   SERVER_NODES:
     description: "Nodes the server spans: ceil(TOTAL_GPUS / GPUS_PER_NODE) -- 1 for this config"
     type: integer
@@ -168,14 +173,14 @@ artifacts:
       backend: pytorch
       tensor_parallel_size: ${{ variables.GPUS_PER_DP_RANK }}
       pipeline_parallel_size: 1
-      moe_expert_parallel_size: ${{ variables.GPUS_PER_DP_RANK }}
+      # moe_expert_parallel_size: ${{ variables.GPUS_PER_DP_RANK }}
       max_batch_size: 256
       max_num_tokens: 2048
       max_seq_len: 23140
       print_iter_log: true
       enable_iter_perf_stats: true
       return_perf_metrics: true
-      enable_layerwise_nvtx_marker: false
+      # enable_layerwise_nvtx_marker: false
       # Chunked prefill so a prompt longer than max_num_tokens (2048) is still prefilled in
       # chunks instead of being rejected -- required now that max_num_tokens is reduced to
       # shrink the activation + cross-node NCCL comm buffers.
@@ -188,26 +193,35 @@ artifacts:
         free_gpu_memory_fraction: ${{ variables.KV_CACHE_FRACTION }}
         enable_block_reuse: false
       enable_attention_dp: true
-      moe_config:
-        backend: CUTEDSL
+      # moe_config:
+      #   backend: CUTEDSL
       cuda_graph_config:
         enable_padding: true
         batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
-      cache_transceiver_config:
-        backend: DEFAULT
+      # cache_transceiver_config:
+      #   backend: DEFAULT
+      # No cache_transceiver_config: this is ONE aggregated trtllm-serve instance
+      # (prefill+decode in the same engine, no disaggregated KV transfer). On
+      # TRT-LLM 1.3 `cache_transceiver_config: backend: DEFAULT` builds a KV-transfer
+      # buffer sized from max_seq_len (23140), which is not a multiple of the KV
+      # tokens_per_block and trips `maxNumTokens % tokensPerBlock == 0`
+      # (cacheTransBuffer.cpp). Omit it (only needed for disaggregated serving).
       attention_dp_config:
         enable_balance: true
         batching_wait_iters: 10
         timeout_iters: 500
 
-  # Node-local SSD copy of the model (staged on each GPU node under the ephemeral SSD by a
-  # model-cache job). As an fs:// artifact NOT covered by a PVC, sflow hostPath-mounts this
-  # path into the server pods at the SAME path. The controller can't stat a node-local path,
-  # so the hostPath type is left empty (lenient) -- the pod still starts on a node without
-  # the copy, and the server script falls back to the PVC model (MODEL_PATH) at runtime.
-  # Loading ~340GB of weights from local NVMe is far faster than from the NFS PVC.
+  # Node-local SSD copy of the model, staged on each GPU node's local NVMe under
+  # /mnt/model-cache/<model-dir> by a one-time copy job (see the DaemonSet that
+  # copies it from the PVC). As an fs:// artifact NOT covered by a PVC, sflow
+  # hostPath-mounts this path into the server pods at the SAME path. The controller
+  # can't stat a node-local path, so the hostPath type is left empty (lenient) --
+  # the pod still starts on a node without the copy, and the server script falls
+  # back to the PVC model (MODEL_PATH) at runtime. Loading ~385GB of weights from
+  # local NVMe is far faster than from the NFS/ceph PVC. Keep the basename in sync
+  # with the staged model dir (and MODEL_PATH).
   - name: NODE_LOCAL_MODEL
-    uri: fs:///mnt/stateful_partition/kube-ephemeral-ssd/model-cache/DeepSeek-R1-NVFP4-v2
+    uri: fs:///mnt/model-cache/HuggingFace_Models_nvidia_DeepSeek_R1_0528_FP4_v2_1
 
 operators:
   - name: test_container
@@ -215,6 +229,10 @@ operators:
     image: ${{ variables.CONTAINER_IMAGE }}
     # 8-way NCCL over intra-node NVLink needs a large /dev/shm (k8s default is 64Mi).
     shm_size: 64Gi
+    # Force root: the Dynamo/TRT-LLM runtime images default to a non-root user, but
+    # the MPI/SSH bootstrap (sshd host keys, /run/sshd, ~/.ssh) and the root-owned
+    # NFS/ceph PVC (the shared .mpi_ssh key exchange + harness results) need root.
+    run_as_root: true
 
 backends:
   - name: k8s_cluster
@@ -223,6 +241,11 @@ backends:
     namespace: ${{ variables.K8S_NAMESPACE }}
     nodes: ${{ variables.NUM_NODES }}
     gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # No node_selector here -- pin pods to your GPU node pool from the CLI (kept out
+    # of the recipe): --kube-node-selector tenant=<your-gpu-tenant> (repeatable /
+    # comma-separated for multiple labels, like kubectl -l).
+    dra:
+      use_compute_domain_channel: ${{ variables.COMPUTE_DOMAIN_CHANNEL }}
     # pod IP == node IP, so the harness reaches the server at its node IP:BASE_PORT.
     host_network: true
     host_ipc: true
@@ -317,27 +340,30 @@ workflow:
           # trtllm-serve's LLM API is MPI-based, so a cross-node instance needs ONE MPI world
           # over every pod (the k8s analogue of SLURM's `srun --mpi=pmix trtllm-llmapi-launch`).
           # The leader (node_index 0) drives `mpirun` over SSH into the workers, which just run
-          # sshd and wait; cross-node TP/EP NCCL rides RDMA (backend rdma: auto -> GKE gIB).
-          # The MNNVL-only MoE alltoall kernel is invalid across an RDMA hop -> disable it.
+          # sshd and wait. On GB300 NVL72 the cross-node TP/EP rides the rack-wide Multi-Node
+          # NVLink (MNNVL) fabric through the IMEX ComputeDomain (dra.use_compute_domain_channel);
+          # NCCL auto-detects MNNVL and IB/RDMA (rdma: auto) is only a fallback for non-NVLink
+          # hops. The MNNVL MoE alltoall-without-allgather kernel is VALID here -> keep it on.
           
-          export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=0
+          export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+          export TRTLLM_WORKER_DISABLE_GC=1
           
-          # NCCL log level (propagated to all ranks via -x below); INFO surfaces cross-node
-          # RDMA/gIB collective failures (the MoE allgather 'unhandled cuda error').
+          # NCCL log level (propagated to all ranks via -x below); set INFO (--set
+          # NCCL_DEBUG=INFO) to surface the topology NCCL picks (MNNVL/NVLS) + collective errors.
           
           export NCCL_DEBUG=${{ variables.NCCL_DEBUG }}
           
-          # NCCL 2.28's cuMem HOST allocations need NUMA support that containers often disable,
-          # and can fail cross-node collectives; force the /dev/shm fallback.
+          # Leave cuMem HOST allocations enabled (NCCL default): MNNVL cross-node NVLink uses
+          # cuMem/VMM with fabric handles, so do NOT disable it on GB300.
           
-          export NCCL_CUMEM_HOST_ENABLE=0
+          export NCCL_CUMEM_HOST_ENABLE=1
           
-          # These a4-highgpu-8g nodes have NO cross-node NVLink domain (sflow detects NVLink
-          # scope 'off'), so NVLS (NVLink SHARP multicast) cannot span the 16-GPU world: NCCL
-          # tries it and aborts with 'nvls.cc Cuda failure out of memory' -> the MoE allgather's
-          # 'unhandled cuda error'. Disable NVLS so NCCL uses ring/tree over intra-node NVLink + IB.
+          # NVLS (NVLink SHARP multicast) spans the rack on GB300 NVL72 via the IMEX
+          # ComputeDomain, so ENABLE it -- NCCL uses it for the cross-node 16-GPU collectives.
+          # (It was disabled on the old single-node-NVLink GKE path, where NVLS could not span
+          # nodes and aborted the MoE allgather with 'nvls.cc Cuda failure out of memory'.)
           
-          export NCCL_NVLS_ENABLE=0
+          export NCCL_NVLS_ENABLE=1
           
           SSH_PORT=2222
           
@@ -352,7 +378,11 @@ workflow:
           fi
           SSHD_BIN="$( [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd || command -v sshd || true )"
           if [ -z "${SSHD_BIN}" ]; then echo "[mpi] FATAL: sshd unavailable after install"; exit 1; fi
-          mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh
+          # sshd's privsep dir MUST be root-owned and NOT group/world-writable; a
+          # permissive container umask makes `mkdir` create it 0777, which sshd
+          # rejects ("/run/sshd must be owned by root and not group or world-writable"),
+          # so force 0755 (and 0700 on ~/.ssh).
+          mkdir -p /run/sshd /root/.ssh && chmod 755 /run/sshd && chmod 700 /root/.ssh
           ssh-keygen -A >/dev/null 2>&1 || true
           
           # Per-run RSA keypair shared through the PVC (both pods mount it rw). The leader
@@ -367,7 +397,7 @@ workflow:
             cp /tmp/mpi_id_rsa "${KEY_DIR}/.id_rsa.tmp" && mv "${KEY_DIR}/.id_rsa.tmp" "${KEY_DIR}/id_rsa"
           fi
           echo "[mpi] node ${SFLOW_TASK_NODE_INDEX}: waiting for shared keypair at ${KEY_DIR}"
-          for _ in $(seq 1 180); do
+          for _ in $(seq 1 600); do
             if [ -f "${KEY_DIR}/id_rsa" ] && [ -f "${KEY_DIR}/id_rsa.pub" ]; then break; fi
             sleep 1
           done

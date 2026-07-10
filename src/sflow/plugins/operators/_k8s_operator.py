@@ -130,6 +130,11 @@ class K8sContainerOperatorConfig(OperatorConfig):
     # bounded by node memory (the K8s 64Mi default is too small for MPI/NCCL and
     # segfaults multi-GPU/multi-node jobs).
     shm_size: str | None = None
+    # Force the container to run as root (securityContext.runAsUser/runAsGroup=0),
+    # overriding an image whose default USER is non-root. Needed when the workload
+    # must write a root-owned NFS/ceph PVC or bootstrap MPI over SSH (sshd host
+    # keys, /run/sshd, ~/.ssh). Default False -> use the image's own user.
+    run_as_root: bool = False
 
     def container_images(self) -> list[str]:
         return [self.image] if self.image else []
@@ -189,6 +194,7 @@ class K8sContainerOperator(Operator):
         self._node_selector: dict[str, str] | None = config.node_selector
         self._tolerations: list[dict[str, Any]] | None = config.tolerations
         self._shm_size: str | None = config.shm_size
+        self._run_as_root: bool = bool(config.run_as_root)
         # Placeholder pods to delete on the create-before-destroy handoff. Only
         # populated for GPU tasks so CPU-only tasks coexist with the placeholder.
         self._handoff_pods: list[str] = []
@@ -831,6 +837,7 @@ class K8sContainerOperator(Operator):
                 host_path_mounts=host_path_mounts,
                 pvc_mounts=pvc_mounts,
                 shm_size=self._shm_size,
+                run_as_root=self._run_as_root,
                 rdma_nic_resources=rdma_nic_resources,
                 rdma_ipc_lock=(bool(rdma_hcas) and self._rdma_ipc_lock) or dra_coalloc,
                 rdma_host_device_paths=(
@@ -1072,6 +1079,7 @@ class K8sContainerOperator(Operator):
                     host_path_mounts=host_path_mounts,
                     pvc_mounts=pvc_mounts,
                     shm_size=self._shm_size,
+                    run_as_root=self._run_as_root,
                     rdma_nic_resources=rdma_nic_resources,
                     # IPC_LOCK + host device mounts apply to pods that got an RDMA
                     # NIC slice (device-plugin/host-device providers) or a DRA

@@ -59,6 +59,30 @@ ExcludeNodesOption = Annotated[
 ]
 
 
+def parse_key_value_args(values: list[str] | None, *, flag: str) -> dict[str, str]:
+    """Parse repeatable ``KEY=VALUE`` CLI options into a dict (later keys win).
+
+    Accepts comma- and/or whitespace-separated tokens within each entry and across
+    repeated flags (same normalization as :func:`split_list_arg`), so all of these
+    yield ``{"a": "1", "b": "2"}``:
+        --opt a=1,b=2
+        --opt "a=1 b=2"
+        --opt a=1 --opt b=2
+    Raises ``typer.BadParameter`` on a token without ``=`` or with an empty key.
+    Returns ``{}`` when falsy (None / empty).
+    """
+    result: dict[str, str] = {}
+    for token in split_list_arg(values) or []:
+        if "=" not in token:
+            raise typer.BadParameter(f"{flag} expects KEY=VALUE, got: {token!r}")
+        key, value = token.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise typer.BadParameter(f"{flag} has an empty key: {token!r}")
+        result[key] = value.strip()
+    return result
+
+
 def split_list_arg(values: list[str] | None) -> list[str] | None:
     """Normalize a repeatable CLI list option into individual tokens.
 

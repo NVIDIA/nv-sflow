@@ -26,6 +26,11 @@ class KubectlConfig:
     context: str | None = None
     # --kube-namespace: overrides the backend's namespace default for all k8s backends.
     namespace: str | None = None
+    # --kube-node-selector (repeatable KEY=VALUE): node-selector labels merged into
+    # (and overriding) every k8s backend's node_selector -- applied as the pod
+    # nodeSelector and the node-discovery selector (kubectl -l). Keeps cluster/node
+    # pool identity (e.g. a `tenant` label) out of the recipe.
+    node_selector: dict[str, str] = field(default_factory=dict)
     # --extra-kubectl-args (repeatable): verbatim global kubectl flags, e.g.
     # "--insecure-skip-tls-verify", "--as=admin", "--request-timeout=30s".
     extra_args: list[str] = field(default_factory=list)
@@ -57,4 +62,5 @@ class KubectlConfig:
             or self.context
             or self.namespace
             or self.extra_args
+            or self.node_selector
         )
