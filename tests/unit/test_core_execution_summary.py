@@ -10,6 +10,7 @@ import pytest
 import sflow.core.execution_summary as execution_summary_mod
 from sflow.core.execution_summary import SflowSummaryWriter
 from sflow.core.task import Task, TaskStatus
+from sflow.core.uploads import UploadResult
 from sflow.core.task_graph import TaskGraph
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
@@ -104,6 +105,24 @@ def test_summary_writer_workflow_finished_flushes_pending_debounced_write(tmp_pa
     assert "Status   : COMPLETED" in text
 
 
+def test_summary_writer_infers_running_while_task_is_finalizing(tmp_path):
+    tg = TaskGraph()
+    task = _task("server", tmp_path)
+    task.status = TaskStatus.FINALIZING
+    tg.dag.add_node("server", task)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+
+    assert writer._infer_status() == "RUNNING"
+
+
 def test_summary_writer_write_failure_removes_temp_file(tmp_path, monkeypatch):
     summary_path = tmp_path / "sflow_summary.log"
     temp_path = tmp_path / ".sflow_summary.log.failed"
@@ -135,6 +154,49 @@ def test_summary_writer_write_failure_removes_temp_file(tmp_path, monkeypatch):
     assert not summary_path.exists()
 
 
+def test_summary_renders_network_warnings_section(tmp_path):
+    # A recorded network warning (e.g. RDMA -> TCP fallback) surfaces in a
+    # dedicated section, prefixed with the task name for triage.
+    tg = TaskGraph()
+    server = _task("decode_server_0", tmp_path)
+    tg.dag.add_node("decode_server_0", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="rt",
+        command_log_paths={},
+    )
+    writer.record_network_warning(
+        server, "RDMA NIC unusable in 1/1 pod(s) (all ports DOWN)"
+    )
+    writer.workflow_finished(status="READY")
+
+    text = (tmp_path / "sflow_summary.log").read_text()
+    assert "Network Warnings" in text
+    assert (
+        "decode_server_0: RDMA NIC unusable in 1/1 pod(s) (all ports DOWN)" in text
+    )
+
+
+def test_summary_omits_network_warnings_section_when_none(tmp_path):
+    tg = TaskGraph()
+    server = _task("s", tmp_path)
+    tg.dag.add_node("s", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="rt",
+        command_log_paths={},
+    )
+    writer.workflow_finished(status="READY")
+    assert "Network Warnings" not in (tmp_path / "sflow_summary.log").read_text()
+
+
 def test_summary_writer_renders_header_dag_timeline_chart_and_final_summary(tmp_path):
     tg = TaskGraph()
     load = _task("load", tmp_path)
@@ -156,6 +218,7 @@ def test_summary_writer_renders_header_dag_timeline_chart_and_final_summary(tmp_
             "bash": bash_log,
             "slurm": tmp_path / "slurm_cmds.log",
         },
+        command_text="sflow run -f cfg.yaml --set X=1",
     )
 
     writer.task_unblocked(load)
@@ -177,6 +240,8 @@ def test_summary_writer_renders_header_dag_timeline_chart_and_final_summary(tmp_
     assert "Workflow : wf" in text
     assert "Status   : FAILED" in text
     assert f"Summary  : {summary_path}" in text
+    # The actual invocation is recorded so a later reader knows what was run.
+    assert "Command  : sflow run -f cfg.yaml --set X=1" in text
     assert "Runtime" in text
     assert "runtime info text" in text
     assert "Command Logs" in text
@@ -532,3 +597,164 @@ def test_summary_writer_renders_gpu_usage_without_assigned_nodes(tmp_path):
         text,
         re.MULTILINE,
     )
+
+
+def test_summary_includes_uploads_section(tmp_path):
+    tg = TaskGraph()
+    task = _task("produce_results", tmp_path)
+    tg.dag.add_node("produce_results", task)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    summary_path = tmp_path / "sflow_summary.log"
+    writer = SflowSummaryWriter(summary_path, debounce_interval=30)
+
+    async def _exercise() -> None:
+        writer.start(
+            workflow=workflow,
+            output_dir=tmp_path,
+            runtime_info_text="runtime",
+            command_log_paths={},
+        )
+        writer.record_uploads(
+            [
+                UploadResult(
+                    task="produce_results",
+                    target="results_bucket",
+                    source="/out/produce_results/results.csv",
+                    destination="s3://bucket/main/results.csv",
+                    status="uploaded",
+                    on_error="warn",
+                ),
+                UploadResult(
+                    task="produce_results",
+                    target="results_bucket",
+                    source="/out/produce_results/summary.json",
+                    destination="s3://bucket/summary.json",
+                    status="failed",
+                    on_error="warn",
+                    error="Unable to parse config file",
+                ),
+            ]
+        )
+        task.status = TaskStatus.COMPLETED
+        writer.workflow_finished(status="COMPLETED")
+
+    asyncio.run(_exercise())
+
+    text = summary_path.read_text()
+    # Dedicated section with a header + counts.
+    assert "Uploads     : uploaded=1, failed=1" in _top_summary_text(text)
+    assert "\nUploads\n-------\n" in text
+    assert "uploaded=1" in text
+    assert "failed=1" in text
+    # Grouped by task, with per-file destination and the failure reason.
+    assert "produce_results:" in text
+    assert "s3://bucket/main/results.csv" in text
+    assert "Unable to parse config file" in text
+
+
+def test_summary_omits_uploads_section_when_no_uploads(tmp_path):
+    tg = TaskGraph()
+    task = _task("t", tmp_path)
+    tg.dag.add_node("t", task)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    summary_path = tmp_path / "sflow_summary.log"
+    writer = SflowSummaryWriter(summary_path, debounce_interval=30)
+
+    async def _exercise() -> None:
+        writer.start(
+            workflow=workflow,
+            output_dir=tmp_path,
+            runtime_info_text="runtime",
+            command_log_paths={},
+        )
+        task.status = TaskStatus.COMPLETED
+        writer.workflow_finished(status="COMPLETED")
+
+    asyncio.run(_exercise())
+
+    text = summary_path.read_text()
+    assert "Uploads     :" not in _top_summary_text(text)
+    assert "\nUploads\n-------\n" not in text
+
+
+def test_summary_renders_probe_traces_section(tmp_path):
+    from sflow.core.probe import ProbeAttempt, ProbeType
+    from sflow.plugins.probes.log_watch import LogWatchProbe
+
+    tg = TaskGraph()
+    task = _task("server", tmp_path)
+    probe = LogWatchProbe(
+        regex_pattern="Application startup complete",
+        type=ProbeType.READINESS,
+        interval=0,
+        timeout=10,
+    )
+    probe.last_attempt = ProbeAttempt(
+        ok=False, runtime=1.5, detail="no match (0/1) | last line: 'loading weights 42%'"
+    )
+    task.probes = [probe]
+    tg.dag.add_node("server", task)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+    writer.flush()
+
+    text = (tmp_path / "sflow_summary.log").read_text(encoding="utf-8")
+    assert "Probe Traces (last attempt)" in text
+    row = next(
+        line
+        for line in text.splitlines()
+        if line.startswith("server") and "log_watch" in line
+    )
+    assert "readiness" in row and "[FAIL]" in row
+    assert "loading weights 42%" in row
+
+
+def test_probe_trace_refreshes_while_task_stays_running(tmp_path):
+    """A stuck DAG (task RUNNING, readiness never satisfied) must still update the
+    probe trace on each check: record_probe_attempt schedules the render, since no
+    task-status event fires to trigger one while the task sits RUNNING."""
+    from sflow.core.probe import ProbeAttempt, ProbeType
+    from sflow.plugins.probes.log_watch import LogWatchProbe
+
+    tg = TaskGraph()
+    task = _task("server", tmp_path)
+    probe = LogWatchProbe(
+        regex_pattern="ready", type=ProbeType.READINESS, interval=0, timeout=10
+    )
+    task.probes = [probe]
+    tg.dag.add_node("server", task)
+    workflow = Workflow(name="wf", task_graph=tg)
+    summary_path = tmp_path / "sflow_summary.log"
+    writer = SflowSummaryWriter(summary_path)
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+
+    # First check (miss). Only record_probe_attempt fires -- no status event.
+    probe.last_attempt = ProbeAttempt(
+        ok=False, runtime=0.1, detail="no match | last line: 'step 1'"
+    )
+    writer.record_probe_attempt(task)
+    writer.flush()
+    assert "step 1" in summary_path.read_text(encoding="utf-8")
+
+    # A later check while STILL RUNNING refreshes the trace to the newest line.
+    probe.last_attempt = ProbeAttempt(
+        ok=False, runtime=0.1, detail="no match | last line: 'step 2'"
+    )
+    writer.record_probe_attempt(task)
+    writer.flush()
+    text = summary_path.read_text(encoding="utf-8")
+    assert "step 2" in text and "step 1" not in text

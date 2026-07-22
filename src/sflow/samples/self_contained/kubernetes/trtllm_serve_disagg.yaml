@@ -1,0 +1,384 @@
+version: "0.1"
+
+# Kubernetes DISAGGREGATED bare `trtllm-serve` (no Dynamo infra). Kubernetes port
+# of examples/self_contained/slurm/trtllm_serve_disagg.yaml.
+#
+# Three tasks, no nats/etcd/frontend service discovery: separate `trtllm-serve`
+# PREFILL and DECODE servers (each on the sflow `k8s_mpi` operator by DEFAULT, so a
+# server spans nodes when its TP exceeds GPUS_PER_NODE), plus a `trtllm-serve
+# disaggregated` router that fans requests to them per the SERVER_CONFIG.
+#
+# URL coordination (vs the Slurm recipe): Slurm appends each server's <ip:port> to
+# a shared-filesystem file at runtime. On Kubernetes there is no shared FS for
+# ConfigMap artifacts, so instead we build the prefill/decode URLs at PLAN time
+# from the RESERVED node IPs: prefill binds the first reserved node
+# (nodes[0]) and decode the last (nodes[-1]); the disaggregated router runs on
+# node 0. This assumes single-node prefill/decode (CTX_TP_SIZE / GEN_TP_SIZE <=
+# GPUS_PER_NODE) placed on distinct nodes -- for automatic multi-instance service
+# discovery use dynamo_trtllm_disagg.yaml (Dynamo etcd) instead.
+#
+# Prerequisites (operator route): the Kubeflow mpi-operator controller + CRD, and
+# an image that provides sshd (or keep mpi.ensure_sshd: true to apt-install it).
+
+variables:
+  # Kubernetes Configuration
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    value: mlperf-sflow
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 4
+  COMPUTE_DOMAIN_CHANNEL:
+    description: "IMEX ComputeDomain channel for cross-node MNNVL: a channel TEMPLATE name, 'auto', or 'disable'/empty. A NAMED channel on a cluster without a ComputeDomain fails preflight."
+    value: auto
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name (advertised by the OpenAI API)"
+    value: Qwen3-8B-FP8
+
+  # Prefill (context) server
+  CTX_TP_SIZE:
+    description: "Context tensor parallel size"
+    type: integer
+    value: 2
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker == its MPI world size"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE }}
+  CTX_NODES:
+    description: "Nodes the prefill worker spans"
+    type: integer
+    value: ${{ ((variables.CTX_GPUS_PER_WORKER / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+  CTX_PORT:
+    description: "Prefill trtllm-serve port"
+    type: integer
+    value: 8001
+  CTX_BATCH_SIZE:
+    value: 128
+  # Sized for the standard probe (ISL up to ~8192). chunked prefill is OFF, so max_num_tokens
+  # must exceed ISL (else prefill 400s "maximum context length"); max_seq_len must exceed
+  # ISL+OSL. The old 4096/1280 fit only the recipe's own ISL=1024 default and 400'd the e2e
+  # ISL=4096 probe -- matches the sibling dynamo_trtllm_disagg (8448 / 10240).
+  CTX_MAX_NUM_TOKENS:
+    value: 8448
+  CTX_MAX_SEQ_LEN:
+    value: 10240
+  CTX_FREE_GPU_MEMORY_FRACTION:
+    value: 0.9
+
+  # Decode (generation) server
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size"
+    type: integer
+    value: 2
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker == its MPI world size"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE }}
+  GEN_NODES:
+    description: "Nodes the decode worker spans"
+    type: integer
+    value: ${{ ((variables.GEN_GPUS_PER_WORKER / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+  GEN_PORT:
+    description: "Decode trtllm-serve port"
+    type: integer
+    value: 8002
+  GEN_BATCH_SIZE:
+    value: 128
+  # See CTX_MAX_* above: sized for the standard probe (was 4096/2304, too small for ISL=4096).
+  GEN_MAX_NUM_TOKENS:
+    value: 8448
+  GEN_MAX_SEQ_LEN:
+    value: 10240
+  GEN_FREE_GPU_MEMORY_FRACTION:
+    value: 0.9
+
+  KV_CACHE_DTYPE:
+    value: fp8
+  FRONTEND_PORT:
+    description: "Disaggregated router (OpenAI API) port"
+    type: integer
+    value: 8000
+  NUM_NODES:
+    description: >-
+      Reserved nodes == CTX_NODES + GEN_NODES + 1: prefill (node 0), decode (last node), and a
+      dedicated node for the disaggregated router. The router runs `trtllm-serve disaggregated`,
+      which imports the CUDA-linked tensorrt_llm package and so needs the NVIDIA driver -- on
+      device_plugin clusters the driver (libcuda.so.1) is only injected into pods that request a
+      GPU, so a GPU-less router pod crashes at import. The router therefore takes its own node + 1
+      GPU (mostly idle; it only routes). prefill/decode still land on the two FULL-GPU nodes since
+      they each need GPUS_PER_NODE GPUs and the router node has one taken.
+    type: integer
+    value: ${{ variables.CTX_NODES + variables.GEN_NODES + 1 }}
+  # Node index for the router + benchmark: the LAST reserved node. Unpinned GPU servers pack onto
+  # the lowest free node indices (prefill -> nodes[0..CTX_NODES-1], decode -> the next GEN_NODES),
+  # leaving this trailing node for the router. The generation URL therefore points at the decode
+  # node (nodes[CTX_NODES]), NOT nodes[-1], which is now the router's node.
+  ROUTER_NODE_INDEX:
+    type: integer
+    value: ${{ variables.CTX_NODES + variables.GEN_NODES }}
+  EXTRA_PREFILL_ARGS:
+    value: ""
+  EXTRA_DECODE_ARGS:
+    value: ""
+
+  # Benchmark Configuration
+  ISL:
+    value: 1024
+  OSL:
+    value: 1024
+  MULTI_ROUND:
+    value: 8
+  CONCURRENCY:
+    value: 20
+    domain: [20]
+
+  # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+  TRTLLM_IMAGE:
+    description: "TensorRT-LLM container image (ships trtllm-serve + mpirun)"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-deepseek-v4-dev.1
+
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///mnt/model-cache/your-model-dir
+  - name: PREFILL_CONFIG
+    uri: file://prefill_config.yaml
+    content: |
+      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      pipeline_parallel_size: 1
+      max_batch_size: ${{ variables.CTX_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.CTX_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.CTX_MAX_SEQ_LEN }}
+      cuda_graph_config: null
+      print_iter_log: true
+      disable_overlap_scheduler: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.CTX_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
+        backend: UCX
+  - name: DECODE_CONFIG
+    uri: file://decode_config.yaml
+    content: |
+      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      pipeline_parallel_size: 1
+      max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.GEN_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.GEN_MAX_SEQ_LEN }}
+      cuda_graph_config:
+        enable_padding: true
+        max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+      print_iter_log: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.GEN_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
+        backend: UCX
+      stream_interval: 20
+  # Disaggregated router config. Prefill/decode URLs are built from the reserved
+  # node IPs at plan time (prefill on node 0, decode on the last node).
+  - name: SERVER_CONFIG
+    uri: file://server_config.yaml
+    content: |
+      hostname: 0.0.0.0
+      port: ${{ variables.FRONTEND_PORT }}
+      backend: pytorch
+      context_servers:
+        num_instances: 1
+        urls:
+          - "${{ backends.k8s_cluster.nodes[0].ip_address }}:${{ variables.CTX_PORT }}"
+      generation_servers:
+        num_instances: 1
+        urls:
+          # decode packs onto nodes[CTX_NODES] (the first free node after prefill); the trailing
+          # node nodes[-1] is the router's, so index the decode node explicitly (not nodes[-1]).
+          - "${{ backends.k8s_cluster.nodes[variables.CTX_NODES].ip_address }}:${{ variables.GEN_PORT }}"
+
+operators:
+  # Multi-node MPI worker for the prefill/decode GPU servers.
+  - name: mpi_trtllm
+    type: k8s_mpi
+    image: ${{ variables.TRTLLM_IMAGE }}
+    shm_size: 64Gi
+    run_as_root: true
+    mpi:
+      route: auto
+      slots_per_worker: ${{ variables.GPUS_PER_NODE }}
+      run_launcher_as_worker: true
+      launcher_creation_policy: WaitForWorkersReady
+      ssh_port: 2222
+      ensure_sshd: true
+  # Plain container operators for the CPU-only disaggregated router + benchmark.
+  - name: trtllm_container
+    type: k8s
+    image: ${{ variables.TRTLLM_IMAGE }}
+  - name: aiperf
+    type: k8s
+    image: ${{ variables.AIPERF_IMAGE }}
+
+backends:
+  - name: k8s_cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    host_network: true
+    host_ipc: true
+    scheduling: device_plugin
+    # sflow auto-detects and uses the IB/RoCE fabric (the cross-node KV path on IB
+    # clusters). On a cluster whose IB is down/absent, force it off per run with
+    # `--kube-rdma disable` (don't hard-code it in the recipe).
+    rdma: auto
+    compute_domain:
+      channel: ${{ variables.COMPUTE_DOMAIN_CHANNEL }}
+    reservation:
+      timeout: 1200
+
+workflow:
+  name: trtllm_serve_disagg
+  timeout: 115m
+  tasks:
+    - name: prefill_server
+      operator: mpi_trtllm
+      resources:
+        gpus:
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
+      script:
+        - set -x
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
+        - unset UCX_TLS
+        # ONE MPI world for this prefill worker (TP spans nodes when
+        # CTX_GPUS_PER_WORKER > GPUS_PER_NODE); rank 0 serves the OpenAI API.
+        - >
+          mpirun -np ${{ variables.CTX_GPUS_PER_WORKER }} --allow-run-as-root
+          trtllm-llmapi-launch
+          trtllm-serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --host 0.0.0.0 --port ${{ variables.CTX_PORT }}
+          --extra_llm_api_options ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Application startup complete"
+          timeout: 1800
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: decode_server
+      operator: mpi_trtllm
+      resources:
+        gpus:
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+      script:
+        - set -x
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
+        - unset UCX_TLS
+        # ONE MPI world for this decode worker (TP spans nodes when
+        # GEN_GPUS_PER_WORKER > GPUS_PER_NODE); rank 0 serves the OpenAI API.
+        - >
+          mpirun -np ${{ variables.GEN_GPUS_PER_WORKER }} --allow-run-as-root
+          trtllm-llmapi-launch
+          trtllm-serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --host 0.0.0.0 --port ${{ variables.GEN_PORT }}
+          --extra_llm_api_options ${{ artifacts.DECODE_CONFIG.path }} ${EXTRA_DECODE_ARGS}
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Application startup complete"
+          timeout: 1800
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: frontend_server
+      operator: trtllm_container
+      # Own node + 1 GPU: `trtllm-serve disaggregated` loads the CUDA-linked tensorrt_llm, so it
+      # needs the NVIDIA driver, which device_plugin clusters inject only into GPU-holding pods.
+      resources:
+        nodes:
+          indices: ["${{ variables.ROUTER_NODE_INDEX }}"]
+        gpus:
+          count: 1
+      script:
+        - set -x
+        - export TRTLLM_SERVER_DISABLE_GC=1
+        - cat ${{ artifacts.SERVER_CONFIG.path }}
+        - trtllm-serve disaggregated -c ${{ artifacts.SERVER_CONFIG.path }} -t 7200 -r 7200
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Application startup complete"
+          timeout: 600
+          interval: 5
+      depends_on:
+        - prefill_server
+        - decode_server
+
+    - name: benchmark
+      operator: aiperf
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ backends.k8s_cluster.nodes[variables.ROUTER_NODE_INDEX].ip_address }}:${{ variables.FRONTEND_PORT }}
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
+      depends_on:
+        - prefill_server
+        - decode_server
+        - frontend_server

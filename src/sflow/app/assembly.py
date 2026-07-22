@@ -13,6 +13,7 @@ This module is the single place where we wire together:
 from __future__ import annotations
 
 import itertools
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from sflow.resolution import (
@@ -34,25 +35,68 @@ from sflow.app.backend_lifecycle import (
     seed_placeholder_backend_allocations as _seed_placeholder_backend_allocations_impl,
 )
 from sflow.app.resource_planner import plan_resource_placements
+from sflow.app.run_support import backends_execute_offhost
 from sflow.app.task_context import (
     build_task_info,
     build_task_expression_hint,
     build_tasks_ctx,
+    compute_task_service,
     extract_task_expressions,
 )
 from sflow.config.schema import SflowConfig
-from sflow.core.backend import Backend
 from sflow.core.state import SflowState
-from sflow.core.task import OutputSpec, RetryPolicy, Task, TaskStatus
+from sflow.core.task import (
+    OutputSpec,
+    ResolvedUpload,
+    ResultConfigRuntime,
+    ResultSpec,
+    RetryPolicy,
+    Task,
+    TaskPort,
+    TaskStatus,
+)
 from sflow.core.task_graph import TaskGraph
 from sflow.core.variable import build_variables_ctx
 from sflow.core.workflow import Workflow
 from sflow.logging import get_logger
-from sflow.utils.container import append_missing_mounts, local_artifact_mounts
 
 resolver = ExpressionResolver()
 
 _logger = get_logger(__name__)
+
+
+def _build_result_config_runtime(r_conf: Any) -> ResultConfigRuntime:
+    """
+    Convert the validated ``ResultConfig`` schema object into the runtime
+    ``ResultConfigRuntime`` used by the orchestrator and result parser.
+
+    Notes:
+    - ``r_conf.patterns`` and ``r_conf.file`` are mutually exclusive (enforced by schema).
+    - Per-pattern ``source`` falls back to the parent ``source`` when not set.
+    """
+    specs: list[ResultSpec] = []
+    parent_source = getattr(r_conf, "source", "log") or "log"
+    for p in list(getattr(r_conf, "patterns", None) or []):
+        per_source = getattr(p, "source", None) or parent_source
+        specs.append(
+            ResultSpec(
+                name=p.name,
+                regex=p.regex,
+                engine="regex",
+                source=per_source,
+                type=getattr(p, "type", "auto"),
+                unit=getattr(p, "unit", None),
+                aggregate=getattr(p, "aggregate", "last"),
+                required=bool(getattr(p, "required", False)),
+                group=getattr(p, "group", None),
+            )
+        )
+    return ResultConfigRuntime(
+        specs=specs,
+        file=getattr(r_conf, "file", None),
+        source=parent_source,
+    )
+
 
 # Backward-compatible private aliases for existing tests/callers during extraction.
 _build_task_info = build_task_info
@@ -82,7 +126,7 @@ def preflight_validate_task_graph(
     Validate task planning against placeholder backend allocations before real allocation.
 
     This reuses the normal graph-building and GPU-packing logic with deterministic placeholder
-    nodes so capacity/configuration errors surface before `salloc` consumes cluster resources.
+    nodes so capacity/configuration errors surface before real backend resources are allocated.
     """
     planning_state = SflowState(
         workflow=Workflow(name=config.workflow.name, task_graph=TaskGraph()),
@@ -136,6 +180,7 @@ def resolve_artifacts(
     workspace_dir: Any | None = None,
     output_dir: Any | None = None,
     materialize: bool = False,
+    remote_filesystem: bool = False,
 ) -> SflowState:
     return _resolve_artifacts_impl(
         config,
@@ -144,6 +189,7 @@ def resolve_artifacts(
         workspace_dir=workspace_dir,
         output_dir=output_dir,
         materialize=materialize,
+        remote_filesystem=remote_filesystem,
     )
 
 
@@ -187,8 +233,12 @@ def resolve_deferred_global_variables(
     )
 
 
-def resolve_backends(config: SflowConfig, state: SflowState) -> SflowState:
-    return _resolve_backends_impl(config, state, resolver=resolver)
+def resolve_backends(
+    config: SflowConfig, state: SflowState, *, kubectl_config: Any | None = None
+) -> SflowState:
+    return _resolve_backends_impl(
+        config, state, resolver=resolver, kubectl_config=kubectl_config
+    )
 
 
 async def allocate_backends(state: SflowState) -> SflowState:
@@ -210,6 +260,364 @@ def resolve_workflow_variables(
     )
 
 
+def resolve_storage_targets(config: SflowConfig, state: SflowState) -> SflowState:
+    """
+    Resolve `${{ ... }}` expressions inside `config.storage` entries and instantiate
+    concrete `StorageTarget` plugins into `state.storage_targets`.
+
+    Storage targets may reference resolved variables, backends, and artifacts in
+    fields like `prefix`, `bucket`, `region`, etc.
+    """
+    if not config.storage:
+        return state
+
+    from sflow.core.storage_registry import (
+        ensure_builtin_storage_registered,
+        get_storage_class,
+        storage_config_type_adapter,
+    )
+
+    ensure_builtin_storage_registered()
+    adapter = storage_config_type_adapter()
+
+    backends_ctx: dict[str, Any] = {
+        name: b.to_dict() for name, b in (state.backends or {}).items()
+    }
+    variables_ctx = build_variables_ctx(state.variables)
+    artifacts_ctx = _artifacts_ctx(state)
+    ctx: dict[str, Any] = {
+        "variables": variables_ctx,
+        "backends": backends_ctx,
+        "artifacts": artifacts_ctx,
+        **variables_ctx,
+    }
+
+    for s_conf in config.storage:
+        # Resolve expressions in the config's dict form, then re-validate so we
+        # end up with a typed, expression-free config to hand to the plugin.
+        as_dict = s_conf.model_dump(by_alias=False)
+        resolved_dict = resolver.resolve(as_dict, ctx)
+        resolved_conf = adapter.validate_python(resolved_dict)
+
+        target_cls = get_storage_class(resolved_conf.type)
+        target = target_cls(resolved_conf)  # type: ignore[call-arg]
+        state.add_storage_target(target)
+
+    return state
+
+
+def _merge_image_key(task: Any) -> tuple[str, ...]:
+    """Container-image identity used to gate merging.
+
+    A merged pod runs ONE container (the leader operator's image), so only tasks
+    that would launch the SAME image may share it -- otherwise a follower's script
+    would silently run in the leader's image. Read the image(s) the task's operator
+    declares via ``container_images`` (operator or its config). Absent (non-container
+    operators / test doubles) -> empty key, i.e. no image constraint.
+    """
+    op = getattr(task, "operator", None)
+    for src in (op, getattr(op, "config", None)):
+        images = getattr(src, "container_images", None)
+        if callable(images):
+            try:
+                return tuple(sorted(str(i) for i in (images() or [])))
+            except Exception:  # noqa: BLE001 - defensive: never block planning
+                return ()
+    return ()
+
+
+def _plan_merge_groups(
+    task_graph: TaskGraph, resource_placements: "Mapping[str, Any]"
+) -> None:
+    """Bundle single-node GPU tasks co-located on one node into one merged pod.
+
+    Runs at assembly time after resource placement. For each backend that opts in
+    via ``merge_colocated_gpu_pods``, tasks with >0 GPUs assigned to exactly one
+    physical node are grouped by ``(backend, node, container-image)`` -- same node
+    AND same image, since a merged pod is one container. Groups with >=2 members
+    become one merged pod owned by a deterministic leader (first member by name):
+
+    * every member sees ALL union GPUs (``CUDA_VISIBLE_DEVICES``), with its own
+      packed slice listed FIRST so the workload uses it as ``cuda:0`` -- exposing
+      the peers' GPUs is what lets cross-member ``cuda_ipc``/NVLink P2P work (a
+      single-GPU-per-member visibility hides the peers and forces UCX/NIXL to TCP);
+    * the leader is made to depend on the union of the members' external deps so
+      the whole group starts together (followers are not launched on their own);
+    * the leader's operator is handed the ordered member Task objects + union GPU
+      count via ``apply_merge_group`` (duck-typed; only the k8s operator uses it).
+
+    Merged members may not depend on one another (they run concurrently in one
+    pod), so an intra-group completion dependency raises ``ValueError``. Multi-node
+    GPU tasks and CPU-only tasks are never merged.
+    """
+    # Key: (backend, node, image). Node keeps co-located members together; image
+    # ensures we only merge tasks that share one container (a merged pod is one
+    # container). Multi-node GPU tasks and CPU-only infra are excluded below.
+    groups: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+    gpu_counts: dict[str, int] = {}
+    for name, placement in resource_placements.items():
+        backend = getattr(placement, "backend", None)
+        if backend is None or not getattr(
+            backend, "merge_colocated_gpu_pods", False
+        ):
+            continue
+        try:
+            gpu_count = int(getattr(placement, "gpu_count", 0) or 0)
+        except (TypeError, ValueError):
+            gpu_count = 0
+        assigned = list(getattr(placement, "assigned_nodes", None) or [])
+        # Only single-node GPU tasks merge; multi-node tasks and CPU-only infra
+        # (etcd/nats/frontend) keep their own pods.
+        if gpu_count <= 0 or len(assigned) != 1:
+            continue
+        image_key = _merge_image_key(task_graph.get_task(name))
+        groups.setdefault(
+            (str(backend.name), assigned[0], image_key), []
+        ).append(name)
+        gpu_counts[name] = gpu_count
+
+    for (backend_name, node, _image_key), members in groups.items():
+        if len(members) < 2:
+            continue
+        members = sorted(members)
+        member_set = set(members)
+        # Concurrent-only: a member that depends on another member -- directly
+        # OR transitively through non-member tasks -- can't be honored inside one
+        # concurrent pod, since the dependency implies a start ordering the merged
+        # pod can't provide. Walk the whole dependency chain (not just direct
+        # edges) so an indirect a->x->b dependency is caught at plan time rather
+        # than deadlocking at run time (the DAG has no b->a edge to detect).
+        for m in members:
+            stack = list(task_graph.dag.get_dependencies(m))
+            seen: set[str] = set()
+            while stack:
+                dep = stack.pop()
+                if dep in seen:
+                    continue
+                seen.add(dep)
+                if dep in member_set:
+                    raise ValueError(
+                        f"Cannot merge co-located tasks {members} on node "
+                        f"'{node}': '{m}' depends on '{dep}' (directly or "
+                        "transitively) in the same merge group, but merged tasks "
+                        "run concurrently in one pod. Remove the intra-group "
+                        "dependency or disable merge_colocated_gpu_pods on the "
+                        "backend."
+                    )
+                stack.extend(task_graph.dag.get_dependencies(dep))
+        leader_name = members[0]
+        group_id = f"{backend_name}:{node}"
+        # Every member's container sees ALL union GPUs, but with its OWN packed
+        # slice FIRST so the workload uses that as cuda:0 / its local rank. Exposing
+        # the peers' GPUs (not just its own) is what lets cross-member cuda_ipc /
+        # NVLink P2P work -- a single-GPU-per-member CUDA_VISIBLE_DEVICES hides the
+        # peers and forces UCX/NIXL KV transfer onto IB, defeating the point of
+        # merging (co-locating so KV transfer rides NVLink/NVSwitch, esp. MNNVL).
+        union_gpus = sum(gpu_counts[m] for m in members)
+        start = 0
+        member_tasks: list[Task] = []
+        for m in members:
+            t = task_graph.get_task(m)
+            count = gpu_counts[m]
+            own = list(range(start, start + count))
+            others = [i for i in range(union_gpus) if i not in own]
+            t.merge_cuda_visible_devices = ",".join(str(i) for i in own + others)
+            t.merge_group_id = group_id
+            start += count
+            member_tasks.append(t)
+        leader = task_graph.get_task(leader_name)
+        leader.merge_members = list(members)
+        for m in members:
+            if m != leader_name:
+                task_graph.get_task(m).merge_leader = leader_name
+        # The leader waits for the union of every member's external deps so the
+        # group starts together (followers never launch on their own).
+        for m in members:
+            for dep in task_graph.dag.get_dependencies(m):
+                if dep not in member_set and dep != leader_name:
+                    task_graph.dag.add_edge(dep, leader_name)
+        # Hand the leader's operator the ordered member tasks + union GPU count so
+        # it renders the single merged pod. Duck-typed: only the k8s container
+        # operator implements apply_merge_group. If the leader operator lacks it,
+        # the followers would be promoted to RUNNING (see the orchestrator) but
+        # never actually launched in a merged container -- so fail loudly at plan
+        # time instead of silently hanging the group.
+        apply_merge_group = getattr(leader.operator, "apply_merge_group", None)
+        if not callable(apply_merge_group):
+            raise ValueError(
+                f"Cannot merge co-located tasks {members} on node '{node}': leader "
+                f"task '{leader_name}' uses operator "
+                f"'{type(leader.operator).__name__}', which does not support merge "
+                "pods (no apply_merge_group). Only the k8s container operator can "
+                "render a merged pod -- disable merge_colocated_gpu_pods on the "
+                "backend, or ensure the co-located GPU tasks use the k8s operator."
+            )
+        apply_merge_group(members=member_tasks, union_gpus=union_gpus)
+        # Transparent log: merging changes the pod topology (sflow-owned), so make
+        # it visible which co-located GPU tasks now share one pod/node.
+        _logger.info(
+            "Kubernetes backend '%s': merged %d co-located GPU tasks %s on node "
+            "'%s' into one pod (%d GPUs; shared NVLink/cuda_ipc, one IMEX channel "
+            "claim per node).",
+            backend_name,
+            len(members),
+            members,
+            node,
+            union_gpus,
+        )
+
+
+def _warn_channel_contention(resource_placements: "Mapping[str, Any]") -> None:
+    """Hard-warn when a ComputeDomain channel claim contends with pod topology.
+
+    The NVIDIA DRA driver publishes ONE IMEX channel per node per ComputeDomain, so
+    a channel claim needs at most one channel-claiming (GPU) pod per node. Merge
+    (default ``auto``) guarantees that. But when a backend has a channel configured
+    AND ``merge_colocated_gpu_pods`` is off, two+ GPU pods can land on one node and
+    all but one fail scheduling ("cannot allocate all claims"). Warn once per
+    backend at plan time (recommend ``merge: auto`` or one GPU pod per node); the
+    run still proceeds. Duck-typed on the backend (only the k8s backend exposes a
+    ``compute_domain_channel``); other backends simply never trigger it.
+    """
+    per_node: dict[tuple[str, str], int] = {}
+    backends_by_name: dict[str, Any] = {}
+    for _name, placement in resource_placements.items():
+        backend = getattr(placement, "backend", None)
+        if backend is None:
+            continue
+        try:
+            gpu_count = int(getattr(placement, "gpu_count", 0) or 0)
+        except (TypeError, ValueError):
+            gpu_count = 0
+        if gpu_count <= 0:
+            continue  # only GPU pods claim the channel
+        backends_by_name[str(backend.name)] = backend
+        for node in getattr(placement, "assigned_nodes", None) or []:
+            per_node[(str(backend.name), str(node))] = (
+                per_node.get((str(backend.name), str(node)), 0) + 1
+            )
+
+    warned: set[str] = set()
+    for (backend_name, node), count in sorted(per_node.items()):
+        if count < 2 or backend_name in warned:
+            continue
+        backend = backends_by_name[backend_name]
+        channel = getattr(backend, "compute_domain_channel", None)
+        merge = getattr(backend, "merge_colocated_gpu_pods", False)
+        if channel and not merge:
+            warned.add(backend_name)
+            _logger.warning(
+                "Kubernetes backend '%s': a ComputeDomain channel ('%s') is claimed "
+                "by every GPU pod, but merge_colocated_gpu_pods is off and %d GPU "
+                "tasks are placed on node '%s'. The NVIDIA driver publishes ONE IMEX "
+                "channel per node, so all but one channel-claiming pod on that node "
+                "will fail scheduling ('cannot allocate all claims'). Set "
+                "merge_colocated_gpu_pods: auto (recommended) or place one GPU pod "
+                "per node.",
+                backend_name,
+                channel,
+                count,
+                node,
+            )
+
+
+def _warn_interconnect_hints(resource_placements: "Mapping[str, Any]") -> None:
+    """App-agnostic interconnect hints from cross-node GPU placement + scope + IB.
+
+    The interconnect priority is NVLink -> IB/RDMA -> TCP. When a backend's GPU pods
+    land on >=2 distinct nodes (cross-node GPU communication is possible) and the
+    fast tier is not reachable, hint the framework/admin-owned piece sflow does not
+    own (it never pins the transport):
+
+    * a configured IMEX ComputeDomain channel (``compute_domain.channel``)
+      IS the cross-node NVLink/MNNVL fast path, so it suppresses these hints -- and
+      avoids a false "no fast interconnect" warning when the NVLink scope is
+      under-detected as ``node`` (the CRD probe needs cluster RBAC).
+    * node-scoped NVLink + IB down + no channel -> no fast cross-node path; if it is
+      actually an NVL72 rack the scope may be mis-detected (set the channel);
+      otherwise co-locate prefill+decode per node (intra-node NVLink) or enable IB.
+    * rack-scoped NVLink + no IMEX channel -> provide
+      ``compute_domain.channel`` (a name or ``auto``) for MNNVL; otherwise
+      cross-node KV falls back to IB (if up) or slow TCP.
+
+    Duck-typed on the backend (only the k8s backend exposes ``nvlink_domain_scope``
+    / ``rdma_enabled`` / ``compute_domain_channel``); warn-only, once per backend.
+    Scope ``None`` (undetected, e.g. dry-run) or ``off`` -> no hint (stay quiet when
+    unsure). The vLLM knob is named only as an example.
+    """
+    gpu_nodes: dict[str, set[str]] = {}
+    backends_by_name: dict[str, Any] = {}
+    for _name, placement in resource_placements.items():
+        backend = getattr(placement, "backend", None)
+        if backend is None:
+            continue
+        try:
+            gpu_count = int(getattr(placement, "gpu_count", 0) or 0)
+        except (TypeError, ValueError):
+            gpu_count = 0
+        if gpu_count <= 0:
+            continue
+        backends_by_name[str(backend.name)] = backend
+        nodes = gpu_nodes.setdefault(str(backend.name), set())
+        for node in getattr(placement, "assigned_nodes", None) or []:
+            nodes.add(str(node))
+
+    for backend_name, nodes in sorted(gpu_nodes.items()):
+        if len(nodes) < 2:
+            continue  # single-node GPU placement: intra-node NVLink handles it
+        backend = backends_by_name[backend_name]
+        scope = getattr(backend, "nvlink_domain_scope", None)
+        rdma_enabled = bool(getattr(backend, "rdma_enabled", False))
+        channel = getattr(backend, "compute_domain_channel", None)
+        if channel:
+            # A configured IMEX ComputeDomain channel IS the cross-node NVLink
+            # (MNNVL) fast path, so the transport is covered regardless of the
+            # detected scope -- and it suppresses the misleading "no fast
+            # interconnect" hint when scope was under-detected as 'node' (the
+            # ComputeDomain CRD probe needs cluster RBAC and reads 'node' when it
+            # is forbidden).
+            continue
+        # sflow does NOT auto-select/attach a ComputeDomain channel from the
+        # cross-node-GPU signal (unlike RDMA, which it auto-prepares): a cluster may
+        # expose SEVERAL ComputeDomain channels and sflow cannot know which the
+        # workload wants, so it warns and leaves the choice to the user rather than
+        # guessing. `compute_domain.channel: auto` self-selects only when EXACTLY one
+        # ComputeDomain exists; with several, name the channel explicitly.
+        _channel_hint = (
+            "sflow does not auto-pick a channel -- a cluster may expose several "
+            "ComputeDomain channels and sflow cannot know which your workload needs. "
+            "List them with `kubectl get computedomains` and set "
+            "compute_domain.channel to a channel name (or 'auto' if there is exactly "
+            "one), e.g. --kube-compute-domain-channel <name|auto>."
+        )
+        if scope == "node" and not rdma_enabled:
+            _logger.warning(
+                "Kubernetes backend '%s': GPU tasks span %d nodes, sflow detected "
+                "no cross-node NVLink (NVLink-domain scope 'node') and IB/RDMA is "
+                "down -- cross-node transfers would use slow TCP. If this IS a "
+                "GB200/GB300 NVL72 rack, the scope is likely mis-detected (the "
+                "ComputeDomain CRD probe needs cluster RBAC): set "
+                "compute_domain.channel (and nvlink_domain: rack) to ride "
+                "cross-node NVLink/MNNVL. Otherwise co-locate the GPU tasks per node "
+                "(intra-node NVLink) or enable IB/RDMA. %s",
+                backend_name,
+                len(nodes),
+                _channel_hint,
+            )
+        elif scope == "rack":
+            _logger.warning(
+                "Kubernetes backend '%s': GPU tasks span %d nodes on a rack-scoped "
+                "(MNNVL) cluster but no IMEX ComputeDomain channel is configured, so "
+                "cross-node GPU traffic will NOT use the NVLink/NVSwitch (MNNVL) fast "
+                "path -- it falls back to IB (if up) or slow TCP. %s Cross-node MNNVL "
+                "also needs the framework's fabric/VMM KV memory (e.g. vLLM "
+                "--enable-sleep-mode) + UCX_CUDA_IPC_ENABLE_MNNVL=y (recipe-owned).",
+                backend_name,
+                len(nodes),
+                _channel_hint,
+            )
+
+
 def build_task_graph(
     config: SflowConfig, state: SflowState, *, workspace_dir: Any | None = None
 ) -> TaskGraph:
@@ -219,17 +627,20 @@ def build_task_graph(
     Requirements / assumptions:
     - `state.backends` must be populated (via `resolve_backends`).
     - Tasks are launched via Operators (operator-only execution model).
-    - If backends have been allocated (`backend.allocation != None`), allocation info (job_id/nodelist)
-      is injected into `srun` operator configs unless explicitly provided by the user.
+    - Backend/allocation-specific launch context is applied through
+      `Operator.apply_backend_context`.
     """
 
     # Import here to avoid plugin imports in core modules.
     from sflow.core.operator_registry import (
         ensure_builtin_operators_registered,
+        format_invalid_override_error,
         get_operator_class,
         operator_config_type_adapter,
+        split_operator_overrides,
     )
     from sflow.core.probe import ProbeType
+    from sflow.core.probe_transport import ProbeTransport
     from sflow.plugins.probes import (
         HttpGetProbe,
         HttpPostProbe,
@@ -428,6 +839,7 @@ def build_task_graph(
         p_conf: Any,
         p_type: ProbeType,
         default_host: str | None = None,
+        default_transport: ProbeTransport | None = None,
     ):
         """
         Convert a ProbeConfig (from config schema) into a concrete Probe instance.
@@ -498,7 +910,13 @@ def build_task_graph(
                 )
             )
             on_node = getattr(tcp, "on_node", "first")
-            return TcpPortProbe(host=host, port=port, on_node=on_node, **common)
+            return TcpPortProbe(
+                host=host,
+                port=port,
+                on_node=on_node,
+                transport=default_transport,
+                **common,
+            )
 
         if getattr(p_conf, "http_get", None) is not None:
             http = p_conf.http_get
@@ -509,7 +927,10 @@ def build_task_graph(
                 else url_raw
             )
             return HttpGetProbe(
-                url=url, headers=getattr(http, "headers", None), **common
+                url=url,
+                headers=getattr(http, "headers", None),
+                transport=default_transport,
+                **common,
             )
 
         if getattr(p_conf, "http_post", None) is not None:
@@ -530,6 +951,7 @@ def build_task_graph(
                 url=url,
                 headers=getattr(http, "headers", None),
                 body=body,
+                transport=default_transport,
                 **common,
             )
 
@@ -555,14 +977,11 @@ def build_task_graph(
             f"Task '{task_name}' probes.{p_type} has no probe type configured"
         )
 
-    def _job_and_nodelist(backend: Backend) -> tuple[str, list[str]]:
-        if backend.allocation:
-            job_id = str(backend.allocation.allocation_id or "0")
-            nodelist = [n.name for n in backend.allocation.nodes]
-            return job_id, nodelist
-        return "0", []
-
     task_graph = TaskGraph()
+
+    # Track variable names already flagged as overridden by backend runtime env,
+    # so we warn at most once per name across the whole graph build.
+    warned_env_overrides: set[str] = set()
 
     # ---------------------------------------------------------------------
     # Replica planning: expand base tasks into concrete DAG nodes
@@ -657,6 +1076,33 @@ def build_task_graph(
         replica_policy_by_base=replica_policy_by_base,
     )
 
+    # Resolve service ports up front so services_by_node (below) can use them.
+    ports_by_node: dict[str, list[TaskPort]] = {}
+    for node_name, placement in resource_placements.items():
+        resolved_ports: list[TaskPort] = []
+        for p in list(getattr(placement.task_config, "ports", None) or []):
+            port_val = _resolve_int(node_name, field="ports.port", value=p.port)
+            if not (1 <= port_val <= 65535):
+                raise ValueError(
+                    f"Task '{node_name}' ports.port must be in 1..65535, got {port_val}"
+                )
+            resolved_ports.append(TaskPort(port=port_val, name=p.name))
+        ports_by_node[node_name] = resolved_ports
+
+    services_by_node = {
+        node_name: compute_task_service(
+            backend=placement.backend,
+            assigned_nodes=placement.assigned_nodes,
+            ports=ports_by_node.get(node_name, []),
+        )
+        for node_name, placement in resource_placements.items()
+    }
+    # task.<name>.service for probes (additive; _build_probe reads ctx at call time).
+    ctx["task"] = {
+        node_name: {"service": service}
+        for node_name, service in services_by_node.items()
+    }
+
     # First pass: add task nodes in planner order so dry-run and real run share
     # the same resource placement and conflict-checking source of truth.
     for node_name, placement in resource_placements.items():
@@ -689,6 +1135,24 @@ def build_task_graph(
                     f"Task '{t_conf.name}' references unknown operator '{operator_name}'"
                 )
 
+            # Reject task operator override keys that are not fields of the resolved
+            # operator (e.g. an srun `ntasks_per_node` on a k8s operator, or a typo).
+            # Backend-specific operator settings belong on the operator in the backend
+            # fragment (composed per backend via deep-merge), not as a task override --
+            # so an incompatible/misspelled key is a hard error, not a silent drop.
+            operator_overrides, invalid_override_keys = split_operator_overrides(
+                base_op, operator_overrides
+            )
+            if invalid_override_keys:
+                raise ValueError(
+                    format_invalid_override_error(
+                        t_conf.name,
+                        operator_name,
+                        base_op.type,
+                        invalid_override_keys,
+                    )
+                )
+
             merged = base_op.model_dump()
             if "extra_args" in operator_overrides and merged.get("extra_args"):
                 operator_overrides["extra_args"] = list(
@@ -707,47 +1171,19 @@ def build_task_graph(
             )
             op_conf = task_operator.config
 
-        # Inject allocation info into srun operators unless explicitly configured.
-        if getattr(op_conf, "type", None) == "srun":
-            job_id, full_nodelist = _job_and_nodelist(backend)
-            effective_nodelist = assigned_nodes if assigned_nodes else full_nodelist
-            if getattr(op_conf, "job_id", None) in (None, "", "0"):
-                setattr(op_conf, "job_id", job_id)
-            if not getattr(op_conf, "nodelist", None):
-                setattr(op_conf, "nodelist", list(effective_nodelist))
-            if getattr(op_conf, "nodes", None) in (None, 0):
-                setattr(op_conf, "nodes", len(effective_nodelist))
-
-            # Auto-add container mounts for local (fs:// / file://) artifacts when using Pyxis containers.
-            #
-            # Motivation: artifact env vars (e.g. ${MODEL_DIR}) resolve to absolute host paths.
-            # When running inside a container, those host paths must be mounted so the same
-            # path is visible inside the container on compute nodes.
-            container_image = getattr(op_conf, "container_image", None)
-            container_name = getattr(op_conf, "container_name", None)
-            if container_image or container_name:
-                existing_mounts = list(
-                    getattr(op_conf, "container_mounts", None) or []
-                )
-                auto_mounts = local_artifact_mounts(
-                    (state.artifacts or {}).values()
-                )
-                merged_mounts = append_missing_mounts(
-                    existing_mounts,
-                    auto_mounts,
-                )
-                if merged_mounts != existing_mounts:
-                    setattr(
-                        op_conf,
-                        "container_mounts",
-                        merged_mounts,
-                    )
-
         if task_operator is None:
             operator_cls = get_operator_class(op_conf.type)
             task_operator = operator_cls(op_conf)  # type: ignore[arg-type]
 
         cuda_visible = placement.cuda_visible_devices
+
+        task_operator.apply_backend_context(
+            backend=backend,
+            assigned_nodes=assigned_nodes,
+            artifacts=list((state.artifacts or {}).values()),
+            cuda_visible_devices=cuda_visible,
+            gpu_count=placement.gpu_count,
+        )
 
         task_logger = get_logger(f"sflow.task.{node_name}")
         task_logger.propagate = False
@@ -791,24 +1227,42 @@ def build_task_graph(
             script=script,
         )
         task.assigned_nodes = list(assigned_nodes or [])
+        # The planner computes this slice uniformly for every backend; it is only
+        # injected into the execution env via backend.resource_env (skipped for
+        # Kubernetes). Carried on the task so the dry-run allocation map is
+        # consistent across backends.
+        task.cuda_visible_devices = cuda_visible
         task.operator_name = operator_name
+        # Authoritative base->replica link (config task name) for plan-time consumers
+        # (e.g. the monitor planner) so they never re-derive it from the name string.
+        task.base_name = t_conf.name
+        # Per-task fail-fast opt-out (default True); `Task.runnable_script` prepends
+        # `set -e` for shell operators at execution time (script itself is untouched).
+        task.fail_fast = bool(t_conf.fail_fast)
         task.sweep_variables = replica_sweep_vars.get(node_name, [])
 
         # Build SFLOW_TASK_ASSIGNED_NODE_NAMES and SFLOW_TASK_ASSIGNED_NODE_IPS env vars
         # These provide easy access to the task's assigned nodes in scripts
         if assigned_nodes and backend and backend.allocation:
+            has_runtime_node_addresses = getattr(
+                getattr(backend, "capabilities", None),
+                "has_runtime_node_addresses",
+                True,
+            )
             alloc_nodes_by_name = {n.name: n for n in backend.allocation.nodes}
             node_names: list[str] = []
             node_ips: list[str] = []
             for n_name in assigned_nodes:
                 node_names.append(n_name)
-                node_obj = alloc_nodes_by_name.get(n_name)
-                if node_obj:
-                    node_ips.append(node_obj.ip_address)
-                else:
-                    node_ips.append("")  # Fallback if node not found
+                if has_runtime_node_addresses:
+                    node_obj = alloc_nodes_by_name.get(n_name)
+                    if node_obj:
+                        node_ips.append(node_obj.ip_address)
+                    else:
+                        node_ips.append("")  # Fallback if node not found
             task.envs["SFLOW_TASK_ASSIGNED_NODE_NAMES"] = ",".join(node_names)
-            task.envs["SFLOW_TASK_ASSIGNED_NODE_IPS"] = ",".join(node_ips)
+            if has_runtime_node_addresses:
+                task.envs["SFLOW_TASK_ASSIGNED_NODE_IPS"] = ",".join(node_ips)
         # Outputs (MVP): store parse patterns to be evaluated from the task log after completion.
         if getattr(t_conf, "outputs", None):
             for o in list(t_conf.outputs or []):
@@ -819,14 +1273,70 @@ def build_task_graph(
                         source=str(getattr(o, "source", "stdout")),
                     )
                 )
+
+        # Consolidated result parsing (new contract).
+        # See docs/developer/dev-notes/result-parsing.md.
+        if getattr(t_conf, "result", None) is not None:
+            task.result_config = _build_result_config_runtime(t_conf.result)
+
+        # ports resolved up front; attach to the task.
+        task.ports = list(ports_by_node.get(node_name, []))
+
+        # Uploads: attach unresolved expression strings; ExpressionResolver runs
+        # at task-completion time (in core.uploads.run_task_uploads) so that
+        # ${{ task.output_dir }} and other task-scoped refs have values.
+        if getattr(t_conf, "uploads", None):
+            # When a task is replicated, every replica shares the same upload `to:`
+            # and would silently overwrite the others on the storage target. By
+            # default sflow auto-disambiguates by inserting the replica name into
+            # the uploaded filename (e.g. results.csv -> results_<replica>.csv).
+            # Users opt out / control the layout by referencing ${{ task.name }}
+            # in `to:`, in which case we leave the destination untouched.
+            multiple_replicas = len(concrete_nodes) > 1
+            for u in list(t_conf.uploads or []):
+                user_named_replica = resolver.references_attribute(
+                    u.to, "task", "name"
+                )
+                disambiguate = multiple_replicas and not user_named_replica
+                # Warn once per upload spec (on the first replica) that sflow is
+                # auto-renaming to avoid cross-replica overwrites.
+                if disambiguate and idx == 0:
+                    dest = u.to or "<filename>"
+                    _logger.warning(
+                        f"Task '{t_conf.name}' is replicated and upload to "
+                        f"'{dest}' does not reference ${{{{ task.name }}}}; sflow "
+                        f"will auto-rename each replica's upload (inserting "
+                        f"'_<replica>' before the extension, e.g. 'results.csv' -> "
+                        f"'results_{t_conf.name}_0.csv') so replicas don't overwrite "
+                        f"each other. Add ${{{{ task.name }}}} to 'to:' to control "
+                        f"the layout and silence this warning."
+                    )
+                task.uploads.append(
+                    ResolvedUpload(
+                        target=u.target,
+                        from_expr=u.from_,
+                        to_expr=u.to,
+                        on_error=u.on_error,
+                        disambiguate_with=task.name if disambiguate else None,
+                    )
+                )
         # Probes (readiness/failure)
         if t_conf.probes:
             # Default probe host: use the task's assigned node IP (not localhost),
-            # so probes can reach services running on remote nodes (e.g. Slurm).
+            # so probes can reach services running on remote backend nodes.
             default_probe_host: str | None = None
             try:
                 alloc = getattr(backend, "allocation", None)
-                if alloc and getattr(alloc, "nodes", None):
+                has_runtime_node_addresses = getattr(
+                    getattr(backend, "capabilities", None),
+                    "has_runtime_node_addresses",
+                    True,
+                )
+                if (
+                    has_runtime_node_addresses
+                    and alloc
+                    and getattr(alloc, "nodes", None)
+                ):
                     by_name = {n.name: n.ip_address for n in alloc.nodes}
                     if assigned_nodes:
                         default_probe_host = by_name.get(assigned_nodes[0])
@@ -834,6 +1344,18 @@ def build_task_graph(
                         default_probe_host = alloc.nodes[0].ip_address
             except Exception:
                 default_probe_host = None
+
+            # Probe transport: backends whose driver host may not reach the
+            # workload network (e.g. Kubernetes) return an in-network transport
+            # so TCP/HTTP checks run from inside the cluster instead of the
+            # driver host. Non-remote backends return None -> driver-local.
+            probe_transport = None
+            try:
+                get_transport = getattr(backend, "probe_transport", None)
+                if callable(get_transport):
+                    probe_transport = get_transport()
+            except Exception:
+                probe_transport = None
 
             # For parallel replicated tasks, skip HTTP probes on non-first
             # replicas when the probe URL/body don't reference any per-replica
@@ -883,14 +1405,19 @@ def build_task_graph(
                                 p_conf=p_conf,
                                 p_type=ProbeType.READINESS,
                                 default_host=default_probe_host,
+                                default_transport=probe_transport,
                             )
                         )
-            if t_conf.probes.failure is not None:
+            failure_probe_configs = _probe_config_list(t_conf.probes.failure)
+            if failure_probe_configs:
                 skip = (
                     can_share_probe
-                    and _is_http_probe_config(t_conf.probes.failure)
-                    and not _http_probe_references_vars(
-                        t_conf.probes.failure, replica_var_names
+                    and all(
+                        _is_http_probe_config(p_conf)
+                        and not _http_probe_references_vars(
+                            p_conf, replica_var_names
+                        )
+                        for p_conf in failure_probe_configs
                     )
                 )
                 if skip:
@@ -903,14 +1430,16 @@ def build_task_graph(
                     if first_task is not None:
                         first_task.failure_followers.append(node_name)
                 else:
-                    task.probes.append(
-                        _build_probe(
-                            node_name,
-                            p_conf=t_conf.probes.failure,
-                            p_type=ProbeType.FAILURE,
-                            default_host=default_probe_host,
+                    for p_conf in failure_probe_configs:
+                        task.probes.append(
+                            _build_probe(
+                                node_name,
+                                p_conf=p_conf,
+                                p_type=ProbeType.FAILURE,
+                                default_host=default_probe_host,
+                                default_transport=probe_transport,
+                            )
                         )
-                    )
         task.backend_name = backend.name
         task.resource_release_after.update(placement.resource_release_after)
         # Optional retry policy (REQ-3.6).
@@ -954,8 +1483,24 @@ def build_task_graph(
             if apath is not None:
                 task.envs.setdefault(aname, str(apath))
         task.envs.update(replica_envs.get(node_name, {}))
-        if cuda_visible is not None:
-            task.envs["CUDA_VISIBLE_DEVICES"] = cuda_visible
+        backend_env = backend.resource_env(cuda_visible_devices=cuda_visible)
+        # The backend's runtime env wins over same-named workflow variables (it
+        # reflects allocation truth, e.g. SLURM_*). Surface this so a user-declared
+        # variable being shadowed is not silent.
+        user_var_names = set(state.variables or {})
+        for env_key, env_val in backend_env.items():
+            if (
+                env_key in user_var_names
+                and task.envs.get(env_key) not in (None, env_val)
+                and env_key not in warned_env_overrides
+            ):
+                _logger.warning(
+                    f"Backend '{backend.name}' runtime env '{env_key}' overrides "
+                    f"workflow variable of the same name; the backend value is used "
+                    f"for task launch."
+                )
+                warned_env_overrides.add(env_key)
+        task.envs.update(backend_env)
         task_graph.dag.add_node(node_name, task)
 
         # If the task is replicated sequentially, enforce replica order by chaining edges.
@@ -1031,6 +1576,17 @@ def build_task_graph(
                 new_script.append(line)
         task.script = new_script
 
+    # Merge-pod mode (default auto per Kubernetes backend): bundle single-node GPU
+    # tasks the planner co-located on one node into one pod so they share
+    # NVLink/cuda_ipc (and one IMEX channel claim per node).
+    _plan_merge_groups(task_graph, resource_placements)
+    # Guard: a claimed ComputeDomain channel + merge off + >1 GPU pod/node contends
+    # on the node's single IMEX channel -> hard-warn (still attempts).
+    _warn_channel_contention(resource_placements)
+    # App-agnostic interconnect hints (cross-node GPU placement + scope + IB +
+    # channel) for the framework/admin-owned pieces sflow does not own.
+    _warn_interconnect_hints(resource_placements)
+
     return task_graph
 
 
@@ -1041,6 +1597,7 @@ async def build_state(
     workspace_dir: Any | None = None,
     output_dir: Any | None = None,
     source_files: list[Any] | None = None,
+    kubectl_config: Any | None = None,
 ) -> SflowState:
     """
     Build runtime state from configuration (composition root).
@@ -1058,7 +1615,7 @@ async def build_state(
 
     # Resolve global variables and backends.
     state = resolve_global_variables(config, state)
-    state = resolve_backends(config, state)
+    state = resolve_backends(config, state, kubectl_config=kubectl_config)
 
     # Allocate resources (unless dry-run).
     if allocate:
@@ -1088,13 +1645,16 @@ async def build_state(
         )
 
         # Resolve artifacts after allocation so they can reference backend info
-        # (e.g. ${{ backends.slurm_cluster.nodes[0].ip_address }} in artifact URIs/content).
+        # (e.g. ${{ backends.<name>.nodes[0].ip_address }} when runtime addresses exist).
+        # Off-host backends (e.g. Kubernetes) execute remotely, so local fs:// paths
+        # are passed through (not validated/created on the controller).
         state = resolve_artifacts(
             config,
             state,
             workspace_dir=workspace_dir,
             output_dir=output_dir,
             materialize=allocate,
+            remote_filesystem=backends_execute_offhost(state),
         )
 
         # Top-level variables may defer references to backends.* and artifacts.*
@@ -1105,9 +1665,34 @@ async def build_state(
         # so resolve them after allocation (real or placeholder).
         state = resolve_workflow_variables(config, state)
 
+        # Instantiate storage targets (S3, etc.) after variables/artifacts/backends are
+        # known, so target fields like `prefix:` can reference any of them.
+        state = resolve_storage_targets(config, state)
+
+        # Capture workflow-level upload_all spec (resolved when the run finishes,
+        # against `workflow.output_dir` / `workflow.run_id`, so it stays unresolved here).
+        if config.workflow.upload_all is not None:
+            from sflow.core.uploads import ResolvedWorkflowUpload
+
+            ua = config.workflow.upload_all
+            state.workflow_upload = ResolvedWorkflowUpload(
+                target=ua.target,
+                to_expr=ua.to,
+                on_error=ua.on_error,
+            )
+
         # Build the task graph (uses allocation info if present).
         tg = build_task_graph(config, state)
         state.workflow = Workflow(name=config.workflow.name, task_graph=tg)
+
+        # Build the hardware monitor schedule (plan time). Resolves nodes/GPUs,
+        # dedups to per-node collectors, and attaches consumers to state/tasks.
+        # Collector scripts + raw dir are materialized only on real runs.
+        from sflow.app.monitor_planner import build_monitor_registry
+
+        state.monitor_registry = build_monitor_registry(
+            config, state, output_dir=output_dir, materialize=allocate
+        )
         return state
     except BaseException:
         # If we allocated real resources, make sure we release them even if planning fails

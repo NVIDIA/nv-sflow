@@ -68,6 +68,19 @@ class _ControlledReadinessProbe(Probe):
         return self._results.pop(0) if self._results else False
 
 
+class _ControlledFailureProbe(Probe):
+    """Failure probe with deterministic check results for OR-semantics tests."""
+
+    def __init__(self, results: list[bool]):
+        super().__init__(
+            type=ProbeType.FAILURE, failure_threshold=1, interval=0, timeout=10
+        )
+        self._results = list(results)
+
+    async def check(self, task) -> bool:
+        return self._results.pop(0) if self._results else False
+
+
 class _RecordingSummary:
     def __init__(self):
         self.ready: list[str] = []
@@ -129,6 +142,41 @@ def test_multiple_readiness_probes_require_all_to_trigger():
     assert second_probe.status == ProbeStatus.TRIGGERED
     assert server.status == TaskStatus.READY
     assert summary.ready == ["server"]
+
+
+def test_multiple_failure_probes_fail_when_any_triggers():
+    """A task fails as soon as any failure probe triggers."""
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+    first_probe = _ControlledFailureProbe([False])
+    second_probe = _ControlledFailureProbe([True])
+    server = Task(
+        name="server",
+        operator=_FakeOperator(),
+        logger=logging.getLogger("sflow.task.server"),
+        status=TaskStatus.RUNNING,
+        probes=[first_probe, second_probe],
+    )
+    tg.dag.add_node("server", server)
+
+    summary = _RecordingSummary()
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0.01,
+        launcher=_HangingLauncher(),
+        fail_fast=True,
+        execution_summary=summary,
+    )
+
+    asyncio.run(orch._run_probe(first_probe, server))
+    assert first_probe.status == ProbeStatus.INITIATED
+    assert server.status == TaskStatus.RUNNING
+
+    asyncio.run(orch._run_probe(second_probe, server))
+    assert second_probe.status == ProbeStatus.TRIGGERED
+    assert server.status == TaskStatus.FAILED
+    assert server.failed_by_probe is True
+    assert summary.failed == [("server", "failure probe")]
 
 
 def test_failure_probe_sets_failed_by_probe_and_cancels_workflow(tmp_path: Path):

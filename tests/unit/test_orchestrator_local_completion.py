@@ -4,8 +4,9 @@
 import asyncio
 import logging
 
+import sflow.core.orchestrator as orchestrator_mod
 from sflow.core.orchestrator import Orchestrator
-from sflow.core.task import Task, TaskStatus
+from sflow.core.task import ResultConfigRuntime, Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
@@ -113,3 +114,60 @@ def test_orchestrator_marks_task_failed_when_launcher_raises():
         "launcher error: out of pty devices",
     )
     assert summary.events[-1] == ("WORKFLOW_FINISHED", "", None, None, "FAILED")
+
+
+def test_orchestrator_keeps_dependency_blocked_while_collecting_result(monkeypatch):
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+
+    logger = logging.getLogger("sflow.tests.orchestrator.finalizing")
+    logger.handlers = []
+    logger.propagate = False
+
+    op = BashOperator(BashOperatorConfig(name="bash"))
+    up = Task(name="up", logger=logger, operator=op, script=["echo up"])
+    up.result_config = ResultConfigRuntime()
+    down = Task(name="down", logger=logger, operator=op, script=["echo down"])
+    tg.dag.add_node("up", up)
+    tg.dag.add_node("down", down)
+    tg.dag.add_edge("up", "down")
+
+    events: list[tuple[str, object]] = []
+
+    class _RecordingLauncher:
+        async def run_async(
+            self, command, shell: bool = False, output_logger=None, env=None, **kwargs
+        ) -> int:
+            name = kwargs.get("task_name")
+            events.append(("submit", name))
+            await asyncio.sleep(0)
+            return 0
+
+    async def _collect(task: Task) -> dict:
+        events.append(
+            (
+                "collect-start",
+                task.status,
+                down.status,
+                [name for kind, name in events if kind == "submit"],
+            )
+        )
+        await asyncio.sleep(0)
+        events.append(("collect-end", task.name))
+        return {"ok": True}
+
+    monkeypatch.setattr(orchestrator_mod, "collect_task_result", _collect)
+
+    orch = Orchestrator(workflow=wf, poll_interval=0, launcher=_RecordingLauncher())
+
+    asyncio.run(asyncio.wait_for(orch.run(), timeout=1.0))
+
+    assert (
+        "collect-start",
+        TaskStatus.FINALIZING,
+        TaskStatus.INITIATED,
+        ["up"],
+    ) in events
+    assert events.index(("collect-end", "up")) < events.index(("submit", "down"))
+    assert up.status == TaskStatus.COMPLETED
+    assert down.status == TaskStatus.COMPLETED

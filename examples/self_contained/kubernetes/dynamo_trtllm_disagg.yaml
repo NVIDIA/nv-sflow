@@ -1,0 +1,560 @@
+version: "0.1"
+
+# Kubernetes port of examples/slurm/self_contained/dynamo_trtllm_disagg.yaml.
+#
+# Native Kubernetes recipe: a `kubernetes` backend (scheduling: device_plugin)
+# reserves and discovers nodes, then each task runs as its own scheduler-placed
+# pod whose GPUs come from the legacy nvidia.com/gpu device plugin. The prefill +
+# decode GPU servers run on the `k8s_mpi` operator by DEFAULT (each is ONE MPI
+# world, spanning nodes when its TP exceeds GPUS_PER_NODE; the operator injects the
+# SSH/hostfile/sshd glue so each task keeps a plain `mpirun ... dynamo.trtllm`).
+# The CPU infra (nats/etcd/frontend) and the benchmark stay `type: k8s` on node 0.
+#
+# Cluster assumptions: NVIDIA gpu-operator (nvidia.com/gpu device plugin). The
+# backend reserves real nodes with placeholder pods that hold the node GPUs,
+# discovers their node names + InternalIPs, pins each task pod via nodeSelector,
+# and hands the GPUs to the GPU tasks via the create-before-destroy handoff.
+# CPU-only infra (etcd/nats/frontend) overlaps on node 0 without consuming GPUs.
+# Set `scheduling: dra` to use DRA (nvidia-dra-driver-gpu, Kubernetes 1.34+,
+# resource.k8s.io/v1, DeviceClass gpu.nvidia.com) instead of the device plugin.
+
+variables:
+  # --- Kubernetes backend configuration ---
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    # PVCs are namespace-scoped, so this must be the namespace that holds
+    # MODEL_PVC_CLAIM. Override both together per cluster, e.g.:
+    #   -s K8S_NAMESPACE=your-namespace -s MODEL_PVC_CLAIM=shared-storage
+    value: mlperf-sflow
+  MODEL_PVC_CLAIM:
+    description: "Existing PVC that holds the model weights (mounted read-only at /models); override per cluster"
+    value: your-model-pvc
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 8
+  NUM_NODES:
+    description: "Number of nodes"
+    value: 3
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: Qwen3-8B-FP8
+  MODEL_NAME:
+    description: "Model path"
+    value: Qwen/Qwen3-8B-FP8
+
+  # Prefill Server Configuration
+  NUM_CTX_SERVERS:
+    description: "Number of context/prefill servers"
+    value: 4
+  CTX_TP_SIZE:
+    description: "Context tensor parallel size"
+    type: integer
+    value: 2
+  CTX_DP_SIZE:
+    description: "Context data parallel size"
+    type: integer
+    value: 1
+  CTX_EP_SIZE:
+    description: "Context expert parallel size"
+    type: integer
+    value: 1
+  CTX_MOE_TP_SIZE:
+    description: "Context MOE tensor parallel size"
+    type: integer
+    value: 1
+  CTX_PP_SIZE:
+    description: "Context pipeline parallel size"
+    type: integer
+    value: 1
+  CTX_GPUS_PER_WORKER:
+    description: "GPUs per prefill worker"
+    type: integer
+    value: ${{ variables.CTX_TP_SIZE * variables.CTX_DP_SIZE * variables.CTX_PP_SIZE }}
+  CTX_BATCH_SIZE:
+    description: "Context batch size"
+    value: 128
+  CTX_MAX_NUM_TOKENS:
+    description: "Context max number of tokens"
+    value: 8448
+  CTX_MAX_SEQ_LEN:
+    description: "Context max sequence length"
+    value: 10240
+  CTX_FREE_GPU_MEMORY_FRACTION:
+    description: "Context free GPU memory fraction"
+    value: 0.9
+  CTX_ENABLE_ATTENTION_DP:
+    description: "Context enable attention DP"
+    value: false
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+
+  # Decode Server Configuration
+  NUM_GEN_SERVERS:
+    description: "Number of generation/decode servers"
+    value: 4
+  GEN_TP_SIZE:
+    description: "Generation tensor parallel size"
+    type: integer
+    value: 4
+  GEN_DP_SIZE:
+    description: "Generation data parallel size"
+    type: integer
+    value: 1
+  GEN_EP_SIZE:
+    description: "Generation expert parallel size"
+    type: integer
+    value: 1
+  GEN_MOE_TP_SIZE:
+    description: "Generation MOE tensor parallel size"
+    type: integer
+    value: 1
+  GEN_PP_SIZE:
+    description: "Generation pipeline parallel size"
+    type: integer
+    value: 1
+  GEN_GPUS_PER_WORKER:
+    description: "GPUs per decode worker"
+    type: integer
+    value: ${{ variables.GEN_TP_SIZE * variables.GEN_DP_SIZE * variables.GEN_PP_SIZE }}
+  GEN_BATCH_SIZE:
+    description: "Generation batch size"
+    value: 128
+  GEN_MAX_NUM_TOKENS:
+    description: "Generation max number of tokens"
+    value: 8448
+  GEN_MAX_SEQ_LEN:
+    description: "Generation max sequence length"
+    value: 10240
+  GEN_FREE_GPU_MEMORY_FRACTION:
+    description: "Generation free GPU memory fraction"
+    value: 0.9
+  GEN_ENABLE_ATTENTION_DP:
+    description: "Generation enable attention DP"
+    value: false
+
+  # Extra Arguments - You can append any optional arguments to the command
+  DYN_REQUEST_PLANE:
+    description: "Dynamo request plane"
+    value: "nats"
+  EXTRA_FRONTEND_ARGS:
+    description: "Extra frontend arguments"
+    value: ""
+  EXTRA_PREFILL_ARGS:
+    description: "Extra prefill arguments"
+    value: ""
+  EXTRA_DECODE_ARGS:
+    description: "Extra decode arguments"
+    value: ""
+  NET_DEBUG:
+    description: "Log NCCL/UCX transport selection (1=on, 0=off) to verify RDMA vs TCP"
+    value: "1"
+
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 512
+    domain: [512]
+
+  # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+  DYNAMO_IMAGE:
+    description: "Dynamo TRTLLM container image"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+
+
+artifacts:
+  # On Kubernetes, artifacts are injected into the task pods the native way (not via
+  # the controller's filesystem), accessible as `${{ artifacts.NAME.path }}`:
+  #   * file:// + inline `content` -> mounted into the pod from a ConfigMap.
+  #   * fs:// -> made visible inside the pod, two ways:
+  #       1. PVC-backed (recommended for models/large data): declare a PVC under the
+  #          backend's `volumes:` and point the fs:// path at a location under its
+  #          `mount_path` (see the commented `volumes:` on the k8s_cluster backend).
+  #       2. hostPath: if no PVC covers the path, fs:// is hostPath-mounted at the
+  #          same path, so it must be NODE-accessible (e.g. an NFS/shared filesystem
+  #          mounted on every node). A missing node path fails the pod loudly.
+  - name: LOCAL_MODEL_PATH
+    # Lives inside the `model-store` PVC (mounted at /models); see backend volumes.
+    uri: fs:///models/Qwen3-8B-FP8
+  - name: PREFILL_CONFIG
+    uri: file://prefill_config.yaml
+    content: |
+      max_batch_size: ${{ variables.CTX_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.CTX_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.CTX_MAX_SEQ_LEN }}
+      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.CTX_TP_SIZE }}
+      enable_attention_dp: ${{ variables.CTX_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: ${{ variables.CTX_PP_SIZE }}
+      # WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).
+      # allreduce_strategy: NCCL
+      cuda_graph_config: null
+      print_iter_log: true
+      disable_overlap_scheduler: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.CTX_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
+        backend: UCX
+  - name: DECODE_CONFIG
+    uri: file://decode_config.yaml
+    content: |
+      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.GEN_TP_SIZE }}
+      enable_attention_dp: ${{ variables.GEN_ENABLE_ATTENTION_DP }}
+      pipeline_parallel_size: ${{ variables.GEN_PP_SIZE }}
+      # WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).
+      # allreduce_strategy: NCCL
+      max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.GEN_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.GEN_MAX_SEQ_LEN }}
+      cuda_graph_config:
+        enable_padding: true
+        max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
+      print_iter_log: true
+      enable_chunked_prefill: false
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: ${{ variables.GEN_FREE_GPU_MEMORY_FRACTION }}
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+      cache_transceiver_config:
+        max_tokens_in_buffer: ${{ variables.CTX_MAX_NUM_TOKENS }}
+        backend: UCX
+      stream_interval: 20
+
+backends:
+  # A kubernetes backend with device-plugin scheduling. No `image` field --
+  # workload images come from the operators (DYNAMO_IMAGE / AIPERF_IMAGE) below.
+  - name: k8s_cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so peers can be addressed by the node InternalIPs that
+    # reservation returns (etcd/NATS registration mirrors the Slurm path).
+    host_network: true
+    # Share the node IPC namespace + a shared hostPath /dev/shm across task pods so
+    # co-located prefill/decode workers can do cross-pod CUDA IPC -- same-node NIXL/UCX
+    # KV transfer uses NVLink (cuda_ipc) instead of falling back to TCP. Privileged
+    # (a pod can see the node's SysV IPC + shared memory), so opt-in.
+    host_ipc: true
+    # Request GPUs via the legacy nvidia.com/gpu device plugin; use 'dra' for
+    # DRA (nvidia-dra-driver-gpu, DeviceClass gpu.nvidia.com).
+    scheduling: device_plugin
+    # RDMA fast path (default 'auto'): on GKE multi-NIC RDMA nodes, task GPU pods
+    # get scoped RDMA device access -- a per-pod slice of the node's
+    # networking.gke.io.networks/rdma-N NICs (sized to the pod's GPU count) plus
+    # CAP_IPC_LOCK -- and a matching UCX_NET_DEVICES/NCCL_IB_HCA, so the
+    # disaggregated KV transfer (NIXL/UCX) and NCCL run over RoCE instead of TCP.
+    # Use 'disable' to turn RDMA off cleanly; or force a provider with
+    # 'gke' | 'shared_device_plugin' | 'host_device' (default 'auto' detects).
+    rdma: auto
+    # Pre-existing PersistentVolumeClaims to mount into task pods. Use this to make
+    # cluster-resident data (e.g. a model staged on shared storage) available to
+    # pods without a node-local hostPath. The PVC + its data must already exist in
+    # the namespace; sflow only references it. A PVC is mounted into a task's pod(s)
+    # only when the task references a path under its mount_path (so e.g. the model
+    # is not mounted into the etcd/nats pods). Use read_only + an ROX/RWX PVC to
+    # share one model across prefill/decode pods on multiple nodes.
+    #
+    # `your-model-pvc` is a dedicated RWX Lustre PVC (in the mlperf-sflow
+    # namespace); the Qwen model is staged at its root, so LOCAL_MODEL_PATH points
+    # at /models/Qwen3-8B-FP8.
+    volumes:
+      - name: model-store
+        claim: ${{ variables.MODEL_PVC_CLAIM }}
+        mount_path: /models
+        read_only: true
+    reservation:
+      timeout: 1200
+
+operators:
+  # Multi-node MPI worker for the GPU servers (prefill/decode): one operator, two
+  # routes (auto-detected). All SSH/MPI glue is injected by sflow -- each server
+  # task carries only its `mpirun` line, and each replica runs a single cross-node
+  # MPI world when its TP/EP spans nodes.
+  - name: dynamo
+    type: k8s_mpi
+    image: ${{ variables.DYNAMO_IMAGE }}
+    shm_size: 64Gi
+    run_as_root: true
+    mpi:
+      route: auto                                       # auto | operator | pods
+      slots_per_worker: ${{ variables.GPUS_PER_NODE }}  # ranks per node in the hostfile
+      run_launcher_as_worker: true                      # launcher node also runs ranks (rank 0 serves)
+      launcher_creation_policy: WaitForWorkersReady
+      ssh_port: 2222
+      ensure_sshd: true                                 # tensorrtllm-runtime lacks sshd; install it
+  # Plain container operators for CPU-only infra + the benchmark client.
+  - name: k8s
+    type: k8s
+    image: ${{ variables.DYNAMO_IMAGE }}
+  - name: aiperf
+    type: k8s
+    image: ${{ variables.AIPERF_IMAGE }}
+
+workflow:
+  name: dynamo_trtllm_disagg
+  timeout: 115m
+
+  variables:
+    # Workflow level variables will overwrite the variables defined in global variables section if using same name
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.k8s_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: nats_server
+      operator: k8s
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          interval: 2
+
+    - name: etcd_server
+      operator: k8s
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          interval: 2
+
+    - name: frontend_server
+      operator: k8s
+      script:
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 300
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: prefill_server
+      operator: dynamo
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        # - export UCX_RNDV_SCHEME=put_zcopy                 # GB200/GB300: zero-copy rendezvous over NVLink
+        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        # WIP_WAR (cross-node TP): the all-reduce autotuner probes NCCL_SYMMETRIC, whose
+        # symmetric-memory window buffers need NVLink P2P and crash across nodes
+        # ("NCCL invalid usage"); disable it. See TRT-LLM #12715 / PR #12709.
+        # - export NCCL_SYMMETRIC_ENABLE=0
+        # - export NCCL_GIN_ENABLE=0
+        # - export NCCL_IB_MERGE_NICS=0
+        # - export LD_LIBRARY_PATH=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
+        
+        - >
+          if [ "${NET_DEBUG}" == "1" ]; then
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=GRAPH,NET
+            export UCX_LOG_LEVEL=info
+          fi
+        # ONE MPI world for this prefill worker (TP spans nodes when
+        # CTX_GPUS_PER_WORKER > GPUS_PER_NODE); trtllm-llmapi-launch bootstraps the
+        # TRT-LLM LLM-API session and runs dynamo.trtllm on rank 0.
+        - >
+          mpirun -np ${{ variables.CTX_GPUS_PER_WORKER }} --allow-run-as-root
+          trtllm-llmapi-launch
+          python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode prefill
+          --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          each_check_timeout: 20
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: decode_server
+      operator: dynamo
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        # - export UCX_RNDV_SCHEME=put_zcopy                 # GB200/GB300: zero-copy rendezvous over NVLink
+        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        # WIP_WAR (cross-node TP): the all-reduce autotuner probes NCCL_SYMMETRIC, whose
+        # symmetric-memory window buffers need NVLink P2P and crash across nodes
+        # ("NCCL invalid usage"); disable it. See TRT-LLM #12715 / PR #12709.
+        # - export NCCL_SYMMETRIC_ENABLE=0
+        # - export NCCL_GIN_ENABLE=0
+        # - export NCCL_IB_MERGE_NICS=0
+        # - export LD_LIBRARY_PATH=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
+
+        - >
+          if [ "${NET_DEBUG}" == "1" ]; then
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=GRAPH,NET
+            export UCX_LOG_LEVEL=info
+          fi
+        # ONE MPI world for this decode worker (TP spans nodes when
+        # GEN_GPUS_PER_WORKER > GPUS_PER_NODE); trtllm-llmapi-launch bootstraps the
+        # TRT-LLM LLM-API session and runs dynamo.trtllm on rank 0.
+        - >
+          mpirun -np ${{ variables.GEN_GPUS_PER_WORKER }} --allow-run-as-root
+          trtllm-llmapi-launch
+          python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode decode
+          --extra-engine-args ${{ artifacts.DECODE_CONFIG.path }} ${EXTRA_DECODE_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.GEN_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          each_check_timeout: 20
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: benchmark
+      operator: aiperf
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # prefill/decode SERVERS' resources (used_by_tasks), not the benchmark
+      # client's own node -- so the report captures the servers' GPU/CPU usage
+      # over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
+      depends_on:
+        - prefill_server
+        - decode_server
+        - frontend_server

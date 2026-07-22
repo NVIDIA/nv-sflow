@@ -13,6 +13,11 @@ _REGISTRY_IMAGE_RE = re.compile(
     r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*(@[a-zA-Z][a-zA-Z0-9]*:[a-fA-F0-9]+)?$"
 )
 
+CONTAINER_IMAGE_INVALID_HINT = (
+    "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag') "
+    "or a local .sqsh file path (e.g. '/path/to/image.sqsh')"
+)
+
 
 def is_valid_container_image(image: str) -> bool:
     """Return True if *image* looks like a registry reference or local .sqsh file."""
@@ -24,6 +29,26 @@ def is_valid_container_image(image: str) -> bool:
     if image.endswith(".sqsh"):
         return True
     return bool(_REGISTRY_IMAGE_RE.match(image))
+
+
+def validate_container_image_reference(
+    image: str | None,
+    *,
+    source: str,
+    error_prefix: str | None = None,
+) -> None:
+    """Raise a standard error if *image* is a concrete invalid image reference."""
+    if image is None:
+        return
+    image_str = str(image)
+    if not image_str:
+        return
+    if not is_valid_container_image(image_str):
+        prefix = f"{error_prefix}: " if error_prefix else ""
+        raise ValueError(
+            f"{prefix}{source} does not look like a valid container image. "
+            f"{CONTAINER_IMAGE_INVALID_HINT}, got: '{image_str}'"
+        )
 
 
 def mount_key(mount: str) -> tuple[str, str] | None:
@@ -53,6 +78,35 @@ def append_missing_mounts(
     return merged
 
 
+def append_runtime_mounts(
+    existing_mounts: Iterable[str],
+    candidate_mounts: Iterable[str],
+) -> list[str]:
+    """Append runtime mounts using the shared source/destination dedupe rule."""
+    return append_missing_mounts(existing_mounts, candidate_mounts)
+
+
+def extract_container_images_from_extra_args(extra_args: list[str]) -> list[str]:
+    """
+    Extract --container-image values from extra_args.
+
+    Supports both ``--container-image VALUE`` and ``--container-image=VALUE``.
+    """
+    images: list[str] = []
+    i = 0
+    while i < len(extra_args):
+        arg = str(extra_args[i])
+        if arg == "--container-image" and i + 1 < len(extra_args):
+            images.append(str(extra_args[i + 1]))
+            i += 2
+        elif arg.startswith("--container-image="):
+            images.append(arg.split("=", 1)[1])
+            i += 1
+        else:
+            i += 1
+    return images
+
+
 def extract_container_mounts_from_extra_args(extra_args: list[str]) -> list[str]:
     """
     Extract --container-mounts values from extra_args.
@@ -73,6 +127,23 @@ def extract_container_mounts_from_extra_args(extra_args: list[str]) -> list[str]
         else:
             i += 1
     return mounts
+
+
+def collect_container_mounts(op_conf: Any) -> list[str]:
+    """Return mounts exposed by an operator config or lightweight config object."""
+    mount_specs = getattr(op_conf, "mount_specs", None)
+    if callable(mount_specs):
+        return list(mount_specs())
+
+    mounts: list[str] = []
+    for field_name in ("container_mounts", "mounts"):
+        field_mounts = list(getattr(op_conf, field_name, None) or [])
+        mounts = append_runtime_mounts(mounts, field_mounts)
+
+    extra_mounts = extract_container_mounts_from_extra_args(
+        list(getattr(op_conf, "extra_args", None) or [])
+    )
+    return append_runtime_mounts(mounts, extra_mounts)
 
 
 def merge_container_mounts_from_extra_args(

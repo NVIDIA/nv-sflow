@@ -37,6 +37,71 @@ def test_resolve_artifacts_file_scheme_resolves_relative_path_against_workspace(
     assert a.path == tmp_path / "data.txt"
 
 
+def test_resolve_artifacts_fs_remote_filesystem_passes_through_missing_path(
+    tmp_path: Path,
+):
+    # Off-host backends (e.g. Kubernetes): a missing fs:// path is a remote path and
+    # must NOT be created/validated on the controller, even when materializing.
+    missing = tmp_path / "remote" / "model"
+    cfg = SflowConfig(
+        version="0.1",
+        artifacts=[{"name": "MODEL", "uri": f"fs://{missing}"}],
+        workflow=WorkflowConfig(
+            name="wf", tasks=[TaskConfig(name="t1", script=["echo hi"])]
+        ),
+    )
+    state = resolve_artifacts(
+        cfg,
+        _empty_state(),
+        workspace_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        materialize=True,
+        remote_filesystem=True,
+    )
+    assert state.artifacts["MODEL"].path == missing
+    assert not missing.exists()
+
+
+def test_resolve_artifacts_fs_local_creates_missing_path(tmp_path: Path):
+    # Host-FS backends keep the convenience of creating a missing fs:// output dir.
+    missing = tmp_path / "local" / "out"
+    cfg = SflowConfig(
+        version="0.1",
+        artifacts=[{"name": "OUT", "uri": f"fs://{missing}"}],
+        workflow=WorkflowConfig(
+            name="wf", tasks=[TaskConfig(name="t1", script=["echo hi"])]
+        ),
+    )
+    resolve_artifacts(
+        cfg,
+        _empty_state(),
+        workspace_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        materialize=True,
+        remote_filesystem=False,
+    )
+    assert missing.exists()
+
+
+def test_backends_execute_offhost_detects_offhost_backends():
+    from types import SimpleNamespace
+
+    from sflow.app.run_support import backends_execute_offhost
+
+    def _be(supports_host_path_mounts: bool):
+        return SimpleNamespace(
+            capabilities=SimpleNamespace(
+                supports_host_path_mounts=supports_host_path_mounts
+            )
+        )
+
+    state = _empty_state()
+    state.backends = {"local": _be(True)}
+    assert backends_execute_offhost(state) is False
+    state.backends = {"local": _be(True), "k8s": _be(False)}
+    assert backends_execute_offhost(state) is True
+
+
 def test_resolve_artifacts_inline_file_content_materializes_only_when_enabled(
     tmp_path: Path,
 ):
@@ -76,6 +141,72 @@ def test_resolve_artifacts_inline_file_content_materializes_only_when_enabled(
     assert p2 is not None
     assert p2 == out_dir2 / "inline.txt"
     assert p2.read_text() == "different"
+
+
+def test_resolve_artifacts_inline_file_content_remote_filesystem_writes_controller_copy(
+    tmp_path: Path,
+):
+    # Off-host backends (e.g. Kubernetes) inject the content natively into the pod
+    # (ConfigMap), but a RELATIVE file:// copy is STILL written to the workflow output
+    # folder on the controller -- parity with the slurm/local backends -- so the
+    # generated file is inspectable on the host.
+    state = _empty_state()
+    cfg = SflowConfig(
+        version="0.1",
+        artifacts=[{"name": "INLINE", "uri": "file://inline.txt", "content": "hello"}],
+        workflow=WorkflowConfig(
+            name="wf", tasks=[TaskConfig(name="t1", script=["echo hi"])]
+        ),
+    )
+
+    out_dir = tmp_path / "output"
+    state = resolve_artifacts(
+        cfg,
+        state,
+        workspace_dir=tmp_path,
+        output_dir=out_dir,
+        materialize=True,
+        remote_filesystem=True,
+    )
+    art = state.artifacts["INLINE"]
+    # Path is resolved under the output dir (scripts reference it; the pod mounts the
+    # file there) AND a controller-side copy is written with the same content.
+    assert art.path == out_dir / "inline.txt"
+    assert (out_dir / "inline.txt").read_text() == "hello"
+    # Inline content is still carried for K8s-native (ConfigMap) injection.
+    assert art.content == "hello"
+
+
+def test_resolve_artifacts_inline_file_content_remote_filesystem_absolute_not_written(
+    tmp_path: Path,
+):
+    # An ABSOLUTE file:// on an off-host backend is an in-pod path -- it must NOT be
+    # created on the controller; only native injection carries the content.
+    state = _empty_state()
+    abs_path = tmp_path / "pod_only" / "inline.txt"
+    cfg = SflowConfig(
+        version="0.1",
+        artifacts=[
+            {"name": "INLINE", "uri": f"file://{abs_path}", "content": "hello"}
+        ],
+        workflow=WorkflowConfig(
+            name="wf", tasks=[TaskConfig(name="t1", script=["echo hi"])]
+        ),
+    )
+
+    out_dir = tmp_path / "output"
+    state = resolve_artifacts(
+        cfg,
+        state,
+        workspace_dir=tmp_path,
+        output_dir=out_dir,
+        materialize=True,
+        remote_filesystem=True,
+    )
+    art = state.artifacts["INLINE"]
+    assert art.path == abs_path
+    assert not abs_path.exists()  # absolute in-pod path not created on the controller
+    assert art.content == "hello"
 
 
 def test_resolve_artifacts_http_downloads_into_workspace_cache(

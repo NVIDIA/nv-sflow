@@ -1,0 +1,66 @@
+# Raw `trtllm-serve` OpenAI server (backend-agnostic, no Dynamo infra).
+#
+# Unlike the Dynamo workloads, this serves the OpenAI API directly from the
+# server on port 8000, so it needs NO nats/etcd/frontend (do NOT compose
+# dynamo_common.yaml). The server is the DAG root and declares
+# `required_by: [benchmark]`.
+#
+# Launches via `mpirun ... trtllm-llmapi-launch trtllm-serve` so ONE MPI world spans
+# SERVER_GPUS ranks: a local mpirun on a single k8s pod (backends/k8s.yaml), or cross-node
+# over the injected hostfile on backends/k8s_mpi.yaml (type: k8s_mpi server) / backends/
+# slurm.yaml. On Kubernetes prefer backends/k8s_mpi.yaml for parity with the self-contained
+# trtllm recipes (MPI glue + the operator's OMP_NUM_THREADS default).
+
+version: "0.1"
+
+variables:
+  SERVED_MODEL_NAME:
+    description: "Served model name (advertised by the OpenAI API)"
+    value: Qwen3-0.6B
+  SERVER_IMAGE:
+    description: "TensorRT-LLM container image"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-deepseek-v4-dev.1
+  MODEL_PATH:
+    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
+    value: /models/Qwen3-0.6B
+  SERVER_GPUS:
+    description: "GPUs per server (tensor-parallel size; may span nodes on k8s_mpi/slurm)"
+    type: integer
+    value: 4
+
+workflow:
+  name: modular_inference
+  timeout: 115m
+  tasks:
+    - name: server
+      operator: server
+      script:
+        - set -x
+        - export TLLM_LOG_LEVEL=INFO
+        # k8s_mpi cross-node UCX: bind to the primary interface, let UCX auto-pick transports.
+        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
+        - unset UCX_TLS
+        # ONE MPI world across SERVER_GPUS ranks -- a local mpirun on a single k8s pod, or
+        # cross-node over the injected hostfile on k8s_mpi/slurm. rank 0 serves the OpenAI API.
+        - >
+          mpirun -np ${{ variables.SERVER_GPUS }} --allow-run-as-root
+          trtllm-llmapi-launch
+          trtllm-serve ${{ variables.MODEL_PATH }}
+          --host 0.0.0.0 --port 8000
+          --tp_size ${{ variables.SERVER_GPUS }}
+      resources:
+        gpus:
+          count: ${{ variables.SERVER_GPUS }}
+      required_by:
+        - benchmark
+      probes:
+        readiness:
+          http_get:
+            url: "http://${{ backends.cluster.nodes[0].ip_address }}:8000/health"
+          timeout: 1200
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30

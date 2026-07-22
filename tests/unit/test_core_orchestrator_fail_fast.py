@@ -4,11 +4,12 @@
 import asyncio
 import logging
 
+import sflow.core.orchestrator as orchestrator_mod
 from sflow.core.command import Command
 from sflow.core.orchestrator import Orchestrator
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.probe import Probe, ProbeType
-from sflow.core.task import Task, TaskStatus
+from sflow.core.task import ResultConfigRuntime, Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
 from sflow.core.workflow import Workflow
 
@@ -255,6 +256,128 @@ def test_orchestrator_launcher_exception_preserves_completed_siblings():
     assert summary.cancelled == [
         ("peer", "cancelled after task 'boom' failed: launcher error: launcher exploded")
     ]
+
+
+def test_orchestrator_launcher_exception_collects_done_sibling_result(monkeypatch):
+    class _ExplodingAfterPeerCompletes:
+        async def run_async(self, command, output_logger=None, env=None, **kwargs):
+            name = kwargs.get("task_name") or output_logger.name.split(".")[-1]
+            if name == "boom":
+                await asyncio.sleep(0)
+                raise RuntimeError("launcher exploded")
+            await asyncio.sleep(0)
+            return 0
+
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+    boom = Task(
+        name="boom",
+        operator=_OperatorExitCode(0),
+        logger=logging.getLogger("sflow.task.boom"),
+    )
+    done = Task(
+        name="done",
+        operator=_OperatorExitCode(0),
+        logger=logging.getLogger("sflow.task.done"),
+    )
+    done.result_config = ResultConfigRuntime()
+    tg.dag.add_node("boom", boom)
+    tg.dag.add_node("done", done)
+
+    collected: list[str] = []
+
+    async def _collect(task: Task) -> dict:
+        collected.append(task.name)
+        return {"ok": True}
+
+    monkeypatch.setattr(orchestrator_mod, "collect_task_result", _collect)
+
+    summary = _RecordingSummary()
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0,
+        launcher=_ExplodingAfterPeerCompletes(),
+        execution_summary=summary,
+    )
+
+    try:
+        asyncio.run(asyncio.wait_for(orch.run(), timeout=1))
+        raise AssertionError("expected launcher exception")
+    except RuntimeError as exc:
+        assert "launcher exploded" in str(exc)
+
+    assert done.status == TaskStatus.COMPLETED
+    assert collected == ["done"]
+    assert summary.completed == ["done"]
+
+
+def test_orchestrator_cancels_running_siblings_before_slow_done_finalization(monkeypatch):
+    class _ExplodingAfterPeerCompletes:
+        def __init__(self):
+            self.cancelled: list[str] = []
+
+        async def run_async(self, command, output_logger=None, env=None, **kwargs):
+            name = kwargs.get("task_name") or output_logger.name.split(".")[-1]
+            if name == "boom":
+                await asyncio.sleep(0)
+                raise RuntimeError("launcher exploded")
+            if name == "done":
+                await asyncio.sleep(0)
+                return 0
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.cancelled.append(name)
+                raise
+
+    tg = TaskGraph()
+    wf = Workflow(name="wf", task_graph=tg)
+    boom = Task(
+        name="boom",
+        operator=_OperatorExitCode(0),
+        logger=logging.getLogger("sflow.task.boom"),
+    )
+    done = Task(
+        name="done",
+        operator=_OperatorExitCode(0),
+        logger=logging.getLogger("sflow.task.done"),
+    )
+    done.result_config = ResultConfigRuntime()
+    peer = Task(
+        name="peer",
+        operator=_OperatorExitCode(0),
+        logger=logging.getLogger("sflow.task.peer"),
+    )
+    tg.dag.add_node("boom", boom)
+    tg.dag.add_node("done", done)
+    tg.dag.add_node("peer", peer)
+
+    launcher = _ExplodingAfterPeerCompletes()
+    events: list[tuple[str, list[str]]] = []
+
+    async def _collect(task: Task) -> dict:
+        events.append(("collect-start", list(launcher.cancelled)))
+        await asyncio.sleep(0)
+        return {"ok": True}
+
+    monkeypatch.setattr(orchestrator_mod, "collect_task_result", _collect)
+
+    orch = Orchestrator(
+        workflow=wf,
+        poll_interval=0,
+        launcher=launcher,
+        execution_summary=_RecordingSummary(),
+    )
+
+    try:
+        asyncio.run(asyncio.wait_for(orch.run(), timeout=1))
+        raise AssertionError("expected launcher exception")
+    except RuntimeError as exc:
+        assert "launcher exploded" in str(exc)
+
+    assert ("collect-start", ["peer"]) in events
+    assert peer.status == TaskStatus.CANCELLED
+    assert done.status == TaskStatus.COMPLETED
 
 
 def test_orchestrator_probe_exception_cancels_running_siblings():

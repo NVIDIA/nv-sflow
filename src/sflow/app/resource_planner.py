@@ -12,6 +12,9 @@ from sflow.core.backend import Backend
 from sflow.core.compute_node import ComputeNode
 from sflow.core.dag import DAG
 from sflow.core.state import SflowState
+from sflow.logging import get_logger
+
+_logger = get_logger(__name__)
 
 
 GpuReservation = tuple[int, int, str, str]
@@ -30,6 +33,7 @@ class ResourcePlacement:
     cuda_visible_devices: str | None
     resource_release_after: dict[str, str]
     nodes_inferred_from_gpus: bool = False
+    gpu_count: int | None = None
 
 
 class ReservationPolicyPlanner:
@@ -472,6 +476,30 @@ class ResourcePlacementPlanner:
             replica_policy = self.replica_policy_by_base.get(base_task_name, "parallel")
             backend = self._resolve_backend(t_conf)
 
+            # GPUs cannot be handed off while a task is still running on backends
+            # that hard-enforce one pod per physical device (Kubernetes DRA /
+            # device-plugin). Coerce GPU release_after=task_ready -> task_completion
+            # there so the planner only reuses a GPU after the owner finishes --
+            # surfacing oversubscription at plan time instead of a runtime hang.
+            supports_gpu_sharing = getattr(
+                getattr(backend, "capabilities", None), "supports_gpu_sharing", True
+            )
+            if (
+                not supports_gpu_sharing
+                and self.gpu_planner.gpu_release_after.get(concrete_node_name)
+                == "task_ready"
+            ):
+                self.gpu_planner.gpu_release_after[concrete_node_name] = (
+                    "task_completion"
+                )
+                _logger.warning(
+                    "Task '%s': GPU resources.gpus.release_after=task_ready is not "
+                    "supported on backend '%s' (GPUs cannot be shared while a task "
+                    "runs under DRA/device-plugin); treating it as task_completion.",
+                    concrete_node_name,
+                    backend.name,
+                )
+
             resources = t_conf.resources
             nodes_resource_conf = resources.nodes if resources and resources.nodes else None
             gpus_resource_conf = resources.gpus if resources and resources.gpus else None
@@ -501,6 +529,19 @@ class ResourcePlacementPlanner:
                 gpus_count_raw=getattr(gpus_resource_conf, "count", None),
             )
 
+            # Resolve the requested GPU count once for the placement.
+            gpu_count: int | None = None
+            if gpus_resource_conf is not None:
+                gpu_count = self._resolve_int(
+                    concrete_node_name,
+                    field="resources.gpus.count",
+                    value=gpus_resource_conf.count,
+                )
+                if gpu_count <= 0:
+                    raise ValueError(
+                        f"Task '{concrete_node_name}' resources.gpus.count must be > 0, got {gpu_count}"
+                    )
+
             release_after: dict[str, str] = {}
             has_readiness = self.gpu_planner.has_readiness.get(concrete_node_name, False)
             if nodes_resource_conf is not None and "release_after" in getattr(
@@ -511,9 +552,14 @@ class ResourcePlacementPlanner:
                     has_readiness=has_readiness,
                 )
             if gpus_resource_conf is not None:
-                release_after["gpus"] = self.gpu_planner.effective_release_after(
-                    gpus_resource_conf,
-                    has_readiness=has_readiness,
+                # Use the stored policy (already coerced above for non-sharing
+                # backends) so the report matches what the planner enforced.
+                release_after["gpus"] = self.gpu_planner.gpu_release_after.get(
+                    concrete_node_name,
+                    self.gpu_planner.effective_release_after(
+                        gpus_resource_conf,
+                        has_readiness=has_readiness,
+                    ),
                 )
 
             placements[concrete_node_name] = ResourcePlacement(
@@ -525,6 +571,7 @@ class ResourcePlacementPlanner:
                 cuda_visible_devices=cuda_visible,
                 resource_release_after=release_after,
                 nodes_inferred_from_gpus=nodes_inferred_from_gpus,
+                gpu_count=gpu_count,
             )
         return placements
 
@@ -682,6 +729,45 @@ class ResourcePlacementPlanner:
         nodes_exclude_raw: Any | None,
         gpus_count_raw: Any | None,
     ) -> tuple[list[str], bool]:
+        capabilities = getattr(runtime_backend, "capabilities", None)
+        if capabilities is not None and not getattr(
+            capabilities, "supports_node_placement", True
+        ):
+            # Non-placement backends (e.g. kubernetes) can't target specific
+            # machines, but a count-only request just *sizes* the job (e.g. the
+            # number of LWS pods), which is fine. Picking specific nodes
+            # (indices/exclude) is still rejected.
+            if nodes_indices_raw is not None or nodes_exclude_raw is not None:
+                raise ValueError(
+                    f"Backend '{runtime_backend.name}' does not support explicit node "
+                    "placement (resources.nodes.indices / resources.nodes.exclude); "
+                    "use resources.nodes.count to size the job."
+                )
+            if nodes_count_raw is None:
+                return [], False
+            count = self._resolve_int(
+                task_name, field="resources.nodes.count", value=nodes_count_raw
+            )
+            if count <= 0:
+                raise ValueError(
+                    f"Task '{task_name}' resources.nodes.count must be > 0, got {count}"
+                )
+            # Surface that many node names (so the count reaches the operator and
+            # routing/sizing work) without reserving real nodes; reuse allocation
+            # names when present, otherwise synthesize stable placeholders.
+            alloc_nodes = (
+                list(runtime_backend.allocation.nodes)
+                if runtime_backend.allocation is not None
+                else []
+            )
+            names = [
+                alloc_nodes[i].name
+                if i < len(alloc_nodes)
+                else f"{runtime_backend.name}-node{i}"
+                for i in range(count)
+            ]
+            return names, False
+
         if runtime_backend.allocation is None:
             return [], False
 
@@ -962,6 +1048,13 @@ class ResourcePlacementPlanner:
     ) -> str | None:
         if gpus_count_raw is None:
             return None
+        # Even when a backend will NOT inject CUDA_VISIBLE_DEVICES (supports_gpu_env
+        # is False, e.g. Kubernetes, where the cluster/DRA assigns the physical
+        # devices), the planner must still reserve GPU intervals here so multi-task
+        # / multi-replica node packing and oversubscription checks are correct
+        # (otherwise every GPU task packs onto the first node). The returned slice
+        # is only turned into an env var downstream via Backend.resource_env(),
+        # which returns {} for supports_gpu_env=False.
         count = self._resolve_int(
             task_name,
             field="resources.gpus.count",

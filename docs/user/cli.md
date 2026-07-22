@@ -12,7 +12,7 @@ sidebar_position: 11
 - `sflow sample` – List and copy sample workflows
 - `sflow skill` – Copy bundled AI-agent skills for writing and debugging sflow YAML
 
-> Note: `--resume` / `--task` are currently marked as not implemented in code and will error immediately.
+> Note: `--resume` / `--task` are currently marked as not implemented in code and will error immediately. (`--skip-dependencies` is a companion flag to `--task`, so it is inert until `--task` lands.)
 
 Global option:
 
@@ -32,14 +32,46 @@ Common options:
 - `--set, -s KEY=VALUE`: override variables (repeatable); variable must already exist in `variables`
 - `--artifact, -a NAME=URI`: override artifacts (repeatable); artifact must already exist in `artifacts`
 - `--missable-tasks, -M <pattern>`: task names or glob patterns (e.g. `prefill_*`) that may be absent when composing multiple files. Missing missable tasks are removed from `depends_on` and probes with a warning. Only valid with multiple input files. Repeatable.
-- `--extra-args, -e <arg>`: extra args passed to the Slurm backend; values are merged with backend config `extra_args` and deduplicated
+- `--extra-args, -e <arg>`: generic, backend-agnostic extra args. They are forwarded to whichever backend the recipe uses — merged into each **Slurm** backend's `salloc`, each **docker** backend's `docker run`, and every **kubectl** call's global flags. Deduplicated by option (CLI wins over the recipe; a more specific `--extra-salloc-args` / `--extra-docker-args` / `--extra-kubectl-args` wins over `--extra-args` on a conflicting option). Repeatable
+- `--extra-salloc-args <arg>`: like `--extra-args` but **Slurm only** — merged into each Slurm backend's `salloc` (e.g. `--gpus-per-node=4`). In a multi-backend recipe it applies to every Slurm backend's `salloc`
+- `--extra-docker-args <arg>`: like `--extra-args` but **docker only** — merged into each docker backend's `docker run` (e.g. `--shm-size=16g`)
+- `--include-nodes <names>` / `--exclude-nodes <names>`: restrict every backend to (or away from) named nodes. Accepts comma-separated (`a,b`), a quoted whitespace list (`"a b"`), and/or repeated flags; unioned into each backend's `include_nodes` / `exclude_nodes`
 - `--bulk-input, -b <csv>`: resolve workflow files and overrides from one CSV row
 - `--row <selector>`: required with `--bulk-input`; `sflow run` accepts exactly one row selector
 - `--workspace-dir <dir>`: workspace root directory (default: current directory)
 - `--output-dir <dir>`: output root directory (default: `<workspace-dir>/sflow_output`)
+- `--kubeconfig <path>`: kubeconfig file for kubernetes backends (also exported as `KUBECONFIG`; default: `$KUBECONFIG` or `~/.kube/config`)
+- `--kube-context <name>`: kubeconfig context for kubernetes backends (default: current-context)
+- `--kube-namespace <name>`: override the namespace for all kubernetes backends
+- `--kube-node-selector <k=v>`: node-selector label(s) merged into every kubernetes backend's nodeSelector; comma-separated and/or repeatable
+- `--kube-compute-domain-channel <name|auto|disable>`: override `compute_domain.channel` for all kubernetes backends (tune Multi-Node NVLink / IMEX per run without editing the recipe; legacy `off` still accepted)
+- `--kube-compute-domain-create / --no-kube-compute-domain-create`: override `compute_domain.create`; when on (and no channel is joined), sflow stands up its own ComputeDomain CR named after the run and injects the channel into every GPU pod
+- `--kube-skip-pvc`: skip all PVC-backed volume mounts (a backend `volumes:` entry with a `claim`) in every kubernetes backend for this run, keeping `empty_dir` volumes. Debug aid for clusters that lack the recipe's PVCs — pods schedule without editing the recipe volume-by-volume. The PVC data (e.g. a model cache) is **not** mounted, so workloads that need it will fail; use for quick scheduling/plumbing checks
+- `--extra-kubectl-args <flag>`: extra global kubectl flag applied to every kubectl call (e.g. `--extra-kubectl-args=--insecure-skip-tls-verify`); repeatable
+- `--enable-workflow-monitor`: enable a default workflow-level hardware monitor (GPU/CPU utilization) for the run without editing the recipe
+- `--enable-task-monitor <names>`: enable a default hardware monitor bound to the named task(s); accepts a comma- or space-separated list and is repeatable (e.g. `--enable-task-monitor prefill_server,decode_server`)
+- `--offload-task-logs` / `--no-offload-task-logs`: force per-task log offload on or off, overriding each backend's `offload_task_logs`. On by default for local/docker/slurm when non-interactive (auto-falls back to streaming on a TTY/`--tui`); no effect on `k8s` (always offloads its pod log to file) or `ssh`/`python` (always stream through the driver). Use `--no-offload-task-logs` to force live streaming through the driver
 - `--tui-refresh <fps>`: TUI refresh rate in frames per second (default: `2`, minimum: `1`)
 - `--log-level <level>`: `debug|info|warning|error|critical` (default: `info`)
 - `--verbose, -v`: enable verbose output
+
+#### `--extra-args` precedence
+
+Extra backend args stack from least- to most-specific, and each backend de-dups by option (CLI always wins over the recipe):
+
+Precedence, low → high: `recipe extra_args` → `--extra-args` (generic) → `--extra-<type>-args` (channel-specific).
+
+```mermaid
+flowchart LR
+  EA["--extra-args (generic)"] --> SAL["every Slurm salloc"]
+  EA --> DOC["every docker run"]
+  EA --> KUB["every kubectl call — global flags"]
+  ES["--extra-salloc-args"] -.->|overrides on a conflicting option| SAL
+  ED["--extra-docker-args"] -.->|overrides| DOC
+  EK["--extra-kubectl-args"] -.->|overrides| KUB
+```
+
+For example, `--extra-args '--gres=gpu:4'` replaces a recipe's `gpu:8` on that option rather than passing both.
 
 Notes:
 
@@ -68,6 +100,9 @@ Common options:
 - `--format <fmt>`: `mermaid|dot|png|svg|pdf`
 - `--output, -o <path>`: output file path; if omitted, writes to `<output-dir>/<run_id>/<workflow>.<ext>`
 - `--show-variables`: include variables in output (as comments)
+- `--set, -s KEY=VALUE`: override variables (repeatable) — so the rendered DAG reflects your overrides
+- `--artifact, -a NAME=URI`: override artifacts (repeatable)
+- `--missable-tasks, -M <pattern>`: same as `run` — task names/globs that may be absent when composing multiple files (only valid with multiple input files)
 - `--workspace-dir <dir>` / `--output-dir <dir>`: same as `run`
 
 Notes:
@@ -126,6 +161,8 @@ Notes:
 
 Generate sbatch scripts for running sflow in Slurm batch mode. Supports three modes:
 
+> Note: `sflow batch` targets **Slurm** — it generates/submits an sbatch script that runs sflow inside the allocation. Kubernetes runs are driver-attached (interactive `sflow run`); a detached batch mode for Kubernetes is planned for a later release.
+
 1. **Single-job mode** (default): generate one sbatch script from config files
 2. **Bulk-input mode** (`--bulk-input`): CSV-driven, one job per row with per-row overrides
 3. **Bulk-submit mode** (`--bulk-submit`): file/folder-driven, each YAML is a standalone job
@@ -144,7 +181,7 @@ sflow batch --bulk-submit ./examples/ -G 4 -p gpu -A myaccount --submit
 sflow batch -B sglang_agg.yaml -B vllm_agg.yaml -G 4 -p gpu --submit
 
 # Bulk-submit with glob pattern
-sflow batch --bulk-submit 'examples/slurm_*' -G 4 -p gpu -A myaccount --submit
+sflow batch --bulk-submit 'examples/self_contained/slurm/*' -G 4 -p gpu -A myaccount --submit
 ```
 
 Common options:
@@ -160,9 +197,13 @@ Common options:
 - `--job-name, -J <name>`: Slurm job name (default: `sflow`)
 - `--set, -s KEY=VALUE`: override variables (repeatable)
 - `--artifact, -a NAME=URI`: override artifacts (repeatable)
+- `--enable-workflow-monitor` / `--enable-task-monitor <names>`: same monitor conveniences as `sflow run` — enable a default hardware monitor at the workflow level or bound to specific task(s) without editing the recipe
 - `--missable-tasks, -M <pattern>`: task names or glob patterns that may be absent when composing modular configs (repeatable). Missing references are removed with a warning. Only valid with multiple input files or `--bulk-input`/`--bulk-submit`.
-- `--sflow-venv-path <path>`: path to existing Python venv for compute nodes
-- `--sflow-version <ref>`: Git branch, tag, or ref to install in generated batch scripts. If omitted, scripts try to reuse the currently installed sflow git ref/version before falling back to `main`.
+- `--include-nodes <names>` / `--exclude-nodes <names>`: same node-restriction flags as `sflow run` — unioned into every backend's `include_nodes` / `exclude_nodes`.
+- `--sflow-venv-path, -v <path>` (note the short alias `-v` — in `sflow batch`, `-v` means venv-path, **not** verbose): parent directory under which **each Slurm job creates its own fresh, disposable per-job venv** (`.sflow_venv-<job id>/`) and installs sflow into it, then removes it when the job exits. This is the venv *parent* dir, not an existing venv to reuse. The venv is built on the compute node with a resolved system `python3`, so it always matches the node architecture (x86/arm). Defaults to compute-node-local scratch resolved at run time (`${TMPDIR:-/tmp}/sflow_compute_node_venv`); pass a shared-filesystem path to override. The per-job dirs are auto-removed on normal exit and on Slurm cancel/timeout, but a hard `SIGKILL`/node crash can leave `.sflow_venv-<job id>`/`.sflow_src-<job id>` behind under a shared path (node-local scratch is reclaimed by the cluster).
+- `--sflow-version <ref>`: Git branch, tag, or ref to install in generated batch scripts. If omitted, scripts try to reuse the currently installed sflow git ref/version before falling back to `main`. Mutually exclusive with `--sflow-source-path`. When `--sflow-index-url` is set, this is instead interpreted as a **PyPI version specifier** (see below).
+- `--sflow-index-url <url>`: install sflow from a **private PyPI index** (e.g. an Artifactory registry such as `https://<host>/artifactory/api/pypi/<repo>/simple`) instead of from git. When set, `--sflow-version` becomes a PyPI version specifier: a bare version is pinned (`0.2.1` → `sflow==0.2.1`), an operator spec is passed through (`>=0.2,<0.3`), and omitting it installs the latest available. The index is added with uv's `--extra-index-url`, so sflow's dependencies still resolve from the default index. Credentials must be available on the compute node via `~/.netrc` or a credential helper; URLs containing embedded credentials are rejected. Mutually exclusive with `--sflow-source-path`.
+- `--sflow-source-path <path>`: local sflow source checkout to install **editable** (`uv pip install -e ".[dev]"`) into each job's per-job venv instead of from a git ref. Each job first copies the checkout into its own per-job source dir (via `rsync`, or `tar` when `rsync` is absent) so concurrent editable builds never race on setuptools-scm build artifacts. The path must be readable from the compute node. Mutually exclusive with `--sflow-version`.
 - `--sbatch-extra-args, -e <arg>`: additional `#SBATCH` directives (repeatable). Supports `${{ variables.X }}` and shorthand `${{ X }}` expressions resolved from config defaults, `--set`, and CSV row values.
 - `--sbatch-output, -O <pattern>`: Slurm stdout pattern (default: `sflow_output/%j-sflow-submit.out`)
 - `--sbatch-error, -E <pattern>`: Slurm stderr pattern (default: `sflow_output/%j-sflow-submit.err`)
@@ -202,30 +243,31 @@ sflow sample --list
 sflow sample
 
 # Copy a self-contained sample
-sflow sample slurm_dynamo_trtllm_agg
+sflow sample self_contained/slurm/dynamo_trtllm_agg
 
 # Copy a modular sample folder
-sflow sample inference_x_v2
+sflow sample modular/inference_x_v2
 
 # Copy with custom output path
-sflow sample local_hello_world --output my_workflow.yaml
+sflow sample self_contained/local/hello_world --output my_workflow.yaml
 
 # Overwrite existing file/folder
-sflow sample inference_x_v2 --force
+sflow sample modular/inference_x_v2 --force
 ```
 
-Available sample categories:
+Available sample categories (run `sflow sample --list` for the full, live list):
 
-- **Local**: `local_hello_world` – minimal local workflow
-- **Slurm (self-contained)**: `slurm_dynamo_sglang_agg`, `slurm_dynamo_vllm_agg`, `slurm_dynamo_trtllm_agg`, etc. – complete workflows in a single YAML
-- **Modular**: `inference_x_v2/` – folder with composable YAML files (slurm_config, common_workflow, framework-specific prefill/decode, benchmarks)
+- **Self-contained** (`self_contained/<backend>/<name>`, one file each): e.g. `self_contained/local/hello_world`, `self_contained/docker/sglang_qwen3`, `self_contained/slurm/dynamo_trtllm_agg`, `self_contained/kubernetes/hello_world`. Backends: `local`, `docker`, `slurm`, `kubernetes`.
+- **Modular** (`modular/inference_x_v2/`): a folder of composable YAML files (slurm_config, common_workflow, framework-specific prefill/decode, benchmarks, plus `composed_recipes/`).
+
+See [Sample Workflows](./samples.md#sample-catalog) for the full catalog.
 
 ### Modular samples
 
 Modular samples are folders containing multiple YAML files designed to be composed together. When you copy a modular sample, the entire folder is copied:
 
 ```bash
-sflow sample inference_x_v2
+sflow sample modular/inference_x_v2
 ```
 
 After copying, you get usage hints showing two workflows:

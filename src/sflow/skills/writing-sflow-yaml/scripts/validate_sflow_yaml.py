@@ -11,6 +11,7 @@ Checks performed:
     - depends_on references exist as task names
     - Operator references exist as declared operators
     - Backend references exist as declared backends
+    - Operator/backend types are valid (e.g. Docker operator is docker_run, backend is docker)
     - Artifact expression references match declared artifacts
     - GPU resource math consistency (TP * DP * PP vs declared gpus)
     - Common mistake warnings (missing probes, missing depends_on, etc.)
@@ -30,6 +31,7 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "artifacts",
     "backends",
     "operators",
+    "storage",
     "workflow",
 }
 EXPRESSION_PATTERN = re.compile(r"\$\{\{(.+?)\}\}", re.DOTALL)
@@ -284,11 +286,130 @@ def check_operator_references(config: dict, result: ValidationResult) -> None:
             )
 
 
+VALID_OPERATOR_TYPES = {
+    "bash",
+    "srun",
+    "docker_run",
+    "python",
+    "ssh",
+    "k8s",
+    "k8s_mpi",
+}
+# Common invalid operator-type mistakes -> the type to use instead. `docker` is the
+# Docker *backend* type, but the Docker launch *operator* is `docker_run`.
+INVALID_OPERATOR_TYPE_HINTS = {
+    "docker": "docker_run",
+}
+VALID_BACKEND_TYPES = {"local", "slurm", "docker", "kubernetes"}
+
+
+def check_operator_types(config: dict, result: ValidationResult) -> None:
+    """Flag invalid operator types and unknown operator/backend types."""
+    operators = config.get("operators", [])
+    if isinstance(operators, list):
+        for op in operators:
+            if not isinstance(op, dict):
+                continue
+            name = op.get("name", "<unnamed>")
+            otype = op.get("type")
+            if not isinstance(otype, str) or "${{" in otype:
+                continue
+            if otype in INVALID_OPERATOR_TYPE_HINTS:
+                result.error(
+                    f"Operator '{name}': type '{otype}' is not valid. "
+                    f"Use '{INVALID_OPERATOR_TYPE_HINTS[otype]}'."
+                )
+            elif otype not in VALID_OPERATOR_TYPES:
+                result.warn(
+                    f"Operator '{name}': unknown type '{otype}'. Expected one of "
+                    f"{sorted(VALID_OPERATOR_TYPES)}."
+                )
+
+    backends = config.get("backends", [])
+    if isinstance(backends, list):
+        for b in backends:
+            if not isinstance(b, dict):
+                continue
+            name = b.get("name", "<unnamed>")
+            btype = b.get("type")
+            if not isinstance(btype, str) or "${{" in btype:
+                continue
+            if btype not in VALID_BACKEND_TYPES:
+                result.warn(
+                    f"Backend '{name}': unknown type '{btype}'. Expected one of "
+                    f"{sorted(VALID_BACKEND_TYPES)}."
+                )
+            # The kubernetes backend has no image; the workload image lives on the k8s operator.
+            if btype == "kubernetes" and "image" in b:
+                result.warn(
+                    f"Backend '{name}': the kubernetes backend has no 'image' field "
+                    f"(it is dropped). Put the workload image on the k8s operator instead."
+                )
+
+
+def _has_kubernetes_backend(config: dict) -> bool:
+    backends = config.get("backends", [])
+    if not isinstance(backends, list):
+        return False
+    return any(
+        isinstance(b, dict) and b.get("type") == "kubernetes" for b in backends
+    )
+
+
+def _k8s_pvc_mount_paths(config: dict) -> list[str]:
+    """Absolute mount_paths of PVC-backed (`claim`) kubernetes backend volumes.
+
+    emptyDir volumes are ephemeral scratch, not a data source, so they don't count
+    as covering an fs:// artifact path.
+    """
+    paths: list[str] = []
+    backends = config.get("backends", [])
+    if not isinstance(backends, list):
+        return paths
+    for b in backends:
+        if not isinstance(b, dict) or b.get("type") != "kubernetes":
+            continue
+        volumes = b.get("volumes", [])
+        if not isinstance(volumes, list):
+            continue
+        for vol in volumes:
+            if not isinstance(vol, dict) or vol.get("claim") is None:
+                continue
+            mp = vol.get("mount_path")
+            if isinstance(mp, str) and mp.startswith("/") and "${{" not in mp:
+                paths.append(mp.rstrip("/") or "/")
+    return paths
+
+
+def _path_covered_by(path: str, mount_paths: list[str]) -> bool:
+    """True if `path` equals or is nested under any of `mount_paths`."""
+    try:
+        p = Path(path)
+    except (ValueError, TypeError):
+        return False
+    for mp in mount_paths:
+        try:
+            m = Path(mp)
+        except (ValueError, TypeError):
+            continue
+        if p == m or m in p.parents:
+            return True
+    return False
+
+
 def check_artifact_fs_paths(config: dict, result: ValidationResult) -> None:
-    """Warn about fs:// artifact paths that don't exist."""
+    """Check fs:// artifact paths.
+
+    On a non-kubernetes recipe, fs:// paths are local and should exist. On a
+    kubernetes recipe they are remote (node / PVC) paths that need not exist on the
+    controller; there, flag fs:// paths that no declared `volumes:` PVC mount_path
+    covers -- those fall back to a same-path hostPath every node must provide.
+    """
     artifacts = config.get("artifacts", [])
     if not isinstance(artifacts, list):
         return
+    is_k8s = _has_kubernetes_backend(config)
+    pvc_mount_paths = _k8s_pvc_mount_paths(config) if is_k8s else []
     for art in artifacts:
         if not isinstance(art, dict):
             continue
@@ -296,10 +417,100 @@ def check_artifact_fs_paths(config: dict, result: ValidationResult) -> None:
         name = art.get("name", "<unnamed>")
         if not isinstance(uri, str) or "${{" in uri:
             continue
-        if uri.startswith("fs://"):
-            fs_path = uri[5:]
-            if fs_path and not Path(fs_path).exists():
-                result.warn(f"Artifact '{name}': fs:// path does not exist: {fs_path}")
+        if not uri.startswith("fs://"):
+            continue
+        fs_path = uri[5:]
+        if not fs_path:
+            continue
+        if is_k8s:
+            # Remote path: don't check local existence. Note uncovered absolute paths
+            # that will hostPath-mount at the same path (the node must have them).
+            if fs_path.startswith("/") and not _path_covered_by(
+                fs_path, pvc_mount_paths
+            ):
+                result.warn(
+                    f"Artifact '{name}': fs:// path '{fs_path}' is not covered by any "
+                    f"kubernetes 'volumes:' PVC mount_path. On k8s it hostPath-mounts at "
+                    f"the same path (every node must have it); declare a backend "
+                    f"'volumes:' PVC covering this path to serve it from shared storage."
+                )
+        elif not Path(fs_path).exists():
+            result.warn(f"Artifact '{name}': fs:// path does not exist: {fs_path}")
+
+
+def check_k8s_volumes(config: dict, result: ValidationResult) -> None:
+    """Validate kubernetes backend `volumes:` (PVC / emptyDir) entries.
+
+    Mirrors the KubernetesVolumeConfig rules: exactly one source (`claim` or
+    `empty_dir`), an absolute `mount_path`, and `ensure_writable` only on a
+    writable (`read_only: false`) PVC.
+    """
+    backends = config.get("backends", [])
+    if not isinstance(backends, list):
+        return
+    for b in backends:
+        if not isinstance(b, dict) or b.get("type") != "kubernetes":
+            continue
+        bname = b.get("name", "<unnamed>")
+        volumes = b.get("volumes")
+        if volumes is None:
+            continue
+        if not isinstance(volumes, list):
+            result.error(f"Backend '{bname}': volumes must be a list")
+            continue
+
+        seen_mounts: dict[str, str] = {}
+        for vol in volumes:
+            if not isinstance(vol, dict):
+                result.error(
+                    f"Backend '{bname}': each volumes entry must be a mapping"
+                )
+                continue
+            vname = vol.get("name", "<unnamed>")
+            has_claim = vol.get("claim") is not None
+            has_empty = vol.get("empty_dir") is not None
+
+            # Exactly one source.
+            if has_claim == has_empty:
+                result.error(
+                    f"Backend '{bname}' volume '{vname}': set exactly one of "
+                    f"'claim' or 'empty_dir'."
+                )
+
+            # mount_path required + absolute (+ collision warning).
+            mp = vol.get("mount_path")
+            if mp is None:
+                result.error(
+                    f"Backend '{bname}' volume '{vname}': missing required 'mount_path'."
+                )
+            elif isinstance(mp, str) and "${{" not in mp:
+                if not mp.startswith("/"):
+                    result.error(
+                        f"Backend '{bname}' volume '{vname}': mount_path must be "
+                        f"absolute, got: {mp!r}"
+                    )
+                else:
+                    key = mp.rstrip("/") or "/"
+                    if key in seen_mounts:
+                        result.warn(
+                            f"Backend '{bname}' volume '{vname}': mount_path '{mp}' "
+                            f"collides with volume '{seen_mounts[key]}' (last wins)."
+                        )
+                    else:
+                        seen_mounts[key] = str(vname)
+
+            # ensure_writable: PVC + read_only:false only (PVCs default read_only).
+            if vol.get("ensure_writable"):
+                if has_empty:
+                    result.error(
+                        f"Backend '{bname}' volume '{vname}': ensure_writable applies to "
+                        f"PVC volumes only (an emptyDir is already writable)."
+                    )
+                elif vol.get("read_only") in (None, True):
+                    result.error(
+                        f"Backend '{bname}' volume '{vname}': ensure_writable requires "
+                        f"read_only: false (PVCs default to read_only: true)."
+                    )
 
 
 def check_gpu_consistency(config: dict, result: ValidationResult) -> None:
@@ -452,7 +663,9 @@ def validate_file(filepath: str) -> ValidationResult:
     check_depends_on(config, result)
     check_task_names_unique(config, result)
     check_operator_references(config, result)
+    check_operator_types(config, result)
     check_artifact_fs_paths(config, result)
+    check_k8s_volumes(config, result)
     check_gpu_consistency(config, result)
     check_common_mistakes(config, result)
 

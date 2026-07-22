@@ -1,0 +1,216 @@
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "if [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n#\
+      \ ===== sflow k8s_mpi launcher (operator route) =====\n# --- sflow: transparent mpirun wrapper ---\n\
+      mkdir -p /tmp/sflow-mpi/bin\ncat > /tmp/sflow-mpi/bin/mpirun <<'SFLOW_MPIRUN_WRAPPER_EOF'\n#!/usr/bin/env\
+      \ bash\n# sflow transparent mpirun wrapper (k8s_mpi). Injects hostfile/SSH transport and\n# -x env\
+      \ forwarding so the recipe keeps a plain `mpirun -np N ... <workload>`.\nset -u\n# Resolve the REAL\
+      \ mpirun. The preamble captured it in SFLOW_REAL_MPIRUN before\n# prepending this shim's dir to\
+      \ PATH; fall back to scanning PATH for a non-self.\n_sflow_real=\"${SFLOW_REAL_MPIRUN:-}\"\nif [\
+      \ -z \"${_sflow_real}\" ]; then\n  for _c in $(type -ap mpirun 2>/dev/null); do\n    if [ \"${_c}\"\
+      \ != \"/tmp/sflow-mpi/bin/mpirun\" ]; then _sflow_real=\"${_c}\"; break; fi\n  done\nfi\n[ -n \"\
+      ${_sflow_real}\" ] || _sflow_real=\"mpirun\"\n\n_sflow_opts=()\n# OpenMPI transport (pods route\
+      \ only): a bare `mpirun` finds neither the hostfile\n# nor the alt SSH port, so inject both -- as\
+      \ ONE plm_rsh_args argument.\nif [ \"0\" = \"1\" ] && [ -f \"/tmp/sflow-mpi/hostfile\" ]; then\n\
+      \  _sflow_opts+=(--hostfile \"/tmp/sflow-mpi/hostfile\" \\\n    --mca plm_rsh_agent ssh \\\n   \
+      \ --mca plm_rsh_args \"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\
+      \ -o ConnectTimeout=10\")\nfi\n# Forward env to remote ranks (sshd gives them a bare env), deduped,\
+      \ from three\n# sources: the always-on whole-name vars, the merged prefix set (scanned NOW so late\n\
+      # `export`s are captured), and every var the recipe itself exported -- the diff of\n# the current\
+      \ exports against the pre-recipe snapshot -- so a plain `export FOO=bar`\n# reaches workers without\
+      \ listing it in forward_env_prefixes.\n_sflow_snap=\"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
+      \n_sflow_names=\"$(\n  for _v in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\\
+      ${${_v}+x}\\\" ]\" && printf '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
+      \  [ -f \"${_sflow_snap}\" ] && comm -13 \"${_sflow_snap}\" <(compgen -e | sort -u)\n)\"\nfor _v\
+      \ in $(printf '%s\\n' \"${_sflow_names}\" | sort -u | sed '/^$/d'); do\n  _sflow_opts+=(-x \"${_v}\"\
+      )\ndone\nexec \"${_sflow_real}\" \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\nchmod\
+      \ +x /tmp/sflow-mpi/bin/mpirun\nexport SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command -v mpirun\
+      \ 2>/dev/null || true)}\"\nexport PATH=/tmp/sflow-mpi/bin:${PATH}\n# --- sflow: snapshot exported\
+      \ env (pre-recipe) for mpirun -x auto-forward ---\nmkdir -p /tmp/sflow-mpi 2>/dev/null || true\n\
+      compgen -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\" 2>/dev/null\
+      \ || true\n# ===== end sflow k8s_mpi launcher =====\nexec mpirun -np 16 trtllm-serve /models/m"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: abc
+      sflow.ai/task: server-abc
+    name: server-abc-cfg
+    namespace: golden-ns
+- apiVersion: kubeflow.org/v2beta1
+  kind: MPIJob
+  metadata:
+    labels:
+      sflow.ai/allocation: abc
+      sflow.ai/task: server-abc
+    name: server-abc
+    namespace: golden-ns
+  spec:
+    launcherCreationPolicy: WaitForWorkersReady
+    mpiImplementation: OpenMPI
+    mpiReplicaSpecs:
+      Launcher:
+        replicas: 1
+        restartPolicy: Never
+        template:
+          metadata:
+            labels:
+              sflow.ai/allocation: abc
+              sflow.ai/task: server-abc
+          spec:
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: server-abc
+                  topologyKey: kubernetes.io/hostname
+            containers:
+            - command:
+              - bash
+              - -l
+              - /sflow/entrypoint.sh
+              env:
+              - name: OMP_NUM_THREADS
+                value: '8'
+              image: trtllm:latest
+              name: server-abc-launcher
+              resources:
+                limits:
+                  nvidia.com/gpu: '8'
+              securityContext:
+                runAsGroup: 0
+                runAsUser: 0
+              volumeMounts:
+              - mountPath: /sflow
+                name: sflow-scripts
+              - mountPath: /dev/shm
+                name: dshm
+            hostNetwork: true
+            nodeSelector:
+              kubernetes.io/hostname: node-0
+            restartPolicy: Never
+            tolerations:
+            - effect: NoSchedule
+              key: nvidia.com/gpu
+              operator: Exists
+            volumes:
+            - configMap:
+                name: server-abc-cfg
+              name: sflow-scripts
+            - emptyDir:
+                medium: Memory
+              name: dshm
+      Worker:
+        replicas: 1
+        restartPolicy: Never
+        template:
+          metadata:
+            labels:
+              sflow.ai/allocation: abc
+              sflow.ai/task: server-abc
+          spec:
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values:
+                      - node-0
+                      - node-1
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: server-abc
+                  topologyKey: kubernetes.io/hostname
+            containers:
+            - command:
+              - bash
+              - -lc
+              - "if [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+                fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\n\
+                fi\n# ===== sflow k8s_mpi launcher (operator route) =====\n# --- sflow: transparent mpirun\
+                \ wrapper ---\nmkdir -p /tmp/sflow-mpi/bin\ncat > /tmp/sflow-mpi/bin/mpirun <<'SFLOW_MPIRUN_WRAPPER_EOF'\n\
+                #!/usr/bin/env bash\n# sflow transparent mpirun wrapper (k8s_mpi). Injects hostfile/SSH\
+                \ transport and\n# -x env forwarding so the recipe keeps a plain `mpirun -np N ... <workload>`.\n\
+                set -u\n# Resolve the REAL mpirun. The preamble captured it in SFLOW_REAL_MPIRUN before\n\
+                # prepending this shim's dir to PATH; fall back to scanning PATH for a non-self.\n_sflow_real=\"\
+                ${SFLOW_REAL_MPIRUN:-}\"\nif [ -z \"${_sflow_real}\" ]; then\n  for _c in $(type -ap mpirun\
+                \ 2>/dev/null); do\n    if [ \"${_c}\" != \"/tmp/sflow-mpi/bin/mpirun\" ]; then _sflow_real=\"\
+                ${_c}\"; break; fi\n  done\nfi\n[ -n \"${_sflow_real}\" ] || _sflow_real=\"mpirun\"\n\n\
+                _sflow_opts=()\n# OpenMPI transport (pods route only): a bare `mpirun` finds neither the\
+                \ hostfile\n# nor the alt SSH port, so inject both -- as ONE plm_rsh_args argument.\n\
+                if [ \"0\" = \"1\" ] && [ -f \"/tmp/sflow-mpi/hostfile\" ]; then\n  _sflow_opts+=(--hostfile\
+                \ \"/tmp/sflow-mpi/hostfile\" \\\n    --mca plm_rsh_agent ssh \\\n    --mca plm_rsh_args\
+                \ \"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\
+                \ -o ConnectTimeout=10\")\nfi\n# Forward env to remote ranks (sshd gives them a bare env),\
+                \ deduped, from three\n# sources: the always-on whole-name vars, the merged prefix set\
+                \ (scanned NOW so late\n# `export`s are captured), and every var the recipe itself exported\
+                \ -- the diff of\n# the current exports against the pre-recipe snapshot -- so a plain\
+                \ `export FOO=bar`\n# reaches workers without listing it in forward_env_prefixes.\n_sflow_snap=\"\
+                ${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\n_sflow_names=\"$(\n  for _v\
+                \ in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\${${_v}+x}\\\" ]\"\
+                \ && printf '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
+                \  [ -f \"${_sflow_snap}\" ] && comm -13 \"${_sflow_snap}\" <(compgen -e | sort -u)\n\
+                )\"\nfor _v in $(printf '%s\\n' \"${_sflow_names}\" | sort -u | sed '/^$/d'); do\n  _sflow_opts+=(-x\
+                \ \"${_v}\")\ndone\nexec \"${_sflow_real}\" \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\n\
+                chmod +x /tmp/sflow-mpi/bin/mpirun\nexport SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command\
+                \ -v mpirun 2>/dev/null || true)}\"\nexport PATH=/tmp/sflow-mpi/bin:${PATH}\n# --- sflow:\
+                \ snapshot exported env (pre-recipe) for mpirun -x auto-forward ---\nmkdir -p /tmp/sflow-mpi\
+                \ 2>/dev/null || true\ncompgen -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
+                \ 2>/dev/null || true\n# ===== end sflow k8s_mpi launcher =====\nif [ ! -x /usr/sbin/sshd\
+                \ ] && ! command -v sshd >/dev/null 2>&1; then\n  echo \"[sflow-mpi] installing openssh-server\"\
+                \n  export DEBIAN_FRONTEND=noninteractive\n  (apt-get update -qq && apt-get install -y\
+                \ -qq --no-install-recommends openssh-server) || echo \"[sflow-mpi] WARNING: could not\
+                \ install openssh-server\"\nfi\nmkdir -p /run/sshd && chmod 755 /run/sshd\nssh-keygen\
+                \ -A >/dev/null 2>&1 || true\nSFLOW_SSHD_BIN=\"$( [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd\
+                \ || command -v sshd || true )\"\nif [ -z \"${SFLOW_SSHD_BIN}\" ]; then echo \"[sflow-mpi]\
+                \ FATAL: sshd unavailable\"; exit 1; fi\necho \"[sflow-mpi] worker sshd on :2222\"\nexec\
+                \ \"${SFLOW_SSHD_BIN}\" -D -e -p 2222"
+              env:
+              - name: OMP_NUM_THREADS
+                value: '8'
+              image: trtllm:latest
+              name: server-abc-worker
+              readinessProbe:
+                failureThreshold: 180
+                initialDelaySeconds: 5
+                periodSeconds: 5
+                tcpSocket:
+                  port: 2222
+                timeoutSeconds: 5
+              resources:
+                limits:
+                  nvidia.com/gpu: '8'
+              securityContext:
+                runAsGroup: 0
+                runAsUser: 0
+              volumeMounts:
+              - mountPath: /sflow
+                name: sflow-scripts
+              - mountPath: /dev/shm
+                name: dshm
+            hostNetwork: true
+            restartPolicy: Never
+            tolerations:
+            - effect: NoSchedule
+              key: nvidia.com/gpu
+              operator: Exists
+            volumes:
+            - configMap:
+                name: server-abc-cfg
+              name: sflow-scripts
+            - emptyDir:
+                medium: Memory
+              name: dshm
+    runLauncherAsWorker: true
+    runPolicy:
+      cleanPodPolicy: Running
+    slotsPerWorker: 8
+    sshAuthMountPath: /root/.ssh
+kind: List

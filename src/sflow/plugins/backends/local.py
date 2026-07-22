@@ -11,12 +11,25 @@ from sflow.core.backend import Allocation, Backend
 from sflow.core.backend_registry import register_backend
 from sflow.core.compute_node import ComputeNode
 from sflow.core.operator import Operator
+from sflow.logging import get_logger
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
+from sflow.utils.node_filters import normalize_node_list, resolve_node_filters
+
+_logger = get_logger(__name__)
 
 
 class LocalBackendConfig(BackendConfig):
     type: Literal["local"] = "local"
     nodes: Resolvable[int] = 1
+    # Per-task log offload is ON by default (CLI flag / env override take
+    # precedence; resolved in the bash operator). When enabled, tasks redirect
+    # their own <task>.log through a compute-side prefixer instead of streaming
+    # it through the sflow driver. Auto-falls back to streaming on an
+    # interactive TTY / --tui session.
+    offload_task_logs: bool = True
+
+    def planning_node_count(self) -> Resolvable[int] | None:
+        return self.nodes
 
 
 @register_backend("local", LocalBackendConfig)
@@ -35,8 +48,16 @@ class LocalBackend(Backend):
         self._gpu_per_node = (
             int(config.gpus_per_node) if config.gpus_per_node is not None else None
         )
+        if normalize_node_list(config.include_nodes) or normalize_node_list(
+            config.exclude_nodes
+        ):
+            _logger.warning(
+                "Local backend '%s': --include-nodes/--exclude-nodes are ignored "
+                "(the local backend always runs on this single machine).",
+                self.name,
+            )
 
-    async def allocate(self) -> Allocation:
+    def placeholder_allocation(self) -> Allocation:
         count = max(int(self._nodes), 1)
         nodes = [
             ComputeNode(
@@ -50,9 +71,18 @@ class LocalBackend(Backend):
         # Synthetic allocation, not owned.
         return Allocation(allocation_id="local", nodes=nodes, owned=False)
 
+    async def allocate(self) -> Allocation:
+        return self.placeholder_allocation()
+
     async def release(self, allocation: Allocation) -> None:
         # Nothing to release for local execution.
         return
+
+    def dry_run_details(self) -> list[tuple[str, str]]:
+        details = [("nodes", str(self._nodes))]
+        if self._gpu_per_node is not None:
+            details.append(("gpus_per_node", str(self._gpu_per_node)))
+        return details
 
     def default_operator(
         self,
@@ -61,7 +91,11 @@ class LocalBackend(Backend):
         assigned_nodes: Sequence[str] | None = None,
     ) -> Operator:
         # Local execution defaults to bash operator.
-        return BashOperator(BashOperatorConfig(name=name))
+        return BashOperator(
+            BashOperatorConfig(
+                name=name, log_to_file=bool(self.config.offload_task_logs)
+            )
+        )
 
     @classmethod
     def resolve_config(
@@ -97,10 +131,15 @@ class LocalBackend(Backend):
                     f"Backend '{conf.name}' gpus_per_node must be >= 0, got {gpus_per_node}"
                 )
 
+        include_nodes, exclude_nodes = resolve_node_filters(resolver, conf, ctx)
+
         return LocalBackendConfig(
             name=conf.name,
             type="local",
             default=bool(getattr(conf, "default", False)),
             nodes=nodes_i,
             gpus_per_node=gpus_per_node,
+            include_nodes=include_nodes,
+            exclude_nodes=exclude_nodes,
+            offload_task_logs=bool(getattr(conf, "offload_task_logs", True)),
         )

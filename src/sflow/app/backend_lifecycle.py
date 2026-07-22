@@ -4,17 +4,18 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 from typing import Any
 
 from sflow.config.schema import SflowConfig
 from sflow.core.backend import Backend
-from sflow.core.compute_node import ComputeNode
 from sflow.core.state import SflowState
 from sflow.core.variable import build_variables_ctx
 from sflow.logging import get_logger
 from sflow.resolution import ExpressionResolver, validate_no_deferred_variable_references
-from sflow.utils.container import is_valid_container_image
+from sflow.utils.container import (
+    extract_container_images_from_extra_args,
+    validate_container_image_reference,
+)
 
 _logger = get_logger(__name__)
 
@@ -23,21 +24,7 @@ def preflight_validate_backends(state: SflowState) -> None:
     """Validate backend prerequisites before allocations/submissions."""
 
     for b in (state.backends or {}).values():
-        b_type = (
-            getattr(getattr(b, "config", None), "type", None) or b.__class__.__name__
-        )
-        if str(b_type).lower() != "slurm":
-            continue
-
-        required = ["salloc", "srun", "scontrol", "scancel"]
-        missing = [c for c in required if shutil.which(c) is None]
-        if missing:
-            raise ValueError(
-                "Pre-flight validation failed for Slurm backend "
-                f"'{getattr(b, 'name', 'unknown')}'. Missing required commands: "
-                f"{', '.join(missing)}. "
-                "Ensure Slurm client tools are installed and available on PATH (e.g., load the Slurm module)."
-            )
+        b.preflight_validate()
 
 
 def preflight_validate_container_images(
@@ -46,7 +33,7 @@ def preflight_validate_container_images(
     *,
     resolver: ExpressionResolver,
 ) -> None:
-    """Validate container image references in srun operators before allocation."""
+    """Validate container image references before allocation."""
 
     variables_ctx = build_variables_ctx(state.variables)
     ctx: dict[str, Any] = {"variables": variables_ctx, **variables_ctx}
@@ -63,64 +50,89 @@ def preflight_validate_container_images(
         except Exception:
             return str(raw)
 
-    invalid_hint = (
-        "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag') "
-        "or a local .sqsh file path (e.g. '/path/to/image.sqsh')"
-    )
-
     def _check_image(image_val: str, *, source: str) -> None:
-        if not image_val:
-            return
-        if "${{" in image_val or "${" in image_val:
-            return
-        if not is_valid_container_image(image_val):
-            raise ValueError(
-                f"Pre-flight validation failed: {source} has invalid container image. "
-                f"{invalid_hint}, got: '{image_val}'"
-            )
+        validate_container_image_reference(
+            image_val,
+            source=f"{source} has invalid container image",
+            error_prefix="Pre-flight validation failed",
+        )
 
-    def _check_extra_args(extra_args: list, *, source: str) -> None:
-        for i, arg in enumerate(extra_args):
-            arg_str = str(arg)
-            raw_val: str | None = None
-            if arg_str.startswith("--container-image="):
-                raw_val = arg_str.split("=", 1)[1]
-            elif arg_str == "--container-image" and i + 1 < len(extra_args):
-                raw_val = str(extra_args[i + 1])
-            if raw_val is not None:
-                _check_image(_try_resolve(raw_val), source=f"{source} extra_args")
+    def _check_operator_config(op_conf: Any, *, source: str) -> None:
+        container_images = getattr(op_conf, "container_images", None)
+        if callable(container_images):
+            images = list(container_images())
+        else:
+            images = []
+            for attr in ("container_image", "image"):
+                raw_image = getattr(op_conf, attr, None)
+                if raw_image is not None and raw_image not in images:
+                    images.append(raw_image)
+            images.extend(
+                extract_container_images_from_extra_args(
+                    list(getattr(op_conf, "extra_args", None) or [])
+                )
+            )
+        for image in images:
+            _check_image(_try_resolve(image), source=source)
 
     for op_conf in config.operators or []:
-        if getattr(op_conf, "type", None) != "srun":
-            continue
-        raw_image = getattr(op_conf, "container_image", None)
-        if raw_image is not None:
-            _check_image(_try_resolve(raw_image), source=f"operator '{op_conf.name}'")
-        extra_args = list(getattr(op_conf, "extra_args", None) or [])
-        _check_extra_args(extra_args, source=f"operator '{op_conf.name}'")
+        _check_operator_config(op_conf, source=f"operator '{op_conf.name}'")
 
+    for backend_conf in config.backends or []:
+        for raw_image in backend_conf.container_images():
+            _check_image(
+                _try_resolve(raw_image),
+                source=f"backend '{backend_conf.name}'",
+            )
+
+    from sflow.core.operator_registry import (
+        format_invalid_override_error,
+        operator_config_type_adapter,
+        split_operator_overrides,
+    )
+
+    operator_adapter = operator_config_type_adapter()
+    operator_confs = {op.name: op for op in config.operators or []}
     for t_conf in config.workflow.tasks or []:
         if t_conf.operator is None or isinstance(t_conf.operator, str):
             continue
+        base_op = operator_confs.get(t_conf.operator.name)
+        if base_op is None:
+            continue
+        merged = base_op.model_dump()
         overrides = t_conf.operator.model_dump(exclude={"name"}, exclude_none=True)
-        raw_image = overrides.get("container_image")
-        if raw_image is not None:
-            _check_image(
-                _try_resolve(raw_image),
-                source=f"task '{t_conf.name}' operator override",
+        # Match build_task_graph: reject override keys not valid for this operator
+        # (typo / wrong-backend key) so the image check sees the same config that
+        # will run and fails with the same clear error.
+        overrides, invalid = split_operator_overrides(base_op, overrides)
+        if invalid:
+            raise ValueError(
+                format_invalid_override_error(
+                    t_conf.name, t_conf.operator.name, base_op.type, invalid
+                )
             )
-        override_extra = overrides.get("extra_args")
-        if override_extra:
-            _check_extra_args(
-                list(override_extra),
-                source=f"task '{t_conf.name}' operator override",
+        if "extra_args" in overrides and merged.get("extra_args"):
+            overrides["extra_args"] = list(merged["extra_args"]) + list(
+                overrides["extra_args"]
             )
+        merged.update(overrides)
+        merged["name"] = t_conf.operator.name
+        try:
+            op_conf = operator_adapter.validate_python(merged)
+        except Exception:
+            class _OperatorConfigView:
+                def __init__(self, values: dict[str, Any]):
+                    self.__dict__.update(values)
+
+            op_conf = _OperatorConfigView(merged)
+        _check_operator_config(
+            op_conf,
+            source=f"task '{t_conf.name}' operator override",
+        )
 
 
 def seed_placeholder_backend_allocations(state: SflowState) -> SflowState:
     """Populate deterministic placeholder allocations for unallocated backends."""
-
-    from sflow.core.backend import Allocation
 
     if not state.backends:
         return state
@@ -128,33 +140,7 @@ def seed_placeholder_backend_allocations(state: SflowState) -> SflowState:
     for b in state.backends.values():
         if b.allocation is not None:
             continue
-
-        nodes_count = getattr(b, "_nodes", None)
-        try:
-            nodes_count = int(nodes_count) if nodes_count is not None else 1
-        except Exception:
-            nodes_count = 1
-        nodes_count = max(nodes_count, 1)
-
-        num_gpus = getattr(b, "_gpu_per_node", None)
-        try:
-            num_gpus = int(num_gpus) if num_gpus is not None else None
-        except Exception:
-            num_gpus = None
-
-        nodes: list[ComputeNode] = []
-        for i in range(nodes_count):
-            if b.__class__.__name__ == "LocalBackend" or b.name == "local":
-                name = "localhost" if i == 0 else f"localhost-{i}"
-                ip = "127.0.0.1"
-            else:
-                name = f"{b.name}-node{i}"
-                ip = f"0.0.0.{i + 1}"
-            nodes.append(
-                ComputeNode(name=name, ip_address=ip, index=i, num_gpus=num_gpus)
-            )
-
-        b.allocation = Allocation(allocation_id="0", nodes=nodes, owned=False)
+        b.allocation = b.placeholder_allocation()
 
     return state
 
@@ -164,8 +150,14 @@ def resolve_backends(
     state: SflowState,
     *,
     resolver: ExpressionResolver,
+    kubectl_config: Any | None = None,
 ) -> SflowState:
-    """Resolve backend configuration and populate ``state.backends``."""
+    """Resolve backend configuration and populate ``state.backends``.
+
+    ``kubectl_config`` (CLI-level kube access from ``sflow run``) is applied to any
+    backend that accepts it (the kubernetes backend), keeping recipes
+    cluster-agnostic.
+    """
 
     from sflow.core.backend_registry import (
         backend_config_type_adapter,
@@ -213,10 +205,26 @@ def resolve_backends(
             resolved_conf = b_conf_obj
 
         backend = backend_cls(resolved_conf)  # type: ignore[call-arg]
+        if kubectl_config is not None and hasattr(backend, "apply_kubectl_config"):
+            backend.apply_kubectl_config(kubectl_config)
 
         backends[getattr(b_conf_obj, "name")] = backend
         if getattr(b_conf_obj, "default", False):
             state.default_backend = backend
+
+    # Inform backends of any `k8s_mpi` operator routes so the kubernetes backend's
+    # RBAC preflight requires mpijobs.kubeflow.org verbs only when the operator
+    # route may actually be used (route: operator, or route: auto with the CRD).
+    mpi_routes = [
+        str(getattr(getattr(op, "mpi", None), "route", "auto") or "auto")
+        for op in (config.operators or [])
+        if getattr(op, "type", None) == "k8s_mpi"
+    ]
+    if mpi_routes:
+        for backend in backends.values():
+            noter = getattr(backend, "note_mpi_operator_routes", None)
+            if callable(noter):
+                noter(mpi_routes)
 
     state.backends = backends
     if state.default_backend is None:

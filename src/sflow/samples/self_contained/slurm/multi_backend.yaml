@@ -1,0 +1,89 @@
+version: "0.1"
+
+# Multi-backend Slurm example.
+#
+# Declares two independent Slurm resource pools (cluster_a, cluster_b). Each
+# backend allocates its own Slurm job (its own nodes), and every task binds to
+# its own backend's allocation: the planner reserves nodes/GPUs per backend and
+# each task's operator (srun) targets that backend's job id + nodelist. Tasks
+# without an explicit `backend:` use the default backend (cluster_a).
+#
+# Each backend also runs a DIFFERENT operator with a DIFFERENT container image
+# (worker_a -> IMAGE_A on cluster_a, worker_b -> IMAGE_B on cluster_b), so a
+# single workflow can fan tasks out across heterogeneous pools/runtimes.
+#
+# The two pools use different partition variables so they can map to different
+# physical resource pools; point both at the same partition if your cluster has
+# a single partition with >=2 idle nodes.
+
+variables:
+  SLURM_ACCOUNT:
+    description: "SLURM account (shared by both pools)"
+    value: your_slurm_account
+  PARTITION_A:
+    description: "Partition for the cluster_a resource pool"
+    value: your_partition_a
+  PARTITION_B:
+    description: "Partition for the cluster_b resource pool"
+    value: your_partition_b
+  TIME_LIMIT:
+    description: "SLURM time limit (minutes)"
+    value: 30
+  IMAGE_A:
+    description: "Container image for tasks on cluster_a (Python 3.12)"
+    value: python:3.12-slim
+  IMAGE_B:
+    description: "Container image for tasks on cluster_b (Python 3.11)"
+    value: python:3.11-slim
+
+# Declared so `sflow run -a LOCAL_MODEL_PATH=...` (used by the sample-test
+# harness) is accepted, consistent with the other Slurm samples.
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
+backends:
+  - name: cluster_a
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.PARTITION_A }}
+    nodes: 2
+    gpus_per_node: 4
+    time: ${{ variables.TIME_LIMIT }}
+  - name: cluster_b
+    type: slurm
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.PARTITION_B }}
+    nodes: 1
+    gpus_per_node: 0
+    time: ${{ variables.TIME_LIMIT }}
+
+# Two distinct operators, one per backend, each with its own container image.
+operators:
+  - name: worker_a
+    type: srun
+    container_image: ${{ variables.IMAGE_A }}
+    ntasks_per_node: 1
+  - name: worker_b
+    type: srun
+    container_image: ${{ variables.IMAGE_B }}
+    ntasks_per_node: 1
+
+workflow:
+  name: multi_backend_slurm
+  tasks:
+    # No `backend:` -> runs on the default backend (cluster_a) with worker_a / IMAGE_A.
+    - name: task_a
+      operator: worker_a
+      script:
+        - echo "task_a backend=cluster_a job=${SFLOW_BACKEND_JOB_ID} nodes=${SFLOW_TASK_ASSIGNED_NODE_NAMES}"
+        - hostname
+
+    # Pinned to the second, independent resource pool with worker_b / IMAGE_B.
+    - name: task_b
+      backend: cluster_b
+      operator: worker_b
+      script:
+        - echo "task_b backend=cluster_b job=${SFLOW_BACKEND_JOB_ID} nodes=${SFLOW_TASK_ASSIGNED_NODE_NAMES}"
+        - hostname

@@ -10,20 +10,26 @@ import pytest
 import sflow.core.launcher as launcher_mod
 from sflow.core.command_log import (
     CommandLogRouter,
+    register_command_family,
 )
 from sflow.core.launcher import SubprocessLauncher
 
 
 def test_command_log_router_routes_command_families_and_fallback(tmp_path):
+    register_command_family(
+        "scheduler",
+        {"scheduler-run"},
+        filename="scheduler_cmds.log",
+    )
     router = CommandLogRouter(tmp_path)
 
-    router.record(["srun", "--job-name", "wf"], task_name="worker", shell=False)
+    router.record(["scheduler-run", "--job-name", "wf"], task_name="worker", shell=False)
     router.record(["bash", "-c", "echo hi"], task_name="worker", shell=False)
     router.record([sys.executable, "-c", "print('hi')"], task_name=None, shell=False)
     router.record(["custom-runner", "--flag"], task_name=None, shell=True)
 
-    assert "srun --job-name wf" in (tmp_path / "slurm_cmds.log").read_text()
-    assert "task    : worker" in (tmp_path / "slurm_cmds.log").read_text()
+    assert "scheduler-run --job-name wf" in (tmp_path / "scheduler_cmds.log").read_text()
+    assert "task    : worker" in (tmp_path / "scheduler_cmds.log").read_text()
     assert "bash -c 'echo hi'" in (tmp_path / "bash_cmds.log").read_text()
     assert "-c 'print('\"'\"'hi'\"'\"')'" in (tmp_path / "python_cmds.log").read_text()
     assert "custom-runner --flag" in (tmp_path / "backend_cmds.log").read_text()

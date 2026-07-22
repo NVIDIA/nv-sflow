@@ -1,0 +1,29 @@
+version: "0.1"
+
+backends:
+  - name: docker_cluster
+    type: docker
+    default: true
+    image: ubuntu:22.04
+    hosts:
+      - name: dgx-a
+        docker_host: ssh://dgx-a
+        ip_address: 10.0.0.11
+        gpus_per_node: 8
+      - name: dgx-b
+        docker_host: ssh://dgx-b
+        ip_address: 10.0.0.12
+        gpus_per_node: 8
+
+workflow:
+  name: docker_multi_node
+  tasks:
+    - name: distributed_job
+      resources:
+        nodes:
+          count: 2
+        gpus:
+          count: 1
+      script:
+        - echo "Running on ${SFLOW_TASK_ASSIGNED_NODE_NAMES}"
+        - ./run_worker.sh

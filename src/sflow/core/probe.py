@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,22 @@ class ProbeType(str, Enum):
 
     def __str__(self) -> str:
         return self.value
+
+
+@dataclass
+class ProbeAttempt:
+    """The outcome of the most recent probe check attempt (for the summary log).
+
+    Only the LAST attempt is kept per probe -- enough to see, post-mortem in
+    ``sflow_summary.log``, what the probe observed when the task went READY / timed
+    out / failed, without flooding the log with every attempt. ``detail`` is a short
+    per-type trace (e.g. log_watch: the matched line, or the last line seen on a miss;
+    tcp/http: the endpoint + result). ``runtime`` is how long that check took.
+    """
+
+    ok: bool
+    detail: str
+    runtime: float
 
 
 class ProbeStatus(str, Enum):
@@ -37,6 +54,10 @@ class Probe(ABC):
     """
     Abstract base class for probe checks.
     """
+
+    # Short probe-type label for the summary's Probe Traces section (overridden
+    # by each concrete probe: "log_watch", "tcp_port", "http_get", "http_post").
+    kind: str = "probe"
 
     def __init__(
         self,
@@ -72,6 +93,13 @@ class Probe(ABC):
         self._success_streak = 0
         self._failure_streak = 0
 
+        # Trace of the LAST check attempt only (surfaced in sflow_summary.log). A
+        # concrete check() sets ``_attempt_detail`` to a short per-type description;
+        # probe() wraps it with ok + runtime into ``last_attempt``. None until the
+        # first real check runs.
+        self.last_attempt: ProbeAttempt | None = None
+        self._attempt_detail: str = ""
+
     def reset(self) -> None:
         self.status = ProbeStatus.INITIATED
         self.timed_out = False
@@ -79,6 +107,21 @@ class Probe(ABC):
         self._next_check_at = self._started_at + max(self.delay, 0)
         self._success_streak = 0
         self._failure_streak = 0
+        self.last_attempt = None
+        self._attempt_detail = ""
+
+    @property
+    def effective_check_timeout(self) -> int:
+        """Per-attempt timeout (seconds) for a single check.
+
+        Honors the configured ``each_check_timeout`` directly. ``interval`` is the
+        gap *between* checks, not a bound on how long one attempt may take, so it
+        must not shrink the per-attempt timeout: with the default ``interval=5`` an
+        explicit ``each_check_timeout: 30`` would otherwise be silently capped to
+        5s, and a slow-but-valid endpoint (e.g. an LLM whose first token lands past
+        the interval) would time out on every attempt and never go ready.
+        """
+        return self.each_check_timeout
 
     @abstractmethod
     async def check(self, task: Task) -> bool:
@@ -119,12 +162,23 @@ class Probe(ABC):
 
         self._next_check_at = now + max(self.interval, 0)
 
+        # The concrete check() sets ``_attempt_detail`` as a side effect; reset it so
+        # a stale detail can't linger if a check returns early without setting one.
+        self._attempt_detail = ""
+        check_timeout = max(self.effective_check_timeout, 1)
+        started = time.monotonic()
         try:
-            ok = await asyncio.wait_for(
-                self.check(task), timeout=max(self.each_check_timeout, 1)
-            )
+            ok = await asyncio.wait_for(self.check(task), timeout=check_timeout)
         except asyncio.TimeoutError:
             ok = False
+            self._attempt_detail = f"check timed out after {check_timeout}s"
+        # Keep ONLY this (latest) attempt's trace for post-mortem debugging in
+        # sflow_summary.log -- what the probe last observed, without flooding.
+        self.last_attempt = ProbeAttempt(
+            ok=bool(ok),
+            detail=self._attempt_detail,
+            runtime=time.monotonic() - started,
+        )
 
         if self.type == ProbeType.READINESS:
             if ok:

@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import Field
 
 from sflow.core.command import Command
+from sflow.core.log_offload import unsupported_offload_warning
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.operator_registry import register_operator
 from sflow.utils.script import prepend_envs
@@ -24,6 +25,9 @@ class SshOperatorConfig(OperatorConfig):
     port: int | None = None
     identity_file: str | None = None
     extra_args: list[str] = Field(default_factory=list)
+
+    def runtime_warnings(self) -> list[str]:
+        return unsupported_offload_warning(self.type)
 
 
 @register_operator("ssh", SshOperatorConfig)
@@ -42,6 +46,12 @@ class SshOperator(Operator):
         c = self.config
         dest = f"{c.user}@{c.host}" if c.user else c.host
 
+        # TODO(log-offload): per-task log offload is not implemented for this
+        # operator yet (logs stream through the sflow driver). To add it, wrap the
+        # remote payload with the prefixer (sflow.core.log_offload.wrap_with_prefixer)
+        # and redirect to the per-task log ON THE REMOTE HOST; this only helps when
+        # that path is on shared storage the driver can read (or is fetched back),
+        # like the Slurm case. Also override writes_own_task_log().
         # Build remote payload as a single bash -lc string.
         payload = "\n".join(prepend_envs(list(script), dict(envs)))
         remote_cmd = f"bash -lc {shlex.quote(payload)}"

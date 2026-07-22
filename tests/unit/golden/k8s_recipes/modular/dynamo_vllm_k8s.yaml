@@ -1,0 +1,305 @@
+# sflow K8s recipe golden manifests -- DO NOT EDIT BY HAND.
+# composed: examples/modular/backend_agnostic/backends/k8s.yaml + examples/modular/backend_agnostic/workloads/dynamo_common.yaml + examples/modular/backend_agnostic/workloads/dynamo_vllm.yaml + examples/modular/backend_agnostic/benchmark.yaml
+# Rendered offline with a deterministic placeholder allocation (no cluster).
+# Merge followers are omitted; their containers run in the leader's merged pod.
+# Regenerate: SFLOW_UPDATE_GOLDEN=1 pytest tests/unit/test_k8s_recipe_golden_manifests.py
+---
+# task: nats_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: nats-server -js
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: nats-server-kubernetes
+    name: nats-server-kubernetes-cfg
+    namespace: your-namespace
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: nats-server-kubernetes
+    name: nats-server-kubernetes
+    namespace: your-namespace
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: nats-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+      name: nats-server-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: nats-server-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+kind: List
+---
+# task: etcd_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'etcd --listen-client-urls "http://0.0.0.0:2379" --advertise-client-urls "http://0.0.0.0:2379"
+      --listen-peer-urls "http://0.0.0.0:2380" --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+      --initial-cluster "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd
+
+      '
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: etcd-server-kubernetes
+    name: etcd-server-kubernetes-cfg
+    namespace: your-namespace
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: etcd-server-kubernetes
+    name: etcd-server-kubernetes
+    namespace: your-namespace
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: etcd-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+      name: etcd-server-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: etcd-server-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+kind: List
+---
+# task: frontend_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: python3 -m dynamo.frontend --http-port 8000
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: frontend-server-kubernetes
+    name: frontend-server-kubernetes-cfg
+    namespace: your-namespace
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: frontend-server-kubernetes
+    name: frontend-server-kubernetes
+    namespace: your-namespace
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: frontend-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+      name: frontend-server-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: frontend-server-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+kind: List
+---
+# task: server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "if [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\nset\
+      \ -x\npython3 -m dynamo.vllm --model /models/Qwen3-0.6B --served-model-name Qwen3-0.6B --tensor-parallel-size\
+      \ 4"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: server-kubernetes
+    name: server-kubernetes-cfg
+    namespace: your-namespace
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: server-kubernetes
+    name: server-kubernetes
+    namespace: your-namespace
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+      name: server-kubernetes
+      resources:
+        limits:
+          nvidia.com/gpu: '4'
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: server-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+kind: List
+---
+# task: benchmark (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'pip install aiperf==0.3.0
+
+      set -x
+
+      export COLUMNS=200
+
+      aiperf profile --model Qwen3-0.6B --tokenizer Qwen3-0.6B --endpoint-type chat --endpoint /v1/chat/completions
+      --streaming --url http://0.0.0.1:8000 --synthetic-input-tokens-mean 1024 --output-tokens-mean 1024
+      --concurrency 64 --request-count 512 --warmup-request-count 64
+
+      echo "Benchmarking finished"'
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: benchmark-kubernetes
+    name: benchmark-kubernetes-cfg
+    namespace: your-namespace
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: benchmark-kubernetes
+    name: benchmark-kubernetes
+    namespace: your-namespace
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: benchmark-kubernetes-env
+      image: python:3.12-slim
+      name: benchmark-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: benchmark-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+kind: List

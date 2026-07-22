@@ -5,6 +5,7 @@
 CLI command for running workflows.
 """
 
+import os
 import threading
 from collections import deque
 from pathlib import Path
@@ -14,13 +15,50 @@ import typer
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
+from sflow.core.kubectl_config import KubectlConfig
+from sflow.cli._args import (
+    EnableTaskMonitorOption,
+    EnableWorkflowMonitorOption,
+    ExcludeNodesOption,
+    IncludeNodesOption,
+    parse_key_value_args,
+    split_list_arg,
+)
+from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
 from sflow.logging import configure_logging, get_logger
 from sflow.resolution import enrich_error_with_location
 from sflow.runtime_info import log_runtime_info
+from sflow.utils.extra_args import dedup_merge_extra_args, extra_arg_key
 
 _logger = get_logger(__name__)
 
 _sflow_app = SflowApp()
+
+
+def _read_upload_summary_lines(workflow_out_dir: Path) -> list[str]:
+    """Read the detailed Uploads section from ``sflow_summary.log`` if present."""
+    summary_path = workflow_out_dir / "sflow_summary.log"
+    try:
+        lines = summary_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for idx, line in enumerate(lines):
+        if line != "Uploads":
+            continue
+        if idx + 1 >= len(lines) or lines[idx + 1] != "-------":
+            continue
+        upload_lines: list[str] = []
+        for section_line in lines[idx + 2 :]:
+            if not section_line:
+                break
+            if section_line.startswith("Counts :"):
+                _, value = section_line.split(":", 1)
+                if value := value.strip():
+                    upload_lines.append(value)
+                continue
+            upload_lines.append(section_line.strip())
+        return upload_lines
+    return []
 
 
 def _print_run_artifacts(workflow_out_dir: Path, *, err: bool = False) -> None:
@@ -30,6 +68,11 @@ def _print_run_artifacts(workflow_out_dir: Path, *, err: bool = False) -> None:
     if command_logs:
         paths = ", ".join(str(path) for path in command_logs)
         typer.echo(f"  Command logs: {paths}", err=err)
+    upload_lines = _read_upload_summary_lines(workflow_out_dir)
+    if upload_lines:
+        typer.echo("  Uploads:", err=err)
+        for line in upload_lines:
+            typer.echo(f"    {line}", err=err)
 
 
 def _resolve_bulk_input_row(
@@ -154,9 +197,140 @@ def run(
         typer.Option(
             "--extra-args",
             "-e",
-            help="Extra args to pass to slurm backend (e.g. --gpus-per-node=4). Merged with config extra_args and deduplicated.",
+            help="Generic, backend-agnostic extra args. They are forwarded to "
+            "whichever backend the recipe uses: merged into each Slurm backend's "
+            "salloc, each docker backend's `docker run`, and every kubectl call's "
+            "global flags. Deduplicated by option (CLI wins over the recipe; a more "
+            "specific --extra-salloc-args / --extra-docker-args / --extra-kubectl-args "
+            "wins over --extra-args on a conflicting option). Repeatable.",
         ),
     ] = None,
+    extra_salloc_args: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--extra-salloc-args",
+            help="Extra args merged into each Slurm backend's salloc (e.g. "
+            "--gpus-per-node=4), deduplicated by option against the backend "
+            "config's extra_args (CLI wins). Slurm backends only; in a "
+            "multi-backend recipe they apply to every Slurm backend's salloc.",
+        ),
+    ] = None,
+    extra_docker_args: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--extra-docker-args",
+            help="Extra args merged into each docker backend's `docker run` (e.g. "
+            "--shm-size=16g), deduplicated by option against the backend config's "
+            "extra_args (CLI wins). Docker backends only.",
+        ),
+    ] = None,
+    kubeconfig: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--kubeconfig",
+            help="Path to the kubeconfig file for kubernetes backends (also exported "
+            "as KUBECONFIG). Default: $KUBECONFIG or ~/.kube/config.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+    kube_context: Annotated[
+        Optional[str],
+        typer.Option(
+            "--kube-context",
+            help="kubeconfig context to use for kubernetes backends "
+            "(default: the kubeconfig's current-context).",
+        ),
+    ] = None,
+    kube_namespace: Annotated[
+        Optional[str],
+        typer.Option(
+            "--kube-namespace",
+            help="Override the namespace for all kubernetes backends.",
+        ),
+    ] = None,
+    kube_node_selector: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--kube-node-selector",
+            help="Node-selector label(s) (KEY=VALUE) for kubernetes backends, applied "
+            "as the pod nodeSelector + node-discovery selector (like kubectl -l). "
+            "Merges into and overrides the recipe's node_selector, so cluster/node-pool "
+            "identity (e.g. a 'tenant' label) stays out of the recipe. Accepts "
+            "comma-separated (--kube-node-selector k1=v1,k2=v2) and/or repeated flags.",
+        ),
+    ] = None,
+    kube_compute_domain_channel: Annotated[
+        Optional[str],
+        typer.Option(
+            "--kube-compute-domain-channel",
+            help="Override compute_domain.channel for all kubernetes backends: a channel "
+            "template name (join it), 'auto' (join the sole existing ComputeDomain), or "
+            "'disable' (legacy 'off'; no Multi-Node NVLink). Tune MNNVL/IMEX per run "
+            "without editing the recipe.",
+        ),
+    ] = None,
+    kube_compute_domain_create: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--kube-compute-domain-create/--no-kube-compute-domain-create",
+            help="Override compute_domain.create for all kubernetes backends. When on (and "
+            "no channel is joined), sflow stands up its own ComputeDomain CR named after "
+            "the run and injects the channel into every GPU pod. Unset by default (keeps "
+            "the recipe value).",
+        ),
+    ] = None,
+    kube_skip_pvc: Annotated[
+        bool,
+        typer.Option(
+            "--kube-skip-pvc",
+            help="Skip all PVC-backed volume mounts (a backend 'volumes:' entry with a "
+            "'claim') in every kubernetes backend for this run, keeping emptyDir volumes. "
+            "Debug aid for clusters lacking the recipe's PVCs -- pods schedule without "
+            "editing the recipe. The PVC data (e.g. a model cache) is NOT mounted, so "
+            "workloads that need it will fail; use for quick scheduling/plumbing checks.",
+        ),
+    ] = False,
+    kube_rdma: Annotated[
+        Optional[str],
+        typer.Option(
+            "--kube-rdma",
+            help="Override the 'rdma:' mode for all kubernetes backends this run: 'auto' "
+            "(detect+use IB/RoCE), 'disable' (force RDMA off -> NCCL on sockets/NVLink), or "
+            "a provider key (gke/shared_device_plugin/host_device). Use '--kube-rdma disable' "
+            "on a cluster whose IB fabric is down/absent so shipped recipes can keep "
+            "'rdma: auto'. Unset by default (keeps the recipe value).",
+        ),
+    ] = None,
+    kube_handoff: Annotated[
+        Optional[str],
+        typer.Option(
+            "--kube-handoff",
+            help="Override 'reservation.handoff' (GPU node handoff order) for all kubernetes "
+            "backends this run: 'auto' (destroy-before-create iff a GPU ResourceQuota is "
+            "detected), 'destroy_before_create' (delete the placeholder pod before applying "
+            "the task pod -- quota-safe, never double-counts placeholder+task GPU requests), "
+            "or 'create_before_destroy' (apply task first, no node-loss gap, but double-counts "
+            "under a GPU quota). Use '--kube-handoff destroy_before_create' on a "
+            "quota-constrained cluster so shipped recipes can keep 'auto'. Unset by default "
+            "(keeps the recipe value).",
+        ),
+    ] = None,
+    extra_kubectl_args: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--extra-kubectl-args",
+            help="Extra global kubectl flag applied to every kubectl call "
+            "(e.g. --extra-kubectl-args=--insecure-skip-tls-verify). Repeatable.",
+        ),
+    ] = None,
+    include_nodes: IncludeNodesOption = None,
+    exclude_nodes: ExcludeNodesOption = None,
+    enable_workflow_monitor: EnableWorkflowMonitorOption = False,
+    enable_task_monitor: EnableTaskMonitorOption = None,
     bulk_input: Annotated[
         Optional[Path],
         typer.Option(
@@ -186,7 +360,8 @@ def run(
         typer.Option(
             "--verbose",
             "-v",
-            help="Enable verbose output",
+            help="Show full per-task details in the --dry-run plan "
+            "(default: one-line summary per task)",
         ),
     ] = False,
     log_level: Annotated[
@@ -231,6 +406,18 @@ def run(
             min=1,
         ),
     ] = 2,
+    offload_task_logs: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--offload-task-logs/--no-offload-task-logs",
+            help="Have each task write its own log via the operator (srun --output, "
+            "or a host-side shell redirect for local/docker) through a compute-side "
+            "prefixer, instead of streaming it through the sflow driver. ON by default "
+            "for local/docker/slurm in non-interactive runs (auto-streams on a "
+            "TTY/--tui); pass --no-offload-task-logs to force streaming. Overrides the "
+            "backend's offload_task_logs; no-op for k8s/ssh.",
+        ),
+    ] = None,
 ):
     """
     Run a workflow from one or more sflow YAML files.
@@ -259,6 +446,10 @@ def run(
 
         # Run a single row from a CSV (bulk-input mode)
         sflow run --bulk-input jobs.csv --row 3
+
+        # Enable default hardware monitoring without editing the recipe
+        sflow run workflow.yaml --enable-workflow-monitor
+        sflow run workflow.yaml --enable-task-monitor aiperf,decode_server
 
         # Run a CSV row with additional CLI config files prepended
         sflow run -f common.yaml --bulk-input jobs.csv --row 1
@@ -291,6 +482,9 @@ def run(
                 err=True,
             )
             raise typer.Exit(code=1)
+        # Accept comma- and/or whitespace-separated task names (and repeated flags).
+        enable_task_monitor = split_list_arg(enable_task_monitor)
+
         tui_enabled = bool(tui) and not bool(dry_run)
         if tui and dry_run:
             typer.echo("⚠ --tui is ignored in --dry-run mode (no live execution).")
@@ -324,16 +518,76 @@ def run(
         else:
             _logger.info("Starting workflow execution...")
 
+        # Per-invocation override for the per-task log offload. Operators read
+        # this env and it wins over backend config, so users can toggle offload
+        # without editing recipes (slurm, local, docker).
+        if offload_task_logs is not None:
+            os.environ[OFFLOAD_TASK_LOGS_ENV] = "1" if offload_task_logs else "0"
+
+        # --extra-args is the generic, backend-agnostic flag: fan its values out to
+        # every typed channel (salloc / docker run / kubectl global flags) so whichever
+        # backend the recipe uses picks them up. The matching --extra-<type>-args is the
+        # `override` arg to dedup_merge_extra_args, so a specific flag wins over the
+        # generic one on a conflicting option. Each backend then de-dups again against
+        # its own config extra_args (CLI wins) in SflowApp.run.
+        generic_extra_args = list(extra_args or [])
+        salloc_args = dedup_merge_extra_args(generic_extra_args, list(extra_salloc_args or []))
+        docker_args = dedup_merge_extra_args(generic_extra_args, list(extra_docker_args or []))
+        kubectl_args = dedup_merge_extra_args(generic_extra_args, list(extra_kubectl_args or []))
+
+        # Generic args that end up as kubectl global flags (i.e. not overridden by an
+        # explicit --extra-kubectl-args on the same option). Passed through so a
+        # kubernetes backend can warn if one is actually a Slurm/docker-ism that would
+        # break every kubectl call; unlike salloc/docker, kubectl rejects unknown globals.
+        _kubectl_specific_keys = {extra_arg_key(a) for a in (extra_kubectl_args or [])}
+        generic_kubectl_args = [
+            a for a in kubectl_args if extra_arg_key(a) not in _kubectl_specific_keys
+        ]
+
+        kube_cfg = KubectlConfig(
+            kubeconfig=str(kubeconfig) if kubeconfig else None,
+            context=kube_context,
+            namespace=kube_namespace,
+            node_selector=parse_key_value_args(
+                kube_node_selector, flag="--kube-node-selector"
+            ),
+            compute_domain_channel=kube_compute_domain_channel,
+            compute_domain_create=kube_compute_domain_create,
+            skip_pvc=kube_skip_pvc,
+            rdma=kube_rdma,
+            handoff=kube_handoff,
+            extra_args=kubectl_args,
+            generic_extra_args=generic_kubectl_args,
+        )
+
+        include_nodes = split_list_arg(include_nodes)
+        exclude_nodes = split_list_arg(exclude_nodes)
+
+        # Route the resolved per-type args to their backend type: slurm -> salloc,
+        # docker -> `docker run`. Empty buckets are omitted so backends without CLI
+        # args are untouched.
+        backend_extra_args_by_type: dict[str, list[str]] = {}
+        if salloc_args:
+            backend_extra_args_by_type["slurm"] = salloc_args
+        if docker_args:
+            backend_extra_args_by_type["docker"] = docker_args
+
         workflow_out_dir = None
         try:
             workflow_out_dir = _sflow_app.run(
                 file=files,
                 dry_run=dry_run,
+                verbose=verbose,
                 resume=resume,
                 variable_overrides=set_var,
                 artifact_overrides=artifact,
                 missable_tasks=missable_tasks,
-                backend_extra_args=extra_args,
+                backend_extra_args_by_type=backend_extra_args_by_type or None,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
+                kubectl_config=kube_cfg,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitor,
                 workspace_dir=workspace_dir,
                 output_dir=output_dir,
                 tui=tui_enabled,

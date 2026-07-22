@@ -2,95 +2,155 @@
 name: sflow-error-analysis
 description: >-
   Diagnose and troubleshoot sflow workflow errors from log output, error messages, and
-  task failures. Covers config validation errors, expression resolution failures, SLURM
-  backend issues, probe timeouts, task crashes, and batch submission problems. Use when
-  the user encounters an sflow error, pastes error output, asks to debug a failed workflow,
-  or asks about sflow troubleshooting.
+  task failures. Covers config validation errors, expression resolution failures, backend
+  issues (Slurm, Docker, Kubernetes/kubectl/RBAC), probe timeouts, task crashes, S3
+  storage/upload failures, and batch submission problems. Use when the user encounters an
+  sflow error, pastes error output, asks to debug a failed workflow, or asks about sflow
+  troubleshooting.
 ---
 
 # sflow Error Analysis
 
-## Triage Flow
+Diagnose a failure in a fixed order: **capture → classify → locate → fix → re-verify.**
+The first move depends on *when* it broke:
 
-1. **Identify category** from the error message (see table below)
-2. **Locate source** -- check the file/line hint or task log
-3. **Apply fix** from the quick-fix table or [error-catalog.md](error-catalog.md)
+- **Launch / validation failure** — nothing ran (bad config, YAML, expression, artifact,
+  merge, CSV). Caught by `--dry-run`; the fix is in the YAML.
+- **Runtime failure** — a task started and died (backend launch, probe timeout, crash,
+  upload). You have a run dir; the fix is in the logs.
 
-## Error Categories
+Figure out which you have, then follow that path below.
 
-| Category            | Marker                                           | Where to Look             |
-|---------------------|--------------------------------------------------|---------------------------|
-| Config loading      | `Configuration error:`, `File not found:`        | CLI output / sflow.log    |
-| YAML syntax         | `Error parsing YAML`                             | CLI output                |
-| Expression          | `Undefined variable`, `Invalid expression syntax`| CLI output                |
-| Artifact            | `Artifact path validation failed`                | CLI output / dry-run      |
-| Merge conflict      | `Version conflict`, `Workflow name conflict`     | CLI output (multi-file)   |
-| SLURM               | `salloc failed`, `sbatch failed`                 | CLI / sbatch stderr       |
-| Probe timeout       | Task stuck waiting                               | `<task>/<task>.log`       |
-| Task failure        | `Traceback`, non-zero exit                       | `<task>/<task>.log`       |
-| Batch/CSV           | `CSV file`, `sflow_config_file column`           | CLI output                |
+## Step 1 — Capture the failure
 
-## Log Locations
+- **A task ran and failed (you have a run dir)** → start with the one-shot triage. It walks
+  per-task status → orchestrator `sflow.log` → each failed `<task>/<task>.log` and prints a
+  single root cause + fix. Drill in from its output:
 
-```
+  ```bash
+  python scripts/triage.py <output_dir>/<run_id>/
+  ```
+
+- **It failed at launch (no run dir)** → reproduce with a dry-run and parse it:
+
+  ```bash
+  sflow run -f config.yaml --dry-run
+  python scripts/parse_sflow_errors.py - < <(sflow run -f config.yaml --dry-run 2>&1)
+  ```
+
+- **Only have a pasted error?** Match its marker in Step 2 to pick the path.
+
+## Step 2 — Classify (marker → where to look)
+
+| Category            | Marker in the output                                     | Path    | Where to look             |
+|---------------------|----------------------------------------------------------|---------|---------------------------|
+| Config loading      | `Configuration error:`, `File not found:`                | launch  | CLI output / sflow.log    |
+| YAML syntax         | `Error parsing YAML`                                     | launch  | CLI output                |
+| Expression          | `Undefined variable`, `Invalid expression syntax`        | launch  | CLI output                |
+| Artifact            | `Artifact path validation failed`                        | launch  | CLI output / dry-run      |
+| Schema              | `type 'docker' is not valid` (use `docker_run`), `mutually exclusive` | launch | CLI output (validation) |
+| Merge conflict      | `Version conflict` (name/dup-task now warn+merge)        | launch  | CLI output (multi-file)   |
+| Batch / CSV         | `CSV file`, `sflow_config_file column`                   | launch  | CLI output                |
+| SLURM               | `salloc failed`, `sbatch failed`                         | runtime | CLI / sbatch stderr       |
+| Kubernetes          | `kubectl`, RBAC/preflight, pod `Pending`/`ImagePullBackOff` | runtime | CLI / sflow.log / `kubectl describe` |
+| Docker              | `docker run` errors, remote host, NVIDIA toolkit         | runtime | `<task>/<task>.log`       |
+| Storage / uploads   | `requires boto3`, `No AWS credentials`, upload failures  | runtime | CLI / dry-run / sflow.log |
+| Probe timeout       | Task stuck waiting                                       | runtime | `<task>/<task>.log`       |
+| Task failure        | `Traceback`, non-zero exit                              | runtime | `<task>/<task>.log`       |
+
+## Step 3 — Locate the evidence
+
+```text
 <output_dir>/<run_id>/
-  sflow.log                   # orchestrator log
-  <task_name>/<task_name>.log  # task stdout/stderr
+  sflow.log                    # orchestrator log (launch + status lines)
+  sflow_summary.log            # live per-task status + failure hints
+  *_cmds.log                   # command-only launch logs, by command family
+  results.json                 # workflow-level parsed metrics (aggregated from task result: blocks)
+  sflow_monitor.log            # hardware monitor overview (if monitor: enabled — local/slurm/docker only, NOT k8s)
+  sflow_monitor/               # detailed monitor reports (csv/svg/png) + raw/ samples
+  <task_name>/<task_name>.log  # task stdout/stderr — the crash lives here
+  <task_name>/result.json      # that task's parsed metrics (if it declares a result: block)
   <task_name>_0/               # replica 0
 ```
 
-Batch jobs: also check the `.sh` script and sbatch stdout/stderr files.
+- **Parsed results:** a task with a `result:` block writes `<task>/result.json`
+  (`ok`/`values`/`errors`) and updates the run-level `results.json`. Result parsing is
+  **best-effort** — a missed regex or failed `required:` spec logs a warning and sets
+  `ok=false`, but does not by itself fail the task; check `errors` there if a metric is empty.
+  Parsing runs at task finalize, so a task shows `COMPLETED` only *after* it (and any
+  `uploads:`) finish.
+- **No monitor output?** Hardware monitoring is unsupported on **kubernetes**
+  (`supports_host_monitoring=False`) — sflow logs "node-level hardware monitoring is not
+  implemented for this backend yet" and produces no `sflow_monitor*`. On local/slurm/docker,
+  an empty monitor usually means the `used_by_tasks` target resolved to no nodes.
 
-## Quick-Fix Table
+- **Batch jobs:** also read the generated `.sh` and sbatch stdout/stderr
+  (`sflow_output/%j-sflow-submit.out` / `.err`).
+- **Kubernetes:** `kubectl describe pod <pod>` and `kubectl get events` for
+  scheduling/image issues the pod log can't show.
 
-| Error Text                                              | Fix                                                |
-|---------------------------------------------------------|----------------------------------------------------|
-| `Configuration file not found: <path>`                  | Check `-f` path                                    |
-| `Error parsing YAML configuration: <detail>`            | Fix YAML syntax at indicated line                  |
-| `Configuration validation failed: <detail>`             | Check field types/values (schema-reference.md)     |
-| `Variable '<key>' specified in overrides is not defined` | Declare variable in YAML first                    |
-| `Undefined variable in expression`                      | Fix spelling; ensure variable is declared          |
-| `Invalid expression syntax`                             | Fix `${{ }}` Jinja2 syntax                         |
-| `Artifact path validation failed`                       | Fix `fs://` path or create it                      |
-| `Version conflict`                                      | All files must use `version: "0.1"`                |
-| Probe timeout (task hangs)                              | Check task log; adjust `regex_pattern` / `timeout` |
-| `Traceback` in task log                                 | Read traceback for root cause                      |
-| `salloc failed`                                         | Check partition/account/availability               |
-| `CSV file must contain a 'sflow_config_file' column`   | Add required column to CSV                         |
+## Step 4 — Root-cause & fix
 
-## Quick Diagnostic Commands
+### 4a. Launch / validation — fix in the YAML, re-run `--dry-run`
+
+| Error text                                               | Fix                                                        |
+|----------------------------------------------------------|------------------------------------------------------------|
+| `Configuration file not found: <path>`                   | Check the `-f` path                                        |
+| `Error parsing YAML configuration: <detail>`             | Fix YAML syntax at the indicated line                      |
+| `Configuration validation failed: <detail>`              | Check field types/values (schema-reference.md)             |
+| `Operator type 'docker' is not valid`                    | Use `type: docker_run` for the operator (backend is `type: docker`) |
+| `Variable '<key>' ... is not defined`                    | Declare the variable in YAML before `--set`-ing it         |
+| `Undefined variable in expression`                       | Fix spelling; ensure the variable is declared              |
+| `Invalid expression syntax`                              | Fix the `${{ }}` Jinja2 syntax                             |
+| `Artifact path validation failed`                        | Fix the `fs://` path or create it                          |
+| `Version conflict`                                       | Every file must use `version: "0.1"`                       |
+| `CSV file must contain a 'sflow_config_file' column`     | Add the required column to the CSV                         |
+
+### 4b. Runtime — read the logs (backend launch, then task crash)
+
+| Symptom                                                  | Fix                                                        |
+|----------------------------------------------------------|------------------------------------------------------------|
+| `salloc failed` / `sbatch failed`                        | Check partition/account/availability (`sinfo`, `sacctmgr`) |
+| kube preflight: missing permission / namespace           | Fix RBAC or `--kube-namespace`; `SFLOW_SKIP_K8S_PREFLIGHT=1` to bypass |
+| pod stuck `Pending`                                      | `kubectl describe pod`: no node has the GPUs — check `gpus_per_node`, `scheduling` mode, node-selector/tolerations, and that `gpus.count` is a multiple of the node count |
+| pod `ImagePullBackOff` / container not found             | Wrong `image` or missing `image_pull_secrets`; verify registry access |
+| Docker GPU task fails                                    | Install the NVIDIA container toolkit on the host; set `gpus_per_node` |
+| Probe timeout (task hangs waiting)                       | Read the **Probe Traces (last attempt)** section of `sflow_summary.log` — it shows what each probe last saw (the last log line for `log_watch`, the endpoint result for `tcp_port`/`http`). Then compare server output to `log_watch` — it matches **literally** unless prefixed `re:`/`regex:`; adjust the pattern or `timeout` |
+| `Traceback` in `<task>.log`                              | Read the traceback for the real cause (below are the usual ones) |
+| CUDA OOM                                                 | Reduce batch size, TP/DP, or model size                    |
+| `Address already in use` / port conflict                | Kill stale processes or offset the port                    |
+| NCCL / communication errors                              | Set `NCCL_SOCKET_IFNAME`; check the inter-node network     |
+| `S3 storage requires boto3` / `no AWS credentials` / upload fails | `pip install 'sflow[s3]'`; provide creds via the boto3 chain (`AWS_*` / `~/.aws/credentials` / IAM — never in YAML); verify bucket/region |
+
+For a pattern-by-pattern catalog (exact message, cause, and fix per error), see
+[error-catalog.md](error-catalog.md).
+
+## Step 5 — Re-verify
+
+Re-run the relevant capture command — clean exit means fixed:
 
 ```bash
-# Validate config without executing
-sflow run -f config.yaml --dry-run
-
-# See resolved expressions
-sflow compose file1.yaml file2.yaml --resolve -o merged.yaml
-
-# Check SLURM environment
-sinfo -p <partition>
-sacctmgr show account <name>
-
-# Parse errors from log
-python scripts/parse_sflow_errors.py <sflow.log>
-python scripts/parse_sflow_errors.py - < <(sflow run -f config.yaml --dry-run 2>&1)
-
-# Summarize a run's output
-python scripts/summarize_run.py <output_dir>/<run_id>/
+sflow run -f config.yaml --dry-run          # launch fixes: exit 0 = ready
+python scripts/triage.py <run_dir>/          # runtime fixes: no failed tasks
 ```
 
-## Common Runtime Issues
+## Diagnostic commands (reference)
 
-- **OOM**: Reduce batch size, TP/DP, or model size
-- **Port conflict**: Kill stale processes or adjust port offsets
-- **Container not found**: Verify image URI and registry access
-- **NCCL errors**: Set `NCCL_SOCKET_IFNAME`, check inter-node network
-- **Probe mismatch**: Server output doesn't match `regex_pattern`
+```bash
+sflow run -f config.yaml --dry-run                       # validate + resolve without executing
+sflow compose f1.yaml f2.yaml --resolve -o merged.yaml   # see the merged + resolved config
+python scripts/triage.py <output_dir>/<run_id>/          # one-shot: summary + logs -> root cause
+python scripts/summarize_run.py <output_dir>/<run_id>/   #   per-task status + tracebacks only
+python scripts/parse_sflow_errors.py <run_id>/sflow.log  #   categorize an orchestrator log
+sinfo -p <partition>; sacctmgr show account <name>       # Slurm environment
+kubectl -n <ns> get pods && kubectl -n <ns> describe pod <pod>   # Kubernetes scheduling/image
+kubectl -n <ns> get events --sort-by=.lastTimestamp
+```
 
-## Additional Resources
+## Additional resources
 
-- Exhaustive error patterns: [error-catalog.md](error-catalog.md)
-- Full docs: [faq](https://nvidia.github.io/nv-sflow/docs/user/faq),
+- Exhaustive error patterns → [error-catalog.md](error-catalog.md)
+- Docs → [faq](https://nvidia.github.io/nv-sflow/docs/user/faq),
   [cli](https://nvidia.github.io/nv-sflow/docs/user/cli),
   [configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration),
   [backends](https://nvidia.github.io/nv-sflow/docs/user/backends)

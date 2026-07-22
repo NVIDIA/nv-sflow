@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
@@ -138,7 +140,7 @@ def test_template_resolves_to_invalid_image_raises():
 
 def test_template_in_extra_args_resolves_to_invalid_raises():
     cfg = _config(extra_args=["--container-image=${{ variables.IMG }}"])
-    with pytest.raises(ValueError, match="Pre-flight validation failed.*extra_args.*invalid container image"):
+    with pytest.raises(ValueError, match="Pre-flight validation failed.*operator 'op_srun'.*invalid container image"):
         preflight_validate_container_images(
             cfg,
             _state(IMG="not a valid image!!"),
@@ -169,7 +171,7 @@ def test_invalid_task_override_image_raises():
 
 
 def test_invalid_task_override_extra_args_raises():
-    with pytest.raises(ValueError, match="Pre-flight validation failed.*task.*operator override.*extra_args.*invalid container image"):
+    with pytest.raises(ValueError, match="Pre-flight validation failed.*task.*operator override.*invalid container image"):
         preflight_validate_container_images(
             _config(
                 container_image="nvcr.io/valid:latest",
@@ -187,3 +189,91 @@ def test_valid_task_override_image_passes():
         ),
         _state(),
     )
+
+
+def test_invalid_docker_backend_default_image_raises():
+    cfg = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "docker",
+                "type": "docker",
+                "default": True,
+                "image": "${{ variables.IMG }}",
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo hi"])],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Pre-flight validation failed.*backend 'docker'.*invalid container image"):
+        preflight_validate_container_images(cfg, _state(IMG="not valid!!"))
+
+
+def test_kubernetes_backend_contributes_no_image_to_preflight():
+    # The kubernetes backend has no `image` field anymore (workload images come
+    # from operators), so a stray `image` is dropped and never validated --
+    # preflight must NOT raise on it.
+    cfg = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "k8s",
+                "type": "kubernetes",
+                "default": True,
+                "image": "${{ variables.IMG }}",
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo hi"])],
+        ),
+    )
+
+    assert cfg.backends[0].container_images() == []
+    # No raise even with an otherwise-invalid image value.
+    preflight_validate_container_images(cfg, _state(IMG="not valid!!"))
+
+
+def test_backend_config_exposes_container_images_for_default_operator_preflight():
+    cfg = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "docker",
+                "type": "docker",
+                "default": True,
+                "image": "nvcr.io/example/app:1.0",
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[TaskConfig(name="t1", script=["echo hi"])],
+        ),
+    )
+
+    assert cfg.backends[0].container_images() == ["nvcr.io/example/app:1.0"]
+
+
+def test_operator_container_images_hook_is_validated_even_with_primary_image_attr():
+    class CustomImageOperatorConfig:
+        name = "op_custom"
+        image = "nvcr.io/example/app:1.0"
+        extra_args: list[str] = []
+
+        def container_images(self) -> list[str]:
+            return [self.image, "not valid!!"]
+
+    cfg = SimpleNamespace(
+        operators=[CustomImageOperatorConfig()],
+        backends=[],
+        workflow=SimpleNamespace(tasks=[]),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Pre-flight validation failed.*operator 'op_custom'.*invalid container image",
+    ):
+        preflight_validate_container_images(cfg, _state())

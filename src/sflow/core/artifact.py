@@ -25,6 +25,11 @@ class Artifact:
     description: str | None = None
     # Local materialized path, if applicable (e.g. file:// resolved or downloaded into cache)
     path: Path | None = None
+    # Inline file:// content (verbatim) when declared in the workflow. Carried on the
+    # resolved artifact so off-host operators (e.g. Kubernetes) can inject it natively
+    # (a ConfigMap mounted into the pod) instead of relying on a file written to the
+    # controller's filesystem, which remote pods/nodes cannot see.
+    content: str | None = None
 
     def to_context_dict(self) -> dict[str, str | None]:
         """

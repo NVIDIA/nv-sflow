@@ -1,0 +1,161 @@
+# Local containerized LLM deploy: SGLang serving Qwen3-0.6B, plus a smoke-test
+# client and an AIPerf benchmark (concurrency 8).
+#
+# This is the local-container counterpart of slurm_sglang_server_client.yaml: instead
+# of a Slurm allocation + srun containers, it uses the local Docker backend so you can
+# stand up the model on a single GPU workstation with one command. The AIPerf setup
+# mirrors the benchmark task in slurm_dynamo_trtllm_agg.yaml.
+#
+# Prerequisites:
+#   - Docker installed and on PATH
+#   - An NVIDIA GPU + NVIDIA Container Toolkit (`--gpus all` must work)
+#   - Network access to pull the SGLang image and the model from Hugging Face
+#
+# Run it:
+#   sflow run -f docker_sglang_qwen3.yaml
+#   # validate only:
+#   sflow run -f docker_sglang_qwen3.yaml --dry-run
+#   # add hardware monitoring without editing this file:
+#   sflow run -f docker_sglang_qwen3.yaml --enable-workflow-monitor
+version: "0.1"
+
+variables:
+  # Model
+  HF_MODEL_NAME:
+    description: "Hugging Face model id (or a local path mounted into the container)"
+    value: Qwen/Qwen3-0.6B
+  SERVED_MODEL_NAME:
+    description: "Name the server advertises (used by the OpenAI-compatible API)"
+    value: Qwen3-0.6B
+
+  # Server
+  PORT:
+    description: "Port the SGLang server listens on (shared with the host via --network host)"
+    value: 8000
+  TP_SIZE:
+    description: "Tensor parallel size (Qwen3-0.6B fits on a single GPU)"
+    value: 1
+  MAX_RUNNING_REQUESTS:
+    description: "Max concurrent requests the server will schedule"
+    value: 32
+
+  # Client
+  PROMPT:
+    description: "Prompt sent by the smoke-test client"
+    value: "Give me a one-sentence fun fact about GPUs."
+  MAX_TOKENS:
+    description: "Max tokens the client requests"
+    value: 128
+
+  # Benchmark (aiperf)
+  ISL:
+    description: "Synthetic input sequence length"
+    value: 1024
+  OSL:
+    description: "Synthetic output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Benchmark rounds (request-count = MULTI_ROUND * CONCURRENCY)"
+    value: 2
+  CONCURRENCY:
+    description: "Number of concurrent requests aiperf drives"
+    value: 8
+
+  # Container images. Pin tags compatible with your host driver / environment.
+  SGLANG_IMAGE:
+    description: "SGLang runtime container image"
+    value: "lmsysorg/sglang:v0.5.7-cu130-runtime"
+  AIPERF_IMAGE:
+    description: "AIPerf client container image (CPU-only)"
+    value: python:3.12-slim
+
+backends:
+  - name: local_docker
+    type: docker
+    default: true
+    # Default operator image; every task below sets its own operator, so this is
+    # only a fallback. Kept in sync with SGLANG_IMAGE for consistency.
+    image: ${{ variables.SGLANG_IMAGE }}
+    nodes: 1
+    gpus_per_node: 1
+
+operators:
+  - name: sglang_runtime
+    type: docker_run
+    image: ${{ variables.SGLANG_IMAGE }}
+    gpus: all                      # expose local GPU(s) to the container
+    extra_args:
+      - --network=host             # share host networking so the client reaches localhost:PORT
+      - --shm-size=16g             # SGLang needs ample shared memory
+      - --ipc=host
+  - name: aiperf
+    type: docker_run               # CPU-only client container; no --gpus
+    image: ${{ variables.AIPERF_IMAGE }}
+    extra_args:
+      - --network=host             # reach the SGLang server at localhost:PORT
+
+workflow:
+  name: sglang_qwen3_local
+  timeout: 30m
+  tasks:
+    - name: sglang_server
+      operator: sglang_runtime
+      # Advertised service port (metadata; the container uses host networking).
+      ports:
+        - port: ${{ variables.PORT }}
+      script:
+        - set -x
+        - >
+          python3 -m sglang.launch_server
+          --model-path ${{ variables.HF_MODEL_NAME }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --host 0.0.0.0
+          --port ${{ variables.PORT }}
+          --tp-size ${{ variables.TP_SIZE }}
+          --max-running-requests ${{ variables.MAX_RUNNING_REQUESTS }}
+          --trust-remote-code
+      probes:
+        # Mark the server READY once SGLang prints its startup banner, so the
+        # client task is released only after the model is actually serving.
+        readiness:
+          log_watch:
+            regex_pattern: "The server is fired up and ready to roll"
+          timeout: 1200
+          interval: 5
+        # Fail fast if the server crashes during startup.
+
+    - name: aiperf
+      operator: aiperf
+      depends_on:
+        - sglang_server   # server stays READY while the benchmark runs
+      script:
+        - set -x
+        - pip install --no-cache-dir aiperf==0.3.0
+        - export COLUMNS=200
+        # All ${VARS} below are sflow variables injected into the task env.
+        - >
+          aiperf profile
+          --artifact-dir ${SFLOW_TASK_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${SERVED_MODEL_NAME}
+          --tokenizer ${HF_MODEL_NAME}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://localhost:${PORT}
+          --synthetic-input-tokens-mean ${ISL}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${OSL}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${OSL}"
+          --extra-inputs "min_tokens:${OSL}"
+          --extra-inputs "ignore_eos:true"
+          --concurrency ${CONCURRENCY}
+          --request-count $(( ${MULTI_ROUND} * ${CONCURRENCY} ))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $(( ${MULTI_ROUND} * ${CONCURRENCY} ))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT_USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"

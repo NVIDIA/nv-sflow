@@ -170,7 +170,7 @@ def test_compose_rejects_invalid_merged_config(tmp_path: Path):
 def test_compose_real_disagg_example_files(tmp_path: Path):
     """Compose the real disagg example files and validate the output is loadable."""
     repo_root = Path(__file__).resolve().parents[2]
-    examples_dir = repo_root / "examples" / "inference_x_v2"
+    examples_dir = repo_root / "examples" / "modular" / "inference_x_v2"
     if not examples_dir.exists():
         return
 

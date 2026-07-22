@@ -16,6 +16,7 @@ from sflow.core.operator import Operator
 from sflow.core.state import SflowState
 from sflow.core.task import Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
+from sflow.core.uploads import ResolvedWorkflowUpload
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
@@ -25,12 +26,16 @@ class _BackendWithAllocation(Backend):
     def __init__(self, name: str):
         super().__init__(name=name)
         self.released = False
+        self.emergency_released: list[str] = []
 
     async def allocate(self) -> Allocation:
         raise RuntimeError("not used")
 
     async def release(self, allocation: Allocation) -> None:
         self.released = True
+
+    def emergency_release(self, allocation: Allocation) -> None:
+        self.emergency_released.append(str(allocation.allocation_id))
 
     def default_operator(
         self,
@@ -66,6 +71,7 @@ def test_sflow_app_releases_backend_allocation_on_success(tmp_path, monkeypatch)
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         return state
 
@@ -85,6 +91,129 @@ def test_sflow_app_releases_backend_allocation_on_success(tmp_path, monkeypatch)
     assert "Sflow Summary" in summary_text
     assert "Runtime" in summary_text
     assert "sflow executable" in summary_text
+
+
+def test_sflow_app_uses_generic_run_id_prefix_env(tmp_path, monkeypatch):
+    f = tmp_path / "sflow.yaml"
+    f.write_text(
+        'version: "0.1"\nworkflow:\n  name: wf\n  tasks:\n    - name: t1\n      script:\n        - echo hi\n'
+    )
+
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+
+    async def _fake_build_state(
+        config: SflowConfig,
+        *,
+        allocate: bool = True,
+        workspace_dir=None,
+        output_dir=None,
+        source_files=None,
+        kubectl_config=None,
+    ) -> SflowState:
+        return state
+
+    monkeypatch.setenv("SFLOW_RUN_ID_PREFIX", "submit-123")
+    monkeypatch.setattr(sflow_app_mod, "build_state", _fake_build_state)
+
+    workflow_out_dir = sflow_app_mod.SflowApp().run(
+        file=Path(f),
+        dry_run=False,
+        output_dir=tmp_path / "out",
+    )
+
+    assert workflow_out_dir is not None
+    assert workflow_out_dir.name.startswith("submit-123-wf-")
+
+
+def test_sflow_app_falls_back_to_slurm_job_id_for_run_id_prefix(tmp_path, monkeypatch):
+    f = tmp_path / "sflow.yaml"
+    f.write_text(
+        'version: "0.1"\nworkflow:\n  name: wf\n  tasks:\n    - name: t1\n      script:\n        - echo hi\n'
+    )
+
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+
+    async def _fake_build_state(
+        config: SflowConfig,
+        *,
+        allocate: bool = True,
+        workspace_dir=None,
+        output_dir=None,
+        source_files=None,
+        kubectl_config=None,
+    ) -> SflowState:
+        return state
+
+    monkeypatch.delenv("SFLOW_RUN_ID_PREFIX", raising=False)
+    monkeypatch.setenv("SLURM_JOB_ID", "98765")
+    monkeypatch.setattr(sflow_app_mod, "build_state", _fake_build_state)
+
+    workflow_out_dir = sflow_app_mod.SflowApp().run(
+        file=Path(f),
+        dry_run=False,
+        output_dir=tmp_path / "out",
+    )
+
+    assert workflow_out_dir is not None
+    assert workflow_out_dir.name.startswith("98765-wf-")
+
+
+def test_sflow_app_atexit_cleanup_delegates_to_backend_emergency_release(
+    tmp_path, monkeypatch
+):
+    import atexit
+    import sflow.core.orchestrator as orchestrator_mod
+
+    f = tmp_path / "sflow.yaml"
+    f.write_text(
+        'version: "0.1"\nworkflow:\n  name: wf\n  tasks:\n    - name: t1\n      script:\n        - echo hi\n'
+    )
+
+    backend = _BackendWithAllocation("b1")
+    backend.allocation = Allocation(
+        allocation_id="1",
+        nodes=[ComputeNode(name="n1", ip_address="127.0.0.1", index=0)],
+    )
+
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+    state.backends = {"b1": backend}
+    state.default_backend = backend
+
+    async def _fake_build_state(
+        config: SflowConfig,
+        *,
+        allocate: bool = True,
+        workspace_dir=None,
+        output_dir=None,
+        source_files=None,
+        kubectl_config=None,
+    ) -> SflowState:
+        return state
+
+    callbacks = []
+
+    class _EmergencyCleanupOrchestrator:
+        def __init__(self, workflow, **kwargs):
+            self.workflow = workflow
+
+        def request_stop(self, reason=None):
+            pass
+
+        async def run(self):
+            assert callbacks
+            callbacks[-1]()
+
+    monkeypatch.setattr(atexit, "register", lambda callback: callbacks.append(callback))
+    monkeypatch.setattr(sflow_app_mod, "build_state", _fake_build_state)
+    monkeypatch.setattr(orchestrator_mod, "Orchestrator", _EmergencyCleanupOrchestrator)
+
+    sflow_app_mod.SflowApp().run(
+        file=Path(f),
+        dry_run=False,
+        output_dir=tmp_path / "out",
+    )
+
+    assert backend.emergency_released == ["1"]
 
 
 def test_sflow_app_releases_backend_when_summary_start_fails(tmp_path, monkeypatch):
@@ -110,6 +239,7 @@ def test_sflow_app_releases_backend_when_summary_start_fails(tmp_path, monkeypat
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         return state
 
@@ -174,6 +304,7 @@ def test_sflow_app_raises_on_failed_tasks_and_still_releases_backends(
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         return state
 
@@ -187,6 +318,98 @@ def test_sflow_app_raises_on_failed_tasks_and_still_releases_backends(
 
     assert backend.released is True
     assert backend.allocation is None
+
+
+def test_sflow_app_marks_summary_failed_when_workflow_upload_all_fails(
+    tmp_path, monkeypatch
+):
+    f = tmp_path / "sflow.yaml"
+    f.write_text(
+        """
+version: "0.1"
+storage:
+  - name: archive
+    type: s3
+    bucket: does-not-exist
+workflow:
+  name: wf
+  upload_all:
+    target: archive
+    on_error: fail
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+    state.workflow_upload = ResolvedWorkflowUpload(target="archive", on_error="fail")
+
+    async def _fake_build_state(
+        config: SflowConfig,
+        *,
+        allocate: bool = True,
+        workspace_dir=None,
+        output_dir=None,
+        source_files=None,
+        kubectl_config=None,
+    ) -> SflowState:
+        return state
+
+    class _NoopOrchestrator:
+        def __init__(self, workflow, **kwargs):
+            self.workflow = workflow
+
+        async def run(self):
+            return None
+
+    class _RecordingSummaryWriter:
+        instances = []
+
+        def __init__(self, path):
+            self.workflow_finished_calls = []
+            self.recorded_uploads = []
+            self.flush_count = 0
+            self.__class__.instances.append(self)
+
+        def start(self, **kwargs):
+            pass
+
+        def record_uploads(self, results):
+            self.recorded_uploads.extend(results)
+
+        def workflow_finished(self, **kwargs):
+            self.workflow_finished_calls.append(kwargs)
+
+        def flush(self):
+            self.flush_count += 1
+
+    async def _failed_workflow_upload(*_args, results=None, **_kwargs):
+        return False
+
+    import sflow.core.orchestrator as orchestrator_mod
+    import sflow.core.uploads as uploads_mod
+
+    monkeypatch.setattr(sflow_app_mod, "build_state", _fake_build_state)
+    monkeypatch.setattr(orchestrator_mod, "Orchestrator", _NoopOrchestrator)
+    monkeypatch.setattr(sflow_app_mod, "SflowSummaryWriter", _RecordingSummaryWriter)
+    monkeypatch.setattr(uploads_mod, "run_workflow_upload", _failed_workflow_upload)
+
+    with pytest.raises(RuntimeError, match="upload_all failed"):
+        sflow_app_mod.SflowApp().run(
+            file=Path(f),
+            dry_run=False,
+            output_dir=tmp_path / "out",
+        )
+
+    summary_writer = _RecordingSummaryWriter.instances[0]
+    assert summary_writer.workflow_finished_calls
+    final_call = summary_writer.workflow_finished_calls[-1]
+    assert final_call["status"] == "FAILED"
+    assert "upload_all failed" in final_call["detail"]
+    assert "wf" in final_call["detail"]
+    assert summary_writer.flush_count >= 1
 
 
 @pytest.mark.parametrize(
@@ -229,6 +452,7 @@ def test_sflow_app_preserves_signal_exit_when_signal_cancels_tasks(
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         return state
 
@@ -329,6 +553,7 @@ def test_sflow_app_propagates_sigint_from_tui_interrupt_handler(
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         return state
 
@@ -405,6 +630,7 @@ def test_sflow_app_resets_command_log_router_when_build_state_fails(
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         raise RuntimeError("build_state failed")
 
@@ -446,6 +672,7 @@ def test_sflow_app_does_not_release_when_dry_run(tmp_path, monkeypatch):
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         return state
 
@@ -489,6 +716,7 @@ def test_sflow_app_mounts_sflow_dirs_for_srun_container_tasks(tmp_path, monkeypa
         workspace_dir=None,
         output_dir=None,
         source_files=None,
+        kubectl_config=None,
     ) -> SflowState:
         return state
 

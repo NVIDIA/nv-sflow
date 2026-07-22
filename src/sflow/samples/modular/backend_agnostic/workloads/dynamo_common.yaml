@@ -1,0 +1,81 @@
+# Shared Dynamo infrastructure tasks (NATS + etcd + HTTP frontend).
+#
+# Backend-agnostic: tasks reference the logical `helper` operator (bound to a
+# concrete type by the backends/*.yaml fragment) and the `cluster` backend by
+# name. Compose with a Dynamo server workload (dynamo_trtllm.yaml or
+# dynamo_vllm.yaml) + a backend + benchmark.yaml. NOT needed for trtllm_serve.
+
+version: "0.1"
+
+variables:
+  SERVED_MODEL_NAME:
+    description: "Served model name (advertised by the frontend / OpenAI API)"
+    value: Qwen3-0.6B
+  SERVER_IMAGE:
+    description: "Framework container image (also runs nats/etcd/frontend)"
+    value: <your-dynamo-container-image>
+  FRONTEND_PORT:
+    description: "Frontend / OpenAI HTTP port"
+    type: integer
+    value: 8000
+
+workflow:
+  name: modular_inference
+  timeout: 115m
+
+  variables:
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.cluster.nodes[0].ip_address }}"
+
+  tasks:
+    - name: nats_server
+      operator: helper
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 300
+          interval: 2
+
+    - name: etcd_server
+      operator: helper
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 300
+          interval: 2
+
+    - name: frontend_server
+      operator: helper
+      script:
+        - python3 -m dynamo.frontend --http-port ${{ variables.FRONTEND_PORT }}
+      resources:
+        nodes:
+          indices: [0]
+      depends_on:
+        - nats_server
+        - etcd_server
+      probes:
+        readiness:
+          tcp_port:
+            port: ${{ variables.FRONTEND_PORT }}
+          timeout: 300
+          interval: 5

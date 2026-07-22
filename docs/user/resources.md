@@ -5,7 +5,11 @@ sidebar_position: 7
 
 `resources` lets you constrain where a task runs (which nodes) and how many GPUs it should get.
 
-## GPUs: `CUDA_VISIBLE_DEVICES` slicing (Slurm)
+## GPUs: `CUDA_VISIBLE_DEVICES` slicing (local / Slurm / Docker)
+
+On the **local**, **slurm**, and **docker** backends sflow slices GPU indices per task and
+replica and exports them as `CUDA_VISIBLE_DEVICES`. On **Kubernetes** GPUs are assigned by
+the device plugin (default) or DRA instead — see [GPUs on Kubernetes](#gpus-on-kubernetes) below.
 
 GPU resource example:
 
@@ -170,6 +174,26 @@ workflow:
 ```
 
 If a GPU request cannot fit on one node but is an exact multiple of `backends.<name>.gpus_per_node`, sflow can expand the task across multiple nodes. If the request is not a valid multiple or the selected pool is too small, validation fails before execution.
+
+This `CUDA_VISIBLE_DEVICES` packing applies to the **local**, **slurm**, and **docker** backends. Kubernetes assigns GPUs differently — see below.
+
+## GPUs on Kubernetes
+
+The Kubernetes backend does **not** slice `CUDA_VISIBLE_DEVICES` for ordinary pods.
+Instead, the `device_plugin` (an `nvidia.com/gpu` limit, **the default**) or DRA (a
+`ResourceClaimTemplate`, opt-in / WIP) assigns physical devices to the pod, so for a
+normal single- or multi-node pod `CUDA_VISIBLE_DEVICES` is left unset and the container
+sees exactly the GPUs it was granted.
+
+> **Exception — merged co-located pods.** When sflow co-locates compatible same-node
+> tasks into one pod (`merge_colocated_gpu_pods: auto`, the default), the merged launcher
+> **does** set a per-member `CUDA_VISIBLE_DEVICES` so each task sees its own GPUs first
+> (as `cuda:0`). See [merge-pod (`merge_colocated_gpu_pods`)](./backends.md#kubernetes-backend) in Backends.
+
+`resources.gpus.count` is a **per-task total** that is split evenly across the task's
+assigned nodes, so it must be a multiple of the node count (each pod gets
+`count / nodes` GPUs). A multi-node task becomes **one pod per reserved node**. See
+[Backends: GPU requests](./backends.md#gpu-requests) for details.
 
 ## Resource reuse with `release_after`
 

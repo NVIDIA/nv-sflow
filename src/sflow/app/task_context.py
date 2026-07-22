@@ -8,8 +8,28 @@ from typing import Any
 
 from sflow.core.backend import Backend
 from sflow.core.compute_node import ComputeNode
-from sflow.core.task import Task
+from sflow.core.task import Task, TaskPort
 from sflow.core.task_graph import TaskGraph
+
+
+def compute_task_service(
+    *,
+    backend: Backend | None,
+    assigned_nodes: list[str],
+    ports: list[TaskPort],
+) -> dict[str, Any]:
+    """Resolve task.<name>.service.{host, port, url} (host empty without runtime node IPs)."""
+    host = ""
+    if backend is not None and assigned_nodes:
+        capabilities = getattr(backend, "capabilities", None)
+        allocation = getattr(backend, "allocation", None)
+        if getattr(capabilities, "has_runtime_node_addresses", True) and allocation:
+            node = {n.name: n for n in allocation.nodes}.get(assigned_nodes[0])
+            if node is not None:
+                host = node.ip_address or ""
+    port: Any = ports[0].port if ports else ""
+    url = f"http://{host}:{port}" if host and port != "" else ""
+    return {"host": host, "port": port, "url": url}
 
 
 def build_task_info(
@@ -58,6 +78,11 @@ def build_task_info(
         "gpus": gpus,
         "backend": task.backend_name,
         "operator": task.operator_name,
+        "service": compute_task_service(
+            backend=backend,
+            assigned_nodes=task.assigned_nodes,
+            ports=task.ports,
+        ),
     }
 
 
@@ -89,6 +114,7 @@ def build_tasks_ctx(
                                 "gpus": [],
                                 "backend": None,
                                 "operator": None,
+                                "service": {"host": "", "port": "", "url": ""},
                             }
                         )
                 tasks_ctx[base_name] = replica_list
@@ -98,8 +124,9 @@ def build_tasks_ctx(
 
 TASK_EXPR_RE = re.compile(r"\$\{\{\s*(task\.[^}]+?)\s*\}\}")
 
-TASK_AVAILABLE_ATTRS = ("nodes", "gpus", "backend", "operator")
+TASK_AVAILABLE_ATTRS = ("nodes", "gpus", "backend", "operator", "service")
 TASK_NODE_ATTRS = ("name", "ip_address", "index", "num_gpus")
+TASK_SERVICE_ATTRS = ("host", "port", "url")
 
 
 def extract_task_expressions(line: str) -> list[str]:
@@ -171,6 +198,14 @@ def build_task_expression_hint(
                         f"'{node_attr}' is not an available node attribute. "
                         f"Available node attributes: "
                         f"{', '.join(TASK_NODE_ATTRS)}"
+                    )
+            if accessed_attr == "service" and len(parts) > 3:
+                service_attr = parts[3].split("[")[0]
+                if service_attr not in TASK_SERVICE_ATTRS:
+                    return (
+                        f"'{service_attr}' is not an available service attribute. "
+                        f"Available service attributes: "
+                        f"{', '.join(TASK_SERVICE_ATTRS)}"
                     )
 
         if ctx_val is None:

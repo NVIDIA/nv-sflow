@@ -1,0 +1,63 @@
+# Kubernetes + K8S MPI backend fragment for the modular samples.
+#
+# Same `kubernetes` backend as backends/k8s.yaml, but the `server` operator is
+# `type: k8s_mpi` for cross-node servers (multi-node tensor/expert parallelism):
+# sflow injects the SSH/hostfile/MPIJob glue and the task carries only its
+# launch line. The CPU-only `helper` and the `client` stay plain `k8s`.
+#
+# Compose with a workload + benchmark, e.g.:
+#   sflow run -f backends/k8s_mpi.yaml \
+#             -f workloads/dynamo_common.yaml -f workloads/dynamo_trtllm.yaml \
+#             -f benchmark.yaml -s NUM_NODES=2 -s SERVER_GPUS=16 --dry-run
+
+version: "0.1"
+
+variables:
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    value: your-namespace
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 8
+  NUM_NODES:
+    description: "Number of nodes to reserve (>= 2 for cross-node MPI)"
+    type: integer
+    value: 2
+
+backends:
+  - name: cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so the cross-node MPI hostfile (built by sflow from the
+    # assigned node IPs) works.
+    host_network: true
+    host_ipc: true
+    scheduling: device_plugin
+    reservation:
+      timeout: 1200
+
+operators:
+  # Multi-node MPI server. One operator, auto-detected route (MPIJob when the
+  # Kubeflow MPI Operator is usable, otherwise plain pods). All SSH/MPI glue is
+  # injected by sflow.
+  - name: server
+    type: k8s_mpi
+    image: ${{ variables.SERVER_IMAGE }}
+    shm_size: 64Gi
+    run_as_root: true
+    mpi:
+      route: auto
+      slots_per_worker: ${{ variables.GPUS_PER_NODE }}
+      ensure_sshd: true
+      ssh_port: 2222
+  # CPU-only infra + benchmark client stay single-pod plain k8s.
+  - name: helper
+    type: k8s
+    image: ${{ variables.SERVER_IMAGE }}
+  - name: client
+    type: k8s
+    image: ${{ variables.CLIENT_IMAGE }}

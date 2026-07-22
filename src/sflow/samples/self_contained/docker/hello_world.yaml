@@ -1,0 +1,16 @@
+version: "0.1"
+
+backends:
+  - name: docker
+    type: docker
+    default: true
+    image: ubuntu:22.04
+    nodes: 1
+    gpus_per_node: 0
+
+workflow:
+  name: docker_hello_world
+  tasks:
+    - name: hello
+      script:
+        - echo "Hello from Docker"

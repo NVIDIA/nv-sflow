@@ -1,0 +1,53 @@
+version: "0.1"
+
+# This example demonstrates workflow-level upload: after all tasks finish,
+# sflow zips the entire workflow output directory and uploads one archive.
+#
+# Credentials come from the boto3 default chain (AWS_* env vars,
+# ~/.aws/credentials, or an IAM role). Do NOT put secrets in YAML.
+#
+# Validate locally with `--dry-run`:
+#   sflow run examples/self_contained/local/storage_upload_all.yaml --dry-run
+#
+# To run for real you need an S3 bucket you can write to. Override the
+# bucket name on the CLI:
+#   sflow run examples/self_contained/local/storage_upload_all.yaml \
+#     --set BUCKET=my-bucket --set RUN_ID=my-test-run
+
+variables:
+  - name: BUCKET
+    description: "S3 bucket to upload the workflow archive into"
+    value: my-bucket
+  - name: RUN_ID
+    description: "Per-run prefix to namespace uploaded objects"
+    value: run-001
+
+storage:
+  - name: workflow_archive
+    type: s3
+    bucket: ${{ variables.BUCKET }}
+    region: us-west-2
+    prefix: "sflow-demo/${{ variables.RUN_ID }}/"
+
+workflow:
+  name: local_storage_upload_all
+  # Archive the whole sflow_output/<run_id>/ directory after the workflow
+  # completes. The zip includes sflow.log, sflow_summary.log, command logs,
+  # task logs, task output files, and any parsed outputs.
+  upload_all:
+    target: workflow_archive
+    to: "archive/${{ workflow.run_id }}.zip"
+    on_error: warn
+  tasks:
+    - name: produce_results
+      script:
+        - mkdir -p "${SFLOW_TASK_OUTPUT_DIR}"
+        - echo "metric,value" > "${SFLOW_TASK_OUTPUT_DIR}/results.csv"
+        - echo "throughput,42" >> "${SFLOW_TASK_OUTPUT_DIR}/results.csv"
+        - printf '{"run":"%s","ok":true}\n' "${RUN_ID}" > "${SFLOW_TASK_OUTPUT_DIR}/summary.json"
+
+    - name: produce_report
+      depends_on: [produce_results]
+      script:
+        - mkdir -p "${SFLOW_TASK_OUTPUT_DIR}"
+        - echo "report generated for ${RUN_ID}" > "${SFLOW_TASK_OUTPUT_DIR}/report.txt"

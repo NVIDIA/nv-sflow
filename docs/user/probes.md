@@ -17,14 +17,16 @@ You can use probes under:
 
 Common timing options:
 
-- `delay`: seconds before the first check (default `0`)
-- `timeout`: overall readiness deadline in seconds (default `1200`). Only readiness probes time out the task.
-- `each_check_timeout`: per-check timeout in seconds (default `30`)
-- `interval`: seconds between checks (default `5`)
-- `success_threshold`: consecutive successful readiness checks required (default `1`)
-- `failure_threshold`: consecutive matching failure checks required (default `3`)
+| Option | Default | Applies to | Meaning |
+|--------|---------|------------|---------|
+| `delay` | `0` | both | Seconds to wait before the first check. |
+| `interval` | `5` | both | Seconds between checks. |
+| `each_check_timeout` | `30` | both | Per-check timeout in seconds (e.g. how long one TCP connect / HTTP request may take). |
+| `timeout` | `1200` | readiness | Overall readiness deadline in seconds. Only **readiness** probes time out the task; failure probes keep checking for the task's lifetime. |
+| `success_threshold` | `1` | readiness | Consecutive successful checks required before the probe is satisfied. |
+| `failure_threshold` | `3` | failure | Consecutive matching checks required before the probe fails the task. |
 
-`readiness` may be a single probe or a list of probes. When multiple readiness probes are configured, the task becomes ready only after every readiness probe has triggered.
+Both `readiness` and `failure` may be a single probe or a list of probes. When multiple readiness probes are configured, the task becomes ready only after every readiness probe has triggered; when multiple failure probes are configured, any one of them can fail the task.
 
 ## Readiness: TCP port probe
 
@@ -50,6 +52,12 @@ workflow:
       script:
         - curl -sf http://127.0.0.1:8000/ > /dev/null
 ```
+
+`tcp_port` fields:
+
+- `port` (required): the TCP port to connect to.
+- `host`: host or IP to probe (defaults to the task's assigned node).
+- `on_node`: `"first"` (default) checks only the first assigned node; `"each"` checks the port on every node assigned to the task.
 
 ```mermaid
 flowchart TD
@@ -82,6 +90,10 @@ workflow:
         - curl -sf http://127.0.0.1:8000/health
 ```
 
+A check counts as **success when the endpoint returns any `2xx` or `3xx` status** (the
+range `200–399`, so redirects like `301`/`302` also pass). `4xx`/`5xx` and connection
+errors count as not-ready.
+
 `http_post` supports the same `url` and `headers` fields plus an optional `body`:
 
 ```yaml
@@ -93,6 +105,13 @@ probes:
         Content-Type: application/json
       body: '{"ping": true}'
 ```
+
+> `body` applies only to `http_post`. If you set it under `http_get`, it is ignored.
+
+> **Kubernetes:** TCP/HTTP probes normally run from the `sflow run` host. On the Kubernetes
+> backend they run **from inside the cluster** (via a small per-allocation probe pod) so they
+> still work when the driver host cannot reach the pod network. This is automatic — see
+> [Readiness probes run in-cluster](backends.md#readiness-probes-run-in-cluster-probe-pod).
 
 ## Readiness: log watch probe (+ retries)
 
@@ -120,7 +139,7 @@ probes:
 **Other options:**
 
 - `logger`: watch another task's log instead of the current task's (must be a valid task name)
-- `match_count`: number of times the pattern must appear before the probe passes (default `1`)
+- `match_count`: number of times the pattern must appear before the probe passes (default `1`; accepts `${{ }}` expressions)
 
 ```yaml
 workflow:
@@ -176,6 +195,10 @@ workflow:
 ```
 
 When a failure probe triggers, sflow marks the task as failed by probe and cancels downstream work through fail-fast. Failure probes do not use the overall `timeout` as a deadline; they keep checking while the task is running. `each_check_timeout` still applies to each individual check.
+
+### Debugging a probe that never triggers
+
+The **Probe Traces (last attempt)** section of [`sflow_summary.log`](./outputs.md#execution-summary) shows what each probe last observed — for a `log_watch` probe the matched line (or the last line it saw on a miss) and its running match count, for `tcp_port`/`http_get`/`http_post` the endpoint and result. It refreshes live while the task is RUNNING, so if a readiness probe hangs it's the fastest way to tell whether the marker never appeared or the pattern simply didn't match (`log_watch` is literal unless prefixed `re:`/`regex:`).
 
 ## Replicas and HTTP probe deduplication
 

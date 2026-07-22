@@ -108,17 +108,23 @@ setup_under_dev_sflow() {
     cat > "$SFLOW_WRAPPER_DIR/sflow" <<'EOF'
 #!/bin/bash
 
-has_sflow_version_arg() {
+has_sflow_install_override() {
+    # The caller already chose how the per-job venv installs sflow. Don't inject
+    # our default on top: --sflow-source-path and --sflow-version are mutually
+    # exclusive, so injecting either over an existing choice would be rejected.
     for arg in "$@"; do
-        if [ "$arg" = "--sflow-version" ]; then
-            return 0
-        fi
+        case "$arg" in
+            --sflow-source-path|--sflow-version) return 0 ;;
+        esac
     done
     return 1
 }
 
-if [ "${1:-}" = "batch" ] && ! has_sflow_version_arg "$@"; then
-    set -- "$@" --sflow-version "$SFLOW_UNDER_DEV_REF"
+# Under-dev runs install the local checkout editable into each job's fresh
+# per-job venv via --sflow-source-path, so submitted Slurm jobs run the exact
+# working tree (no git push / remotely reachable ref required).
+if [ "${1:-}" = "batch" ] && ! has_sflow_install_override "$@"; then
+    set -- "$@" --sflow-source-path "$SFLOW_UNDER_DEV_REPO"
 fi
 
 export PYTHONPATH="$SFLOW_UNDER_DEV_SRC${PYTHONPATH:+:$PYTHONPATH}"
@@ -128,9 +134,7 @@ EOF
     export PATH="$SFLOW_WRAPPER_DIR:$PATH"
 
     echo "Using under-dev sflow from $SFLOW_UNDER_DEV_REPO (ref: $SFLOW_UNDER_DEV_REF)"
-    if ! git -C "$repo_dir" diff --quiet 2>/dev/null || ! git -C "$repo_dir" diff --cached --quiet 2>/dev/null; then
-        echo "WARNING: local sflow checkout has uncommitted changes; submitted Slurm jobs can only install ref '$SFLOW_UNDER_DEV_REF'." >&2
-    fi
+    echo "Submitted Slurm jobs install this checkout editable (--sflow-source-path), so uncommitted working-tree changes are included."
     local sflow_runtime_info
     sflow_runtime_info="$(sflow --version)"
     printf '%s\n' "$sflow_runtime_info"

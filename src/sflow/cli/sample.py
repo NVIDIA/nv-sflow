@@ -28,8 +28,9 @@ def sample(
     name: Annotated[
         Optional[str],
         typer.Argument(
-            help="Name of the sample to copy (e.g., 'local_hello_world' or 'local_hello_world.yaml'). "
-            "Omit to list all available samples.",
+            help="Name of the sample to copy (a subpath under the samples tree, e.g. "
+            "'self_contained/local/hello_world' or a modular bundle "
+            "'modular/inference_x_v2'). Omit to list all available samples.",
         ),
     ] = None,
     output: Annotated[
@@ -69,13 +70,13 @@ def sample(
         sflow sample
 
         # Copy a sample to current directory
-        sflow sample local_hello_world
+        sflow sample self_contained/local/hello_world
 
         # Copy with custom output path
-        sflow sample local_hello_world --output my_workflow.yaml
+        sflow sample self_contained/local/hello_world --output my_workflow.yaml
 
         # Overwrite existing file
-        sflow sample local_hello_world --force
+        sflow sample self_contained/local/hello_world --force
     """
     # If no name provided or --list flag, show available samples
     if name is None or list_all:
@@ -263,33 +264,26 @@ def _list_samples():
 
     typer.echo("Available sample workflows:\n")
 
-    # Group top-level samples by category
-    categories = {
-        "Local": [],
-        "Slurm (self-contained)": [],
-        "Other": [],
-    }
-
+    # Group self-contained samples by backend folder. Names are relative subpaths
+    # like `self_contained/slurm/auto_replica`; group on the `<backend>` segment.
+    categories: dict[str, list[str]] = {}
     for sample in samples:
-        sample_name = sample.replace(".yaml", "")
-        if sample.startswith("local"):
-            categories["Local"].append(sample_name)
-        elif sample.startswith("slurm_") or "slurm" in sample.lower():
-            categories["Slurm (self-contained)"].append(sample_name)
-        else:
-            categories["Other"].append(sample_name)
+        parts = sample.split("/")
+        backend = (
+            parts[1] if parts[0] == "self_contained" and len(parts) > 2 else parts[0]
+        )
+        categories.setdefault(backend, []).append(sample)
 
-    for category, sample_list in categories.items():
-        if sample_list:
-            typer.echo(f"  {category}:")
-            for sample_name in sample_list:
-                sample_path = samples_dir / f"{sample_name}.yaml"
-                node_info = _get_sample_node_info(sample_path)
-                if node_info:
-                    typer.echo(f"    - {sample_name:<50} [{node_info}]")
-                else:
-                    typer.echo(f"    - {sample_name}")
-            typer.echo()
+    for backend in sorted(categories):
+        typer.echo(f"  {backend.capitalize()} (self-contained):")
+        for sample_name in categories[backend]:
+            sample_path = samples_dir / f"{sample_name}.yaml"
+            node_info = _get_sample_node_info(sample_path)
+            if node_info:
+                typer.echo(f"    - {sample_name:<52} [{node_info}]")
+            else:
+                typer.echo(f"    - {sample_name}")
+        typer.echo()
 
     # Show modular samples (subdirectories)
     if modular:

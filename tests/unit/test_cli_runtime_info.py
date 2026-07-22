@@ -63,6 +63,26 @@ workflow:
     workflow_out_dir = tmp_path / "sflow_output" / "test-run"
     workflow_out_dir.mkdir(parents=True)
     (workflow_out_dir / "bash_cmds.log").write_text("cmd\n")
+    (workflow_out_dir / "sflow_summary.log").write_text(
+        "Sflow Summary\n"
+        "=============\n"
+        "Workflow : test\n"
+        "Uploads     : uploaded=2\n"
+        "\n"
+        "Runtime\n"
+        "-------\n"
+        "runtime\n"
+        "\n"
+        "Uploads\n"
+        "-------\n"
+        "Counts : uploaded=2\n"
+        "produce_results:\n"
+        "  [OK]   results.csv -> s3://bucket/main/results.csv\n"
+        "  [OK]   summary.json -> s3://bucket/summary.json\n"
+        "\n"
+        "Workflow DAG\n"
+        "------------\n"
+    )
 
     with patch("sflow.cli.run._sflow_app") as mock_app:
         mock_app.run = MagicMock(return_value=workflow_out_dir)
@@ -77,6 +97,12 @@ workflow:
     assert result.exit_code == 0, result.output
     assert f"Summary: {workflow_out_dir / 'sflow_summary.log'}" in result.output
     assert f"Command logs: {workflow_out_dir / 'bash_cmds.log'}" in result.output
+    assert "Uploads: uploaded=2" not in result.output
+    assert "  Uploads:" in result.output
+    assert "    uploaded=2" in result.output
+    assert "    [OK]   results.csv -> s3://bucket/main/results.csv" in result.output
+    assert "    [OK]   summary.json -> s3://bucket/summary.json" in result.output
+    assert result.output.index("Command logs:") < result.output.index("  Uploads:")
 
 
 def test_format_runtime_info_reports_editable_direct_url(monkeypatch, tmp_path):
@@ -207,6 +233,11 @@ def test_format_runtime_info_omits_parent_repo_git_for_regular_install(
         "_git_info_for_repo",
         lambda repo: "(main abc123, dirty)" if repo is not None else "",
     )
+    # Pin the version so the source label is deterministic regardless of how the
+    # test environment's sflow is versioned (a `.dev` build -> "remote pypi
+    # package"; a clean release -> "remote pypi release"). The label is incidental
+    # here -- this test targets the parent-repo git omission below.
+    monkeypatch.setattr(runtime_info, "__version__", "0.2.3.dev1")
 
     info = runtime_info.format_runtime_info()
 

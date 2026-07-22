@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 import sflow.cli.batch as batch_mod
 from sflow.cli import app
 from sflow.cli.batch import (
+    _batch_launch_strategy,
     _build_var_map,
     _classify_csv_columns,
     _dedup_words,
@@ -32,6 +33,15 @@ from sflow.cli.batch import (
 
 
 runner = CliRunner()
+
+
+def test_batch_launch_strategy_defers_unimplemented_backends():
+    try:
+        _batch_launch_strategy("docker")
+        assert False, "Expected Docker batch strategy to be deferred"
+    except NotImplementedError as e:
+        assert "docker" in str(e)
+        assert "persistent launcher" in str(e)
 
 
 @pytest.fixture
@@ -56,6 +66,43 @@ workflow:
         - echo hello
 """)
     return workflow_file
+
+
+def test_batch_node_filters_emit_sbatch_directives_and_forward_to_inner_run(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """--include-nodes/--exclude-nodes add #SBATCH --nodelist/--exclude and forward
+    to the inner `sflow run`."""
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "2",
+            "--sbatch-path",
+            str(sbatch_path),
+            "--include-nodes",
+            "node001,node002",
+            "--exclude-nodes",
+            "bad001",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert "#SBATCH --nodelist=node001,node002" in script_content
+    assert "#SBATCH --exclude=bad001" in script_content
+    # Forwarded to the inner sflow run so every backend applies them.
+    assert "--include-nodes node001" in script_content
+    assert "--exclude-nodes bad001" in script_content
 
 
 def test_batch_sbatch_extra_args_single(mock_sflow_app, temp_workflow_file, tmp_path):
@@ -190,6 +237,133 @@ def test_batch_sbatch_extra_args_preserves_value(
     assert "#SBATCH --mem-per-cpu=4G" in script_content
 
 
+def _slurm_backend_workflow(extra_args: list[str]) -> str:
+    """A single-slurm-backend workflow YAML with the given backend extra_args."""
+    args_yaml = "".join(f"      - {a}\n" for a in extra_args)
+    return (
+        'version: "0.1"\n'
+        "backends:\n"
+        "  - name: slurm_cluster\n"
+        "    type: slurm\n"
+        "    default: true\n"
+        "    account: testaccount\n"
+        "    partition: batch\n"
+        "    time: '00:10:00'\n"
+        "    nodes: 1\n"
+        "    gpus_per_node: 8\n"
+        "    extra_args:\n"
+        f"{args_yaml}"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+
+
+def test_batch_includes_backend_extra_args_single(mock_sflow_app, tmp_path):
+    """Backend extra_args are emitted as #SBATCH directives in the single-backend script."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(_slurm_backend_workflow(["--exclusive", "--gres=gpu:8"]))
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert "#SBATCH --exclusive" in script_content
+    assert "#SBATCH --gres=gpu:8" in script_content
+
+
+def test_batch_merges_and_dedups_backend_and_cli_extra_args(mock_sflow_app, tmp_path):
+    """CLI --sbatch-extra-args and backend extra_args merge and de-dup by option (CLI wins)."""
+    workflow_file = tmp_path / "wf.yaml"
+    workflow_file.write_text(_slurm_backend_workflow(["--exclusive", "--gres=gpu:8"]))
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sbatch-path",
+            str(sbatch_path),
+            "-e",
+            "--gres=gpu:4",
+            "-e",
+            "--constraint=gpu",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    # CLI value wins on the conflicting --gres option; only one --gres directive.
+    assert "#SBATCH --gres=gpu:4" in script_content
+    assert "#SBATCH --gres=gpu:8" not in script_content
+    assert script_content.count("#SBATCH --gres") == 1
+    # Non-conflicting args from both sources are present exactly once.
+    assert script_content.count("#SBATCH --exclusive") == 1
+    assert "#SBATCH --constraint=gpu" in script_content
+
+
+def test_dedup_merge_extra_args_override_wins():
+    """Unit: dedup_merge_extra_args de-dups single-valued flags by option, override wins."""
+    from sflow.utils.extra_args import dedup_merge_extra_args
+
+    merged = dedup_merge_extra_args(
+        ["--exclusive", "--gres=gpu:8", "--time=01:00:00"],
+        ["--gres=gpu:4", "--constraint=gpu"],
+    )
+    assert merged == ["--exclusive", "--gres=gpu:4", "--time=01:00:00", "--constraint=gpu"]
+
+
+def test_dedup_merge_extra_args_keeps_repeatable_kv_flags():
+    """Repeatable key=value flags (e.g. --env) with distinct value-keys all
+    survive; the same value-key is overridden by the later (override) value."""
+    from sflow.utils.extra_args import dedup_merge_extra_args
+
+    merged = dedup_merge_extra_args(
+        ["--env=FOO=1", "--env=BAR=2"],
+        ["--env=FOO=9", "--env=BAZ=3"],
+    )
+    # FOO overridden in place, BAR kept, BAZ appended.
+    assert merged == ["--env=FOO=9", "--env=BAR=2", "--env=BAZ=3"]
+
+
+def test_dedup_merge_extra_args_repeatable_kv_space_form():
+    """Same, for the space form '--env FOO=1' (one token, space-separated)."""
+    from sflow.utils.extra_args import dedup_merge_extra_args
+
+    merged = dedup_merge_extra_args(
+        ["--env FOO=1", "--env BAR=2"],
+        ["--env FOO=9"],
+    )
+    assert merged == ["--env FOO=9", "--env BAR=2"]
+
+
 def test_batch_without_sbatch_extra_args(mock_sflow_app, temp_workflow_file, tmp_path):
     """Test that batch works without --sbatch-extra-args."""
     sbatch_path = tmp_path / "test.sh"
@@ -223,6 +397,54 @@ def test_batch_without_sbatch_extra_args(mock_sflow_app, temp_workflow_file, tmp
     assert (
         script_content.count("#SBATCH") == 7
     )  # job-name, output, error, mem, partition, account, nodes
+
+
+def test_batch_dry_run_does_not_pass_slurm_overrides_to_sflow_app(
+    mock_sflow_app, tmp_path
+):
+    workflow_file = tmp_path / "slurm_workflow.yaml"
+    workflow_file.write_text(
+        'version: "0.1"\n'
+        "backends:\n"
+        "  - name: slurm_cluster\n"
+        "    type: slurm\n"
+        "    account: testaccount\n"
+        "    partition: batch\n"
+        "    time: '00:10:00'\n"
+        "    nodes: 1\n"
+        "    gpus_per_node: 1\n"
+        "workflow:\n"
+        "  name: test\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hello\n"
+    )
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "2",
+            "--gpus-per-node",
+            "4",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kwargs = mock_sflow_app.run.call_args.kwargs
+    assert "slurm_nodes" not in kwargs
+    assert "slurm_gpus_per_node" not in kwargs
 
 
 def test_batch_gpus_per_node_warns_it_is_not_sbatch_directive(
@@ -802,9 +1024,11 @@ def test_bulk_input_writes_results_csv_with_submit(mock_sflow_app, tmp_path):
         rows = list(reader)
     assert len(rows) == 2
     assert "slurm_job_id" in reader.fieldnames
+    assert "backend_job_id" in reader.fieldnames
     assert "sflow_output_dir" in reader.fieldnames
     assert "sflow_batch_dir" in reader.fieldnames
     assert rows[0]["slurm_job_id"] == "99999"
+    assert rows[0]["backend_job_id"] == rows[0]["slurm_job_id"]
     assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
@@ -846,6 +1070,7 @@ def test_bulk_input_results_csv_without_submit_has_not_submitted(mock_sflow_app,
         rows = list(_csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["slurm_job_id"] == "not submitted"
+    assert rows[0]["backend_job_id"] == "not submitted"
     assert rows[0]["sflow_output_dir"] == "not submitted"
     assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
 
@@ -906,7 +1131,9 @@ def test_bulk_input_results_csv_marks_failed_rows(tmp_path):
         rows = list(csv_mod.DictReader(f))
     assert len(rows) == 2
     assert rows[0]["slurm_job_id"] == "11111"
+    assert rows[0]["backend_job_id"] == "11111"
     assert rows[1]["slurm_job_id"] == "FAILED"
+    assert rows[1]["backend_job_id"] == "FAILED"
     assert rows[1]["sflow_output_dir"] == ""
     assert rows[0]["sflow_batch_dir"] == bulk_dirs[0].name
     assert rows[1]["sflow_batch_dir"] == bulk_dirs[0].name
@@ -1827,6 +2054,7 @@ def test_bulk_submit_results_csv_not_submitted_values(mock_sflow_app, tmp_path):
         rows = list(_csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["slurm_job_id"] == "not submitted"
+    assert rows[0]["backend_job_id"] == "not submitted"
     assert rows[0]["sflow_output_dir"] == "not submitted"
     assert rows[0]["sflow_batch_dir"].startswith("bulk_submit_")
 
@@ -1952,6 +2180,103 @@ def test_sbatch_script_copies_logs_to_output_dir(mock_sflow_app, temp_workflow_f
     assert "SFLOW_WF_DIR" in script
     assert "cp " in script
     assert "SLURM_JOB_ID" in script
+    assert 'export SFLOW_RUN_ID_PREFIX="$SLURM_JOB_ID"' in script
+
+
+def test_sbatch_script_copies_custom_sbatch_log_paths(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """Custom sbatch log patterns are the source paths copied into workflow output."""
+    out = tmp_path / "out.sh"
+    stdout_pattern = tmp_path / "slurm_logs" / "%j.custom.out"
+    stderr_pattern = tmp_path / "slurm_logs" / "%j.custom.err"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            str(temp_workflow_file),
+            "--partition", "gpu",
+            "--account", "test",
+            "--nodes", "1",
+            "--sbatch-output", str(stdout_pattern),
+            "--sbatch-error", str(stderr_pattern),
+            "-o", str(out),
+        ],
+    )
+    assert result.exit_code == 0
+    script = out.read_text()
+    assert f"#SBATCH --output={stdout_pattern}" in script
+    assert f"#SBATCH --error={stderr_pattern}" in script
+    assert f"SBATCH_OUT_PATTERN={shlex.quote(str(stdout_pattern))}" in script
+    assert f"SBATCH_ERR_PATTERN={shlex.quote(str(stderr_pattern))}" in script
+    assert 'SBATCH_OUT="${SBATCH_OUT_PATTERN//%j/$SLURM_JOB_ID}"' in script
+    assert 'SBATCH_ERR="${SBATCH_ERR_PATTERN//%j/$SLURM_JOB_ID}"' in script
+    assert 'SBATCH_OUT=' + shlex.quote(str(tmp_path / "sflow_output")) not in script
+
+
+def test_sbatch_script_always_copies_logs_via_finalize_trap(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """The .out/.err (and config) copy runs from the exit/signal trap, always.
+
+    Putting the copy in a trap (not just a post-run block) means a failed
+    bootstrap, a crashed run, or a Slurm cancel/timeout still leaves the sbatch
+    logs in the workflow output dir. When the run never created its
+    ``<job id>-*`` dir, the copy falls back to a ``<job id>-sflow-submit`` dir so
+    the logs are still captured somewhere useful.
+    """
+    out = tmp_path / "out.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            str(temp_workflow_file),
+            "--partition", "gpu",
+            "--account", "test",
+            "--nodes", "1",
+            "-o", str(out),
+        ],
+    )
+    assert result.exit_code == 0
+    script = out.read_text()
+
+    # The copy lives in the finalize function, which the trap runs on exit AND
+    # on the signals Slurm uses for timeout/cancel/preempt.
+    assert "_sflow_finalize() {" in script
+    assert "trap _sflow_finalize EXIT INT TERM HUP" in script
+    # Fallback dir so logs land somewhere even if no workflow dir was created.
+    assert '"${SLURM_JOB_ID}-sflow-submit"' in script
+    assert 'mkdir -p "$SFLOW_WF_DIR"' in script
+
+    # The .out/.err copy is inside the finalize function (between its definition
+    # and the trap registration), i.e. not gated behind a happy-path-only block.
+    fn_idx = script.index("_sflow_finalize() {")
+    cp_out_idx = script.index('cp "$SBATCH_OUT" "$SFLOW_WF_DIR/"')
+    cp_err_idx = script.index('cp "$SBATCH_ERR" "$SFLOW_WF_DIR/"')
+    trap_idx = script.index("trap _sflow_finalize")
+    assert fn_idx < cp_out_idx < trap_idx
+    assert fn_idx < cp_err_idx < trap_idx
+
+    # A failed copy/cleanup must never change the job's exit status: the finalize
+    # fn captures the incoming rc first (before any step), disarms every trap so it
+    # runs exactly once (no re-entry from a signal mid-cleanup or the EXIT trap
+    # firing after a signal-triggered run), then exits with that rc last -- with
+    # errexit disabled and every step guarded so it always reaches the exit.
+    assert "_sflow_rc=$?" in script
+    assert "trap - EXIT INT TERM HUP" in script
+    assert 'exit "$_sflow_rc"' in script
+    rc_capture_idx = script.index("_sflow_rc=$?")
+    disarm_idx = script.index("trap - EXIT INT TERM HUP")
+    rc_exit_idx = script.index('exit "$_sflow_rc"')
+    # rc captured before the disarm (so $? is the real incoming rc, not the trap
+    # builtin's 0), and the disarm precedes the copy/cleanup steps.
+    assert fn_idx < rc_capture_idx < disarm_idx < cp_out_idx
+    assert cp_err_idx < rc_exit_idx < trap_idx
+    # Cleanup is best-effort too (guarded), so a stuck rm can't fail the job.
+    assert (
+        'rm -rf "$SFLOW_VENV_DIR" ${SFLOW_SRC_DIR:+"$SFLOW_SRC_DIR"} 2>/dev/null || true'
+        in script
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3288,7 +3613,1353 @@ def test_batch_defaults_sflow_version_from_execution_env(
 
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     script_content = sbatch_path.read_text()
+    # With neither --sflow-version nor --sflow-source-path, the install link must be
+    # the git ref auto-detected from the running sflow env, installed with
+    # --prerelease=allow ...
+    expected_install = (
+        '"$VIRTUAL_ENV/bin/uv" pip install '
+        "'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@feature/infmax_v3' "
+        "--prerelease=allow"
+    )
+    assert expected_install in script_content
+    # ... and the editable (--sflow-source-path) install path must NOT be taken.
+    assert 'pip install -e ".[dev]"' not in script_content
+
+
+def test_batch_sflow_version_accepts_repo_url_with_ref(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    sbatch_path = tmp_path / "test.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-version",
+            "https://git.example.com/example/sflow.git@develop",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
     assert (
-        "git+https://github.com/NVIDIA/nv-sflow.git@feature/infmax_v3"
+        "sflow @ git+https://git.example.com/example/sflow.git@develop"
         in script_content
     )
+    assert (
+        "git+https://github.com/NVIDIA/nv-sflow.git@https://git.example.com"
+        not in script_content
+    )
+
+
+# ---------------------------------------------------------------------------
+# Install sflow from a private PyPI registry (--sflow-index-url)
+# ---------------------------------------------------------------------------
+
+
+def test_sflow_pypi_requirement_builds_specs():
+    """_sflow_pypi_requirement turns a validated version/specifier into a requirement."""
+    assert batch_mod._sflow_pypi_requirement(None) == "sflow"
+    assert batch_mod._sflow_pypi_requirement("") == "sflow"
+    assert batch_mod._sflow_pypi_requirement("   ") == "sflow"
+    assert batch_mod._sflow_pypi_requirement("0.2.1") == "sflow==0.2.1"
+    assert batch_mod._sflow_pypi_requirement("==0.2.1") == "sflow==0.2.1"
+    assert batch_mod._sflow_pypi_requirement(">=0.2,<0.3") == "sflow>=0.2,<0.3"
+    assert batch_mod._sflow_pypi_requirement("~=0.2.0") == "sflow~=0.2.0"
+
+
+def test_batch_sflow_index_url_installs_pinned_version_from_registry(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """--sflow-index-url installs a pinned wheel from the private index, not git."""
+    sbatch_path = tmp_path / "test.sh"
+    index_url = "https://example.com/artifactory/api/pypi/private/simple"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-version",
+            "0.2.1",
+            "--sflow-index-url",
+            index_url,
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert (
+        '"$VIRTUAL_ENV/bin/uv" pip install sflow==0.2.1 '
+        f"--extra-index-url {index_url} --prerelease=allow" in script_content
+    )
+    assert (
+        "set +x\n"
+        '"$VIRTUAL_ENV/bin/uv" pip install sflow==0.2.1 '
+        f"--extra-index-url {index_url} --prerelease=allow\n"
+        "set -x"
+        in script_content
+    )
+    # Registry mode must NOT fall back to the git or editable install paths.
+    assert "git+" not in script_content
+    assert 'pip install -e ".[dev]"' not in script_content
+
+
+def test_batch_sflow_index_url_without_version_installs_latest(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """Omitting --sflow-version with --sflow-index-url installs the latest wheel."""
+    sbatch_path = tmp_path / "test.sh"
+    index_url = "https://example.com/simple"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-index-url",
+            index_url,
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert (
+        f'"$VIRTUAL_ENV/bin/uv" pip install sflow --extra-index-url {index_url} '
+        "--prerelease=allow" in script_content
+    )
+    assert "git+" not in script_content
+
+
+def test_batch_sflow_index_url_passes_through_version_spec(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """An operator-led --sflow-version is passed through as a PEP 508 specifier."""
+    sbatch_path = tmp_path / "test.sh"
+    index_url = "https://example.com/simple"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-version",
+            ">=0.2,<0.3",
+            "--sflow-index-url",
+            index_url,
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    assert "'sflow>=0.2,<0.3'" in script_content
+    assert f"--extra-index-url {index_url}" in script_content
+
+
+def test_batch_sflow_index_url_and_source_path_mutually_exclusive(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """--sflow-index-url and --sflow-source-path cannot be combined."""
+    src_dir = tmp_path / "sflow_src"
+    src_dir.mkdir()
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-index-url",
+            "https://example.com/simple",
+            "--sflow-source-path",
+            str(src_dir),
+            "--sbatch-path",
+            str(tmp_path / "test.sh"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert (
+        "--sflow-index-url and --sflow-source-path are mutually exclusive"
+        in result.output
+    )
+
+
+def test_batch_sflow_index_url_rejects_embedded_credentials(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """Credentials for --sflow-index-url must come from node-local auth config."""
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-index-url",
+            "https://user:token@example.com/simple",
+            "--sbatch-path",
+            str(tmp_path / "test.sh"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--sflow-index-url must not contain embedded credentials" in result.output
+
+
+def test_sflow_version_error_pypi_route_validates_pep440_specifiers():
+    """PyPI route: only plain PEP 440 versions/specifiers pass."""
+    # Accepted: empty (latest), bare versions, wildcards, pre/dev, specifiers.
+    for ok in (
+        None,
+        "",
+        "   ",
+        "0.2.1",
+        "0.2.*",
+        "v0.2.0",
+        "0.2.1.dev3",
+        "1.0.0rc1",
+        "==0.2.1",
+        ">=0.2,<0.3",
+        "~=0.2.0",
+    ):
+        assert batch_mod._sflow_version_error(ok, registry=True) is None, ok
+    # Rejected: git refs, package names, PEP 508 direct references, markers.
+    for bad in (
+        "main",
+        "feature/x",
+        "sflow==0.2.1",
+        "sflow @ https://example.com/sflow-0.2.1-py3-none-any.whl",
+        "name @ https://example.com/x.whl",
+        "https://example.com/x.whl",
+        "0.2.1 ; python_version>'3.9'",
+    ):
+        assert batch_mod._sflow_version_error(bad, registry=True) is not None, bad
+
+
+def test_sflow_version_error_git_route_allows_refs_rejects_whitespace():
+    """Git route: refs/URLs (and empty) pass; whitespace is rejected."""
+    for ok in (None, "", "main", "v0.1.0", "feature/x",
+               "https://git.example.com/example/sflow.git@develop"):
+        assert batch_mod._sflow_version_error(ok, registry=False) is None, ok
+    # A PyPI-style spec is fine as a value here (no whitespace); only whitespace
+    # -- which a git ref/URL never contains -- is flagged as a likely mistake.
+    assert batch_mod._sflow_version_error("main branch", registry=False) is not None
+    assert batch_mod._sflow_version_error(">=0.2, <0.3", registry=False) is not None
+
+
+def test_batch_sflow_index_url_rejects_git_ref_version(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """In registry mode a git-ref-style --sflow-version fails fast at generation."""
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-version",
+            "main",
+            "--sflow-index-url",
+            "https://example.com/simple",
+            "--sbatch-path",
+            str(tmp_path / "test.sh"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "not a valid PyPI version specifier" in result.output
+
+
+def test_batch_sflow_index_url_rejects_direct_reference_version(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """A PEP 508 direct reference as --sflow-version is rejected in registry mode."""
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-version",
+            "sflow @ https://example.com/sflow-0.2.1-py3-none-any.whl",
+            "--sflow-index-url",
+            "https://example.com/simple",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "not a valid PyPI version specifier" in result.output
+    assert not sbatch_path.exists()
+
+
+def test_batch_sflow_index_url_threads_into_bulk_submit(mock_sflow_app, tmp_path):
+    """Registry mode applies to every script generated by --bulk-submit."""
+    (tmp_path / "wf1.yaml").write_text(_VALID_SFLOW_YAML)
+    out_dir = tmp_path / "output"
+    index_url = "https://example.com/simple"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-submit",
+            str(tmp_path),
+            "--partition",
+            "gpu",
+            "--account",
+            "test",
+            "--output-dir",
+            str(out_dir),
+            "--nodes",
+            "1",
+            "--sflow-version",
+            "0.2.1",
+            "--sflow-index-url",
+            index_url,
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    bulk_dirs = list(out_dir.glob("bulk_*"))
+    assert bulk_dirs, "expected a bulk_* output directory"
+    scripts = sorted(bulk_dirs[0].glob("*.sh"))
+    assert scripts, "expected at least one generated script"
+    content = scripts[0].read_text()
+    assert (
+        f"pip install sflow==0.2.1 --extra-index-url {index_url} --prerelease=allow"
+        in content
+    )
+    assert "git+" not in content
+
+
+# ---------------------------------------------------------------------------
+# Multi-backend (per-backend salloc) driver script generation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def temp_multi_backend_file(tmp_path):
+    """A self-contained two-Slurm-backend workflow for multi-backend tests."""
+    f = tmp_path / "multi_backend.yaml"
+    f.write_text(
+        """
+version: "0.1"
+variables:
+  PARTITION_A: { value: part_a }
+  PARTITION_B: { value: part_b }
+  ACCT: { value: my_acct }
+backends:
+  - name: cluster_a
+    type: slurm
+    default: true
+    account: ${{ variables.ACCT }}
+    partition: ${{ variables.PARTITION_A }}
+    nodes: 2
+    gpus_per_node: 4
+    time: 30
+  - name: cluster_b
+    type: slurm
+    account: ${{ variables.ACCT }}
+    partition: ${{ variables.PARTITION_B }}
+    nodes: 1
+    gpus_per_node: 0
+    time: 30
+operators:
+  - name: worker_a
+    type: srun
+    ntasks_per_node: 1
+  - name: worker_b
+    type: srun
+    ntasks_per_node: 1
+workflow:
+  name: mb
+  tasks:
+    - name: task_a
+      operator: worker_a
+      script: ["echo a"]
+    - name: task_b
+      backend: cluster_b
+      operator: worker_b
+      script: ["echo b"]
+"""
+    )
+    return f
+
+
+def test_resolve_slurm_backends_resolves_and_orders(temp_multi_backend_file):
+    """_resolve_slurm_backends resolves ${{ }} fields, preserves config order, and
+    applies --set overrides."""
+    from sflow.cli.batch import _resolve_slurm_backends
+
+    backends = _resolve_slurm_backends([temp_multi_backend_file], ["PARTITION_A=ovr_a"])
+
+    assert [b.name for b in backends] == ["cluster_a", "cluster_b"]
+    assert backends[0].partition == "ovr_a"  # --set wins over config default
+    assert backends[1].partition == "part_b"
+    assert backends[0].account == "my_acct"
+    assert backends[0].nodes == 2
+    assert backends[1].nodes == 1
+    assert backends[0].gpus_per_node == 4
+    assert backends[1].gpus_per_node == 0
+
+
+def test_resolve_slurm_backends_accepts_dict_style_backends(tmp_path):
+    """Raw backend detection should honor the schema's dict-to-list normalization."""
+    from sflow.cli.batch import _resolve_slurm_backends
+
+    f = tmp_path / "dict_backends.yaml"
+    f.write_text(
+        """
+version: "0.1"
+variables:
+  ACCT: { value: my_acct }
+backends:
+  cluster-a:
+    type: slurm
+    default: true
+    account: ${{ variables.ACCT }}
+    partition: part_a
+    nodes: 2
+    gpus_per_node: 4
+    time: 30
+  cluster_b:
+    type: slurm
+    account: ${{ variables.ACCT }}
+    partition: part_b
+    nodes: 1
+    gpus_per_node: 0
+    time: 30
+workflow:
+  name: mb
+  tasks:
+    - name: task_a
+      script: ["echo a"]
+"""
+    )
+
+    backends = _resolve_slurm_backends([f], None)
+
+    assert [b.name for b in backends] == ["cluster-a", "cluster_b"]
+    assert [b.partition for b in backends] == ["part_a", "part_b"]
+
+
+def test_batch_multi_backend_generates_per_backend_salloc_driver(
+    mock_sflow_app, temp_multi_backend_file, tmp_path
+):
+    """A config with two Slurm backends produces a single driver sbatch sized to
+    the leader backend (NOT a hetjob); every other backend runs its own salloc
+    at runtime. The driver exports the per-backend-salloc markers so each backend
+    gets its own Slurm job id (required for pyxis/enroot on every partition)."""
+    sbatch_path = tmp_path / "mb.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_multi_backend_file),
+            "--partition",
+            "ignored_cli_partition",
+            "--account",
+            "ignored_cli_account",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    s = sbatch_path.read_text()
+
+    # No heterogeneous job is emitted anymore.
+    assert "#SBATCH hetjob" not in s
+    assert "SFLOW_SLURM_HET_BACKEND" not in s
+    # Driver sbatch is sized to the leader backend (cluster_a).
+    assert "#SBATCH --partition=part_a" in s
+    assert "#SBATCH --nodes=2" in s
+    # The non-leader backend's partition is NOT baked into the sbatch; cluster_b
+    # allocates itself at runtime via salloc.
+    assert "#SBATCH --partition=part_b" not in s
+    # Per-backend-salloc markers drive SlurmBackend.allocate().
+    assert "export SFLOW_SLURM_MULTI_BACKEND_SALLOC=1" in s
+    assert "export SFLOW_SLURM_WRAPPER_BACKEND=cluster_a" in s
+    # The single-allocation CLI partition must NOT be emitted.
+    assert "ignored_cli_partition" not in s
+
+
+def test_multi_backend_driver_leader_sbatch_and_inner_run_extra_salloc_args(tmp_path):
+    """Multi-backend: #SBATCH carries only the leader's merged set (its extra_args
+    + the CLI -e args, de-duped, CLI wins). The CLI args are threaded into the
+    inner `sflow run` as --extra-salloc-args so every backend merges them into
+    its own salloc at runtime (no magic env var)."""
+    f = tmp_path / "mb_extra.yaml"
+    f.write_text(
+        """
+version: "0.1"
+backends:
+  - name: cluster_a
+    type: slurm
+    default: true
+    account: acct
+    partition: part_a
+    nodes: 2
+    gpus_per_node: 4
+    time: 30
+    extra_args: ["--exclusive", "--gres=gpu:8"]
+  - name: cluster_b
+    type: slurm
+    account: acct
+    partition: part_b
+    nodes: 1
+    gpus_per_node: 0
+    time: 30
+operators:
+  - name: w
+    type: srun
+    ntasks_per_node: 1
+workflow:
+  name: mb
+  tasks:
+    - name: a
+      operator: w
+      script: ["echo a"]
+    - name: b
+      backend: cluster_b
+      operator: w
+      script: ["echo b"]
+"""
+    )
+    sbatch_path = tmp_path / "mb.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(f),
+            "--partition",
+            "ignored",
+            "--account",
+            "ignored",
+            "--sbatch-path",
+            str(sbatch_path),
+            "-e",
+            "--gres=gpu:4",
+            "-e",
+            "--constraint=gpu",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    s = sbatch_path.read_text()
+
+    # Leader is cluster_a (heavier). #SBATCH = leader merged set; CLI wins on --gres.
+    assert "export SFLOW_SLURM_WRAPPER_BACKEND=cluster_a" in s
+    assert "#SBATCH --exclusive" in s
+    assert "#SBATCH --gres=gpu:4" in s
+    assert "#SBATCH --gres=gpu:8" not in s
+    assert s.count("#SBATCH --gres") == 1
+    assert "#SBATCH --constraint=gpu" in s
+
+    # No magic env var: the CLI args reach each backend's salloc via the inner
+    # `sflow run --extra-salloc-args`, which merges them into every backend.
+    assert "SFLOW_SLURM_CLI_EXTRA_ARGS" not in s
+    assert "--extra-salloc-args --gres=gpu:4" in s
+    assert "--extra-salloc-args --constraint=gpu" in s
+
+
+def test_select_wrapper_backend_picks_most_resource_heavy():
+    """The driver sbatch wraps the heaviest backend (most nodes, then most total
+    GPUs, then most GPUs/node); ties keep config-declaration order."""
+    from sflow.cli.batch import _ResolvedSlurmBackend, _select_wrapper_backend
+
+    def be(name, nodes, gpn):
+        return _ResolvedSlurmBackend(
+            name=name,
+            partition="p",
+            account="a",
+            nodes=nodes,
+            time=None,
+            extra_args=[],
+            gpus_per_node=gpn,
+        )
+
+    # Most nodes wins even when another backend has more GPUs/node.
+    assert (
+        _select_wrapper_backend([be("a", 1, 0), be("b", 3, 8), be("c", 2, 8)]).name
+        == "b"
+    )
+    # Tie on nodes -> more total GPUs wins.
+    assert _select_wrapper_backend([be("d", 2, 2), be("e", 2, 8)]).name == "e"
+    # Full tie -> first declared (config order).
+    assert _select_wrapper_backend([be("f", 2, 4), be("g", 2, 4)]).name == "f"
+
+
+def test_batch_multi_backend_driver_wraps_heaviest_backend(mock_sflow_app, tmp_path):
+    """The driver sbatch is sized to the most resource-heavy backend (here the
+    second-declared cluster_b), not the first/default; lighter backends salloc."""
+    f = tmp_path / "heavy_second.yaml"
+    f.write_text(
+        """
+version: "0.1"
+backends:
+  - name: cluster_a
+    type: slurm
+    default: true
+    account: acct
+    partition: part_a
+    nodes: 1
+    gpus_per_node: 0
+    time: 30
+  - name: cluster_b
+    type: slurm
+    account: acct
+    partition: part_b
+    nodes: 3
+    gpus_per_node: 8
+    time: 30
+workflow:
+  name: mb
+  tasks:
+    - name: task_a
+      script: ["echo a"]
+    - name: task_b
+      backend: cluster_b
+      script: ["echo b"]
+"""
+    )
+    sbatch_path = tmp_path / "mb.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(f),
+            "--partition",
+            "ignored",
+            "--account",
+            "ignored",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    s = sbatch_path.read_text()
+    # Driver wraps the heavier cluster_b (3 nodes / 8 GPUs), not the default cluster_a.
+    assert "export SFLOW_SLURM_WRAPPER_BACKEND=cluster_b" in s
+    assert "#SBATCH --partition=part_b" in s
+    assert "#SBATCH --nodes=3" in s
+    # cluster_a (lighter) is NOT baked into the sbatch; it sallocs at runtime.
+    assert "#SBATCH --partition=part_a" not in s
+
+
+def test_batch_multi_backend_exports_wrapper_backend_name_safely(
+    mock_sflow_app, tmp_path
+):
+    """The leader backend name is exported as a value (hyphens are safe) so
+    SlurmBackend.allocate can identify which backend reuses the driver alloc."""
+    f = tmp_path / "hyphen_backend.yaml"
+    f.write_text(
+        """
+version: "0.1"
+backends:
+  - name: cluster-a
+    type: slurm
+    default: true
+    account: acct
+    partition: part_a
+    nodes: 1
+    gpus_per_node: 1
+    time: 30
+  - name: cluster-b
+    type: slurm
+    account: acct
+    partition: part_b
+    nodes: 1
+    gpus_per_node: 0
+    time: 30
+workflow:
+  name: mb
+  tasks:
+    - name: task_a
+      script: ["echo a"]
+"""
+    )
+    sbatch_path = tmp_path / "mb.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(f),
+            "--partition",
+            "ignored",
+            "--account",
+            "ignored",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    s = sbatch_path.read_text()
+    assert "export SFLOW_SLURM_WRAPPER_BACKEND=cluster-a" in s
+    assert "export SFLOW_SLURM_MULTI_BACKEND_SALLOC=1" in s
+    assert "SFLOW_SLURM_HET_BACKEND" not in s
+
+
+def test_batch_multi_backend_applies_cli_extra_args_to_driver(
+    mock_sflow_app, temp_multi_backend_file, tmp_path
+):
+    """CLI sbatch extras apply to the single driver sbatch (one allocation)."""
+    sbatch_path = tmp_path / "mb.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_multi_backend_file),
+            "--partition",
+            "ignored",
+            "--account",
+            "ignored",
+            "--sbatch-extra-args",
+            "--exclusive",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert sbatch_path.read_text().count("#SBATCH --exclusive") == 1
+
+
+def test_batch_multi_backend_honors_set_overrides(
+    mock_sflow_app, temp_multi_backend_file, tmp_path
+):
+    """--set overrides set the leader's driver partition and flow to non-leader
+    backends through the wrapped `sflow run` command (they salloc at runtime)."""
+    sbatch_path = tmp_path / "mb.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_multi_backend_file),
+            "--partition",
+            "ignored",
+            "--account",
+            "ignored",
+            "--set",
+            "PARTITION_A=genesisq",
+            "--set",
+            "PARTITION_B=gamoraq",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    s = sbatch_path.read_text()
+    # The driver sbatch is sized to the leader (cluster_a) partition only.
+    assert "#SBATCH --partition=genesisq" in s
+    assert "#SBATCH --partition=gamoraq" not in s
+    # The non-leader partition flows to sflow run, which sallocs it at runtime.
+    assert "PARTITION_B=gamoraq" in s
+
+
+def test_batch_multi_backend_reports_per_backend_plan(
+    mock_sflow_app, temp_multi_backend_file, tmp_path
+):
+    """The CLI reports each backend's partition/nodes/gpus and its allocation
+    role (leader reuses the driver; others salloc), not a single derived value."""
+    sbatch_path = tmp_path / "mb.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_multi_backend_file),
+            "--partition",
+            "ignored",
+            "--account",
+            "ignored",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    out = result.output
+    assert "2 Slurm backends detected" in out
+    assert "multi-backend driver job" in out
+    assert "[cluster_a] partition=part_a, nodes=2, gpus_per_node=4" in out
+    assert "[cluster_b] partition=part_b, nodes=1, gpus_per_node=0" in out
+    assert "driver/leader" in out
+    assert "own salloc" in out
+    # The misleading single-value derivation messages must NOT appear here.
+    assert "--nodes not specified, derived from config" not in out
+    assert "--gpus-per-node not specified, derived from config" not in out
+
+
+def test_batch_multi_backend_warns_cli_nodes_ignored(
+    mock_sflow_app, temp_multi_backend_file, tmp_path
+):
+    """Passing -N/-G with a multi-backend config warns that they are ignored
+    (each backend uses its own config values)."""
+    sbatch_path = tmp_path / "mb.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_multi_backend_file),
+            "--partition",
+            "ignored",
+            "--account",
+            "ignored",
+            "--nodes",
+            "9",
+            "--gpus-per-node",
+            "9",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    out = result.output
+    assert "ignored for multi-backend" in out
+    # The CLI single value must not leak into the driver directives; the driver
+    # is sized to the leader backend (nodes=2), and the non-leader nodes (1) are
+    # not baked into the sbatch (cluster_b sallocs at runtime).
+    s = sbatch_path.read_text()
+    assert "#SBATCH --nodes=9" not in s
+    assert "#SBATCH --nodes=2" in s
+    assert "#SBATCH --nodes=1" not in s
+
+
+def test_batch_single_backend_is_not_hetjob(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """A config without >=2 Slurm backends keeps the single-allocation script."""
+    sbatch_path = tmp_path / "single.sh"
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    s = sbatch_path.read_text()
+    assert "#SBATCH hetjob" not in s
+    assert "SFLOW_SLURM_HET_GROUP" not in s
+    assert "#SBATCH --partition=batch" in s
+
+
+def test_slurm_strategy_plan_reports_multi_backend_components(temp_multi_backend_file):
+    """The Slurm launch strategy owns multi-backend planning: it detects multiple
+    Slurm backends and reports each backend's plan + allocation role, instead of
+    batch() doing it."""
+    from sflow.cli.batch import BatchPlanRequest, SlurmBatchLaunchStrategy
+
+    plan = SlurmBatchLaunchStrategy().plan(
+        BatchPlanRequest(
+            files=[temp_multi_backend_file],
+            set_var=None,
+            cli_nodes=None,
+            cli_gpus_per_node=None,
+        )
+    )
+
+    joined = "\n".join(plan.messages)
+    assert plan.error is None
+    assert "2 Slurm backends detected" in joined
+    assert "[cluster_a] partition=part_a, nodes=2, gpus_per_node=4" in joined
+    assert "[cluster_b] partition=part_b, nodes=1, gpus_per_node=0" in joined
+    assert "driver/leader" in joined
+    # Each backend carries its own nodes/gpus, so dry-run must not override them
+    # with a single CLI value.
+    assert plan.dry_run_nodes is None
+    assert plan.dry_run_gpus_per_node is None
+
+
+def test_slurm_strategy_plan_derives_single_backend_nodes(tmp_path):
+    """For a single Slurm backend the strategy derives nodes/gpus from config."""
+    from sflow.cli.batch import BatchPlanRequest, SlurmBatchLaunchStrategy
+
+    f = tmp_path / "single.yaml"
+    f.write_text(
+        """
+version: "0.1"
+backends:
+  - name: only
+    type: slurm
+    default: true
+    account: acct
+    partition: part
+    nodes: 3
+    gpus_per_node: 8
+    time: 30
+workflow:
+  name: single
+  tasks:
+    - name: t
+      script: ["echo hi"]
+"""
+    )
+
+    plan = SlurmBatchLaunchStrategy().plan(
+        BatchPlanRequest(files=[f], set_var=None, cli_nodes=None, cli_gpus_per_node=None)
+    )
+
+    assert plan.error is None
+    assert plan.nodes == 3
+    assert plan.gpus_per_node == 8
+    assert any("derived from config: 3" in m for m in plan.messages)
+
+
+def test_batch_single_job_delegates_planning_to_strategy(
+    mock_sflow_app, temp_workflow_file, tmp_path, monkeypatch
+):
+    """batch() must obtain its node/gpu/hetjob plan from the launch strategy
+    rather than deciding hetjob state itself."""
+    sbatch_path = tmp_path / "out.sh"
+    real_plan = batch_mod.SlurmBatchLaunchStrategy.plan
+    calls: list[str] = []
+
+    def spy_plan(self, request):
+        calls.append("called")
+        return real_plan(self, request)
+
+    monkeypatch.setattr(batch_mod.SlurmBatchLaunchStrategy, "plan", spy_plan)
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "acct",
+            "--nodes",
+            "1",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert calls == ["called"]
+
+
+def test_batch_script_bootstraps_venv_with_resolved_system_python(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """The generated sbatch venv bootstrap must not use a bare ``python3``.
+
+    A bare ``python3`` resolves through PATH, so if the submitting shell has a
+    virtualenv activated, sbatch's default ``--export=ALL`` leaks that venv into
+    the job and ``python3 -m venv`` runs the caller's interpreter -- which fails
+    with "Exec format error" when the login node and compute node differ in
+    architecture (e.g. x86 login vs aarch64 Grace compute).
+
+    The script must instead clear the inherited virtualenv and resolve a real
+    system python3: prefer well-known absolute locations, then fall back to a
+    PATH-resolved interpreter so nodes that install python outside /usr/bin work.
+
+    It must also drop a leaked PYTHONPATH: --export=ALL carries the submitter's
+    PYTHONPATH into the job, and if it points at an sflow source tree (e.g. the
+    under-dev e2e exports PYTHONPATH=<repo>/src) it is prepended to sys.path
+    ahead of site-packages and shadows the per-job editable install, so sflow
+    would be imported from that shared tree instead of the job's own venv/copy.
+    """
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+    # Venv is created via a resolved interpreter, never a bare python3 from PATH.
+    assert '"$SFLOW_BOOTSTRAP_PYTHON" -m venv "$SFLOW_VENV_DIR"' in script_content
+    assert "python3 -m venv" not in script_content
+    # Well-known absolute location is tried first, with a PATH fallback for nodes
+    # that install python elsewhere.
+    assert "/usr/bin/python3" in script_content
+    assert "command -v python3" in script_content
+    # An inherited (possibly wrong-arch) virtualenv must be neutralized.
+    assert "unset VIRTUAL_ENV" in script_content
+    assert 'grep -vxF "$VIRTUAL_ENV/bin"' in script_content
+    # A leaked PYTHONPATH would shadow the per-job editable install (import from
+    # a shared source tree instead of this job's venv/copy), so it is dropped too.
+    assert "PYTHONPATH" in script_content
+    assert "unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT PYTHONHOME PYTHONPATH" in script_content
+
+
+def test_batch_script_creates_fresh_per_job_venv_without_flock(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """Each Slurm job builds its own fresh venv -- no shared venv, no flock.
+
+    Sharing one venv across concurrent batch jobs caused create/install races and
+    required flock plus an exists/reuse branch (and, because the bootstrap ran in
+    the flock subshell, a fragile parent-side exit-code propagation). Keying the
+    venv path on ``$SLURM_JOB_ID`` gives every job a private venv, eliminating the
+    race -- and the subshell -- entirely, so ``set -e`` in the main shell can abort
+    the job directly on any bootstrap failure.
+    """
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+
+    # With no --sflow-venv-path, the parent defaults to compute-node-local scratch
+    # resolved at runtime ($TMPDIR, falling back to /tmp) -- not a baked submit-side
+    # path -- so it honors per-node/per-job cluster scratch.
+    assert (
+        'SFLOW_VENV_PARENT="${TMPDIR:-/tmp}/sflow_compute_node_venv"' in script_content
+    )
+    # Per-job venv path keyed on the Slurm job id (PID fallback off-Slurm).
+    assert (
+        'SFLOW_VENV_DIR="$SFLOW_VENV_PARENT/.sflow_venv-${SLURM_JOB_ID:-$$}"'
+        in script_content
+    )
+    # Created fresh with a resolved system python3, and sflow runs from that venv.
+    assert '"$SFLOW_BOOTSTRAP_PYTHON" -m venv "$SFLOW_VENV_DIR"' in script_content
+    assert '"$SFLOW_VENV_DIR/bin/sflow" run' in script_content
+
+    # No shared-venv concurrency machinery remains (the word "flock" may still
+    # appear in an explanatory comment, so assert the command/lock are gone).
+    assert "flock -w" not in script_content
+    assert "SFLOW_LOCK" not in script_content
+    assert ".sflow_venv.lock" not in script_content
+    # No "venv already exists -> reuse" branch and no subshell exit-code dance.
+    assert "SFLOW_ACTIVATE" not in script_content
+    assert "SFLOW_VENV_RC" not in script_content
+
+    # Disposable: the per-job venv (and per-job source copy, if any) is cleaned up
+    # by the finalize trap on exit AND on the termination signals Slurm uses
+    # (timeout/cancel/preempt), because a bare EXIT trap does not run on an
+    # untrapped signal -- otherwise the venvs would leak on every cancelled job.
+    assert "trap _sflow_finalize EXIT INT TERM HUP" in script_content
+    assert (
+        'rm -rf "$SFLOW_VENV_DIR" ${SFLOW_SRC_DIR:+"$SFLOW_SRC_DIR"}' in script_content
+    )
+
+    # Bootstrap still fails fast. There is no subshell now, so set -e in the main
+    # shell aborts the job directly; it is re-disabled before the run so log
+    # copying still happens after a failed workflow.
+    assert "\nset -e\n" in script_content
+    assert "\nset +e\n" in script_content
+    set_e_idx = script_content.index("\nset -e\n")
+    venv_create_idx = script_content.index('"$SFLOW_BOOTSTRAP_PYTHON" -m venv')
+    set_plus_e_idx = script_content.index("\nset +e\n")
+    assert set_e_idx < venv_create_idx < set_plus_e_idx
+
+    # The job exits with the workflow's status (captured right after the run), so a
+    # failed workflow is a failed Slurm job rather than always exit 0 (which would
+    # mask failures and wrongly satisfy --dependency=afterok).
+    assert "SFLOW_RUN_RC=$?" in script_content
+    assert 'exit "$SFLOW_RUN_RC"' in script_content
+    run_idx = script_content.index('"$SFLOW_VENV_DIR/bin/sflow" run')
+    rc_capture_idx = script_content.index("SFLOW_RUN_RC=$?")
+    rc_exit_idx = script_content.index('exit "$SFLOW_RUN_RC"')
+    assert run_idx < rc_capture_idx < rc_exit_idx
+
+
+def test_batch_sflow_venv_path_overrides_default_parent(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """An explicit --sflow-venv-path bakes that absolute path as the venv parent.
+
+    The default is compute-node-local scratch resolved at runtime, but passing a
+    path (e.g. a shared filesystem) pins SFLOW_VENV_PARENT to that resolved path
+    instead, so the default $TMPDIR expression is not emitted.
+    """
+    venv_parent = tmp_path / "shared_venvs"
+    venv_parent.mkdir()
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-venv-path",
+            str(venv_parent),
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+
+    assert f"SFLOW_VENV_PARENT={shlex.quote(str(venv_parent.resolve()))}" in script_content
+    assert "${TMPDIR:-/tmp}/sflow_compute_node_venv" not in script_content
+
+
+def test_batch_script_installs_editable_from_source_path(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """--sflow-source-path installs sflow editable from a *per-job copy*.
+
+    A shared source tree cannot be reused across concurrent jobs: an editable
+    build rewrites setuptools-scm's _version.py and *.egg-info back into the tree,
+    so concurrent installs would race. Each job instead copies the checkout into
+    its own per-job dir (rsync, or a tar fallback when rsync is absent;
+    heavy/generated paths excluded) and runs ``uv pip install -e ".[dev]"`` from
+    that copy into the fresh per-job venv.
+    """
+    src_dir = tmp_path / "sflow_src"
+    src_dir.mkdir()
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-source-path",
+            str(src_dir),
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+
+    # Per-job source dir keyed on the Slurm job id, populated from the provided
+    # checkout, then an editable install from the copy.
+    assert (
+        'SFLOW_SRC_DIR="$SFLOW_VENV_PARENT/.sflow_src-${SLURM_JOB_ID:-$$}"'
+        in script_content
+    )
+    # rsync preferred, with a tar fallback when the compute node has no rsync.
+    assert "if command -v rsync >/dev/null 2>&1; then" in script_content
+    assert "rsync -a --exclude=" in script_content
+    assert (
+        f'{shlex.quote(str(src_dir.resolve()))}/ "$SFLOW_SRC_DIR/"' in script_content
+    )
+    assert (
+        f'tar -C {shlex.quote(str(src_dir.resolve()))} --exclude='
+        in script_content
+    )
+    assert '-cf - . | tar -C "$SFLOW_SRC_DIR" -xf -' in script_content
+    assert 'cd "$SFLOW_SRC_DIR"' in script_content
+    assert '"$VIRTUAL_ENV/bin/uv" pip install -e ".[dev]"' in script_content
+    # The shared source tree is NOT cd'd into directly, and no git-ref install.
+    assert f"cd {shlex.quote(str(src_dir.resolve()))}\n" not in script_content
+    assert "sflow @ git+" not in script_content
+    # Heavy/generated paths are excluded from the copy (and still bootstrapped
+    # into the fresh per-job venv, not a bare pip).
+    assert "--exclude=sflow_output" in script_content
+    assert "--exclude='*.egg-info'" in script_content
+    assert '"$VIRTUAL_ENV/bin/pip" install uv' in script_content
+    # Correctness-critical: the per-job venv/source dirs must be excluded so that
+    # when the venv parent IS the source (e2e passes both = $REPO_DIR) the copy
+    # does not recurse into its own destination / sibling jobs' growing copies.
+    assert "--exclude='.sflow_venv*'" in script_content
+    assert "--exclude='.sflow_src*'" in script_content
+    # The per-job source copy is cleaned up with the venv on exit/signal.
+    assert '${SFLOW_SRC_DIR:+"$SFLOW_SRC_DIR"}' in script_content
+
+
+def test_batch_source_copy_excludes_per_job_dirs_when_venv_parent_is_source(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """Regression: venv parent == source must not cause a runaway self-copy.
+
+    The under-dev e2e passes --sflow-venv-path and --sflow-source-path both as
+    $REPO_DIR, so SFLOW_SRC_DIR (=$SFLOW_VENV_PARENT/.sflow_src-<job id>) lands
+    inside the directory being copied. The copy MUST exclude the per-job venv/src
+    dirs; otherwise rsync/tar recurse into the destination (and every concurrent
+    job's growing copy), which hung CI for hours. Verify both the source-copy and
+    its destination share the same parent and that both per-job globs are excluded.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-venv-path",
+            str(repo),
+            "--sflow-source-path",
+            str(repo),
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_content = sbatch_path.read_text()
+
+    # venv parent and the source being copied are the same dir (the e2e setup).
+    assert f"SFLOW_VENV_PARENT={shlex.quote(str(repo.resolve()))}" in script_content
+    assert f'{shlex.quote(str(repo.resolve()))}/ "$SFLOW_SRC_DIR/"' in script_content
+    # Both per-job globs must be in the exclude args of the copy, so the copy can
+    # never descend into its own destination or a sibling job's copy.
+    assert "--exclude='.sflow_venv*'" in script_content
+    assert "--exclude='.sflow_src*'" in script_content
+
+
+def test_batch_sflow_version_and_source_path_are_mutually_exclusive(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    """--sflow-version and --sflow-source-path cannot be combined."""
+    src_dir = tmp_path / "sflow_src"
+    src_dir.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-version",
+            "main",
+            "--sflow-source-path",
+            str(src_dir),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output

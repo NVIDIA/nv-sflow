@@ -16,9 +16,47 @@ from typing import Any
 from sflow.utils.gpu import parse_cuda_visible_devices
 
 from .task import Task, TaskStatus
+from .uploads import UploadResult
 from .workflow import Workflow
 
 _RESOURCE_CHART_MARKS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+# Fixed render order + short labels for upload rows in the Uploads section.
+_UPLOAD_STATUS_ORDER = ("uploaded", "failed", "skipped", "dry-run")
+_UPLOAD_STATUS_LABEL = {
+    "uploaded": "[OK]  ",
+    "failed": "[FAIL]",
+    "skipped": "[SKIP]",
+    "dry-run": "[DRY] ",
+}
+
+
+def format_upload_row(result: UploadResult) -> str:
+    """Render one upload row: ``[STATUS] <source-basename> -> <destination>``,
+    with ``(error)  [on_error=...]`` appended for failures.
+
+    Shared by the summary file's Uploads section and the console end-of-run
+    block so both render identically.
+    """
+    label = _UPLOAD_STATUS_LABEL.get(result.status, f"[{result.status}]")
+    source = Path(result.source).name or result.source
+    row = f"{label} {source} -> {result.destination}"
+    if result.status == "failed":
+        if result.error:
+            row += f"  ({result.error})"
+        row += f"  [on_error={result.on_error}]"
+    return row
+
+
+def format_upload_counts(results: list[UploadResult]) -> str:
+    """Return compact upload counts in stable display order, e.g. ``uploaded=2``."""
+    counts = Counter(result.status for result in results)
+    parts = [
+        f"{status}={counts[status]}"
+        for status in _UPLOAD_STATUS_ORDER
+        if counts.get(status)
+    ]
+    return ", ".join(parts) if parts else "none"
 
 @dataclass
 class _TimelineEvent:
@@ -40,6 +78,7 @@ class SflowSummaryWriter:
         self._workflow: Workflow | None = None
         self._output_dir: Path | None = None
         self._runtime_info_text = ""
+        self._command_text = ""
         self._command_log_paths: dict[str, Path] = {}
         self._started_at: datetime | None = None
         self._ended_at: datetime | None = None
@@ -49,6 +88,8 @@ class SflowSummaryWriter:
         self._workflow_detail: str | None = None
         self._timeline: list[_TimelineEvent] = []
         self._failure_hints: list[str] = []
+        self._network_warnings: list[str] = []
+        self._uploads: list[UploadResult] = []
         self._task_started: dict[str, float] = {}
         self._task_ready: dict[str, float] = {}
         self._task_finished: dict[str, float] = {}
@@ -65,10 +106,14 @@ class SflowSummaryWriter:
         output_dir: Path | str,
         runtime_info_text: str,
         command_log_paths: dict[str, Path | str],
+        command_text: str = "",
     ) -> None:
         self._workflow = workflow
         self._output_dir = Path(output_dir)
         self._runtime_info_text = runtime_info_text
+        # The invocation that produced this run (e.g. "sflow run -f cfg.yaml --set X=1"),
+        # recorded in the header so a later reader knows exactly what was run.
+        self._command_text = command_text
         self._command_log_paths = {
             name: Path(path) for name, path in command_log_paths.items()
         }
@@ -134,6 +179,47 @@ class SflowSummaryWriter:
         self._task_ready[task.name] = ready_at
         self._task_finished[task.name] = ready_at
         self._append_event("READY", task)
+
+    def record_network_warning(self, task: Task, message: str, **_: Any) -> None:
+        """Record a non-fatal network warning (e.g. RDMA -> TCP fallback).
+
+        Surfaced in the dedicated 'Network Warnings' section, prefixed with the
+        task name. Duck-typed like the other summary hooks, so consumers that
+        don't implement it are unaffected.
+        """
+        if not message:
+            return
+        self._network_warnings.append(f"{task.name}: {message}")
+        self._schedule_render()
+
+    def record_probe_attempt(self, task: Task, **_: Any) -> None:
+        """A probe check just ran: refresh so the Probe Traces section stays current
+        even while the task sits RUNNING.
+
+        The pull-model render reads each probe's ``last_attempt``, so this only marks
+        the summary dirty (debounced). Without it, a stuck DAG -- a readiness probe
+        that never triggers, no task-status event to schedule a render -- would freeze
+        the probe trace at the last status change, which is exactly when you need it
+        live. Duck-typed like the other hooks, so consumers that don't implement it
+        are unaffected."""
+        self._schedule_render()
+
+    def record_uploads(self, results: list[UploadResult], **_: Any) -> None:
+        """Record upload outcomes for the dedicated end-of-run Uploads section.
+
+        Called by the orchestrator (per-task uploads) and the app (workflow
+        ``upload_all``). Duck-typed like the other summary hooks, so consumers
+        that don't implement it are unaffected.
+        """
+        if not results:
+            return
+        self._uploads.extend(results)
+        self._schedule_render()
+
+    @property
+    def upload_results(self) -> list[UploadResult]:
+        """All recorded upload outcomes, in the order they were reported."""
+        return list(self._uploads)
 
     def workflow_finished(
         self,
@@ -278,9 +364,13 @@ class SflowSummaryWriter:
             f"Tasks    : {len(tasks)}",
             f"Summary  : {self.path}",
         ]
+        if self._command_text:
+            lines.append(f"Command  : {self._command_text}")
         lines.extend(self._end_summary_lines(tasks))
         lines.extend(["", "Runtime", "-------"])
         lines.extend(self._runtime_info_text.splitlines() or ["(runtime unavailable)"])
+
+        lines.extend(self._network_warning_lines())
 
         if self._status == "FAILED":
             lines.extend(["", "Failure Hints", "-------------"])
@@ -290,6 +380,7 @@ class SflowSummaryWriter:
         lines.extend(self._duration_chart_lines(tasks))
         lines.extend(["", "Timeline", "--------"])
         lines.extend(self._timeline_lines())
+        lines.extend(self._probe_trace_lines())
         lines.extend(["", "GPU Usage Chart", "---------------"])
         lines.extend(self._gpu_usage_chart_lines(tasks))
         lines.extend(["", "Node Usage Chart", "----------------"])
@@ -306,6 +397,8 @@ class SflowSummaryWriter:
                 lines.append(f"{name}: {path}")
         else:
             lines.append("(none)")
+
+        lines.extend(self._upload_section_lines())
 
         lines.extend(["", "Workflow DAG", "------------"])
         lines.extend(f"  {line}" for line in workflow.task_graph.dag.render_ascii())
@@ -385,6 +478,41 @@ class SflowSummaryWriter:
                         self._event_summary(event),
                     ]
                 )
+            )
+        return lines
+
+    def _probe_trace_lines(self) -> list[str]:
+        """Render the LAST attempt of every probe (readiness + failure), for
+        post-mortem debugging -- only the final try is kept per probe (see
+        ``Probe.last_attempt``), so this shows what each probe observed when the task
+        resolved: the log line a ``log_watch`` matched, the last line it saw before a
+        timeout, or a tcp/http endpoint result. Returns [] when no task has probes."""
+        if self._workflow is None:
+            return []
+        rows: list[tuple[str, str, str, str, str, str]] = []
+        for task in self._workflow.get_tasks():
+            for probe in getattr(task, "probes", None) or []:
+                phase = str(getattr(probe, "type", "") or "")
+                kind = str(getattr(probe, "kind", "probe"))
+                attempt = getattr(probe, "last_attempt", None)
+                if attempt is None:
+                    status, runtime, detail = "[--]", "-", "(no attempt run)"
+                else:
+                    status = "[OK]" if attempt.ok else "[FAIL]"
+                    runtime = f"{attempt.runtime:.2f}s"
+                    detail = attempt.detail or "(no detail)"
+                rows.append((task.name, phase, kind, status, runtime, detail))
+        if not rows:
+            return []
+        tw = max(4, *(len(r[0]) for r in rows))
+        pw = max(5, *(len(r[1]) for r in rows))
+        kw = max(4, *(len(r[2]) for r in rows))
+        sw = max(len(r[3]) for r in rows)
+        lines = ["", "Probe Traces (last attempt)", "---------------------------"]
+        for name, phase, kind, status, runtime, detail in rows:
+            lines.append(
+                f"{name:<{tw}}  {phase:<{pw}}  {kind:<{kw}}  "
+                f"{status:<{sw}}  {runtime:>7}  {detail}"
             )
         return lines
 
@@ -658,6 +786,27 @@ class SflowSummaryWriter:
             "FAILED/CANCELLED Tasks : "
             + (", ".join(failed_or_cancelled) if failed_or_cancelled else "none")
         )
+        if self._uploads:
+            lines.append(f"Uploads     : {format_upload_counts(self._uploads)}")
+        return lines
+
+    def _network_warning_lines(self) -> list[str]:
+        """Render the 'Network Warnings' section, or [] when none were recorded."""
+        if not self._network_warnings:
+            return []
+        return ["", "Network Warnings", "----------------", *self._network_warnings]
+
+    def _upload_section_lines(self) -> list[str]:
+        """Render the dedicated 'Uploads' section, or [] when no uploads ran."""
+        if not self._uploads:
+            return []
+        lines = ["", "Uploads", "-------", f"Counts : {format_upload_counts(self._uploads)}"]
+        grouped: dict[str, list[UploadResult]] = {}
+        for result in self._uploads:
+            grouped.setdefault(result.task, []).append(result)
+        for task_name, rows in grouped.items():
+            lines.append(f"{task_name}:")
+            lines.extend(f"  {format_upload_row(row)}" for row in rows)
         return lines
 
     def _format_failure_hint(

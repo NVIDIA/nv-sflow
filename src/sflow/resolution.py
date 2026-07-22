@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Literal, Optional, Set
 
 from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
 from jinja2 import meta as jinja2_meta
+from jinja2 import nodes as jinja2_nodes
 from jinja2.sandbox import SandboxedEnvironment
 
 from sflow.config.schema import SflowConfig
@@ -200,6 +202,40 @@ class ExpressionResolver:
         elif isinstance(value, dict):
             for val in value.values():
                 self._extract_recursive(val, references)
+
+    def references_attribute(self, value: Any, root: str, attr: str) -> bool:
+        """Return True if a ``${{ }}`` expression in ``value`` reads ``root.attr``.
+
+        Detection is AST-based (via the same Jinja2 environment used to resolve
+        expressions), so it is robust where naive string matching is not: it
+        tolerates any internal whitespace (``${{task.name}}``), finds the
+        reference inside a larger sub-expression (``${{ 'p_' + task.name }}``),
+        accepts item access (``${{ task['name'] }}``), and — crucially — ignores
+        matches inside string literals (``${{ "task.name" }}``). Used e.g. to
+        decide whether a user already placed ``task.name`` in an upload ``to:``.
+        """
+        if not isinstance(value, str) or "${{" not in value:
+            return False
+        try:
+            ast = self._env.parse(value)
+        except TemplateSyntaxError:
+            return False
+        for node in ast.find_all(jinja2_nodes.Getattr):
+            if (
+                node.attr == attr
+                and isinstance(node.node, jinja2_nodes.Name)
+                and node.node.name == root
+            ):
+                return True
+        for node in ast.find_all(jinja2_nodes.Getitem):
+            if (
+                isinstance(node.node, jinja2_nodes.Name)
+                and node.node.name == root
+                and isinstance(node.arg, jinja2_nodes.Const)
+                and node.arg.value == attr
+            ):
+                return True
+        return False
 
     def resolve(self, value: Any, context: Dict[str, Any]) -> Any:
         """Resolve a value using the given context."""
@@ -854,8 +890,15 @@ def resolve_artifacts(
     workspace_dir: Any | None = None,
     output_dir: Any | None = None,
     materialize: bool = False,
+    remote_filesystem: bool = False,
 ) -> SflowState:
-    """Resolve artifact URIs and inline content into ``state.artifacts``."""
+    """Resolve artifact URIs and inline content into ``state.artifacts``.
+
+    ``remote_filesystem`` is set when the workflow's backend executes off the
+    controller host (e.g. Kubernetes). It is forwarded to artifact resolvers that
+    accept it (the file/fs resolver) so local ``fs://`` paths are passed through
+    instead of being validated/created on the controller.
+    """
     ensure_builtin_artifacts_registered()
 
     ws_dir = Path(workspace_dir) if workspace_dir is not None else Path.cwd()
@@ -909,7 +952,7 @@ def resolve_artifacts(
             )
             continue
 
-        artifact = resolver_obj.resolve(
+        resolve_kwargs: dict[str, Any] = dict(
             name=artifact_conf.name,
             uri=uri,
             description=artifact_conf.description,
@@ -919,6 +962,11 @@ def resolve_artifacts(
             output_dir=out_dir,
             materialize=materialize,
         )
+        # Only resolvers that opt in (the file/fs resolver) receive remote_filesystem,
+        # so http/hf/docker resolvers keep their existing behavior unchanged.
+        if "remote_filesystem" in inspect.signature(resolver_obj.resolve).parameters:
+            resolve_kwargs["remote_filesystem"] = remote_filesystem
+        artifact = resolver_obj.resolve(**resolve_kwargs)
         artifacts[artifact.name] = artifact
 
     state.artifacts = artifacts
@@ -1040,7 +1088,15 @@ def resolve_and_update_variables(
             for key, value in resolved_values.items()
             if not resolver.has_expression(value)
         }
-        ctx: dict[str, Any] = {"variables": ctx_values, **ctx_values}
+        # Wrap in VariableValue so expressions can read `.domain`/`.value`
+        # metadata (e.g. `variables.CONCURRENCY.domain | max`). Reuse the shared
+        # builder (also used by the compose path) so wrapping stays one
+        # ground-truth; arithmetic and string rendering transparently delegate to
+        # the underlying value.
+        wrapped_values = build_variables_ctx_from_raw(
+            ctx_values, {key: variables[key].domain for key in ctx_values}
+        )
+        ctx: dict[str, Any] = {"variables": wrapped_values, **wrapped_values}
         if extra_ctx:
             ctx.update(extra_ctx)
 

@@ -1,11 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+import json
+import logging
+
 import pytest
+from pydantic import Field
 
 from sflow.app.assembly import build_task_graph, resolve_artifacts
-from collections.abc import Sequence
-from sflow.core.operator import Operator
+from collections.abc import Mapping, Sequence
+from typing import Literal
+
 from sflow.config.schema import (
     GpuResourceConfig,
     LogWatchProbeConfig,
@@ -16,17 +22,55 @@ from sflow.config.schema import (
     ResourcesConfig,
     SflowConfig,
     TaskConfig,
+    UploadSpec,
     WorkflowConfig,
 )
-from sflow.core.backend import Allocation, Backend
+from sflow.core.backend import Allocation, Backend, BackendCapabilities
+from sflow.core.command import Command
 from sflow.core.compute_node import ComputeNode
+from sflow.core.operator import Operator, OperatorConfig
+from sflow.core.operator_registry import register_operator
 from sflow.core.state import SflowState
 from sflow.core.task_graph import TaskGraph
 from sflow.core.variable import Variable, VariableType
 from sflow.core.workflow import Workflow
+from sflow.plugins.backends.docker import DockerBackend, DockerBackendConfig
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
 from sflow.plugins.probes import HttpGetProbe, HttpPostProbe, TcpPortProbe
+
+
+class _RecordingOperatorConfig(OperatorConfig):
+    name: str
+    type: Literal["recording"] = "recording"
+    backend_name: str | None = None
+    assigned_nodes: list[str] = Field(default_factory=list)
+    gpu_count: int | None = None
+
+
+@register_operator("recording", _RecordingOperatorConfig)
+class _RecordingOperator(Operator):
+    def apply_backend_context(
+        self,
+        *,
+        backend: Backend,
+        assigned_nodes: Sequence[str],
+        artifacts: Sequence[object],
+        cuda_visible_devices: str | None = None,
+        gpu_count: int | None = None,
+    ) -> None:
+        self.config.backend_name = backend.name
+        self.config.assigned_nodes = list(assigned_nodes)
+        self.config.gpu_count = gpu_count
+
+    def build_command(
+        self,
+        *,
+        task_name: str,
+        script: Sequence[str],
+        envs: Mapping[str, str],
+    ) -> Command:
+        return Command(exec="recording")
 
 
 class _FakeBackend(Backend):
@@ -109,6 +153,750 @@ def test_build_task_graph_creates_nodes_edges_and_default_operator():
     assert t1.operator.config.type == "srun"
     assert t1.operator.config.job_id == "111"
     assert t1.operator.config.nodelist == ["n1"]
+
+
+def _single_node_state() -> SflowState:
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+    return state
+
+
+def _slurm_backend_dict():
+    return {
+        "name": "b1",
+        "type": "slurm",
+        "default": True,
+        "account": "acct",
+        "partition": "batch",
+        "time": "00:10:00",
+        "nodes": 1,
+        "gpus_per_node": 1,
+    }
+
+
+def test_build_task_graph_required_by_matches_depends_on():
+    """`required_by` folds into `depends_on`, so the built DAG edges are identical
+    to the equivalent `depends_on` workflow."""
+
+    def _edges(tasks):
+        config = SflowConfig.model_validate(
+            {
+                "version": "0.1",
+                "backends": [_slurm_backend_dict()],
+                "workflow": {"name": "wf", "tasks": tasks},
+            }
+        )
+        tg = build_task_graph(config, _single_node_state())
+        return {n: set(tg.dag.get_dependencies(n)) for n in tg.dag.nodes}
+
+    via_required_by = _edges(
+        [
+            {"name": "a", "script": ["echo a"], "required_by": ["c"]},
+            {"name": "b", "script": ["echo b"], "required_by": ["c"]},
+            {"name": "c", "script": ["echo c"]},
+        ]
+    )
+    via_depends_on = _edges(
+        [
+            {"name": "a", "script": ["echo a"]},
+            {"name": "b", "script": ["echo b"]},
+            {"name": "c", "script": ["echo c"], "depends_on": ["a", "b"]},
+        ]
+    )
+    assert via_required_by == via_depends_on
+    assert via_required_by["c"] == {"a", "b"}
+
+
+def test_build_task_graph_required_by_cycle_is_rejected():
+    """A `required_by` cycle (A required_by B, B required_by A) folds into mutual
+    `depends_on`. The schema accepts it (no cycle check there), so the cycle must be
+    caught at graph-build time -- guards the fold path against a silent hang."""
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [_slurm_backend_dict()],
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {"name": "a", "script": ["echo a"], "required_by": ["b"]},
+                    {"name": "b", "script": ["echo b"], "required_by": ["a"]},
+                ],
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="cycle"):
+        build_task_graph(config, _single_node_state())
+
+
+def test_build_task_graph_applies_backend_context_to_explicit_operator():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "b1",
+                "type": "slurm",
+                "default": True,
+                "account": "acct",
+                "partition": "batch",
+                "time": "00:10:00",
+                "nodes": 2,
+                "gpus_per_node": 8,
+            }
+        ],
+        operators=[{"name": "rec", "type": "recording"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator="rec",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[1]),
+                    ),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.backend_name == "b1"
+    assert t1.operator.config.assigned_nodes == ["n2"]
+
+
+def test_build_task_graph_binds_each_task_to_its_own_backend_multi_backend():
+    """Multi-backend: each task's operator must bind to its OWN backend's
+    allocation (job id + nodelist), not the default backend's.
+
+    Regression guard for the per-task -> backend linkage: a task without an
+    explicit `backend:` uses the default backend, while a pinned task uses its
+    own. Each operator's job_id/nodelist must come from its task's backend.
+    """
+    state = _state()
+    state.backends = {
+        "cluster_a": _FakeBackend(
+            "cluster_a",
+            allocation=Allocation(
+                allocation_id="1001",
+                nodes=[ComputeNode(name="a-node0", ip_address="10.0.0.1", index=0)],
+            ),
+        ),
+        "cluster_b": _FakeBackend(
+            "cluster_b",
+            allocation=Allocation(
+                allocation_id="2002",
+                nodes=[ComputeNode(name="b-node0", ip_address="10.0.1.1", index=0)],
+            ),
+        ),
+    }
+    state.default_backend = state.backends["cluster_a"]
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "cluster_a",
+                "type": "slurm",
+                "default": True,
+                "account": "acct",
+                "partition": "part_a",
+                "time": "00:10:00",
+                "nodes": 1,
+                "gpus_per_node": 0,
+            },
+            {
+                "name": "cluster_b",
+                "type": "slurm",
+                "account": "acct",
+                "partition": "part_b",
+                "time": "00:10:00",
+                "nodes": 1,
+                "gpus_per_node": 0,
+            },
+        ],
+        workflow=WorkflowConfig(
+            name="multi_backend",
+            tasks=[
+                # No `backend:` -> default backend (cluster_a).
+                TaskConfig(name="task_a", script=["echo a"]),
+                # Pinned to the second backend.
+                TaskConfig(name="task_b", backend="cluster_b", script=["echo b"]),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    task_a = tg.get_task("task_a")
+    task_b = tg.get_task("task_b")
+
+    # task_a binds to cluster_a's allocation.
+    assert task_a.backend_name == "cluster_a"
+    assert task_a.operator.config.job_id == "1001"
+    assert task_a.operator.config.nodelist == ["a-node0"]
+
+    # task_b binds to cluster_b's allocation (different pool).
+    assert task_b.backend_name == "cluster_b"
+    assert task_b.operator.config.job_id == "2002"
+    assert task_b.operator.config.nodelist == ["b-node0"]
+
+    # The two backends must be distinct pools: different job ids and node lists.
+    assert task_a.operator.config.job_id != task_b.operator.config.job_id
+    assert task_a.operator.config.nodelist != task_b.operator.config.nodelist
+    assert task_a.backend_name != task_b.backend_name
+
+
+def test_build_task_graph_passes_gpu_count_to_operator_when_backend_skips_gpu_planning():
+    # supports_gpu_env=False (e.g. Kubernetes): no client CUDA slice, but the requested
+    # count must still reach the operator via apply_backend_context.
+    state = _state()
+    backend = _FakeBackend(
+        "k8s",
+        allocation=Allocation(
+            allocation_id="kubernetes",
+            nodes=[ComputeNode(name="k8s-node0", ip_address="", index=0, num_gpus=8)],
+            owned=False,
+        ),
+    )
+    backend.capabilities = BackendCapabilities(
+        supports_node_placement=False,
+        supports_gpu_env=False,
+        supports_host_path_mounts=False,
+        has_runtime_node_addresses=False,
+    )
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[{"name": "k8s", "type": "local", "default": True}],
+        operators=[{"name": "rec", "type": "recording"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator="rec",
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=2)),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.gpu_count == 2
+    assert "CUDA_VISIBLE_DEVICES" not in t1.envs
+
+
+def test_build_task_graph_docker_nodes_count_launches_one_container_per_host():
+    state = _state()
+    backend = DockerBackend(
+        DockerBackendConfig(
+            name="docker_cluster",
+            type="docker",
+            image="ubuntu:22.04",
+            hosts=[
+                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "gpus_per_node": 8},
+                {"name": "dgx-b", "docker_host": "ssh://dgx-b", "gpus_per_node": 8},
+            ],
+        )
+    )
+    backend.allocation = asyncio.run(backend.allocate())
+    state.backends = {"docker_cluster": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "docker_cluster",
+                "type": "docker",
+                "default": True,
+                "image": "ubuntu:22.04",
+                "hosts": [
+                    {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
+                    {"name": "dgx-b", "docker_host": "ssh://dgx-b"},
+                ],
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="distributed_job",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(count=2),
+                        gpus=GpuResourceConfig(count=1),
+                    ),
+                    script=["./run_worker.sh"],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    task = tg.get_task("distributed_job")
+
+    assert task.assigned_nodes == ["dgx-a", "dgx-b"]
+    script = task.launch_command.as_list()[2]
+    assert script.count("docker --host") == 4  # two run commands and two cleanup commands
+    assert "docker --host ssh://dgx-a run" in script
+    assert "docker --host ssh://dgx-b run" in script
+
+
+def test_build_task_graph_does_not_assign_synthetic_nodes_for_backend_without_node_placement():
+    state = _state()
+    backend = _FakeBackend(
+        "k8s",
+        allocation=Allocation(
+            allocation_id="kubernetes",
+            nodes=[ComputeNode(name="k8s-node0", ip_address="0.0.0.1", index=0)],
+            owned=False,
+        ),
+    )
+    backend.capabilities = BackendCapabilities(
+        supports_node_placement=False,
+        supports_gpu_env=False,
+        supports_host_path_mounts=False,
+        has_runtime_node_addresses=False,
+    )
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "k8s",
+                "type": "local",
+                "default": True,
+            }
+        ],
+        operators=[{"name": "bash", "type": "bash"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    backend="k8s",
+                    operator="bash",
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.assigned_nodes == []
+    assert "SFLOW_TASK_ASSIGNED_NODE_NAMES" not in t1.envs
+    assert "SFLOW_TASK_ASSIGNED_NODE_IPS" not in t1.envs
+
+
+def test_build_task_graph_count_only_sizes_non_placement_backend():
+    # A count-only resources.nodes request is allowed on a non-placement backend
+    # (e.g. kubernetes) and surfaces that many nodes to the operator, so multi-node
+    # jobs (LWS) can size themselves from the planner.
+    state = _state()
+    backend = _FakeBackend(
+        "k8s",
+        allocation=Allocation(
+            allocation_id="kubernetes",
+            nodes=[
+                ComputeNode(name=f"k8s-node{i}", ip_address="", index=i, num_gpus=8)
+                for i in range(4)
+            ],
+            owned=False,
+        ),
+    )
+    backend.capabilities = BackendCapabilities(
+        supports_node_placement=False,
+        supports_gpu_env=False,
+        supports_host_path_mounts=False,
+        has_runtime_node_addresses=False,
+    )
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[{"name": "k8s", "type": "local", "default": True}],
+        operators=[{"name": "rec", "type": "recording"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator="rec",
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=4)),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    assert t1.operator.config.assigned_nodes == [
+        "k8s-node0",
+        "k8s-node1",
+        "k8s-node2",
+        "k8s-node3",
+    ]
+
+
+def test_build_task_graph_k8s_multinode_sizes_to_requested_node_count():
+    # End-to-end: resources.nodes.count flows through the planner to the real
+    # k8s operator, which renders one pod per assigned node (leader = index 0).
+    from sflow.core.operator_registry import ensure_builtin_operators_registered
+    from sflow.plugins.backends.kubernetes import (
+        KubernetesBackend,
+        KubernetesBackendConfig,
+    )
+
+    ensure_builtin_operators_registered()
+    state = _state()
+    backend = KubernetesBackend(
+        KubernetesBackendConfig(
+            name="k8s",
+            type="kubernetes",
+            namespace="default",
+            nodes=4,
+            gpus_per_node=8,
+            scheduling="dra",  # exercise the DRA ResourceClaimTemplate render path
+        )
+    )
+    backend.allocation = backend.placeholder_allocation()
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "k8s",
+                "type": "kubernetes",
+                "default": True,
+                "namespace": "default",
+                "nodes": 4,
+                "gpus_per_node": 8,
+                "scheduling": "dra",
+            }
+        ],
+        operators=[
+            {"name": "trainer", "type": "k8s", "image": "nvcr.io/example/app:1.0"}
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="train",
+                    operator="trainer",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(count=4),
+                        gpus=GpuResourceConfig(count=8),
+                    ),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    task = tg.get_task("train")
+    assert len(task.assigned_nodes) == 4
+
+    shell = task.launch_command.as_list()[2]
+    start = shell.index("<<'SFLOW_K8S_MANIFEST'")
+    body_start = shell.index("\n", start) + 1
+    body_end = shell.index("\nSFLOW_K8S_MANIFEST", body_start)
+    manifest = json.loads(shell[body_start:body_end])
+    assert manifest["kind"] == "List"
+    pods = [i for i in manifest["items"] if i["kind"] == "Pod"]
+    assert len(pods) == 4
+    # 8 GPUs across 4 nodes -> 2 per pod via a DRA ResourceClaimTemplate.
+    rct = [i for i in manifest["items"] if i["kind"] == "ResourceClaimTemplate"]
+    assert len(rct) == 1
+    assert (
+        rct[0]["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"] == 2
+    )
+    # The apply step waits for each of the 4 pods to start (leader + 3 workers);
+    # log streaming is a separate driver-managed step, not in the apply command.
+    assert shell.count("final phase=") == 4
+    assert "kubectl logs -f" not in shell
+
+
+def test_build_task_graph_merges_colocated_gpu_pods_into_one_pod():
+    # End-to-end: with merge_colocated_gpu_pods, two GPU tasks the planner packs
+    # onto one node become a single merged pod requesting the union of their GPUs.
+    from sflow.core.operator_registry import ensure_builtin_operators_registered
+    from sflow.plugins.backends.kubernetes import (
+        KubernetesBackend,
+        KubernetesBackendConfig,
+    )
+
+    ensure_builtin_operators_registered()
+    state = _state()
+    backend = KubernetesBackend(
+        KubernetesBackendConfig(
+            name="k8s",
+            type="kubernetes",
+            namespace="default",
+            nodes=1,
+            gpus_per_node=8,
+            merge_colocated_gpu_pods=True,
+            scheduling="dra",  # exercise the DRA ResourceClaimTemplate render path
+        )
+    )
+    backend.allocation = backend.placeholder_allocation()
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "k8s",
+                "type": "kubernetes",
+                "default": True,
+                "namespace": "default",
+                "nodes": 1,
+                "gpus_per_node": 8,
+                "merge_colocated_gpu_pods": True,
+                "scheduling": "dra",
+            }
+        ],
+        operators=[{"name": "server", "type": "k8s", "image": "img:1"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="decode",
+                    operator="server",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0]),
+                        gpus=GpuResourceConfig(count=4),
+                    ),
+                    script=["run-decode"],
+                    fail_fast=True,
+                ),
+                TaskConfig(
+                    name="prefill",
+                    operator="server",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(indices=[0]),
+                        gpus=GpuResourceConfig(count=2),
+                    ),
+                    script=["run-prefill"],
+                    fail_fast=True,
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    leader = tg.get_task("decode")  # deterministic leader = first member by name
+    follower = tg.get_task("prefill")
+    assert leader.merge_members == ["decode", "prefill"]
+    assert follower.merge_leader == "decode"
+
+    # The leader renders exactly ONE pod requesting the union of GPUs (4 + 2 = 6),
+    # with both members' scripts mounted in the merged launcher's ConfigMap.
+    shell = leader.launch_command.as_list()[2]
+    start = shell.index("<<'SFLOW_K8S_MANIFEST'")
+    body_start = shell.index("\n", start) + 1
+    body_end = shell.index("\nSFLOW_K8S_MANIFEST", body_start)
+    manifest = json.loads(shell[body_start:body_end])
+    pods = [i for i in manifest["items"] if i["kind"] == "Pod"]
+    # The merged pod is named after its members (decode + prefill), not the leader
+    # alone, so it's clear in `kubectl get pods` that it runs several tasks.
+    assert len(pods) == 1
+    assert pods[0]["metadata"]["name"].startswith("merged-decode-prefill-")
+    rct = [i for i in manifest["items"] if i["kind"] == "ResourceClaimTemplate"][0]
+    assert rct["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"] == 6
+    cm = [
+        i
+        for i in manifest["items"]
+        if i["kind"] == "ConfigMap" and "entrypoint.sh" in i.get("data", {})
+    ][0]
+    # Merged member scripts carry the fail-fast prelude when opted in (fail_fast: true):
+    # `set -e` is prepended (so a failed command fails the pod) ahead of each member's
+    # own command.
+    assert "set -e" in cm["data"]["merge_decode.sh"]
+    assert cm["data"]["merge_decode.sh"].endswith("run-decode")
+    assert "set -e" in cm["data"]["merge_prefill.sh"]
+    assert cm["data"]["merge_prefill.sh"].endswith("run-prefill")
+
+
+def test_build_task_graph_fail_fast_default_off_and_opt_in():
+    # Config -> task, end to end: `fail_fast` defaults OFF (the shell default: only the
+    # last command's exit code counts), and `fail_fast: true` opts in so a shell task's
+    # runnable_script carries the `set -e` prelude (a failed command fails the task, not
+    # masked by a later `echo`). The task's `script` always stays the user's resolved lines.
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "b1",
+                "type": "slurm",
+                "default": True,
+                "account": "acct",
+                "partition": "batch",
+                "time": "00:10:00",
+                "nodes": 1,
+                "gpus_per_node": 1,
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="strict", script=["do-thing", "echo done"], fail_fast=True
+                ),
+                TaskConfig(name="loose", script=["do-thing", "echo done"]),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    strict = tg.get_task("strict")
+    loose = tg.get_task("loose")
+    # Opt in (fail_fast: true): srun is a shell operator -> the prelude leads the script.
+    assert strict.fail_fast is True
+    assert strict.runnable_script[:2] == ["# sflow: fail-fast", "set -e"]
+    assert strict.script == ["do-thing", "echo done"]  # user's lines untouched
+    # Default off: no prelude.
+    assert loose.fail_fast is False
+    assert "set -e" not in loose.runnable_script
+
+
+def test_build_task_graph_rejects_explicit_indices_on_non_placement_backend():
+    # Count-only is allowed, but picking specific nodes (indices/exclude) is not.
+    state = _state()
+    backend = _FakeBackend(
+        "k8s",
+        allocation=Allocation(
+            allocation_id="kubernetes",
+            nodes=[ComputeNode(name="k8s-node0", ip_address="", index=0)],
+            owned=False,
+        ),
+    )
+    backend.capabilities = BackendCapabilities(
+        supports_node_placement=False,
+        supports_gpu_env=False,
+        supports_host_path_mounts=False,
+        has_runtime_node_addresses=False,
+    )
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[{"name": "k8s", "type": "local", "default": True}],
+        operators=[{"name": "rec", "type": "recording"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator="rec",
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(indices=[0])),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not support explicit node placement"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_does_not_use_synthetic_ip_for_probe_default_host():
+    state = _state()
+    backend = _FakeBackend(
+        "k8s",
+        allocation=Allocation(
+            allocation_id="kubernetes",
+            nodes=[ComputeNode(name="k8s-node0", ip_address="0.0.0.1", index=0)],
+            owned=False,
+        ),
+    )
+    backend.capabilities = BackendCapabilities(
+        supports_node_placement=False,
+        supports_gpu_env=False,
+        supports_host_path_mounts=False,
+        has_runtime_node_addresses=False,
+    )
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "k8s",
+                "type": "local",
+                "default": True,
+            }
+        ],
+        operators=[{"name": "bash", "type": "bash"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    backend="k8s",
+                    operator="bash",
+                    script=["python serve.py"],
+                    probes={"readiness": {"tcp_port": {"port": 8000}}},
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    probe = tg.get_task("svc").probes[0]
+    assert isinstance(probe, TcpPortProbe)
+    assert probe._host == "127.0.0.1"
 
 
 def test_build_task_graph_srun_operator_resolves_container_image_and_extra_args():
@@ -199,6 +987,219 @@ def test_build_task_graph_operator_override_allows_task_level_srun_overrides_nta
     assert t1.operator.config.type == "srun"
     assert t1.operator.config.ntasks == 4
     assert t1.operator.config.ntasks_per_node == 2
+
+
+def test_build_task_graph_operator_override_rejects_incompatible_keys():
+    # Cross-backend: an `srun` operator has no `image` field (a k8s concept). A task
+    # override carrying a key that is not valid for the resolved operator is now a HARD
+    # ERROR (a typo, or a wrong-backend key), not a silent drop -- so mistakes surface
+    # instead of the intended setting vanishing with no effect.
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="222",
+                nodes=[
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=0),
+                    ComputeNode(name="n2", ip_address="10.0.0.2", index=1),
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+
+    config = SflowConfig(
+        version="0.1",
+        operators=[{"name": "ctr", "type": "srun", "container_image": "img:1"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator={"name": "ctr", "ntasks": 4, "image": "nope:1"},
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not valid for operator 'ctr'.*image"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_rejects_slurm_keys_on_k8s_operator():
+    # A Slurm flag (gres/partition) on a k8s operator is a HARD ERROR: backend-specific
+    # operator settings belong on the operator in the backend fragment (composed per
+    # backend via deep-merge), not as a task override that silently drops off-backend.
+    from sflow.core.operator_registry import ensure_builtin_operators_registered
+    from sflow.plugins.backends.kubernetes import (
+        KubernetesBackend,
+        KubernetesBackendConfig,
+    )
+
+    ensure_builtin_operators_registered()
+    state = _state()
+    backend = KubernetesBackend(
+        KubernetesBackendConfig(
+            name="k8s", type="kubernetes", namespace="default", nodes=1,
+            gpus_per_node=8, scheduling="device_plugin",
+        )
+    )
+    backend.allocation = backend.placeholder_allocation()
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[{
+            "name": "k8s", "type": "kubernetes", "default": True,
+            "namespace": "default", "nodes": 1, "gpus_per_node": 8,
+            "scheduling": "device_plugin",
+        }],
+        operators=[{"name": "server", "type": "k8s", "image": "img:1"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator={
+                        "name": "server", "cpu": 5,
+                        "gres": "gpu:8", "partition": "batch",
+                    },
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(count=1),
+                        gpus=GpuResourceConfig(count=2),
+                    ),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not valid for operator 'server'"):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_operator_override_bad_value_on_valid_key_still_errors():
+    # Only *unknown* keys are skipped. A malformed value on a *valid* field must
+    # still raise, so real user mistakes are not masked.
+    from sflow.core.operator_registry import ensure_builtin_operators_registered
+    from sflow.plugins.backends.kubernetes import (
+        KubernetesBackend,
+        KubernetesBackendConfig,
+    )
+
+    ensure_builtin_operators_registered()
+    state = _state()
+    backend = KubernetesBackend(
+        KubernetesBackendConfig(
+            name="k8s", type="kubernetes", namespace="default", nodes=1,
+            gpus_per_node=8, scheduling="device_plugin",
+        )
+    )
+    backend.allocation = backend.placeholder_allocation()
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[{
+            "name": "k8s", "type": "kubernetes", "default": True,
+            "namespace": "default", "nodes": 1, "gpus_per_node": 8,
+            "scheduling": "device_plugin",
+        }],
+        operators=[{"name": "server", "type": "k8s", "image": "img:1"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    # node_selector is a valid k8s field but must be a mapping;
+                    # a string is a real type error, not an incompatible key.
+                    operator={"name": "server", "node_selector": "not-a-dict"},
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(count=1),
+                        gpus=GpuResourceConfig(count=2),
+                    ),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(Exception):
+        build_task_graph(config, state)
+
+
+def test_build_task_graph_task_overrides_k8s_operator_cpu_memory():
+    # Same override mechanism as srun, but for the k8s container-resources fields:
+    # the operator gives a unified cpu (8); a task referencing it overrides
+    # cpu/memory/cpu_limit, and the FINALIZED pod manifest must honor the task's
+    # values (not the operator's, and not the computed 8 x GPUs default).
+    from sflow.core.operator_registry import ensure_builtin_operators_registered
+    from sflow.plugins.backends.kubernetes import (
+        KubernetesBackend,
+        KubernetesBackendConfig,
+    )
+
+    ensure_builtin_operators_registered()
+    state = _state()
+    backend = KubernetesBackend(
+        KubernetesBackendConfig(
+            name="k8s", type="kubernetes", namespace="default", nodes=1,
+            gpus_per_node=8, scheduling="device_plugin",
+        )
+    )
+    backend.allocation = backend.placeholder_allocation()
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[{
+            "name": "k8s", "type": "kubernetes", "default": True,
+            "namespace": "default", "nodes": 1, "gpus_per_node": 8,
+            "scheduling": "device_plugin",
+        }],
+        operators=[{"name": "server", "type": "k8s", "image": "img:1", "cpu": 8}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator={
+                        "name": "server", "cpu": 5, "memory": "32Gi", "cpu_limit": 24,
+                    },
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(count=1),
+                        gpus=GpuResourceConfig(count=2),
+                    ),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    t1 = tg.get_task("t1")
+    # Config-level: the task override beat the operator's unified cpu=8.
+    assert t1.operator.config.cpu == 5
+    assert t1.operator.config.memory == "32Gi"
+    assert t1.operator.config.cpu_limit == 24
+
+    # Manifest-level: the rendered pod honors the task override (5, not 8, not 8x2).
+    shell = t1.launch_command.as_list()[2]
+    start = shell.index("<<'SFLOW_K8S_MANIFEST'")
+    body_start = shell.index("\n", start) + 1
+    body_end = shell.index("\nSFLOW_K8S_MANIFEST", body_start)
+    manifest = json.loads(shell[body_start:body_end])
+    pod = [i for i in manifest["items"] if i["kind"] == "Pod"][0]
+    res = pod["spec"]["containers"][0]["resources"]
+    assert res["requests"]["cpu"] == "5"
+    assert res["requests"]["memory"] == "32Gi"
+    assert res["limits"]["cpu"] == "24"
+    assert res["limits"]["nvidia.com/gpu"] == "2"
 
 
 def test_build_task_graph_srun_operator_resolves_container_image_from_artifact_path(
@@ -538,6 +1539,36 @@ def test_build_task_graph_keeps_single_readiness_probe_object_compatibility():
     assert len(svc.probes) == 1
     assert isinstance(svc.probes[0], HttpGetProbe)
     assert svc.probes[0].timeout == 30
+
+
+def test_build_task_graph_attaches_multiple_failure_probes():
+    state = _state_with_slurm_backend()
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="svc",
+                    script=["echo hi"],
+                    probes={
+                        "failure": [
+                            {"tcp_port": {"port": 8000}},
+                            {"http_get": {"url": "http://10.0.0.1:8000/fail"}},
+                        ]
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    svc = tg.get_task("svc")
+
+    assert len(svc.probes) == 2
+    assert isinstance(svc.probes[0], TcpPortProbe)
+    assert isinstance(svc.probes[1], HttpGetProbe)
 
 
 def test_build_task_graph_replica_sweep_uses_variable_domain_and_injects_envs():
@@ -1192,6 +2223,92 @@ def test_build_task_graph_resources_gpus_count_sets_cuda_visible_devices_with_of
     tg = build_task_graph(config, state)
     assert tg.get_task("t1_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert tg.get_task("t1_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
+
+
+def test_build_task_graph_warns_once_when_backend_env_overrides_user_variable(
+    monkeypatch,
+):
+    """Backend runtime env wins over a same-named user variable, with a single warning."""
+    state = _state()
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+    state.variables = {
+        "CUDA_VISIBLE_DEVICES": Variable(
+            name="CUDA_VISIBLE_DEVICES", value="7", type=VariableType.STRING
+        )
+    }
+
+    import sflow.app.assembly as assembly_mod
+
+    warnings_seen: list[str] = []
+    monkeypatch.setattr(
+        assembly_mod._logger,
+        "warning",
+        lambda msg, *a, **k: warnings_seen.append(str(msg)),
+    )
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    replicas=ReplicaConfig(count=2, policy="parallel"),
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=2)),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    # Documented precedence: backend runtime env wins over the user variable.
+    assert tg.get_task("t1_0").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert tg.get_task("t1_1").envs["CUDA_VISIBLE_DEVICES"] == "2,3"
+
+    # The override is surfaced exactly once (deduped per variable name).
+    cuda_warnings = [
+        w
+        for w in warnings_seen
+        if "CUDA_VISIBLE_DEVICES" in w and "overrides workflow variable" in w
+    ]
+    assert len(cuda_warnings) == 1
+
+
+def test_build_task_graph_no_override_warning_without_user_variable(monkeypatch):
+    """No collision warning when the user did not declare a same-named variable."""
+    state = _state()
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    import sflow.app.assembly as assembly_mod
+
+    warnings_seen: list[str] = []
+    monkeypatch.setattr(
+        assembly_mod._logger,
+        "warning",
+        lambda msg, *a, **k: warnings_seen.append(str(msg)),
+    )
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=2)),
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t1").envs["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert not any("overrides workflow variable" in w for w in warnings_seen)
 
 
 def test_build_task_graph_resources_gpus_respects_compute_node_num_gpus():
@@ -3227,3 +4344,228 @@ def test_build_task_graph_replica_sweep_arithmetic_with_jinja():
     tg = build_task_graph(config, state)
     assert tg.get_task("t_2").script[0] == "echo doubled=4"
     assert tg.get_task("t_8").script[0] == "echo doubled=16"
+
+
+def test_build_task_graph_replica_uploads_auto_disambiguate():
+    state = _state()
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        storage=[{"name": "bucket", "type": "s3", "bucket": "b"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    replicas=ReplicaConfig(count=2, policy="parallel"),
+                    uploads=[
+                        # Literal `to:` -> auto-disambiguated with the replica name.
+                        UploadSpec(
+                            target="bucket",
+                            from_="${{ task.output_dir }}/r.csv",
+                            to="main/r.csv",
+                        ),
+                        # Already references ${{ task.name }} -> left untouched.
+                        UploadSpec(
+                            target="bucket",
+                            from_="${{ task.output_dir }}/r.csv",
+                            to="${{ task.name }}/r.csv",
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+
+    t0 = tg.get_task("t1_0")
+    assert t0.uploads[0].disambiguate_with == "t1_0"
+    assert t0.uploads[1].disambiguate_with is None
+
+    t1 = tg.get_task("t1_1")
+    assert t1.uploads[0].disambiguate_with == "t1_1"
+    assert t1.uploads[1].disambiguate_with is None
+
+
+def test_build_task_graph_non_replicated_upload_not_disambiguated():
+    state = _state()
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        storage=[{"name": "bucket", "type": "s3", "bucket": "b"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    uploads=[
+                        UploadSpec(
+                            target="bucket",
+                            from_="${{ task.output_dir }}/r.csv",
+                            to="main/r.csv",
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t1").uploads[0].disambiguate_with is None
+
+
+def test_build_task_graph_replica_upload_respects_task_name_whitespace_variant():
+    # Regression: a `to:` using a whitespace variant of ${{ task.name }} must be
+    # treated as user-controlled (no auto-rename), not silently disambiguated.
+    state = _state()
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        storage=[{"name": "bucket", "type": "s3", "bucket": "b"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    script=["echo 1"],
+                    replicas=ReplicaConfig(count=2, policy="parallel"),
+                    uploads=[
+                        UploadSpec(
+                            target="bucket",
+                            from_="${{ task.output_dir }}/r.csv",
+                            to="${{ task.name}}/r.csv",  # variant: no space before }}
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t1_0").uploads[0].disambiguate_with is None
+    assert tg.get_task("t1_1").uploads[0].disambiguate_with is None
+
+
+def _ports_state_and_backend():
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="1",
+                nodes=[ComputeNode(name="n1", ip_address="10.0.0.1", index=0)],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+    return state
+
+
+def _ports_config(ports: list[dict]) -> SflowConfig:
+    return SflowConfig(
+        version="0.1",
+        backends=[{"name": "b1", "type": "local", "default": True}],
+        operators=[{"name": "bash", "type": "bash"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="frontend",
+                    backend="b1",
+                    operator="bash",
+                    ports=ports,
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+
+def test_build_task_graph_populates_task_ports():
+    state = _ports_state_and_backend()
+    ports = build_task_graph(
+        _ports_config([{"name": "http", "port": 8000}]), state
+    ).get_task("frontend").ports
+    assert len(ports) == 1
+    assert ports[0].port == 8000
+    assert ports[0].name == "http"
+
+
+def test_build_task_graph_resolves_expression_port():
+    state = _ports_state_and_backend()
+    state.variables = {
+        "PORT": Variable(name="PORT", value=9000, type=VariableType.INTEGER)
+    }
+    ports = build_task_graph(
+        _ports_config([{"port": "${{ variables.PORT }}"}]), state
+    ).get_task("frontend").ports
+    assert ports[0].port == 9000
+    assert ports[0].name is None
+
+
+def test_build_task_graph_rejects_out_of_range_port():
+    state = _ports_state_and_backend()
+    with pytest.raises(ValueError, match=r"ports.port must be in 1\.\.65535"):
+        build_task_graph(_ports_config([{"port": 70000}]), state)
+
+
+def _frontend_client_config(client_extra: dict) -> SflowConfig:
+    return SflowConfig(
+        version="0.1",
+        backends=[{"name": "b1", "type": "local", "default": True}],
+        operators=[{"name": "bash", "type": "bash"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="frontend",
+                    backend="b1",
+                    operator="bash",
+                    ports=[{"name": "http", "port": 8000}],
+                    script=["python serve.py"],
+                ),
+                TaskConfig(
+                    name="client",
+                    backend="b1",
+                    operator="bash",
+                    depends_on=["frontend"],
+                    **client_extra,
+                ),
+            ],
+        ),
+    )
+
+
+def test_build_task_graph_resolves_task_service_url_in_probe():
+    state = _ports_state_and_backend()  # node n1 ip 10.0.0.1
+    config = _frontend_client_config(
+        {
+            "script": ["curl"],
+            "probes": {
+                "readiness": {
+                    "http_get": {"url": "${{ task.frontend.service.url }}/health"}
+                }
+            },
+        }
+    )
+    probe = build_task_graph(config, state).get_task("client").probes[0]
+    assert probe._url == "http://10.0.0.1:8000/health"
+
+
+def test_build_task_graph_resolves_task_service_url_in_script():
+    state = _ports_state_and_backend()  # node n1 ip 10.0.0.1
+    config = _frontend_client_config(
+        {"script": ["echo ${{ task.frontend.service.url }}"]}
+    )
+    assert build_task_graph(config, state).get_task("client").script == [
+        "echo http://10.0.0.1:8000"
+    ]

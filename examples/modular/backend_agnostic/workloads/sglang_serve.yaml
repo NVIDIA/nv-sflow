@@ -1,0 +1,53 @@
+# Raw `sglang.launch_server` OpenAI server (backend-agnostic, no Dynamo infra).
+#
+# Like trtllm_serve, this serves the OpenAI API directly from the server on port
+# 8000, so it needs NO nats/etcd/frontend (do NOT compose dynamo_common.yaml). The
+# server is the DAG root and declares `required_by: [benchmark]`.
+#
+# Single-worker (intra-node tensor parallelism): run on backends/k8s.yaml or
+# backends/slurm.yaml with SERVER_GPUS <= GPUS_PER_NODE. (Cross-node SGLang needs
+# its --dist-init-addr/--nnodes/--node-rank wiring, out of scope for this sample.)
+
+version: "0.1"
+
+variables:
+  SERVED_MODEL_NAME:
+    description: "Served model name (advertised by the OpenAI API)"
+    value: Qwen3-0.6B
+  SERVER_IMAGE:
+    description: "SGLang runtime container image"
+    value: lmsysorg/sglang:latest
+  MODEL_PATH:
+    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
+    value: /models/Qwen3-0.6B
+  SERVER_GPUS:
+    description: "GPUs per server (tensor-parallel size)"
+    type: integer
+    value: 4
+
+workflow:
+  name: modular_inference
+  timeout: 115m
+  tasks:
+    - name: server
+      operator: server
+      script:
+        - set -x
+        - >
+          python3 -m sglang.launch_server
+          --model-path ${{ variables.MODEL_PATH }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --host 0.0.0.0 --port 8000
+          --tp-size ${{ variables.SERVER_GPUS }}
+          --trust-remote-code
+      resources:
+        gpus:
+          count: ${{ variables.SERVER_GPUS }}
+      required_by:
+        - benchmark
+      probes:
+        readiness:
+          http_get:
+            url: "http://${{ backends.cluster.nodes[0].ip_address }}:8000/health"
+          timeout: 1200
+          interval: 20

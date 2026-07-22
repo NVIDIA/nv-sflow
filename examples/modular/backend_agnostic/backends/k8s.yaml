@@ -1,0 +1,54 @@
+# Kubernetes backend fragment (plain `k8s` operators) for the modular samples.
+#
+# Single-pod-per-task scheduling on a `kubernetes` backend. Binds the logical
+# operator names (server / helper / client) to `type: k8s` operators and names
+# the backend `cluster` for uniform node references.
+#
+# Compose with a workload + benchmark, e.g.:
+#   sflow run -f backends/k8s.yaml \
+#             -f workloads/dynamo_common.yaml -f workloads/dynamo_vllm.yaml \
+#             -f benchmark.yaml --dry-run
+#
+# The GPU count each server needs is taken from the task's `resources.gpus.count`
+# (SERVER_GPUS in the workload); keep SERVER_GPUS <= GPUS_PER_NODE for the plain
+# `k8s` operator (single-node). For cross-node servers use backends/k8s_mpi.yaml.
+
+version: "0.1"
+
+variables:
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    value: your-namespace
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 8
+  NUM_NODES:
+    description: "Number of nodes to reserve"
+    type: integer
+    value: 1
+
+backends:
+  - name: cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so peers can be addressed by the discovered node IPs.
+    host_network: true
+    host_ipc: true
+    scheduling: device_plugin
+    reservation:
+      timeout: 1200
+
+operators:
+  - name: server
+    type: k8s
+    image: ${{ variables.SERVER_IMAGE }}
+  - name: helper
+    type: k8s
+    image: ${{ variables.SERVER_IMAGE }}
+  - name: client
+    type: k8s
+    image: ${{ variables.CLIENT_IMAGE }}

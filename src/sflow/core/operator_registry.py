@@ -67,6 +67,49 @@ def get_operator_class(type_name: str) -> type[Operator]:
     return reg.operator_cls
 
 
+def split_operator_overrides(
+    base_op: OperatorConfig, overrides: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """Split task-level operator overrides by the base operator config's fields.
+
+    Task operator overrides are parsed permissively (``extra="allow"``), so a
+    task's ``operator:`` block may carry a key that is not a field of the
+    operator it resolves to. Returns ``(valid, invalid)`` where ``valid`` are the
+    override keys that ARE fields of ``base_op``'s config model and ``invalid``
+    are the ones that are not.
+
+    Callers REJECT the run when ``invalid`` is non-empty (see
+    :func:`format_invalid_override_error`). This used to silently drop the
+    incompatible keys with a warning to keep a task portable across backends, but
+    that hid genuine typos (a misspelled key just vanished with no effect). The
+    portable path is instead the composer's deep-merge: define backend-specific
+    operator settings on the operator in the backend fragment (composed per
+    backend), not as a task-level override that only fits one backend.
+    """
+    valid_fields = set(type(base_op).model_fields)
+    valid = {k: v for k, v in overrides.items() if k in valid_fields}
+    invalid = [k for k in overrides if k not in valid_fields]
+    return valid, invalid
+
+
+def format_invalid_override_error(
+    task_name: str,
+    operator_name: str,
+    operator_type: str,
+    invalid: list[str],
+) -> str:
+    """Error message for task operator override keys that are not fields of the
+    resolved operator (see :func:`split_operator_overrides`)."""
+    return (
+        f"Task '{task_name}': operator override key(s) not valid for operator "
+        f"'{operator_name}' (type '{operator_type}'): {', '.join(invalid)}. "
+        f"Check for a typo. If these are backend-specific operator settings, define "
+        f"them on the '{operator_name}' operator in the backend fragment (composed per "
+        f"backend via deep-merge) instead of as a task-level operator override -- they "
+        f"are no longer silently dropped on an incompatible backend."
+    )
+
+
 def ensure_builtin_operators_registered() -> None:
     """
     Import built-in operator plugins to populate the registry.

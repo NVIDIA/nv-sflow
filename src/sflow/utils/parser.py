@@ -2,8 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import re
 
 from parse import parse, with_pattern
+
+# Matches the standard sflow logging prefix
+# "%(asctime)s - %(name)s - %(levelname)s - " (milliseconds optional), so callers
+# can strip it ONLY when it is actually present. Raw lines - e.g. an unprefixed
+# offload fallback, or a message that itself contains " - " - are returned
+# unchanged instead of being mis-split.
+_SFLOW_LOG_PREFIX_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{3})? - \S+ - [A-Z]+ - "
+)
+
+
+def strip_sflow_log_prefix(line: str) -> str:
+    """Strip the sflow logging prefix from a line, only if it is present."""
+    match = _SFLOW_LOG_PREFIX_RE.match(line)
+    return line[match.end() :] if match else line
 
 
 @with_pattern(r"\w*")

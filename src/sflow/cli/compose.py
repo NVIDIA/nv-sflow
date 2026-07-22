@@ -12,6 +12,7 @@ from typing import Annotated, Any, Dict, List, Optional
 import typer
 import yaml
 
+from sflow.app.monitor_cli import inject_cli_monitors_into_dict
 from sflow.cli import DOCS_URL, app
 from sflow.config.loader import (
     ConfigLoader,
@@ -73,6 +74,8 @@ def _compose_files(
     resolve: bool = False,
     missable_tasks: List[str] | None = None,
     quiet_missable: bool = False,
+    enable_workflow_monitor: bool = False,
+    enable_task_monitors: List[str] | None = None,
 ) -> str:
     """Compose multiple YAML files into a single YAML string.
 
@@ -119,6 +122,13 @@ def _compose_files(
             )
             for _ms in missable_stripped:
                 _logger.warning(f"  ⚠ {_ms}")
+
+    # Inject CLI-enabled monitors so the composed snapshot reflects them.
+    inject_cli_monitors_into_dict(
+        merged,
+        enable_workflow_monitor=enable_workflow_monitor,
+        enable_task_monitors=enable_task_monitors,
+    )
 
     from pydantic import ValidationError
 
@@ -312,7 +322,6 @@ def _run_bulk_compose(
                 SflowApp().run(
                     file=config_files,
                     dry_run=True,
-                    quiet=True,
                     variable_overrides=list(set_var) if set_var else None,
                     artifact_overrides=list(artifacts) if artifacts else None,
                     missable_tasks=effective_missable,
@@ -572,7 +581,6 @@ def compose(
                 SflowApp().run(
                     file=files,
                     dry_run=True,
-                    quiet=True,
                     variable_overrides=set_var,
                     artifact_overrides=artifact,
                     missable_tasks=missable_tasks,

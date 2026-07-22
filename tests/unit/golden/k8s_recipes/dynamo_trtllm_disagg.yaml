@@ -1,0 +1,875 @@
+# sflow K8s recipe golden manifests -- DO NOT EDIT BY HAND.
+# recipe: examples/self_contained/kubernetes/dynamo_trtllm_disagg.yaml
+# Rendered offline with a deterministic placeholder allocation (no cluster).
+# Merge followers are omitted; their containers run in the leader's merged pod.
+# Regenerate: SFLOW_UPDATE_GOLDEN=1 pytest tests/unit/test_k8s_recipe_golden_manifests.py
+---
+# task: nats_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: nats-server -js
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: nats-server-kubernetes
+    name: nats-server-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  data:
+    DECODE_CONFIG: "tensor_parallel_size: 4\nmoe_expert_parallel_size: 4\nenable_attention_dp: False\n\
+      pipeline_parallel_size: 1\n# WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs\
+      \ NVLink P2P).\n# allreduce_strategy: NCCL\nmax_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len:\
+      \ 10240\ncuda_graph_config:\n  enable_padding: true\n  max_batch_size: 128\nprint_iter_log: true\n\
+      enable_chunked_prefill: false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction:\
+      \ 0.9\n  dtype: fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX\nstream_interval:\
+      \ 20"
+    PREFILL_CONFIG: "max_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len: 10240\ntensor_parallel_size:\
+      \ 2\nmoe_expert_parallel_size: 2\nenable_attention_dp: False\npipeline_parallel_size: 1\n# WIP -\
+      \ Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).\n# allreduce_strategy:\
+      \ NCCL\ncuda_graph_config: null\nprint_iter_log: true\ndisable_overlap_scheduler: true\nenable_chunked_prefill:\
+      \ false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.9\n  dtype:\
+      \ fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: nats-server-kubernetes
+    name: nats-server-kubernetes-artifacts
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: nats-server-kubernetes
+    name: nats-server-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: nats-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+      name: nats-server-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /sflow-golden/sflow_output/prefill_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: PREFILL_CONFIG
+      - mountPath: /sflow-golden/sflow_output/decode_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: DECODE_CONFIG
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: nats-server-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+    - configMap:
+        name: nats-server-kubernetes-artifacts
+      name: sflow-artifacts
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+kind: List
+---
+# task: etcd_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'etcd --listen-client-urls "http://0.0.0.0:2379" --advertise-client-urls "http://0.0.0.0:2379"
+      --listen-peer-urls "http://0.0.0.0:2380" --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+      --initial-cluster "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd
+
+      '
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: etcd-server-kubernetes
+    name: etcd-server-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  data:
+    DECODE_CONFIG: "tensor_parallel_size: 4\nmoe_expert_parallel_size: 4\nenable_attention_dp: False\n\
+      pipeline_parallel_size: 1\n# WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs\
+      \ NVLink P2P).\n# allreduce_strategy: NCCL\nmax_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len:\
+      \ 10240\ncuda_graph_config:\n  enable_padding: true\n  max_batch_size: 128\nprint_iter_log: true\n\
+      enable_chunked_prefill: false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction:\
+      \ 0.9\n  dtype: fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX\nstream_interval:\
+      \ 20"
+    PREFILL_CONFIG: "max_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len: 10240\ntensor_parallel_size:\
+      \ 2\nmoe_expert_parallel_size: 2\nenable_attention_dp: False\npipeline_parallel_size: 1\n# WIP -\
+      \ Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).\n# allreduce_strategy:\
+      \ NCCL\ncuda_graph_config: null\nprint_iter_log: true\ndisable_overlap_scheduler: true\nenable_chunked_prefill:\
+      \ false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.9\n  dtype:\
+      \ fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: etcd-server-kubernetes
+    name: etcd-server-kubernetes-artifacts
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: etcd-server-kubernetes
+    name: etcd-server-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: etcd-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+      name: etcd-server-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /sflow-golden/sflow_output/prefill_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: PREFILL_CONFIG
+      - mountPath: /sflow-golden/sflow_output/decode_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: DECODE_CONFIG
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: etcd-server-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+    - configMap:
+        name: etcd-server-kubernetes-artifacts
+      name: sflow-artifacts
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+kind: List
+---
+# task: frontend_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'python3 -m dynamo.frontend --http-port 8000 '
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: frontend-server-kubernetes
+    name: frontend-server-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  data:
+    DECODE_CONFIG: "tensor_parallel_size: 4\nmoe_expert_parallel_size: 4\nenable_attention_dp: False\n\
+      pipeline_parallel_size: 1\n# WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs\
+      \ NVLink P2P).\n# allreduce_strategy: NCCL\nmax_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len:\
+      \ 10240\ncuda_graph_config:\n  enable_padding: true\n  max_batch_size: 128\nprint_iter_log: true\n\
+      enable_chunked_prefill: false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction:\
+      \ 0.9\n  dtype: fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX\nstream_interval:\
+      \ 20"
+    PREFILL_CONFIG: "max_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len: 10240\ntensor_parallel_size:\
+      \ 2\nmoe_expert_parallel_size: 2\nenable_attention_dp: False\npipeline_parallel_size: 1\n# WIP -\
+      \ Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).\n# allreduce_strategy:\
+      \ NCCL\ncuda_graph_config: null\nprint_iter_log: true\ndisable_overlap_scheduler: true\nenable_chunked_prefill:\
+      \ false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.9\n  dtype:\
+      \ fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: frontend-server-kubernetes
+    name: frontend-server-kubernetes-artifacts
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: frontend-server-kubernetes
+    name: frontend-server-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: frontend-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+      name: frontend-server-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /sflow-golden/sflow_output/prefill_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: PREFILL_CONFIG
+      - mountPath: /sflow-golden/sflow_output/decode_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: DECODE_CONFIG
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: frontend-server-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+    - configMap:
+        name: frontend-server-kubernetes-artifacts
+      name: sflow-artifacts
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+kind: List
+---
+# task: prefill_server_0 (operator: K8sMpiOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "set -uo pipefail\nif [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n_sflow_rc_dir=\"\
+      $(mktemp -d)\"\n_sflow_run() {\n  _name=\"$1\"; _cvd=\"$2\"; _script=\"$3\"; _envf=\"$4\"\n  (\n\
+      \    export CUDA_VISIBLE_DEVICES=\"$_cvd\"\n    export NVIDIA_VISIBLE_DEVICES=\"$_cvd\"\n    if\
+      \ [ -f \"$_envf\" ]; then . \"$_envf\"; fi\n    bash -l \"$_script\"\n    echo \"$?\" > \"$_sflow_rc_dir/$_name\"\
+      \n  ) 2>&1 | while IFS= read -r _sflow_line || [ -n \"$_sflow_line\" ]; do\n      printf '[[sflow-mux:%s]]\
+      \ %s\\n' \"$_name\" \"$_sflow_line\"\n    done &\n}\n_sflow_run prefill_server_0 0,1,2,3,4,5,6,7\
+      \ /sflow/merge_prefill_server_0.sh /sflow/menv/prefill-server-0/envsh\n_sflow_run prefill_server_1\
+      \ 2,3,0,1,4,5,6,7 /sflow/merge_prefill_server_1.sh /sflow/menv/prefill-server-1/envsh\n_sflow_run\
+      \ prefill_server_2 4,5,0,1,2,3,6,7 /sflow/merge_prefill_server_2.sh /sflow/menv/prefill-server-2/envsh\n\
+      _sflow_run prefill_server_3 6,7,0,1,2,3,4,5 /sflow/merge_prefill_server_3.sh /sflow/menv/prefill-server-3/envsh\n\
+      wait\n_sflow_rc=0\nfor _f in \"$_sflow_rc_dir\"/*; do\n  _c=\"$(cat \"$_f\" 2>/dev/null || echo\
+      \ 1)\"\n  [ \"$_c\" = \"0\" ] || _sflow_rc=\"$_c\"\ndone\nexit \"$_sflow_rc\""
+    merge_prefill_server_0.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 2 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ prefill --extra-engine-args /sflow-golden/sflow_output/prefill_config.yaml ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_1.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 2 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ prefill --extra-engine-args /sflow-golden/sflow_output/prefill_config.yaml ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_2.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 2 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ prefill --extra-engine-args /sflow-golden/sflow_output/prefill_config.yaml ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_3.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 2 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ prefill --extra-engine-args /sflow-golden/sflow_output/prefill_config.yaml ${EXTRA_PREFILL_ARGS}"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-prefill-server-79673c-kubernetes
+    name: merged-prefill-server-79673c-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  data:
+    DECODE_CONFIG: "tensor_parallel_size: 4\nmoe_expert_parallel_size: 4\nenable_attention_dp: False\n\
+      pipeline_parallel_size: 1\n# WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs\
+      \ NVLink P2P).\n# allreduce_strategy: NCCL\nmax_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len:\
+      \ 10240\ncuda_graph_config:\n  enable_padding: true\n  max_batch_size: 128\nprint_iter_log: true\n\
+      enable_chunked_prefill: false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction:\
+      \ 0.9\n  dtype: fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX\nstream_interval:\
+      \ 20"
+    PREFILL_CONFIG: "max_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len: 10240\ntensor_parallel_size:\
+      \ 2\nmoe_expert_parallel_size: 2\nenable_attention_dp: False\npipeline_parallel_size: 1\n# WIP -\
+      \ Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).\n# allreduce_strategy:\
+      \ NCCL\ncuda_graph_config: null\nprint_iter_log: true\ndisable_overlap_scheduler: true\nenable_chunked_prefill:\
+      \ false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.9\n  dtype:\
+      \ fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-prefill-server-79673c-kubernetes
+    name: merged-prefill-server-79673c-kubernetes-artifacts
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-prefill-server-79673c-kubernetes
+    name: merged-prefill-server-79673c-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      env:
+      - name: OMP_NUM_THREADS
+        value: '8'
+      image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+      name: merged-prefill-server-79673c-kubernetes
+      resources:
+        limits:
+          nvidia.com/gpu: '8'
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /sflow-golden/sflow_output/prefill_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: PREFILL_CONFIG
+      - mountPath: /sflow-golden/sflow_output/decode_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: DECODE_CONFIG
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-0
+        name: sflow-menv-0
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-1
+        name: sflow-menv-1
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-2
+        name: sflow-menv-2
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-3
+        name: sflow-menv-3
+        readOnly: true
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: merged-prefill-server-79673c-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+    - configMap:
+        name: merged-prefill-server-79673c-kubernetes-artifacts
+      name: sflow-artifacts
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: sflow-menv-0
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-79673c-kubernetes-menv-0
+    - name: sflow-menv-1
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-79673c-kubernetes-menv-1
+    - name: sflow-menv-2
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-79673c-kubernetes-menv-2
+    - name: sflow-menv-3
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-79673c-kubernetes-menv-3
+kind: List
+---
+# task: decode_server_0 (operator: K8sMpiOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "set -uo pipefail\nif [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n_sflow_rc_dir=\"\
+      $(mktemp -d)\"\n_sflow_run() {\n  _name=\"$1\"; _cvd=\"$2\"; _script=\"$3\"; _envf=\"$4\"\n  (\n\
+      \    export CUDA_VISIBLE_DEVICES=\"$_cvd\"\n    export NVIDIA_VISIBLE_DEVICES=\"$_cvd\"\n    if\
+      \ [ -f \"$_envf\" ]; then . \"$_envf\"; fi\n    bash -l \"$_script\"\n    echo \"$?\" > \"$_sflow_rc_dir/$_name\"\
+      \n  ) 2>&1 | while IFS= read -r _sflow_line || [ -n \"$_sflow_line\" ]; do\n      printf '[[sflow-mux:%s]]\
+      \ %s\\n' \"$_name\" \"$_sflow_line\"\n    done &\n}\n_sflow_run decode_server_0 0,1,2,3,4,5,6,7\
+      \ /sflow/merge_decode_server_0.sh /sflow/menv/decode-server-0/envsh\n_sflow_run decode_server_1\
+      \ 4,5,6,7,0,1,2,3 /sflow/merge_decode_server_1.sh /sflow/menv/decode-server-1/envsh\nwait\n_sflow_rc=0\n\
+      for _f in \"$_sflow_rc_dir\"/*; do\n  _c=\"$(cat \"$_f\" 2>/dev/null || echo 1)\"\n  [ \"$_c\" =\
+      \ \"0\" ] || _sflow_rc=\"$_c\"\ndone\nexit \"$_sflow_rc\""
+    merge_decode_server_0.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 4 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ decode --extra-engine-args /sflow-golden/sflow_output/decode_config.yaml ${EXTRA_DECODE_ARGS}"
+    merge_decode_server_1.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 4 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ decode --extra-engine-args /sflow-golden/sflow_output/decode_config.yaml ${EXTRA_DECODE_ARGS}"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-0d3ace-kubernetes
+    name: merged-decode-server-0d3ace-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  data:
+    DECODE_CONFIG: "tensor_parallel_size: 4\nmoe_expert_parallel_size: 4\nenable_attention_dp: False\n\
+      pipeline_parallel_size: 1\n# WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs\
+      \ NVLink P2P).\n# allreduce_strategy: NCCL\nmax_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len:\
+      \ 10240\ncuda_graph_config:\n  enable_padding: true\n  max_batch_size: 128\nprint_iter_log: true\n\
+      enable_chunked_prefill: false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction:\
+      \ 0.9\n  dtype: fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX\nstream_interval:\
+      \ 20"
+    PREFILL_CONFIG: "max_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len: 10240\ntensor_parallel_size:\
+      \ 2\nmoe_expert_parallel_size: 2\nenable_attention_dp: False\npipeline_parallel_size: 1\n# WIP -\
+      \ Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).\n# allreduce_strategy:\
+      \ NCCL\ncuda_graph_config: null\nprint_iter_log: true\ndisable_overlap_scheduler: true\nenable_chunked_prefill:\
+      \ false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.9\n  dtype:\
+      \ fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-0d3ace-kubernetes
+    name: merged-decode-server-0d3ace-kubernetes-artifacts
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-0d3ace-kubernetes
+    name: merged-decode-server-0d3ace-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      env:
+      - name: OMP_NUM_THREADS
+        value: '8'
+      image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+      name: merged-decode-server-0d3ace-kubernetes
+      resources:
+        limits:
+          nvidia.com/gpu: '8'
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /sflow-golden/sflow_output/prefill_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: PREFILL_CONFIG
+      - mountPath: /sflow-golden/sflow_output/decode_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: DECODE_CONFIG
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /sflow/menv/decode-server-0
+        name: sflow-menv-0
+        readOnly: true
+      - mountPath: /sflow/menv/decode-server-1
+        name: sflow-menv-1
+        readOnly: true
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node1
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: merged-decode-server-0d3ace-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+    - configMap:
+        name: merged-decode-server-0d3ace-kubernetes-artifacts
+      name: sflow-artifacts
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: sflow-menv-0
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-decode-server-0d3ace-kubernetes-menv-0
+    - name: sflow-menv-1
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-decode-server-0d3ace-kubernetes-menv-1
+kind: List
+---
+# task: decode_server_2 (operator: K8sMpiOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "set -uo pipefail\nif [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n_sflow_rc_dir=\"\
+      $(mktemp -d)\"\n_sflow_run() {\n  _name=\"$1\"; _cvd=\"$2\"; _script=\"$3\"; _envf=\"$4\"\n  (\n\
+      \    export CUDA_VISIBLE_DEVICES=\"$_cvd\"\n    export NVIDIA_VISIBLE_DEVICES=\"$_cvd\"\n    if\
+      \ [ -f \"$_envf\" ]; then . \"$_envf\"; fi\n    bash -l \"$_script\"\n    echo \"$?\" > \"$_sflow_rc_dir/$_name\"\
+      \n  ) 2>&1 | while IFS= read -r _sflow_line || [ -n \"$_sflow_line\" ]; do\n      printf '[[sflow-mux:%s]]\
+      \ %s\\n' \"$_name\" \"$_sflow_line\"\n    done &\n}\n_sflow_run decode_server_2 0,1,2,3,4,5,6,7\
+      \ /sflow/merge_decode_server_2.sh /sflow/menv/decode-server-2/envsh\n_sflow_run decode_server_3\
+      \ 4,5,6,7,0,1,2,3 /sflow/merge_decode_server_3.sh /sflow/menv/decode-server-3/envsh\nwait\n_sflow_rc=0\n\
+      for _f in \"$_sflow_rc_dir\"/*; do\n  _c=\"$(cat \"$_f\" 2>/dev/null || echo 1)\"\n  [ \"$_c\" =\
+      \ \"0\" ] || _sflow_rc=\"$_c\"\ndone\nexit \"$_sflow_rc\""
+    merge_decode_server_2.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 4 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ decode --extra-engine-args /sflow-golden/sflow_output/decode_config.yaml ${EXTRA_DECODE_ARGS}"
+    merge_decode_server_3.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nexport TLLM_LOG_LEVEL=INFO\nexport\
+      \ TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1\nexport TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1\n\
+      export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nenv | grep TLLM\nenv | grep UCX\nunset\
+      \ UCX_TLS\nif [ \"${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=GRAPH,NET\n\
+      \  export UCX_LOG_LEVEL=info\nfi\n\nmpirun -np 4 --allow-run-as-root trtllm-llmapi-launch python3\
+      \ -m dynamo.trtllm --model-path /models/Qwen3-8B-FP8 --served-model-name ${SERVED_MODEL_NAME} --disaggregation-mode\
+      \ decode --extra-engine-args /sflow-golden/sflow_output/decode_config.yaml ${EXTRA_DECODE_ARGS}"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-d55177-kubernetes
+    name: merged-decode-server-d55177-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  data:
+    DECODE_CONFIG: "tensor_parallel_size: 4\nmoe_expert_parallel_size: 4\nenable_attention_dp: False\n\
+      pipeline_parallel_size: 1\n# WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs\
+      \ NVLink P2P).\n# allreduce_strategy: NCCL\nmax_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len:\
+      \ 10240\ncuda_graph_config:\n  enable_padding: true\n  max_batch_size: 128\nprint_iter_log: true\n\
+      enable_chunked_prefill: false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction:\
+      \ 0.9\n  dtype: fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX\nstream_interval:\
+      \ 20"
+    PREFILL_CONFIG: "max_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len: 10240\ntensor_parallel_size:\
+      \ 2\nmoe_expert_parallel_size: 2\nenable_attention_dp: False\npipeline_parallel_size: 1\n# WIP -\
+      \ Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).\n# allreduce_strategy:\
+      \ NCCL\ncuda_graph_config: null\nprint_iter_log: true\ndisable_overlap_scheduler: true\nenable_chunked_prefill:\
+      \ false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.9\n  dtype:\
+      \ fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-d55177-kubernetes
+    name: merged-decode-server-d55177-kubernetes-artifacts
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-d55177-kubernetes
+    name: merged-decode-server-d55177-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      env:
+      - name: OMP_NUM_THREADS
+        value: '8'
+      image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+      name: merged-decode-server-d55177-kubernetes
+      resources:
+        limits:
+          nvidia.com/gpu: '8'
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /sflow-golden/sflow_output/prefill_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: PREFILL_CONFIG
+      - mountPath: /sflow-golden/sflow_output/decode_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: DECODE_CONFIG
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /sflow/menv/decode-server-2
+        name: sflow-menv-0
+        readOnly: true
+      - mountPath: /sflow/menv/decode-server-3
+        name: sflow-menv-1
+        readOnly: true
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node2
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: merged-decode-server-d55177-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+    - configMap:
+        name: merged-decode-server-d55177-kubernetes-artifacts
+      name: sflow-artifacts
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: sflow-menv-0
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-decode-server-d55177-kubernetes-menv-0
+    - name: sflow-menv-1
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-decode-server-d55177-kubernetes-menv-1
+kind: List
+---
+# task: benchmark_512 (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'pip install aiperf==0.3.0
+
+      set -x
+
+      export COLUMNS=200
+
+      aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY} --model
+      Qwen3-8B-FP8 --tokenizer /models/Qwen3-8B-FP8 --endpoint-type chat --endpoint /v1/chat/completions
+      --streaming --url http://0.0.0.1:8000 --synthetic-input-tokens-mean 1024 --synthetic-input-tokens-stddev
+      0 --output-tokens-mean 1024 --output-tokens-stddev 0 --extra-inputs "max_tokens:1024" --extra-inputs
+      "min_tokens:1024" --extra-inputs "ignore_eos:true" --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+      --extra-inputs "repetition_penalty:1.0" --extra-inputs "temperature: 0.0" --concurrency ${CONCURRENCY}
+      --request-count $((8*${CONCURRENCY})) --warmup-request-count ${CONCURRENCY} --num-dataset-entries
+      $((8*${CONCURRENCY})) --random-seed 100 -H ''Authorization: Bearer NOT USED'' -H ''Accept: text/event-stream''
+      --record-processors 8 --ui simple
+
+      echo "Benchmarking finished"'
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: benchmark-512-kubernetes
+    name: benchmark-512-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  data:
+    DECODE_CONFIG: "tensor_parallel_size: 4\nmoe_expert_parallel_size: 4\nenable_attention_dp: False\n\
+      pipeline_parallel_size: 1\n# WIP - Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs\
+      \ NVLink P2P).\n# allreduce_strategy: NCCL\nmax_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len:\
+      \ 10240\ncuda_graph_config:\n  enable_padding: true\n  max_batch_size: 128\nprint_iter_log: true\n\
+      enable_chunked_prefill: false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction:\
+      \ 0.9\n  dtype: fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX\nstream_interval:\
+      \ 20"
+    PREFILL_CONFIG: "max_batch_size: 128\nmax_num_tokens: 8448\nmax_seq_len: 10240\ntensor_parallel_size:\
+      \ 2\nmoe_expert_parallel_size: 2\nenable_attention_dp: False\npipeline_parallel_size: 1\n# WIP -\
+      \ Plain NCCL all-reduce so cross-node TP works (AUTO/NVLS needs NVLink P2P).\n# allreduce_strategy:\
+      \ NCCL\ncuda_graph_config: null\nprint_iter_log: true\ndisable_overlap_scheduler: true\nenable_chunked_prefill:\
+      \ false\nkv_cache_config:\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.9\n  dtype:\
+      \ fp8\ncache_transceiver_config:\n  max_tokens_in_buffer: 8448\n  backend: UCX"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: benchmark-512-kubernetes
+    name: benchmark-512-kubernetes-artifacts
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: benchmark-512-kubernetes
+    name: benchmark-512-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: benchmark-512-kubernetes-env
+      image: python:3.12-slim
+      name: benchmark-512-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /sflow-golden/sflow_output/prefill_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: PREFILL_CONFIG
+      - mountPath: /sflow-golden/sflow_output/decode_config.yaml
+        name: sflow-artifacts
+        readOnly: true
+        subPath: DECODE_CONFIG
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+    hostIPC: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: benchmark-512-kubernetes-cfg
+      name: sflow-scripts
+    - hostPath:
+        path: /dev/shm
+        type: Directory
+      name: dshm
+    - configMap:
+        name: benchmark-512-kubernetes-artifacts
+      name: sflow-artifacts
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+kind: List

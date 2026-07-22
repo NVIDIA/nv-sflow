@@ -1,0 +1,57 @@
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "if [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\ntrtllm-llmapi-launch\
+      \ python3 -m dynamo.trtllm --model-path /models/m"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: abc
+      sflow.ai/task: server-abc
+    name: server-abc-cfg
+    namespace: golden-ns
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: abc
+      sflow.ai/task: server-abc
+    name: server-abc
+    namespace: golden-ns
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: server-abc-env
+      image: dynamo:trtllm
+      name: server-abc
+      resources:
+        limits:
+          nvidia.com/gpu: '4'
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: node-0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: server-abc-cfg
+      name: sflow-scripts
+    - emptyDir:
+        medium: Memory
+      name: dshm
+kind: List

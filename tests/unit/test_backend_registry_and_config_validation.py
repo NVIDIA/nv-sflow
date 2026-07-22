@@ -22,7 +22,7 @@ def _minimal_cfg_dict(**extra):
 def test_backend_registry_has_builtins():
     ensure_builtin_backends_registered()
     reg = get_backend_registry()
-    for t in ["local", "slurm"]:
+    for t in ["local", "slurm", "docker", "kubernetes"]:
         assert t in reg
 
 

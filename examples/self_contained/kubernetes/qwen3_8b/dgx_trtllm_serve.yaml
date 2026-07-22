@@ -1,0 +1,223 @@
+version: "0.1"
+
+# Qwen3-8B (dense, FP8) — bare `trtllm-serve` (no Dynamo infra) on a DGX-style node
+# (8 GPUs/node, e.g. DGX B200). Serves the OpenAI API directly from trtllm-serve on
+# port 8000; there is NO nats/etcd/frontend. TP=8 fits on ONE node (intra-node NVLink),
+# so no MNNVL / IMEX ComputeDomain is needed. Compare with gb_trtllm_serve.yaml.
+#
+# Qwen3-8B is DENSE: `trtllm-serve` gets `--tp_size` only (no `--ep_size`).
+
+variables:
+  # --- Kubernetes backend ---
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods (must hold the model PVC/hostPath)"
+    value: your-namespace
+  GPUS_PER_NODE:
+    description: "GPUs per node. DGX B200 = 8, so TP=8 fits on ONE node."
+    type: integer
+    value: 8
+
+  # --- Model (dense Qwen3-8B) ---
+  SERVED_MODEL_NAME:
+    description: "Served model name (advertised by the OpenAI API)"
+    value: Qwen3-8B-FP8
+  TP_SIZE:
+    description: "Tensor parallel size. Default 8 => one full DGX node."
+    type: integer
+    value: 8
+  PP_SIZE:
+    description: "Pipeline parallel size"
+    type: integer
+    value: 1
+  GPUS_PER_WORKER:
+    description: "GPUs per worker == the MPI world size (TP*PP)."
+    type: integer
+    value: ${{ variables.TP_SIZE * variables.PP_SIZE }}
+  NUM_NODES:
+    description: "Nodes to reserve == ceil(GPUS_PER_WORKER / GPUS_PER_NODE). DGX: 8/8 = 1."
+    type: integer
+    value: ${{ ((variables.GPUS_PER_WORKER / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+  MAX_BATCH_SIZE:
+    description: "Max batch size"
+    type: integer
+    value: 512
+  MAX_NUM_TOKENS:
+    description: "Max number of tokens"
+    type: integer
+    value: 8192
+  MAX_SEQ_LEN:
+    description: "Max sequence length"
+    type: integer
+    value: 8192
+  FREE_GPU_MEMORY_FRACTION:
+    description: "KV-cache free GPU memory fraction"
+    value: 0.9
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+  BASE_PORT:
+    description: "OpenAI HTTP port trtllm-serve listens on"
+    type: integer
+    value: 8000
+  EXTRA_SERVER_ARGS:
+    description: "Extra trtllm-serve arguments"
+    value: ""
+
+  # --- Benchmark ---
+  ISL:
+    description: "Input sequence length"
+    value: 4096
+  OSL:
+    description: "Output sequence length"
+    value: 512
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 1
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 2
+    domain: [2]
+
+  # --- Container images ---
+  AIPERF_IMAGE:
+    description: "AIPerf benchmark client image"
+    value: python:3.12-slim
+  TRTLLM_IMAGE:
+    description: "TensorRT-LLM container image (ships trtllm-serve + mpirun)"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-deepseek-v4-dev.1
+
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///mnt/model-cache/Qwen3-8B-FP8
+  - name: SERVER_CONFIG
+    uri: file://server_config.yaml
+    content: |
+      backend: pytorch
+      tensor_parallel_size: ${{ variables.TP_SIZE }}
+      pipeline_parallel_size: ${{ variables.PP_SIZE }}
+      max_batch_size: ${{ variables.MAX_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.MAX_SEQ_LEN }}
+      print_iter_log: true
+      enable_chunked_prefill: true
+      stream_interval: 20
+      scheduler_config:
+        capacity_scheduler_policy: MAX_UTILIZATION
+        context_chunking_policy: FIRST_COME_FIRST_SERVED
+      kv_cache_config:
+        dtype: ${{ variables.KV_CACHE_DTYPE }}
+        free_gpu_memory_fraction: ${{ variables.FREE_GPU_MEMORY_FRACTION }}
+        enable_block_reuse: false
+      cuda_graph_config:
+        enable_padding: true
+        batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+operators:
+  # Single-node MPI worker (TP=8 on one 8-GPU node). k8s_mpi keeps it portable to >8 GPUs.
+  - name: mpi_trtllm
+    type: k8s_mpi
+    image: ${{ variables.TRTLLM_IMAGE }}
+    shm_size: 64Gi
+    run_as_root: true
+    mpi:
+      route: auto
+      slots_per_worker: ${{ variables.GPUS_PER_NODE }}
+      run_launcher_as_worker: true
+      launcher_creation_policy: WaitForWorkersReady
+      ssh_port: 2222
+      ensure_sshd: true
+  - name: aiperf
+    type: k8s
+    image: ${{ variables.AIPERF_IMAGE }}
+
+backends:
+  - name: k8s_cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    host_network: true
+    host_ipc: true
+    scheduling: device_plugin
+    # DGX = node-scope NVLink: TP=8 is intra-node. No MNNVL / IMEX ComputeDomain.
+    rdma: auto
+    reservation:
+      timeout: 1200
+
+workflow:
+  name: dgx_trtllm_serve
+  timeout: 115m
+  tasks:
+    - name: server
+      operator: mpi_trtllm
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_WORKER }}
+      script:
+        - set -x
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
+        - unset UCX_TLS
+        - export PORT=${{ variables.BASE_PORT }}
+        # ONE MPI world (TP=8) on a single DGX node; rank 0 serves the OpenAI API.
+        # Dense model => `--tp_size` only (no `--ep_size`).
+        - >
+          mpirun -np ${{ variables.GPUS_PER_WORKER }} --allow-run-as-root
+          trtllm-llmapi-launch
+          trtllm-serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --host 0.0.0.0 --port ${PORT}
+          --tp_size ${{ variables.TP_SIZE }}
+          --pp_size ${{ variables.PP_SIZE }}
+          --extra_llm_api_options ${{ artifacts.SERVER_CONFIG.path }} ${EXTRA_SERVER_ARGS}
+      probes:
+        readiness:
+          http_get:
+            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:${{ variables.BASE_PORT }}/health"
+          timeout: 1800
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: benchmark
+      operator: aiperf
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ backends.k8s_cluster.nodes[0].ip_address }}:${{ variables.BASE_PORT }}
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          --ui simple
+        - echo "Benchmarking finished"
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      monitor:
+        resources:
+          used_by_tasks:
+            - server
+        report:
+          enabled: true
+      depends_on:
+        - server

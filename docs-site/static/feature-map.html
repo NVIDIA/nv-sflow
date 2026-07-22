@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sflow Feature Map — Find Docs by Goal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --cy:#00d4ff;--gr:#76ff02;--bg:#060a10;--card:#0d1420;--card-h:#141e2e;
+  --txt:#dce3ed;--dim:#6b7d95;--bdr:rgba(0,212,255,0.14);
+  --warn:#e3b341;--bad:#ff7b72;--grad:linear-gradient(135deg,#00d4ff,#76ff03);
+}
+html{scroll-behavior:smooth;min-height:100%;background:var(--bg)}
+body{font-family:'IBM Plex Mono','Consolas',monospace;background:var(--bg);color:var(--txt);min-height:100vh;overflow-x:hidden}
+a{color:inherit}
+button,input{font:inherit}
+.gbg{position:fixed;inset:0;z-index:0;background-image:linear-gradient(rgba(0,212,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.035) 1px,transparent 1px);background-size:60px 60px;pointer-events:none}
+.orb{position:fixed;border-radius:50%;z-index:0;pointer-events:none;opacity:.1;filter:blur(2px)}
+.oc{background:radial-gradient(circle,var(--cy),transparent 70%)}.og{background:radial-gradient(circle,var(--gr),transparent 70%)}
+.shell{position:relative;z-index:1;max-width:1380px;margin:0 auto;padding:clamp(1rem,3vw,3rem);display:flex;flex-direction:column;gap:clamp(1rem,2vw,2rem)}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+.crumb{display:inline-flex;align-items:center;gap:.5rem;color:var(--dim);font-size:.86rem;text-decoration:none}
+.crumb:hover{color:var(--cy)}
+.badge{display:inline-flex;align-items:center;gap:.45rem;padding:.35em .85em;border:1px solid var(--bdr);border-radius:999px;color:var(--cy);background:rgba(0,212,255,.08);font-weight:600;font-size:.84rem}
+.hero{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.95fr);gap:clamp(1rem,3vw,3rem);align-items:center}
+.eyebrow{display:inline-flex;align-items:center;gap:.45rem;margin-bottom:.7rem;color:var(--gr);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase}
+.eyebrow::before{content:"";width:1.8rem;height:1px;background:var(--gr);box-shadow:0 0 8px rgba(118,255,2,.45)}
+.hero h1{font-family:'Syne',sans-serif;font-size:clamp(2.2rem,5vw,4.2rem);line-height:1.02;letter-spacing:-.04em;font-weight:800;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero p{font-size:clamp(1rem,1.6vw,1.28rem);line-height:1.65;color:var(--dim);max-width:780px;margin-top:1rem}
+.accent{color:var(--cy)}.green{color:var(--gr)}.warn{color:var(--warn)}
+.cta-row{display:flex;gap:.8rem;flex-wrap:wrap;margin-top:1.4rem}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.45rem;padding:.72em 1.25em;border-radius:999px;border:1px solid var(--cy);color:var(--cy);text-decoration:none;background:rgba(0,212,255,.06);font-weight:700;transition:all .25s}
+.btn:hover{background:var(--cy);color:#060a10;box-shadow:0 0 22px rgba(0,212,255,.28);transform:translateY(-2px)}
+.btn.secondary{border-color:rgba(118,255,2,.5);color:var(--gr);background:rgba(118,255,2,.06)}
+.btn.secondary:hover{background:var(--gr);color:#060a10;box-shadow:0 0 22px rgba(118,255,2,.24)}
+.panel{background:linear-gradient(180deg,rgba(13,20,32,.96),rgba(8,13,22,.96));border:1px solid var(--bdr);border-radius:18px;box-shadow:0 24px 80px rgba(0,0,0,.32);overflow:hidden}
+.terminal{font-family:'IBM Plex Mono','Consolas',monospace;font-size:clamp(.72rem,1vw,.92rem);line-height:1.65;color:#8b949e;padding:1.2rem;white-space:pre-wrap}
+.terminal .hi{color:var(--txt)}.terminal .cy{color:var(--cy)}.terminal .gr{color:var(--gr)}.terminal .yl{color:var(--warn)}
+
+/* === NEED SHORTCUTS === */
+.needs{padding:clamp(1rem,2.2vw,1.6rem)}
+.needs-head{display:flex;align-items:end;justify-content:space-between;gap:1rem;margin-bottom:1rem}
+.needs-head h2,.toolbar h2,.info-card h3{font-family:'Syne',sans-serif}
+.needs-head h2{font-size:clamp(1.35rem,2.5vw,2rem);letter-spacing:-.03em}
+.needs-head p{max-width:620px;color:var(--dim);font-size:.86rem;line-height:1.55;text-align:right}
+.need-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.7rem}
+.need-card{position:relative;display:grid;grid-template-columns:auto 1fr auto;gap:.7rem;align-items:center;padding:.8rem;border:1px solid rgba(107,125,149,.28);border-radius:12px;background:#0b1523;color:var(--txt);text-align:left;cursor:pointer;transition:transform .22s,border-color .22s,box-shadow .22s,background .22s}
+.need-card:hover,.need-card:focus-visible{border-color:var(--cy);background:rgba(0,212,255,.07);box-shadow:0 0 18px rgba(0,212,255,.14);outline:0;transform:translateY(-2px)}
+.need-icon{width:2rem;aspect-ratio:1;display:grid;place-items:center;border:1px solid var(--bdr);border-radius:50%;color:var(--cy);font-size:.68rem;font-weight:700}
+.need-copy strong{display:block;font-family:'Syne',sans-serif;font-size:.95rem}
+.need-copy small{display:block;margin-top:.15rem;color:var(--dim);font-size:.68rem;line-height:1.4}
+.need-arrow{color:var(--gr);font-size:1rem}
+
+/* === TOOLBAR === */
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;padding:1rem 1.1rem;border-bottom:1px solid var(--bdr);background:rgba(0,0,0,.22)}
+.toolbar h2{font-size:clamp(1.1rem,2vw,1.5rem);font-weight:700;letter-spacing:-.01em}
+.legend{display:flex;gap:.7rem;flex-wrap:wrap;color:var(--dim);font-size:.8rem;margin-top:.35rem}
+.legend span{display:inline-flex;align-items:center;gap:.35rem}
+.dot{width:.55rem;height:.55rem;border-radius:999px;display:inline-block;background:var(--cy);box-shadow:0 0 10px rgba(0,212,255,.5)}
+.controls{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.search{display:flex;align-items:center;gap:.55rem;min-width:min(100%,360px);padding:.5rem .75rem;border:1px solid rgba(107,125,149,.35);border-radius:999px;background:#0a111d;color:var(--dim)}
+.search input{width:100%;border:0;outline:0;background:transparent;color:var(--txt)}
+.search input::placeholder{color:#536377}
+.reset{padding:.5rem .9rem;border:1px solid rgba(107,125,149,.35);border-radius:999px;background:transparent;color:var(--dim);cursor:pointer;font-weight:600;font-size:.84rem;transition:all .2s}
+.reset:hover{border-color:var(--cy);color:var(--cy)}
+
+/* === GRAPH === */
+.graphwrap{position:relative;padding:clamp(1rem,2.5vw,1.6rem)}
+.hint{color:var(--dim);font-size:.85rem;margin-bottom:.9rem;min-height:1.2em}
+.hint code{color:var(--cy)}
+.graph{position:relative;display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:clamp(1.6rem,5vw,5rem);align-items:center;min-height:540px}
+.edges{position:absolute;inset:0;z-index:0;pointer-events:none;overflow:visible}
+.edges path{fill:none;stroke:#2c3a4f;stroke-width:1.6;transition:stroke .2s}
+.edges path.bright{stroke:var(--cy);stroke-width:2.4;filter:drop-shadow(0 0 4px rgba(0,212,255,.4))}
+.edges path.feat{stroke:var(--gr);stroke-width:2;opacity:.85}
+.col{position:relative;z-index:1;display:flex;flex-direction:column;gap:.6rem;justify-content:center}
+.node{position:relative;display:inline-flex;align-items:center;gap:.5rem;border:1px solid rgba(107,125,149,.32);border-radius:12px;background:#0d1726;color:var(--txt);padding:.6rem .85rem;font-weight:600;font-size:.92rem;text-decoration:none;transition:transform .2s,border-color .2s,box-shadow .2s,opacity .2s,background .2s;cursor:pointer}
+.node:hover,.node:focus-visible{border-color:var(--cy);box-shadow:0 0 16px rgba(0,212,255,.18);outline:0;transform:translateY(-1px)}
+.node.root{align-self:center;justify-content:center;border:2px solid transparent;background:linear-gradient(#0a121d,#0a121d) padding-box,var(--grad) border-box;color:var(--gr);font-weight:800;font-size:1.15rem;padding:1rem 1.2rem;letter-spacing:-.01em}
+.node.root small{display:block;color:var(--dim);font-weight:500;font-size:.66rem;letter-spacing:.02em;margin-top:.15rem}
+.node.goal{justify-content:space-between;min-width:206px}
+.node.goal .chev{color:var(--dim);font-size:.8rem;transition:transform .2s,color .2s}
+.node.goal.active{border-color:var(--cy);background:rgba(0,212,255,.1);box-shadow:0 0 18px rgba(0,212,255,.16)}
+.node.goal.active .chev{transform:rotate(90deg);color:var(--cy)}
+.node.dim{opacity:.3}
+.node.feature{justify-content:space-between;min-width:210px;gap:.6rem}
+.node.feature .tag{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cy);border:1px solid rgba(0,212,255,.3);background:rgba(0,212,255,.07);border-radius:999px;padding:.12em .55em;white-space:nowrap}
+.node.feature.partial .tag{color:var(--warn);border-color:rgba(227,179,65,.35);background:rgba(227,179,65,.07)}
+.node .detail{display:none}
+.empty{color:var(--dim);font-size:.9rem;padding:.5rem .2rem}
+
+/* === TOOLTIP === */
+.tip{position:absolute;z-index:60;width:min(300px,80vw);background:#0b1422;border:1px solid var(--cy);border-radius:12px;padding:.75rem .85rem;box-shadow:0 18px 50px rgba(0,0,0,.5);font-size:.82rem;line-height:1.5;color:var(--dim);pointer-events:none;opacity:0;transform:translateY(4px);transition:opacity .15s,transform .15s}
+.tip.show{opacity:1;transform:translateY(0)}
+.tip h4{font-size:.95rem;color:var(--txt);margin-bottom:.25rem}
+.tip .use{margin-top:.4rem;color:#9fb1c9}
+.tip .use strong{color:var(--cy)}
+.tip .tag{display:inline-block;font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cy);margin-bottom:.35rem}
+
+/* === DETAILS / FOOTER === */
+.details{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}
+.info-card{padding:1rem;border:1px solid var(--bdr);border-radius:16px;background:rgba(13,20,32,.72)}
+.info-card h3{font-weight:700;margin-bottom:.45rem;color:var(--txt)}
+.info-card p,.info-card li{color:var(--dim);line-height:1.55;font-size:.9rem}
+.info-card ul{padding-left:1.1rem}
+.info-card a{color:var(--cy);text-decoration:none;border-bottom:1px solid rgba(0,212,255,.25)}
+.info-card a:hover{color:var(--gr);border-color:var(--gr)}
+.tip-list{display:grid;gap:.55rem;list-style:none;padding-left:0!important}
+.tip-list li{position:relative;padding-left:1.25rem}
+.tip-list li::before{content:"→";position:absolute;left:0;color:var(--gr)}
+.tip-list code{color:var(--cy)}
+.footer{color:var(--dim);font-size:.86rem;text-align:center;padding:1rem 0 0}
+
+@media(max-width:1080px){.hero{grid-template-columns:1fr}.details{grid-template-columns:1fr}.need-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:860px){
+  .needs-head{align-items:flex-start;flex-direction:column}.needs-head p{text-align:left}
+  .need-grid{grid-template-columns:1fr}
+  .graph{grid-template-columns:1fr;gap:.6rem;min-height:auto}
+  .edges{display:none}
+  .col{gap:.5rem}
+  .col.root{align-items:flex-start}
+  .node{width:100%}
+  .node.goal,.node.feature{min-width:0}
+  .node.feature{flex-direction:column;align-items:flex-start}
+  .node .detail{display:block;color:var(--dim);font-weight:400;font-size:.8rem;line-height:1.45;margin-top:.35rem}
+  .node .detail .use{display:block;margin-top:.25rem;color:#9fb1c9}
+  .tip{display:none}
+}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div class="gbg"></div>
+<div class="orb oc" style="width:520px;height:520px;top:-160px;left:-130px"></div>
+<div class="orb og" style="width:420px;height:420px;bottom:-140px;right:-120px"></div>
+
+<main class="shell">
+  <div class="topbar">
+    <a class="crumb" href="docs/user/intro" target="_top">&larr; Back to docs</a>
+    <span class="badge">Find docs by intent</span>
+  </div>
+
+  <section class="hero">
+    <div>
+      <span class="eyebrow">sflow feature map</span>
+      <h1>Find your path through sflow</h1>
+      <p>
+        Start with your job—not a documentation hierarchy. Follow a need to the right
+        feature, open the exact guide, and pick up practical tips along the way.
+      </p>
+      <div class="cta-row">
+        <a class="btn" href="#needs">Choose a need</a>
+        <a class="btn secondary" href="docs/user/quickstart" target="_top">Run the quickstart &rarr;</a>
+      </div>
+    </div>
+    <div class="panel terminal"><span class="hi">How to use this map</span>
+<span class="cy">1.</span> Choose a common <span class="cy">need</span> below, or select a map goal.
+<span class="cy">2.</span> Follow the branch to the smallest feature that expresses your intent.
+<span class="cy">3.</span> Hover for a "Use when..." hint; click to open the exact docs.
+<span class="cy">4.</span> Search across every feature when you already know a keyword.
+
+<span class="gr">Tip:</span> validate with <span class="gr">--dry-run</span> before spending cluster time.</div>
+  </section>
+
+  <section class="panel needs" id="needs" aria-labelledby="needs-title">
+    <div class="needs-head">
+      <div><span class="eyebrow">Common starting points</span><h2 id="needs-title">What do you need right now?</h2></div>
+      <p>Each shortcut opens the matching branch of the map. From there, choose a feature to open its documentation.</p>
+    </div>
+    <div class="need-grid">
+      <button type="button" class="need-card" data-need-goal="run"><span class="need-icon">01</span><span class="need-copy"><strong>Run a workflow</strong><small>Tasks, dependencies, operators, and validation</small></span><span class="need-arrow">→</span></button>
+      <button type="button" class="need-card" data-need-goal="backend-env"><span class="need-icon">02</span><span class="need-copy"><strong>Move to another backend</strong><small>Local, Docker, Slurm, or Kubernetes</small></span><span class="need-arrow">→</span></button>
+      <button type="button" class="need-card" data-need-goal="placement"><span class="need-icon">03</span><span class="need-copy"><strong>Plan nodes &amp; GPUs</strong><small>Placement, topology, packing, and lifetimes</small></span><span class="need-arrow">→</span></button>
+      <button type="button" class="need-card" data-need-goal="health"><span class="need-icon">04</span><span class="need-copy"><strong>Debug readiness or failure</strong><small>Probes, retries, logs, and error hints</small></span><span class="need-arrow">→</span></button>
+      <button type="button" class="need-card" data-need-goal="outputs"><span class="need-icon">05</span><span class="need-copy"><strong>Understand a run</strong><small>Start with sflow_summary.log, then logs, metrics, and monitor</small></span><span class="need-arrow">→</span></button>
+      <button type="button" class="need-card" data-need-goal="agents"><span class="need-icon">06</span><span class="need-copy"><strong>Use an AI coding agent</strong><small>Install skills, author YAML, and analyze errors</small></span><span class="need-arrow">→</span></button>
+    </div>
+  </section>
+
+  <section class="panel" id="map">
+    <div class="toolbar">
+      <div>
+        <h2>What do you want to do?</h2>
+        <div class="legend">
+          <span><i class="dot"></i> implemented / documented</span>
+          <span>Features open the exact docs</span>
+        </div>
+      </div>
+      <div class="controls">
+        <label class="search" for="feature-search">
+          <span>Search</span>
+          <input id="feature-search" type="search" placeholder="kubernetes, gpu, debug, metrics, agent" autocomplete="off">
+        </label>
+        <button type="button" class="reset" id="reset-btn">Reset</button>
+      </div>
+    </div>
+
+    <div class="graphwrap">
+      <p class="hint" id="hint"></p>
+      <div class="graph" id="graph">
+        <svg class="edges" id="edges" aria-hidden="true">
+          <defs>
+            <marker id="ah-dim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2c3a4f"/></marker>
+            <marker id="ah-cy" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#00d4ff"/></marker>
+            <marker id="ah-gr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#76ff02"/></marker>
+          </defs>
+          <g id="edge-paths"></g>
+        </svg>
+        <div class="col root"><button type="button" class="node root" id="root-node">sflow<small>describe once &middot; run anywhere</small></button></div>
+        <div class="col goals" id="goals"></div>
+        <div class="col features" id="features"></div>
+      </div>
+      <div class="tip" id="tip" role="status" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section class="details">
+    <div class="info-card">
+      <h3>Recommended learning path</h3>
+      <ul class="tip-list">
+        <li>Run the <a href="docs/user/quickstart" target="_top">Quickstart</a> once.</li>
+        <li>Adapt a runnable <a href="docs/user/samples" target="_top">sample workflow</a>.</li>
+        <li>Keep the <a href="docs/user/quick-reference" target="_top">Quick Reference</a> open while editing YAML.</li>
+      </ul>
+    </div>
+    <div class="info-card">
+      <h3>Useful habits</h3>
+      <ul class="tip-list">
+        <li>Run <code>--dry-run</code> before a real allocation.</li>
+        <li>Add readiness probes to long-running servers.</li>
+        <li>Use failure <code>log_watch</code> probes for tracebacks.</li>
+        <li>Use named artifacts instead of inline shell heredocs.</li>
+      </ul>
+    </div>
+    <div class="info-card">
+      <h3>When a run fails</h3>
+      <ul class="tip-list">
+        <li>Start with <a href="docs/user/outputs" target="_top"><code>sflow_summary.log</code></a>.</li>
+        <li>Open the failing task's <code>task.log</code> and command log.</li>
+        <li>Compare timestamps with <a href="docs/user/monitor" target="_top">hardware monitoring</a>.</li>
+        <li>Use the <a href="docs/agents/sflow-error-analysis/" target="_top">error-analysis skill</a> for guided triage.</li>
+      </ul>
+    </div>
+  </section>
+
+  <div class="footer">sflow feature discovery map - describe once, run anywhere.</div>
+</main>
+
+<script>
+(function(){
+  var GOALS = [
+    { id: "run",          label: "Define & run",      desc: "Tasks, DAGs, backends, and operators." },
+    { id: "backend-env",  label: "Backends & env",    desc: "Port recipes and backend-specific runtime guidance." },
+    { id: "parameterize", label: "Parameterize",      desc: "Variables, expressions, and artifacts." },
+    { id: "placement",    label: "Place on hardware", desc: "Nodes, GPUs, packing, and lifetimes." },
+    { id: "scale",        label: "Scale & sweep",     desc: "Replicas, domains, and CSV bulk runs." },
+    { id: "health",       label: "Gate on health",    desc: "Readiness, failure checks, and retries." },
+    { id: "outputs",      label: "Capture outputs",   desc: "Logs, metrics, results, and uploads." },
+    { id: "operate",      label: "Operate & learn",   desc: "CLI, TUI, samples, and FAQ." },
+    { id: "agents",       label: "Agent skills",      desc: "Skills & docs for AI coding agents." }
+  ];
+
+  var FEATURES = [
+    { title: "Workflow & tasks", href: "docs/user/configuration", tag: "core", branches: ["run"],
+      desc: "Define a DAG with task scripts, dependencies, timeouts, resources, probes, and results.",
+      use: "you are writing or reviewing an sflow.yaml file.",
+      keywords: "workflow task dag yaml configuration schema author write" },
+    { title: "Backends", href: "docs/user/backends", tag: "core", branches: ["run","placement","backend-env"],
+      desc: "Choose where compute comes from: local development, Slurm allocations, Docker, or Kubernetes.",
+      use: "you need to switch environments or configure cluster resources.",
+      keywords: "backend local slurm docker kubernetes compute allocation where run deploy recipe" },
+    { title: "Deploy a recipe on another backend", href: "docs/user/backends", tag: "guide", branches: ["backend-env","run"],
+      desc: "Start from the backend block, then adjust the operator, resources, and backend-specific flags.",
+      use: "you have a working recipe and want it to run locally, on Slurm, Docker, or Kubernetes.",
+      keywords: "port deploy recipe backend migrate same yaml different cluster environment" },
+    { title: "Backend expression context", href: "docs/user/variables#available-expression-contexts", tag: "guide", branches: ["backend-env","parameterize"],
+      desc: "Reference backend node info, task placement, artifact paths, and variables from expressions.",
+      use: "a recipe needs backend-discovered hostnames, IPs, nodes, or task metadata.",
+      keywords: "backend context expressions variables backends nodes ip address task assigned node runtime deploy" },
+    { title: "Operators", href: "docs/user/operators", tag: "core", branches: ["run","backend-env"],
+      desc: "Control how each task is launched: bash, srun, Docker, SSH, Python, or Kubernetes.",
+      use: "the same workflow needs different execution wrappers per task.",
+      keywords: "operator bash srun docker_run ssh python kubernetes launch command backend specific runtime" },
+    { title: "Variables & expressions", href: "docs/user/variables", tag: "core", branches: ["parameterize","scale"],
+      desc: "Use ${{ ... }} expressions and CLI overrides to reuse one workflow across many runs.",
+      use: "values differ by model, cluster, benchmark, or experiment.",
+      keywords: "variables expressions jinja set domain override parameterize sweep context" },
+    { title: "Artifacts", href: "docs/user/artifacts", tag: "core", branches: ["parameterize","outputs"],
+      desc: "Reference models, configs, datasets, and inline files by name instead of hard-coded paths.",
+      use: "tasks need shared external inputs or generated config files.",
+      keywords: "artifacts uri model dataset file http s3 path content artifact" },
+    { title: "Nodes & GPUs", href: "docs/user/resources", tag: "core", branches: ["placement","backend-env"],
+      desc: "Pin tasks to nodes, slice GPUs with CUDA_VISIBLE_DEVICES, and model resource reuse.",
+      use: "tensor-parallel servers or benchmarks must land on specific hardware.",
+      keywords: "resources gpu node placement cuda visible devices packing release_after topology backend" },
+    { title: "Replicas & sweeps", href: "docs/user/replicas", tag: "core", branches: ["scale","placement"],
+      desc: "Run multiple copies of a task in parallel or sequence, including Cartesian variable sweeps.",
+      use: "you need workers, benchmark repetitions, or parameter sweeps.",
+      keywords: "replicas parallel sequential sweep domain cartesian gpu allocation scaling" },
+    { title: "Probes", href: "docs/user/probes", tag: "core", branches: ["health"],
+      desc: "Block dependents until services are ready, or fail fast when logs/ports reveal fatal issues.",
+      use: "a client must wait for servers, routers, or endpoints to be live.",
+      keywords: "probes readiness failure health tcp http log watch gate dependency retry" },
+    { title: "Structured results", href: "docs/user/results", tag: "core", branches: ["outputs"],
+      desc: "Parse benchmark metrics from logs or JSON into per-task result.json and workflow results.json.",
+      use: "runs should produce machine-readable scores or measurements.",
+      keywords: "results metrics regex json result parsing benchmark structured values" },
+    { title: "Execution summary (sflow_summary.log)", href: "docs/user/outputs#execution-summary", tag: "new", branches: ["outputs","operate","health"],
+      desc: "The whole-run status report: outcome, runtime provenance, task timelines, placement charts, command logs, DAG, dependencies, and failure hints.",
+      use: "you want the first and fastest place to understand, review, or triage a run.",
+      keywords: "sflow summary log overall go to first stop status duration timeline provenance dag dependencies failure hints triage understand run" },
+    { title: "Outputs & logs", href: "docs/user/outputs", tag: "core", branches: ["outputs","operate","backend-env"],
+      desc: "Understand the output directory, per-task task.log files, workflow logs, result files, and runtime env vars.",
+      use: "you need the ground-truth files produced by a run.",
+      keywords: "outputs logs task.log directories summary stdout stderr environment variables debug backend runtime ground truth" },
+    { title: "Command logs & runtime provenance", href: "docs/user/outputs#command-logs", tag: "new", branches: ["outputs","operate","health"],
+      desc: "Inspect timestamped launch commands by family and reproduce generated Slurm, Docker, SSH, Python, or backend invocations.",
+      use: "you need to verify exactly what sflow launched or reproduce a backend command.",
+      keywords: "command logs timestamp provenance reproduce launch slurm bash docker ssh python backend cmds debug" },
+    { title: "Reserved runtime variables", href: "docs/user/quick-reference#reserved-environment-variables", tag: "reference", branches: ["backend-env","outputs","operate"],
+      desc: "See the SFLOW_*, SLURM_*, and CUDA_VISIBLE_DEVICES values available to task scripts.",
+      use: "backend-specific scripts need job IDs, node lists, assigned nodes, or GPU masks.",
+      keywords: "runtime environment variables env reserved sflow slurm backend job id nodelist cuda visible devices" },
+    { title: "Slurm environment aliases", href: "docs/user/operators#slurm-runtime-environment-aliases", tag: "reference", branches: ["backend-env","run","placement"],
+      desc: "Map common Slurm step and rank variables to backend-agnostic SFLOW_* aliases.",
+      use: "porting Slurm scripts or making rank/node logic less scheduler-specific.",
+      keywords: "slurm runtime aliases sflow backend step node rank proc localid ntasks environment" },
+    { title: "Uploads", href: "docs/user/uploads", tag: "core", branches: ["outputs"],
+      desc: "Ship task outputs or whole-run bundles to S3-compatible object storage after execution.",
+      use: "benchmark logs/results need to outlive the cluster workspace.",
+      keywords: "uploads s3 storage archive logs results artifact upload credentials" },
+    { title: "Modular workflows", href: "docs/user/modular-workflows", tag: "advanced", branches: ["scale","run","parameterize","operate"],
+      desc: "Split large workflows into reusable YAML modules and compose them directly at run or batch time.",
+      use: "you mix frameworks, benchmarks, cluster configs, or CSV input sets.",
+      keywords: "modular workflows compose multiple yaml csv bulk missable tasks resolve" },
+    { title: "Deep merge & required_by", href: "docs/user/modular-workflows#reverse-dependencies-required_by--preferred-for-modular-fragments", tag: "new", branches: ["scale","run","parameterize"],
+      desc: "Recursively merge same-named fragments and let a module declare the downstream task that should depend on it.",
+      use: "backend, workload, or benchmark fragments must compose without central dependency rewrites.",
+      keywords: "modular deep merge required_by reverse dependencies fragments duplicate task names compose recursive" },
+    { title: "CLI commands", href: "docs/user/cli", tag: "core", branches: ["operate","run","scale","backend-env"],
+      desc: "Run, validate, visualize, batch-submit, list samples, and export AI agent skills.",
+      use: "you know what to run and need the exact command or flag.",
+      keywords: "cli run batch compose visualize sample skill dry-run tui submit bulk backend deploy" },
+    { title: "Backend CLI overrides", href: "docs/user/cli#sflow-run", tag: "new", branches: ["backend-env","run","operate"],
+      desc: "Keep volatile cluster access and extra backend arguments on the command line, with specific Slurm, Docker, and kubectl variants.",
+      use: "the recipe should stay portable while each run selects a context, namespace, nodes, or backend flags.",
+      keywords: "cli extra args kubeconfig context namespace node selector include exclude kubectl docker salloc override backend portable" },
+    { title: "Quick Reference", href: "docs/user/quick-reference", tag: "reference", branches: ["operate","parameterize","run"],
+      desc: "Lookup every YAML field at a glance, including defaults, required fields, and supported types.",
+      use: "you already know the concept and need field-level details fast.",
+      keywords: "quick reference fields schema table yaml all config" },
+    { title: "Sample workflows", href: "docs/user/samples", tag: "learn", branches: ["operate","run","scale"],
+      desc: "Browse runnable local and Slurm workflows that demonstrate common patterns.",
+      use: "it is faster to adapt a working template than start from scratch.",
+      keywords: "samples examples templates local slurm inference benchmark copy" },
+    { title: "Architecture & TUI", href: "docs/user/architecture", tag: "advanced", branches: ["operate"],
+      desc: "Understand execution flow, plugin boundaries, orchestrator behavior, and terminal UI concepts.",
+      use: "you are debugging behavior or need to reason about internals.",
+      keywords: "architecture internals execution flow orchestrator tui plugins lifecycle" },
+    { title: "FAQ", href: "docs/user/faq", tag: "learn", branches: ["operate"],
+      desc: "Answers for common gotchas, not-yet-implemented flags, dry-run behavior, and Graphviz setup.",
+      use: "something surprising happens and you want the short answer first.",
+      keywords: "faq troubleshooting limitations resume task dry run graphviz artifact not implemented" },
+    { title: "Agent skills overview", href: "docs/agents/intro", tag: "learn", branches: ["agents", "operate"],
+      desc: "What ships, when to use each skill, and how a coding agent uses them end-to-end.",
+      use: "you want a coding agent (Cursor, Claude Code, Copilot) to write or debug sflow configs.",
+      keywords: "agent skills ai assistant cursor claude copilot overview sflow skill" },
+    { title: "Install skills (setup)", href: "docs/agents/setup", tag: "guide", branches: ["agents", "operate"],
+      desc: "Run `sflow skill` to copy the bundled skills into .cursor/skills, .claude/skills, or AGENTS.md.",
+      use: "you are wiring sflow skills into your editor or repo for an agent to read.",
+      keywords: "setup install sflow skill cursor claude copilot agents.md output directory wiring" },
+    { title: "Skill: writing sflow YAML", href: "docs/agents/writing-sflow-yaml/", tag: "learn", branches: ["agents", "run", "parameterize"],
+      desc: "Schema, patterns, container reuse, probes, replicas, GPU planning, and validation for authoring YAML.",
+      use: "an agent is creating or modifying an sflow.yaml.",
+      keywords: "writing sflow yaml skill schema examples authoring config agent" },
+    { title: "Skill: error analysis", href: "docs/agents/sflow-error-analysis/", tag: "learn", branches: ["agents", "health", "outputs"],
+      desc: "Triage flow, error categories, quick-fix table, log locations, and diagnostic commands.",
+      use: "an agent is debugging a failed run or triaging logs and error output.",
+      keywords: "error analysis skill debug troubleshoot logs traceback diagnostics agent" },
+    { title: "AGENTS.md guidelines", href: "docs/agents/agents-guidelines", tag: "reference", branches: ["agents", "operate"],
+      desc: "The canonical agent workflow and hard rules (validate, file:// scripts, probes, no secrets).",
+      use: "you want the step-by-step authoring workflow and rules every agent should follow.",
+      keywords: "agents.md guidelines workflow rules conventions canonical agent" },
+    { title: "Docker backend", href: "docs/user/backends#docker-backend", tag: "core", branches: ["run","placement","backend-env"],
+      desc: "Run containerized tasks locally or across an explicit pool of remote Docker hosts.",
+      use: "you need reproducible containers without a Slurm or Kubernetes scheduler.",
+      keywords: "docker backend container docker_run multi host gpu devices deploy recipe supported" },
+    { title: "Kubernetes backend", href: "docs/user/backends#kubernetes-backend", tag: "core", branches: ["run","placement","backend-env"],
+      desc: "Reserve real nodes, schedule task pods, allocate GPUs, run in-cluster probes, relay logs, and collect outputs.",
+      use: "the same portable recipe needs to run on bare-metal Kubernetes or GKE.",
+      keywords: "kubernetes backend k8s pods claims device plugin dra gke bare metal deploy recipe supported" },
+    { title: "Kubernetes operators (k8s / k8s_mpi)", href: "docs/user/operators#k8s", tag: "new", branches: ["run","backend-env","scale"],
+      desc: "Launch single-pod tasks or MPI-style multi-pod jobs while preserving the workflow's logical task model.",
+      use: "a Kubernetes task needs one pod, multiple assigned nodes, or MPI-style startup.",
+      keywords: "kubernetes operator k8s k8s_mpi mpi pods multi node leader worker launch" },
+    { title: "Kubernetes GPU scheduling", href: "docs/user/resources#gpus-on-kubernetes", tag: "new", branches: ["placement","backend-env"],
+      desc: "Plan per-task GPU totals and request devices through the default device plugin or the opt-in DRA path.",
+      use: "GPU pods need correct counts, node placement, reservations, or DRA claims.",
+      keywords: "kubernetes gpu scheduling device plugin dra resource claim count reservation placement affinity" },
+    { title: "Complete Kubernetes task logs", href: "docs/user/outputs#output-directory-structure", tag: "new", branches: ["outputs","health","backend-env"],
+      desc: "Supervised live streams plus terminal reconciliation make the on-disk task.log the complete source of truth.",
+      use: "pod output appears incomplete, a live stream stalls, or result parsing must wait for final logs.",
+      keywords: "kubernetes logs task.log complete relay supervised stream stale terminal reconciliation pod output result parsing" },
+    { title: "Kubernetes samples", href: "docs/user/samples#kubernetes-samples", tag: "learn", branches: ["run","backend-env","operate"],
+      desc: "Copy runnable Kubernetes examples, from hello world to disaggregated Dynamo inference with AIPerf.",
+      use: "you want a working pod-based recipe before writing one from scratch.",
+      keywords: "kubernetes k8s samples examples hello world dynamo trtllm disaggregated aiperf" },
+    { title: "Merge co-located GPU tasks", href: "docs/user/backends#merge-co-located-gpu-tasks-for-intra-node-nvlink", tag: "advanced", branches: ["placement","backend-env"],
+      desc: "Pack related same-node GPU tasks into one pod with combined GPU visibility for CUDA IPC and NVLink-capable transfers.",
+      use: "cooperating workers on one node need a faster intra-node communication path.",
+      keywords: "merge pod colocated gpu nvlink nvswitch cuda ipc kv transfer prefill decode topology" },
+    { title: "Hardware monitoring", href: "docs/user/monitor", tag: "core", branches: ["outputs","operate","placement"],
+      desc: "Collect GPU, CPU, memory, disk, and network telemetry with readable summaries and charts.",
+      use: "you need to correlate task progress with hardware utilization.",
+      keywords: "monitor hardware gpu utilization memory power cpu disk network csv svg chart telemetry" }
+  ];
+
+  var graph = document.getElementById("graph");
+  var goalsCol = document.getElementById("goals");
+  var featuresCol = document.getElementById("features");
+  var edgePaths = document.getElementById("edge-paths");
+  var edgesSvg = document.getElementById("edges");
+  var rootNode = document.getElementById("root-node");
+  var hint = document.getElementById("hint");
+  var tip = document.getElementById("tip");
+  var search = document.getElementById("feature-search");
+  var resetBtn = document.getElementById("reset-btn");
+  var needCards = document.querySelectorAll("[data-need-goal]");
+
+  var state = { activeGoal: null, query: "" };
+  var goalEls = {};
+
+  function tokens(f) {
+    return (f.title + " " + f.desc + " " + f.use + " " + f.keywords + " " + f.branches.join(" ")).toLowerCase();
+  }
+
+  // Build goal nodes once.
+  GOALS.forEach(function(g) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "node goal";
+    btn.setAttribute("data-goal", g.id);
+    btn.innerHTML = "<span>" + g.label + "</span><span class=\"chev\">&#9656;</span>";
+    btn.addEventListener("click", function() {
+      if (search.value) { search.value = ""; state.query = ""; }
+      state.activeGoal = (state.activeGoal === g.id) ? null : g.id;
+      render();
+    });
+    goalsCol.appendChild(btn);
+    goalEls[g.id] = btn;
+  });
+
+  function visibleFeatures() {
+    var q = state.query.trim().toLowerCase();
+    var base;
+    if (state.activeGoal) {
+      base = FEATURES.filter(function(f){ return f.branches.indexOf(state.activeGoal) !== -1; });
+    } else if (q) {
+      base = FEATURES.slice();
+    } else {
+      base = [];
+    }
+    if (q) base = base.filter(function(f){ return tokens(f).indexOf(q) !== -1; });
+    return base;
+  }
+
+  function parentGoalOf(f) {
+    if (state.activeGoal && f.branches.indexOf(state.activeGoal) !== -1) return state.activeGoal;
+    for (var i = 0; i < f.branches.length; i++) {
+      if (goalEls[f.branches[i]]) return f.branches[i];
+    }
+    return f.branches[0];
+  }
+
+  function render() {
+    var q = state.query.trim().toLowerCase();
+    var feats = visibleFeatures();
+
+    // Which goals are "lit": the active one, or any goal that parents a visible feature during search.
+    var litGoals = {};
+    if (state.activeGoal) {
+      litGoals[state.activeGoal] = true;
+    } else if (q) {
+      feats.forEach(function(f){ litGoals[parentGoalOf(f)] = true; });
+    }
+    var hasSelection = state.activeGoal || q;
+
+    GOALS.forEach(function(g) {
+      var el = goalEls[g.id];
+      el.classList.toggle("active", !!litGoals[g.id]);
+      el.classList.toggle("dim", hasSelection && !litGoals[g.id]);
+    });
+
+    // Rebuild feature column.
+    featuresCol.innerHTML = "";
+    feats.forEach(function(f) {
+      var a = document.createElement("a");
+      a.className = "node feature" + (f.tag === "partial" ? " partial" : "");
+      a.href = f.href;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.setAttribute("data-goal", parentGoalOf(f));
+      a.innerHTML =
+        "<span>" + f.title + "</span><span class=\"tag\">" + f.tag + "</span>" +
+        "<span class=\"detail\">" + f.desc + "<span class=\"use\"><strong>Use when:</strong> " + f.use + "</span></span>";
+      a.addEventListener("mouseenter", function(){ showTip(a, f); });
+      a.addEventListener("mouseleave", hideTip);
+      a.addEventListener("focus", function(){ showTip(a, f); });
+      a.addEventListener("blur", hideTip);
+      featuresCol.appendChild(a);
+    });
+
+    // Hint text.
+    if (!hasSelection) {
+      hint.innerHTML = "Click a <code>goal</code> to branch out its features, or search to filter across all goals.";
+    } else if (feats.length === 0) {
+      hint.textContent = "No features match \u201C" + state.query.trim() + "\u201D.";
+    } else if (state.activeGoal) {
+      var g = GOALS.filter(function(x){ return x.id === state.activeGoal; })[0];
+      hint.textContent = (g ? g.label + ": " : "") + feats.length + " feature" + (feats.length === 1 ? "" : "s") + ".";
+    } else {
+      hint.textContent = feats.length + " feature" + (feats.length === 1 ? "" : "s") + " match your search.";
+    }
+
+    hideTip();
+    requestAnimationFrame(drawEdges);
+  }
+
+  function center(el, gx, gy, side) {
+    var r = el.getBoundingClientRect();
+    var y = r.top - gy + r.height / 2;
+    var x = side === "left" ? (r.left - gx) : (r.right - gx);
+    return { x: x, y: y };
+  }
+
+  function path(a, b) {
+    var dx = Math.max(40, (b.x - a.x) / 2);
+    return "M" + a.x + "," + a.y + " C" + (a.x + dx) + "," + a.y + " " + (b.x - dx) + "," + b.y + " " + b.x + "," + b.y;
+  }
+
+  function addEdge(from, to, cls, marker) {
+    var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    p.setAttribute("d", path(from, to));
+    if (cls) p.setAttribute("class", cls);
+    p.setAttribute("marker-end", "url(#" + marker + ")");
+    edgePaths.appendChild(p);
+  }
+
+  function drawEdges() {
+    if (window.innerWidth <= 860) return;
+    edgePaths.innerHTML = "";
+    var gr = graph.getBoundingClientRect();
+    var w = graph.clientWidth, h = graph.clientHeight;
+    edgesSvg.setAttribute("width", w);
+    edgesSvg.setAttribute("height", h);
+    edgesSvg.setAttribute("viewBox", "0 0 " + w + " " + h);
+
+    var rootRight = center(rootNode, gr.left, gr.top, "right");
+
+    // root -> goals
+    GOALS.forEach(function(g) {
+      var el = goalEls[g.id];
+      var lit = el.classList.contains("active");
+      addEdge(rootRight, center(el, gr.left, gr.top, "left"), lit ? "bright" : "", lit ? "ah-cy" : "ah-dim");
+    });
+
+    // goal -> feature
+    var featEls = featuresCol.querySelectorAll(".node.feature");
+    featEls.forEach(function(el) {
+      var gEl = goalEls[el.getAttribute("data-goal")];
+      if (!gEl) return;
+      addEdge(center(gEl, gr.left, gr.top, "right"), center(el, gr.left, gr.top, "left"), "feat", "ah-gr");
+    });
+  }
+
+  function showTip(el, f) {
+    if (window.innerWidth <= 860) return;
+    tip.innerHTML =
+      "<span class=\"tag\">" + f.tag + "</span><h4>" + f.title + "</h4>" + f.desc +
+      "<div class=\"use\"><strong>Use when:</strong> " + f.use + "</div>";
+    tip.classList.add("show");
+    var wrap = el.offsetParent || graph.parentElement;
+    var wr = wrap.getBoundingClientRect();
+    var r = el.getBoundingClientRect();
+    var tw = tip.offsetWidth, th = tip.offsetHeight;
+    var left = (r.left - wr.left) + r.width / 2 - tw / 2;
+    left = Math.max(8, Math.min(left, wrap.clientWidth - tw - 8));
+    var top = (r.top - wr.top) - th - 12;
+    if (top < 4) top = (r.bottom - wr.top) + 12;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  }
+
+  function hideTip() { tip.classList.remove("show"); }
+
+  function reset() {
+    state.activeGoal = null;
+    state.query = "";
+    search.value = "";
+    render();
+  }
+
+  rootNode.addEventListener("click", reset);
+  resetBtn.addEventListener("click", reset);
+  search.addEventListener("input", function() { state.query = search.value; render(); });
+  needCards.forEach(function(card) {
+    card.addEventListener("click", function() {
+      state.activeGoal = card.getAttribute("data-need-goal");
+      state.query = "";
+      search.value = "";
+      render();
+      document.getElementById("map").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+
+  var resizeTimer = null;
+  window.addEventListener("resize", function() {
+    if (resizeTimer) cancelAnimationFrame(resizeTimer);
+    resizeTimer = requestAnimationFrame(drawEdges);
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,131 @@
+# Standalone Dynamo bootstrap (utility fragment).
+#
+# Checks for and installs the three things a Dynamo run needs but that an OSS framework
+# image may ship WITHOUT: the `ai-dynamo` python libs, `nats-server`, and `etcd`. Each is
+# installed ONLY if it is missing (idempotent) and on EVERY reserved node.
+#
+# Merge it into any Dynamo workflow. It adds ONE `setup_dynamo` task and uses the
+# `required_by` key to fold itself into the `depends_on` of the infra + server tasks
+# WITHOUT editing their definitions. Only tasks that actually exist in the merged workflow
+# get the dependency -- any `required_by` target that is absent is silently skipped -- so
+# this one file composes with the trtllm / vllm / sglang and agg / disagg recipes alike:
+#
+#   sflow run -f slurm_config.yaml -f common_workflow.yaml -f utils/set_up_dynamo.yaml \
+#             -f trtllm/prefill.yaml -f trtllm/decode.yaml -f benchmark_aiperf.yaml
+#
+# This is the drop-in, `required_by`-wired alternative to the inline `install_dependency`
+# task in inference_x_v2/common_workflow.yaml -- use it with a lean base that has the infra
+# + server tasks but no bootstrap of its own.
+#
+# Assumes the SLURM modular layout (as inference_x_v2 uses): the base recipe defines the
+# `dynamo` operator and a `slurm_cluster` backend, and NUM_NODES is set (slurm_config.yaml).
+# The nats/etcd binaries install into `$PWD/configs` on the shared filesystem; the
+# nats_server / etcd_server tasks already prepend that dir to PATH.
+
+version: "0.1"
+
+variables:
+  # Dependency versions (only used when the tool is missing from the image).
+  DYNAMO_VERSION:
+    description: "Dynamo version to install when missing from the container image"
+    value: 1.2.1
+  NATS_VERSION:
+    description: "NATS server version to install when missing"
+    value: v2.10.14
+  ETCD_VERSION:
+    description: "ETCD version to install when missing"
+    value: v3.5.14
+
+workflow:
+  name: dynamo_benchmark
+  tasks:
+    - name: setup_dynamo
+      operator:
+        name: dynamo_vllm
+        ntasks_per_node: 1
+      # Fold this bootstrap into the depends_on of every Dynamo task that needs the libs
+      # or binaries, without those tasks referencing it. Absent targets (e.g. no
+      # decode_server in an agg-only recipe) are skipped, so the same list works everywhere.
+      required_by:
+        - nats_server
+        - etcd_server
+        - frontend_server
+        - agg_server
+        - prefill_server
+        - decode_server
+      script:
+        - set -x
+        - |
+          echo "Checking for dynamo, nats-server, and etcd..."
+
+          # Install dynamo if missing (check for the base dynamo module which all backends use)
+          if ! python3 -c "import dynamo" >/dev/null 2>&1; then
+            echo "dynamo not found, installing ai-dynamo packages (${DYNAMO_VERSION})..."
+            pip install --break-system-packages --quiet ai-dynamo-runtime==${DYNAMO_VERSION} ai-dynamo==${DYNAMO_VERSION}
+          else
+            echo "dynamo already installed."
+          fi
+
+          # Install nats-server if missing
+          if ! command -v nats-server >/dev/null 2>&1; then
+            mkdir -p configs
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)  ARCH_SHORT="amd64" ;;
+              aarch64) ARCH_SHORT="arm64" ;;
+              *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+            esac
+            echo "Downloading NATS (${NATS_VERSION}) for $ARCH_SHORT..."
+            NATS_DEB="nats-server-${NATS_VERSION}-$ARCH_SHORT.deb"
+            NATS_URL="https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/${NATS_DEB}"
+            wget -q --tries=3 --waitretry=5 "$NATS_URL" -O "configs/${NATS_DEB}"
+            TMP_DIR=$(mktemp -d)
+            dpkg-deb -x "configs/${NATS_DEB}" "$TMP_DIR"
+            if [ -f "$TMP_DIR/usr/local/bin/nats-server" ]; then
+              cp "$TMP_DIR/usr/local/bin/nats-server" configs/
+            elif [ -f "$TMP_DIR/usr/bin/nats-server" ]; then
+              cp "$TMP_DIR/usr/bin/nats-server" configs/
+            else
+              echo "Could not find nats-server binary in .deb package"; exit 1
+            fi
+            chmod +x configs/nats-server
+            rm -rf "$TMP_DIR" "configs/${NATS_DEB}"
+            export PATH="$PWD/configs:$PATH"
+            echo "nats-server installed."
+          else
+            echo "nats-server already installed."
+          fi
+
+          # Install etcd if missing
+          if ! command -v etcd >/dev/null 2>&1; then
+            mkdir -p configs
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)  ARCH_SHORT="amd64" ;;
+              aarch64) ARCH_SHORT="arm64" ;;
+              *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+            esac
+            echo "Downloading ETCD (${ETCD_VERSION}) for $ARCH_SHORT..."
+            ETCD_TAR="etcd-${ETCD_VERSION}-linux-$ARCH_SHORT.tar.gz"
+            ETCD_URL="https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/${ETCD_TAR}"
+            wget -q --tries=3 --waitretry=5 "$ETCD_URL" -O "configs/${ETCD_TAR}"
+            tar -xzf "configs/${ETCD_TAR}" --strip-components=1 -C configs \
+              etcd-${ETCD_VERSION}-linux-$ARCH_SHORT/etcd \
+              etcd-${ETCD_VERSION}-linux-$ARCH_SHORT/etcdctl
+            chmod +x configs/etcd configs/etcdctl
+            rm "configs/${ETCD_TAR}"
+            export PATH="$PWD/configs:$PATH"
+            echo "etcd installed."
+          else
+            echo "etcd already installed."
+          fi
+
+          echo "All dependencies checked."
+          sleep 3600
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "All dependencies checked."
+            match_count: ${{ variables.NUM_NODES }}
+          timeout: 1200
+          interval: 2

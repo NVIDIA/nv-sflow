@@ -16,15 +16,31 @@ _ACTIVE_COMMAND_LOG_ROUTER: contextvars.ContextVar[CommandLogRouter | None] = (
     contextvars.ContextVar("sflow_command_log_router", default=None)
 )
 
-_SLURM_COMMANDS = {"salloc", "srun", "scontrol", "scancel", "sbatch"}
 _FAMILY_FILES = {
-    "slurm": "slurm_cmds.log",
     "bash": "bash_cmds.log",
     "docker": "docker_cmds.log",
     "ssh": "ssh_cmds.log",
     "python": "python_cmds.log",
     "backend": "backend_cmds.log",
 }
+_EXECUTABLE_FAMILIES = {
+    "bash": "bash",
+    "sh": "bash",
+    "docker": "docker",
+    "ssh": "ssh",
+}
+
+
+def register_command_family(
+    family: str,
+    executables: set[str] | frozenset[str],
+    *,
+    filename: str | None = None,
+) -> None:
+    """Register backend/plugin-owned command routing."""
+    _FAMILY_FILES[family] = filename or f"{family}_cmds.log"
+    for executable in executables:
+        _EXECUTABLE_FAMILIES[executable] = family
 
 
 class CommandLogRouter:
@@ -67,14 +83,9 @@ class CommandLogRouter:
 
     def _family(self, command: Command | str | list[str]) -> str:
         executable = _executable_name(command)
-        if executable in _SLURM_COMMANDS:
-            return "slurm"
-        if executable in {"bash", "sh"}:
-            return "bash"
-        if executable == "docker":
-            return "docker"
-        if executable == "ssh":
-            return "ssh"
+        family = _EXECUTABLE_FAMILIES.get(executable)
+        if family is not None:
+            return family
         if executable.startswith("python") or executable == Path(sys.executable).name:
             return "python"
         return "backend"

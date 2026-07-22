@@ -172,3 +172,30 @@ def test_resolve_variables_raises_on_get_self_cycle():
 
     with pytest.raises(ValueError, match=r"Unresolved variable expressions.*A"):
         resolve_global_variables(config, state)
+
+
+def test_resolve_variables_exposes_domain_metadata_in_expressions():
+    # A global variable can reference another variable's `domain` list (e.g. to
+    # size a value off the largest sweep point), mirroring what already works in
+    # task scripts and `compose --resolve`.
+    config = _minimal_config(
+        variables=[
+            {
+                "name": "CONCURRENCY",
+                "value": 512,
+                "type": "integer",
+                "domain": [128, 512],
+            },
+            {"name": "NUM_SERVERS", "value": 4, "type": "integer"},
+            {
+                "name": "BATCH_SIZE",
+                "value": "${{ (variables.CONCURRENCY.domain | max) // variables.NUM_SERVERS }}",
+                "type": "integer",
+            },
+        ]
+    )
+    state = _minimal_state()
+
+    out = resolve_global_variables(config, state)
+
+    assert out.variables["BATCH_SIZE"].value == 128  # max([128, 512]) // 4

@@ -47,6 +47,42 @@ def test_extract_references_returns_undeclared_names(resolver: ExpressionResolve
     assert refs == {"foo", "bar", "variables"}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "${{ task.name }}/r.csv",
+        "${{task.name}}/r.csv",
+        "${{ task.name}}/r.csv",
+        "${{task.name }}/r.csv",
+        "${{   task.name   }}/r.csv",
+        "results_${{ task.name }}.csv",
+        "${{ 'p_' + task.name }}/r.csv",
+        "${{ task['name'] }}/r.csv",
+    ],
+)
+def test_references_attribute_detects_all_spellings(
+    resolver: ExpressionResolver, value: str
+):
+    assert resolver.references_attribute(value, "task", "name") is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        123,
+        "main/r.csv",
+        "task.name/r.csv",  # not an expression
+        "${{ task.output_dir }}/r.csv",  # different attribute
+        "${{ taskname }}/r.csv",  # different name
+        "${{ variables.name }}/r.csv",  # different root
+        '${{ "task.name" }}/r.csv',  # inside a string literal, not a real ref
+    ],
+)
+def test_references_attribute_negatives(resolver: ExpressionResolver, value):
+    assert resolver.references_attribute(value, "task", "name") is False
+
+
 def test_resolve_string_strict_undefined_raises_value_error(
     resolver: ExpressionResolver,
 ):
@@ -135,6 +171,19 @@ class TestVariableValueInExpressions:
         ctx = {"variables": {"HOST": VariableValue("10.0.0.1"), "PORT": VariableValue(8080)}}
         result = resolver.resolve("${{ variables.HOST }}:${{ variables.PORT }}", ctx)
         assert result == "10.0.0.1:8080"
+
+    def test_string_method_delegates_to_value(self, resolver):
+        # A wrapped value must delegate str methods (upper/split/replace) so
+        # expressions keep working after values are wrapped in VariableValue.
+        ctx = {"variables": {"MODEL": VariableValue("org/Qwen3-8B")}}
+        assert resolver.resolve("${{ variables.MODEL.upper() }}", ctx) == "ORG/QWEN3-8B"
+        assert (
+            resolver.resolve("${{ variables.MODEL.split('/')[-1] }}", ctx) == "Qwen3-8B"
+        )
+
+    def test_list_method_delegates_to_value(self, resolver):
+        ctx = {"variables": {"NODES": VariableValue(["n1", "n2", "n3"])}}
+        assert resolver.resolve("${{ variables.NODES.index('n2') }}", ctx) == "1"
 
     def test_range_list_expression(self, resolver):
         ctx = {

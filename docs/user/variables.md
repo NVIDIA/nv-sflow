@@ -19,7 +19,7 @@ sflow variables offer significant advantages over traditional environment variab
 | **Resolution time** | Before workflow execution (plan time) | At runtime (shell expansion) |
 | **Scope** | Across entire YAML (backends, operators, resources, scripts) | Only within shell scripts |
 | **Dynamic values** | Can reference backends, artifacts, tasks, other variables | Static values only |
-| **Type safety** | Supports int, float, bool, string, list with validation | Strings only |
+| **Type safety** | Typed via `type:` — one of `string`, `integer`, `float`, `boolean`, `list`, `dict` — with validation | Strings only |
 | **Override** | `--set VAR=value` from CLI | Requires manual export |
 | **Visibility** | Shown in dry-run plan | Hidden until execution |
 
@@ -86,7 +86,32 @@ When using `${{ ... }}` expressions, you have access to these contexts:
 | `workflow` | `${{ workflow.name }}` | Workflow metadata |
 | `task` | `${{ task.my_task.nodes[0].ip_address }}` | Task-specific node and GPU info (scripts only) |
 
+### Resolution order
+
+Variables are resolved in phases, so each phase can reference the results of the ones
+before it:
+
+```mermaid
+flowchart TD
+  P1["1 · static globals<br/>no backend/artifact refs — usable in backends:"] --> P2["2 · backend allocation<br/>salloc / node discovery populates backends.*"]
+  P2 --> P3["3 · deferred globals<br/>variables that reference backends.* / artifacts.*"]
+  P3 --> P4["4 · artifacts<br/>URIs resolved to local paths — artifacts.*.path"]
+  P4 --> P5["5 · workflow.variables<br/>resolved after allocation (runtime-derived values)"]
+  P5 --> P6["6 · task scripts<br/>per-task env; adds the task.* context (nodes, GPUs)"]
+```
+
+Later phases may reference earlier ones, never the reverse.
+
+The `backends.*`/`artifacts.*` contexts are only available from phase 3 onward, and the
+`task.*`/`workflow.*` contexts only inside task/workflow scope (phases 5–6). That is why a
+static global cannot reference a backend it is meant to configure (see the invalid example
+below).
+
 ### Top-Level Static and Deferred Variables
+
+> The deferred phase (step 3 above) actually splits around artifact resolution:
+> backend-derived globals resolve *before* artifacts (so artifact URIs can reference them),
+> while artifact-derived globals resolve *after* artifacts exist.
 
 Top-level `variables` are resolved in two passes:
 
@@ -146,6 +171,11 @@ value: "${{ MY_VAR }}"
 
 When a variable declares a `domain`, the current value still renders normally, and the domain list is available as metadata:
 
+:::note `value` must be a domain member
+When a variable sets `domain`, its `value` must be one of the domain entries — sflow rejects the config otherwise. The `value` acts as the default (non-swept runs, `--set` overrides); the full `domain` drives replica sweeps.
+:::
+
+
 ```yaml
 variables:
   CONCURRENCY:
@@ -162,7 +192,24 @@ workflow:
         - echo "max=${{ variables.CONCURRENCY.domain | max }}"
 ```
 
-This also works in places that resolve expressions before execution, including `sflow compose --resolve` and `sflow batch -e/--sbatch-extra-args`.
+Domain metadata is also available when computing other variables, so you can size one variable off another's sweep. For example, size the decode batch to the largest concurrency spread across the decode servers:
+
+```yaml
+variables:
+  CONCURRENCY:
+    value: 512
+    type: integer
+    domain: [128, 256, 512]
+  NUM_GEN_SERVERS:
+    value: 4
+    type: integer
+  GEN_BATCH_SIZE:
+    type: integer
+    # max([128, 256, 512]) // 4 = 128
+    value: ${{ (variables.CONCURRENCY.domain | max) // variables.NUM_GEN_SERVERS }}
+```
+
+This works everywhere expressions are resolved: the top-level and `workflow` `variables:` sections (resolved by `sflow run`), task scripts, `sflow compose --resolve`, and `sflow batch -e/--sbatch-extra-args`.
 
 For replica sweeps, `${{ variables.CONCURRENCY }}` resolves to each replica's row value while `${{ variables.CONCURRENCY.domain }}` stays the full domain list for every replica.
 
@@ -217,11 +264,29 @@ sflow automatically injects these environment variables into every task script:
 | `SFLOW_OUTPUT_DIR` | Output root directory | `/home/user/project/sflow_output` |
 | `SFLOW_WORKFLOW_OUTPUT_DIR` | Workflow-specific output directory | `sflow_output/12345-wf-20260315-abcdef` |
 | `SFLOW_TASK_OUTPUT_DIR` | Task-specific output directory | `sflow_output/12345-wf-20260315-abcdef/task_name` |
+| `SFLOW_TASK_RESULT_FILE` | Canonical per-task result file (`${SFLOW_TASK_OUTPUT_DIR}/result.json`) | `.../task_name/result.json` |
+| `SFLOW_WORKFLOW_RESULT_FILE` | Workflow-level results index (`${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json`) | `.../results.json` |
 | `SFLOW_REPLICA_INDEX` | Replica index (0-based) for replicated tasks | `0`, `1`, `2` |
 | `SFLOW_TASK_ASSIGNED_NODE_NAMES` | Comma-separated hostnames assigned to this task | `node0,node1` |
 | `SFLOW_TASK_ASSIGNED_NODE_IPS` | Comma-separated IPs assigned to this task | `10.0.0.1,10.0.0.2` |
+| `SFLOW_BACKEND_JOB_ID` | Backend allocation/job id when available (Slurm: mirrors `SLURM_JOB_ID`) | `123456` |
+| `SFLOW_BACKEND_NODELIST` | Backend allocation nodelist when available (Slurm: mirrors `SLURM_JOB_NODELIST`) | `node[0-1]` |
+| `SFLOW_BACKEND_NUM_NODES` | Number of nodes in the backend allocation (Slurm: mirrors `SLURM_NNODES`) | `2` |
+| `CUDA_VISIBLE_DEVICES` | GPU indices allocated to this task (set when `resources.gpus.count` is used) | `0,1` |
+
+The `srun` operator additionally maps common Slurm step/rank variables into
+backend-agnostic aliases at runtime: `SFLOW_BACKEND_STEP_ID`, `SFLOW_TASK_NODE_NAME`,
+`SFLOW_TASK_NODE_INDEX`, `SFLOW_TASK_PROCESS_ID`, `SFLOW_TASK_LOCAL_PROCESS_ID`, and
+`SFLOW_TASK_NUM_PROCESSES`. See the full list in
+[Reserved Environment Variables](./quick-reference.md#reserved-environment-variables).
 
 In addition, all user-defined variables are available as environment variables by their name (e.g. `${SLURM_NODES}`, `${MODEL_NAME}`).
+
+> **Avoid reusing a reserved name.** Do not name a variable after a reserved
+> `SFLOW_*` / `CUDA_VISIBLE_DEVICES` env var above — sflow injects and owns these at
+> launch, so a same-named variable collides and causes undefined behavior.
+> `sflow run --dry-run` prints a **Reserved env collisions** section listing any such
+> variables so you can rename them before a real run.
 
 #### Output directory variables
 

@@ -5,11 +5,16 @@ sidebar_position: 4
 
 `artifacts` are “named URIs” you can reference from expressions and task scripts.
 
-In v0.1, artifacts are **not automatically downloaded/pulled**. They are mainly used to:
+Local schemes (`fs://` / `file://`) resolve to a local filesystem path, while
+`http(s)://` artifacts **are downloaded and cached** on the controller (SHA256-keyed).
+They are mainly used to:
 
 - Normalize local paths (`fs://` / `file://`) so you can reference them consistently
+- Download and cache remote files (`http(s)://`) so every task sees the same local copy
 - Inject a convenient env var `${NAME}` into every task (the artifact's resolved `path`)
-- Automatically mount path when running with containers inside slurm cluster
+- Make paths available inside containers: bind-mounted when running with containers
+  on **slurm** / **docker**; on **kubernetes**, `file://` inline content is injected
+  via a ConfigMap and `fs://` paths are treated as remote (see below)
 
 ## Minimal example
 
@@ -29,7 +34,7 @@ workflow:
         - echo "expr=${{ artifacts.MODEL_DIR.path }}"
 ```
 
-## Supported URI schemes (v0.1)
+## Supported URI schemes
 
 Artifacts are exposed as:
 
@@ -37,11 +42,14 @@ Artifacts are exposed as:
 - `${{ artifacts.NAME.path }}`
 - `${NAME}` (env var injected into tasks)
 
-Rules in v0.1:
-
-- `fs://<path>` and `file://<path>` become a real local filesystem path
-  - relative paths are resolved relative to `--workspace-dir` (default: current directory)
-- other schemes keep `path` as the raw URI string (no download/pull yet)
+| Scheme | Resolves to | Notes |
+|--------|-------------|-------|
+| `fs://<path>` | Local filesystem path | Relative paths resolve against `--workspace-dir` (default: current directory). |
+| `file://<path>` | Local filesystem path | Supports inline `content` (see below). Relative paths resolve against `--workspace-dir`. |
+| `http://` / `https://` | Downloaded local copy | The file **is downloaded and cached** on the controller (SHA256-keyed), so `path` points at the cached copy and every task reads the same file. |
+| `hf://` / `huggingface://` | — | **Not yet implemented** — raises `NotImplementedError` when materialized. Reference a local `fs://` / `file://` path instead. |
+| `docker://` | — | **Not yet implemented** — raises `NotImplementedError` when materialized. |
+| `s3://` | Raw URI (passthrough) | Accepted by URI validation but has **no artifact resolver**, so `path` stays the raw `s3://...` string — it is **not** downloaded. (To *upload* results to S3, see [Uploads](./uploads.md).) |
 
 ## Override artifacts at runtime (`--artifact`)
 
@@ -75,9 +83,11 @@ The expression is resolved before the artifact path is validated. This means:
 
 ### Path validation
 
-`fs://` artifact paths are validated during dry-run to catch missing paths early (before allocating Slurm nodes):
+`fs://` artifact paths are checked on disk to surface missing paths early (before allocating backend resources). The severity depends on the run mode and backend:
 
-- **`fs://` paths**: must exist on disk. If missing, the dry-run fails with an error.
+- **`--dry-run`**: a missing `fs://` path is a **warning** — the dry-run still succeeds.
+- **Real run on a local / Slurm / Docker backend**: a missing `fs://` path **fails** the run before allocation (`Artifact path validation failed`), so create input paths first.
+- **Off-host backends (e.g. Kubernetes)**: `fs://` paths are treated as **remote** paths on the cluster/image, so they are **not validated or created locally** — a missing path just warns. Ensure the path exists inside the pod (baked into the image, or mounted via a PVC/hostPath you configure).
 - **`file://` paths with `content`**: skipped (the file is generated at runtime from the inline content).
 - **URIs with unresolved expressions**: skipped (validated later during full resolution).
 

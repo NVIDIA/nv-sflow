@@ -1,0 +1,61 @@
+# Shared benchmark hub for the modular samples.
+#
+# This task is intentionally dependency-free: each workload's `server` task
+# points at it with `required_by: [benchmark]`, which sflow folds into this
+# task's `depends_on`. Compose it last. If you compose a workload WITHOUT this
+# file, the servers' `required_by: [benchmark]` simply resolves to nothing (no
+# --missable-tasks needed).
+
+version: "0.1"
+
+variables:
+  CLIENT_IMAGE:
+    description: "Benchmark client image (AIPerf runs here)"
+    value: python:3.12-slim
+  ISL:
+    description: "Input sequence length"
+    type: integer
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    type: integer
+    value: 1024
+  CONCURRENCY:
+    description: "Concurrent request count"
+    type: integer
+    value: 64
+  TOKENIZER:
+    description: "Tokenizer for aiperf: a HuggingFace name OR a local model dir. Defaults to the
+      served model name; point it at a local path to avoid a HuggingFace download on offline clusters."
+    value: ${{ variables.SERVED_MODEL_NAME }}
+
+workflow:
+  name: modular_inference
+  tasks:
+    - name: benchmark
+      operator: client
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        # Render the aiperf results table at a fixed wide width. Without this, aiperf sizes the
+        # table to the pod's default ~80 columns and TRUNCATES metric labels (e.g. "Output Token
+        # Throughput (tokens/sec)" -> "Output Token"), unpredictably per run, which breaks any
+        # log-scraping consumer (the k8s e2e verify perf check). Matches the self-contained recipes.
+        - export COLUMNS=200
+        - >
+          aiperf profile
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ variables.TOKENIZER }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ backends.cluster.nodes[0].ip_address }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --output-tokens-mean ${{ variables.OSL }}
+          --concurrency ${{ variables.CONCURRENCY }}
+          --request-count ${{ variables.CONCURRENCY * 8 }}
+          --warmup-request-count ${{ variables.CONCURRENCY }}
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]

@@ -12,6 +12,7 @@ uv venv --python python3
 source .venv/bin/activate
 uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
 sflow --help
+sflow --version   # or: sflow -V — print version + runtime/build details
 ```
 
 If `curl` is unavailable (e.g. on some locked-down clusters), install `uv` via pip instead:
@@ -20,17 +21,24 @@ If `curl` is unavailable (e.g. on some locked-down clusters), install `uv` via p
 pip install uv
 ```
 
+**Optional extras** enable features that pull in extra dependencies:
+
+```bash
+pip install 'sflow[s3]'        # S3 artifact/result uploads (boto3)
+pip install 'sflow[monitor]'   # PNG charts for the hardware monitor
+```
+
 ---
 
 ## One-Minute Mindset
 
-`sflow` lets you describe a multi-step workflow in a single YAML file and run it on **any compute backend** — your laptop today, a Slurm cluster tomorrow — without rewriting scripts.
+`sflow` lets you describe a multi-step workflow in a single YAML file and run it on **any compute backend** — your laptop, a Slurm cluster, a Docker host, or a Kubernetes cluster — without rewriting scripts.
 
 **Core ideas:**
 
 | Concept | What it does | Example |
 |---------|-------------|---------|
-| **Backend** | Declares *where* tasks run. Swap one line to move between local and Slurm. | `type: slurm`, `partition: gpu` |
+| **Backend** | Declares *where* tasks run. Swap one line to move between `local`, `slurm`, `docker`, and `kubernetes`. | `type: slurm`, `partition: gpu` |
 | **Operator** | Declares *how* a task's script is launched. Each backend has a default (local → `bash`, Slurm → `srun`). Define named operators to preset flags and reuse them across tasks. | `type: srun`, `ntasks: 4` |
 | **Variable** | A named value reusable everywhere — scripts, resource counts, backend config. Override from the CLI with `--set`. | `NUM_GPUS: 8` |
 | **Task & DAG** | Each task is a unit of work with a script. `depends_on` wires them into a directed graph so sflow runs them in the right order. | `depends_on: [train]` |
@@ -46,6 +54,10 @@ This guide teaches sflow in two parts:
 
 - **Part I: Learn the Basics Locally** – Write workflows, build DAGs, add variables — no cluster needed
 - **Part II: Run on Slurm** – Take the same config to a real HPC cluster
+
+:::tip More backends
+This quickstart uses `local` and `slurm`, but the same YAML also runs on the **Docker** and **Kubernetes** backends — just swap the backend block. See [Backends](./backends.md) for all four, and try the Kubernetes samples: `sflow sample self_contained/kubernetes/hello_world` and `sflow sample self_contained/kubernetes/dynamo_trtllm_disagg`.
+:::
 
 ---
 
@@ -192,7 +204,7 @@ Variables can be used in two ways:
 - **In YAML fields** (resolved before execution): `${{ variables.MODEL_NAME }}`
 - **In scripts** (as env var at runtime): `${MODEL_NAME}`
 
-Here's the full parameterized version (or get it via `sflow sample local_dag`):
+Here's the full parameterized version (or get it via `sflow sample self_contained/local/dag`):
 
 ```yaml
 version: "0.1"
@@ -256,6 +268,21 @@ sflow run --file sflow.yaml --dry-run
 
 Dry-run does not create output directories/files. It prints the execution plan and computed output paths.
 
+### 5. Explore More Local Capabilities
+
+The `local` backend is enough to try several sflow features before touching a cluster. Copy any of these with `sflow sample <name>` (each writes `./<basename>.yaml` in the current directory — e.g. `sflow sample self_contained/local/result_parsing` writes `./result_parsing.yaml`):
+
+| Capability | Sample | What it shows |
+|-----------|--------|---------------|
+| Result parsing | `self_contained/local/result_parsing` | Parse metrics from a log/JSON into `result.json` (see [Results](./results.md)) |
+| Storage uploads | `self_contained/local/storage_upload`, `self_contained/local/storage_upload_all` | Ship logs/results to a storage target such as S3 (see [Uploads](./uploads.md)) |
+| Workflow monitor | `self_contained/local/monitor` | Sample hardware utilization during a run and (optionally) render charts (see [Monitor](./monitor.md)) |
+
+```bash
+sflow sample self_contained/local/monitor
+sflow run -f monitor.yaml
+```
+
 ---
 
 ## Part II: Slurm Cluster
@@ -267,24 +294,9 @@ Take the same workflow concepts to a real HPC cluster. Make sure you have alread
 
 **How it works (Slurm example):**
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  workflow.yaml                                          │
-│                                                         │
-│  variables:          backends:          workflow:       │
-│    NUM_GPUS: 8         type: slurm        tasks:        │
-│    MODEL: llama        partition: gpu      - train      │
-│                        nodes: 2            - evaluate   │
-│                                            - export     │
-└──────────────────────────┬──────────────────────────────┘
-                           │  sflow run -f workflow.yaml
-                           ▼
-              ┌────────────────────────┐
-              │  1. Resolve variables  │
-              │  2. Allocate (salloc)  │
-              │  3. Place tasks on GPUs│
-              │  4. Execute DAG        │
-              └────────────────────────┘
+```mermaid
+flowchart TD
+  Y["workflow.yaml<br/>variables: NUM_GPUS, MODEL · backends: slurm · workflow.tasks: train, evaluate, export"] -->|sflow run -f workflow.yaml| P["1 · Resolve variables<br/>2 · Allocate (salloc)<br/>3 · Place tasks on GPUs<br/>4 · Execute DAG"]
 ```
 
 Start with a plain-text config — hardcode your actual cluster values. No variables yet.
@@ -300,6 +312,7 @@ backends:
     partition: "your_slurm_partition"
     time: "00:10:00"
     nodes: 1
+    gpus_per_node: 8
 
 workflow:
   name: wf
@@ -344,7 +357,7 @@ You can also use `sflow sample` to get starter workflows with variables already 
 
 ```bash
 sflow sample --list
-sflow sample slurm_dynamo_trtllm_disagg
+sflow sample self_contained/slurm/dynamo_trtllm_disagg
 ```
 
 ### 2. Operators & srun — How Your Script Actually Runs
@@ -502,7 +515,7 @@ sflow batch --file workflow.yaml --sbatch-path run_workflow.sh -e '--exclusive' 
 
 ```bash
 sflow batch \
-  --file examples/slurm_sglang_server_client.yaml \
+  --file sglang_server_client.yaml \
   --partition gpu \
   --account myaccount \
   --time 02:00:00 \
@@ -527,21 +540,25 @@ sflow batch \
   --sbatch-path run.sh
 ```
 
-#### Custom Virtual Environment
+#### Per-Job Virtual Environment
 
-If you have a pre-configured venv (important for clusters with different architectures like x86 login nodes and arm64 compute nodes):
+By default each Slurm job creates its own fresh, disposable venv on the compute node
+(`.sflow_venv-<job id>/`) using the node's system `python3`, so it always matches the node
+architecture (e.g. x86 login node vs arm64 compute node) and is removed when the job exits.
+Pass `--sflow-venv-path` to change the parent directory it is created under (e.g. a
+shared-filesystem path instead of node-local scratch):
 
 ```bash
 sflow batch \
   --file workflow.yaml \
-  --sflow-venv-path /path/to/arm64/.venv \
+  --sflow-venv-path /shared/scratch/sflow-venvs \
   --sbatch-path run.sh
 ```
 
 #### What the Generated Script Does
 
 1. **Sets sbatch directives**: job name, output/error files, partition, account, time limit
-2. **Activates or creates a Python venv**: Uses existing `.sflow_venv/` or creates one with sflow installed
+2. **Creates a fresh per-job venv**: builds `.sflow_venv-<job id>/` on the compute node with sflow installed, then removes it on exit (override the parent dir with `--sflow-venv-path`)
 3. **Runs dry-run validation**: Catches configuration errors before the full run
 4. **Executes the workflow**: Runs `sflow run` with all provided options
 
@@ -560,7 +577,7 @@ sflow batch \
 | `--job-name`, `-J` | Slurm job name (default: `sflow`) |
 | `--set`, `-s` | Override variable (can be repeated) |
 | `--artifact`, `-a` | Override artifact URI (can be repeated) |
-| `--sflow-venv-path`, `-v` | Path to existing Python venv |
+| `--sflow-venv-path` | Parent dir for the fresh per-job venv (default: compute-node-local scratch) |
 
 #### Monitoring Batch Jobs
 

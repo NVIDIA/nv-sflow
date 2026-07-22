@@ -102,6 +102,33 @@ Fix: check line 5 for indentation or syntax issues.
 
 ---
 
+### 1.6 Invalid Task Operator Override Key
+
+**Pattern:**
+```
+Task '<task>': operator override key(s) not valid for operator '<op>' (type '<type>'): <keys>.
+Check for a typo. If these are backend-specific operator settings, define them on the
+'<op>' operator in the backend fragment (composed per backend via deep-merge) instead of
+as a task-level operator override -- they are no longer silently dropped on an incompatible backend.
+```
+
+**Cause:** A task's inline `operator:` block carries a key that is **not a field of the
+operator it resolves to** — a typo (e.g. `ntaks_per_node`), or a setting meant for a
+different backend's operator (e.g. an srun `ntasks_per_node` on a `kubernetes` operator).
+As of this change these keys are a **hard error**. (Earlier versions silently dropped
+incompatible keys with a warning to keep a task portable across backends, but that hid
+genuine typos — the misspelled key just vanished with no effect.)
+
+**Fix:**
+- If it's a typo, correct the key to a real field of that operator.
+- If it's a genuinely backend-specific operator setting, move it off the task and onto the
+  **operator definition inside the backend fragment**. The composer deep-merges operators
+  by name per backend, so the setting applies only where that backend is used and the task
+  stays portable. See the `writing-sflow-yaml` skill's schema-reference (composition /
+  deep-merge) for the pattern.
+
+---
+
 ## 2. Variable / Expression Errors
 
 ### 2.1 Undefined Variable in Expression
@@ -183,9 +210,13 @@ Invalid variable override format: '<override>'. Expected KEY=VALUE.
   Artifact '<name>' (fs://) path does not exist: <path>
 ```
 
-**Cause:** An `fs://` artifact URI points to a path that doesn't exist on the filesystem.
+**Cause:** An `fs://` artifact URI points to a path that doesn't exist on the filesystem. This
+is raised only on a **real run** with a local/Slurm/Docker backend. On `--dry-run` a missing
+`fs://` path is a **warning** (the run still validates), and on off-host backends (Kubernetes)
+it also just warns (the path is treated as remote on the cluster/image).
 
-**Fix:** Create the directory/file or fix the URI path. This is checked during dry-run.
+**Fix:** Create the directory/file or fix the URI path before a real run (or use `--dry-run`
+to validate without it).
 
 ---
 
@@ -243,16 +274,20 @@ ArtifactConfig: content is only valid with file:// URIs
 
 ---
 
-### 4.2 Workflow Name Conflict
+### 4.2 Workflow Name / Duplicate Task Names (relaxed in v0.3.0)
 
-**Pattern:**
-```
-✗ Configuration error: Workflow name conflict: '<a>' vs '<b>' (from <file_label>)
-```
+**Behavior change:** As of v0.3.0 the multi-file merge is a recursive deep merge keyed on
+`name`, so these are **no longer hard errors**:
 
-**Cause:** Two files define different `workflow.name` values.
+- A differing `workflow.name` across files no longer raises `Workflow name conflict` — the
+  **last non-null name wins** (a warning is logged).
+- **Duplicate task names across files** are **deep-merged** into one task (a definition can be
+  scattered across files) instead of raising `Duplicate task names`.
 
-**Fix:** Use the same `workflow.name` in all files, or omit it from fragment files.
+**Watch out:** if you relied on these as guardrails, a name collision now silently merges.
+Audit composed files if a task looks like it picked up unexpected fields. (Duplicate task
+names *within a single file* still raise — see 1.4.) Leaf scalars/value-lists still
+last-file-wins with an override warning.
 
 ---
 
@@ -577,3 +612,172 @@ or system cannot find `dot`.
 **Cause:** Graphviz is not installed but `--format png/svg/pdf` was requested.
 
 **Fix:** Install Graphviz (`apt install graphviz` or `conda install graphviz`), or use `--format mermaid` or `--format dot` which don't require Graphviz.
+
+---
+
+## 10. Kubernetes Backend Errors
+
+The kubernetes backend runs `kubectl` on the `sflow run` host. Most failures surface either
+in a fast pre-flight (before allocation) or as pod status. Use `kubectl -n <ns> describe pod
+<pod>` and `kubectl -n <ns> get events` to inspect.
+
+### 10.1 Access Pre-flight Failure (RBAC / namespace / unreachable)
+
+**Cause:** On a real run sflow verifies the cluster is reachable and authenticated, the
+namespace exists, and (via `kubectl auth can-i`) that the credentials hold the RBAC it needs
+(create/delete pods, configmaps, secrets; get pods/logs/nodes; DRA
+`resourceclaimtemplates`/`deviceclasses`; `computedomains` when creating one).
+
+**Fix:**
+- Wrong cluster/context/namespace: pass `--kubeconfig`, `--kube-context`, `--kube-namespace`.
+- Missing permission: grant the RBAC, or use a namespace where you have it.
+- To bypass the check (e.g. cluster that disallows `auth can-i`): `SFLOW_SKIP_K8S_PREFLIGHT=1`.
+
+### 10.2 Pod Stuck `Pending` (unschedulable)
+
+**Pattern (`kubectl describe pod`):** `0/N nodes are available: insufficient nvidia.com/gpu`
+or no node matches the nodeSelector/affinity.
+
+**Cause:** No node can satisfy the GPU request or the node-selector/tolerations/`include_nodes`.
+
+**Fix:** Check `gpus_per_node` vs real capacity, the `scheduling` mode (`dra` needs
+`nvidia-dra-driver-gpu`; `device_plugin` needs the gpu-operator), `node_selector` /
+`tolerations`, and that `resources.gpus.count` is a multiple of the node count.
+
+### 10.3 `ImagePullBackOff` / `ErrImagePull`
+
+**Cause:** The `k8s` operator `image` is wrong or private without credentials.
+
+**Fix:** Fix the operator `image`; for private registries add `image_pull_secrets: [<secret>]`
+(the workload image lives on the **operator**, not the backend).
+
+### 10.4 GPU count not divisible by node count
+
+**Cause:** For a multi-node k8s task, `resources.gpus.count` is split evenly across nodes.
+
+**Fix:** Make `gpus.count` a multiple of the assigned node count (or reduce nodes).
+
+### 10.5 kubectl flag not recognized
+
+**Pattern:** an `--extra-args` value that is not a valid global kubectl flag is applied to
+every `kubectl` call and emits a warning (or kubectl rejects it).
+
+**Fix:** Use `--extra-kubectl-args` for kubectl-only flags (or `--extra-args`, which is generic
+across Slurm/docker/kubectl). Don't pass Slurm-isms (e.g. `--gpus-per-node`) as kubectl flags.
+
+---
+
+## 11. Docker Backend Errors
+
+### 11.1 docker run failed / daemon unreachable
+
+**Cause:** The Docker daemon isn't running/reachable, or `docker run` rejected the args.
+
+**Fix:** Verify `docker info` works on the host; check the backend `image`, `mounts`,
+`extra_args`. For remote hosts, verify the `docker_host` (`ssh://...`) or `context`.
+
+### 11.2 NVIDIA container toolkit missing (GPU tasks)
+
+**Cause:** `resources.gpus` requested but the host lacks the NVIDIA container toolkit.
+
+**Fix:** Install the NVIDIA container toolkit on the Docker host and set `gpus_per_node` to
+the host GPU count. sflow narrows `docker run --gpus device=...` to the planned slice.
+
+### 11.3 Remote host path not found
+
+**Cause:** For remote daemons (`docker_host`/`context`) sflow does not auto-mount local
+workspace/output paths (they may not exist on the remote host).
+
+**Fix:** Provide explicit backend/host/operator `mounts` pointing at a shared filesystem
+available at the same path on every Docker host.
+
+---
+
+## 12. Storage / Upload Errors
+
+### 12.1 boto3 Not Installed
+
+**Pattern:**
+```
+S3 storage requires boto3. Install with: pip install 'sflow[s3]'
+```
+or (dry-run) `storage target '<name>' (s3) requires boto3, which is not installed`.
+
+**Fix:** `pip install 'sflow[s3]'`.
+
+### 12.2 No AWS Credentials
+
+**Pattern (dry-run):**
+```
+storage target '<name>' (s3): no AWS credentials detected ...
+```
+
+**Cause:** No `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or `AWS_PROFILE` env and no
+`~/.aws/credentials`. (An attached IAM role can't be detected offline.)
+
+**Fix:** Provide credentials via the boto3 chain (env vars, `~/.aws/credentials`, or an
+instance/pod IAM role). **Never put secrets in YAML.**
+
+### 12.3 Unknown Storage Target
+
+**Pattern:**
+```
+Task '<name>' upload references unknown storage target '<target>'. Declared targets: ...
+```
+or `workflow.upload_all references unknown storage target '<target>'`.
+
+**Fix:** Declare a matching entry under the top-level `storage:` block, or fix the `target:`.
+
+### 12.4 Glob `to` Must End With `/`
+
+**Pattern:**
+```
+upload 'to' must end with '/' when 'from' contains a glob pattern ...
+```
+
+**Cause:** A literal `to:` against a glob `from:` is ambiguous across runs.
+
+**Fix:** End `to:` with `/` (directory) or omit it.
+
+### 12.5 Upload Failure at Runtime
+
+**Cause:** Bucket/region/endpoint wrong, network, or permissions. Uploads are **not** retried
+by the task's `retries:` block.
+
+**Fix:** For a hard failure, set `on_error: fail` only when the upload IS the deliverable;
+otherwise `warn` (default) keeps the task `COMPLETED`. Verify `bucket`/`region`/`endpoint_url`.
+
+---
+
+## 13. Schema Validation Errors
+
+### 13.1 Operator `type: docker` (use `docker_run`)
+
+**Pattern:**
+```
+Operator type 'docker' is not valid; use `type: docker_run` for the Docker launch operator.
+```
+
+**Fix:** Use `type: docker_run` for the operator. The Docker **backend** is `type: docker`, but its launch operator is `type: docker_run`.
+
+### 13.2 Result Parsing Validation
+
+**Patterns:**
+```
+result.patterns and result.file are mutually exclusive in this release
+result.file must point to a JSON source path ending in '.json'; for a metric named 'file', use result.patterns
+```
+
+**Fix:** Use either `patterns:` or `file:` (not both); `result.file` must end in `.json`.
+
+### 13.3 Monitor Validation
+
+**Patterns:**
+```
+monitor interval must be >= 100ms (got <N>); ...
+monitor.scopes is set but no scope is active; enable at least one built-in scope (...) or add scopes.custom
+workflow.monitor.resources.used_by_tasks refers to unknown task '<ref>'
+```
+
+**Fix:** Use an `interval` >= 100 (ms); enable at least one scope when `scopes:` is present;
+ensure `used_by_tasks` names existing tasks.

@@ -14,6 +14,8 @@ from sflow.core.state import SflowState
 from sflow.core.task_graph import TaskGraph
 from sflow.core.variable import Variable, VariableType
 from sflow.core.workflow import Workflow
+from sflow.plugins.backends.docker import DockerBackend
+from sflow.plugins.backends.kubernetes import KubernetesBackend
 from sflow.plugins.backends.slurm import SlurmBackend
 
 
@@ -233,3 +235,97 @@ def test_resolve_backends_instantiates_cpu_only_slurm_backend():
     backend = state.backends["cpu_cluster"]
     assert isinstance(backend, SlurmBackend)
     assert backend._gpu_per_node == 0
+
+
+def test_resolve_backends_instantiates_docker_backend_with_resolved_fields():
+    config = SflowConfig(
+        version="0.1",
+        variables=[
+            {"name": "IMAGE", "value": "ubuntu:22.04", "type": "string"},
+        ],
+        backends=[
+            {
+                "name": "docker",
+                "type": "docker",
+                "default": True,
+                "image": "${{ variables.IMAGE }}",
+                "nodes": 2,
+                "gpus_per_node": 4,
+            }
+        ],
+        workflow=_minimal_workflow(),
+    )
+
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+    state = resolve_global_variables(config, state)
+    state = resolve_backends(config, state)
+
+    backend = state.backends["docker"]
+    assert isinstance(backend, DockerBackend)
+    assert backend._image == "ubuntu:22.04"
+    assert backend._nodes == 2
+    assert backend._gpu_per_node == 4
+
+
+def test_resolve_backends_instantiates_kubernetes_backend_with_resolved_fields():
+    config = SflowConfig(
+        version="0.1",
+        variables=[
+            {"name": "IMAGE", "value": "ubuntu:22.04", "type": "string"},
+            {"name": "NAMESPACE", "value": "bench", "type": "string"},
+        ],
+        backends=[
+            {
+                "name": "k8s",
+                "type": "kubernetes",
+                "default": True,
+                "namespace": "${{ variables.NAMESPACE }}",
+                "nodes": 2,
+                "gpus_per_node": 0,
+            }
+        ],
+        workflow=_minimal_workflow(),
+    )
+
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+    state = resolve_global_variables(config, state)
+    state = resolve_backends(config, state)
+
+    backend = state.backends["k8s"]
+    assert isinstance(backend, KubernetesBackend)
+    # The kubernetes backend no longer carries an image (operators own images).
+    assert not hasattr(backend, "_image")
+    assert backend._namespace == "bench"
+    assert backend._nodes == 2
+    assert backend._gpu_per_node == 0
+
+
+def test_resolve_backends_applies_cli_kubectl_config():
+    from sflow.core.kubectl_config import KubectlConfig
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "k8s",
+                "type": "kubernetes",
+                "default": True,
+                "namespace": "default",
+            }
+        ],
+        workflow=_minimal_workflow(),
+    )
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+    state = resolve_global_variables(config, state)
+    state = resolve_backends(
+        config,
+        state,
+        kubectl_config=KubectlConfig(
+            kubeconfig="/k/cfg", context="ctx", namespace="cli-ns"
+        ),
+    )
+
+    backend = state.backends["k8s"]
+    assert backend.kubectl_global_args == ["--kubeconfig", "/k/cfg", "--context", "ctx"]
+    # --kube-namespace overrides the recipe namespace.
+    assert backend.namespace == "cli-ns"

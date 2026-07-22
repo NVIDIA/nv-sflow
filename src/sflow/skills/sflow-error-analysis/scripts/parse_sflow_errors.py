@@ -214,6 +214,115 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="File not found at runtime",
         fix="Check file paths. Ensure model/data paths are accessible inside the container.",
     ),
+    # Schema / rename (config)
+    ErrorPattern(
+        category="config",
+        pattern=re.compile(r"Operator type 'docker' is not valid"),
+        description="Operator type 'docker' is not valid (use 'docker_run')",
+        fix="Use `type: docker_run` for the operator. The Docker backend is `type: docker`.",
+    ),
+    ErrorPattern(
+        category="config",
+        pattern=re.compile(
+            r"operator override key\(s\) not valid for operator '(.+?)'"
+        ),
+        description="Task operator override key not a field of that operator",
+        fix="Fix the typo, or move a backend-specific operator setting onto that "
+        "operator in the backend fragment (deep-merged per backend) instead of the task.",
+    ),
+    ErrorPattern(
+        category="config",
+        pattern=re.compile(
+            r"result\.patterns and result\.file are mutually exclusive"
+        ),
+        description="result.patterns and result.file both set",
+        fix="Use either `patterns:` or `file:` in a task `result:`, not both.",
+    ),
+    ErrorPattern(
+        category="config",
+        pattern=re.compile(r"result\.file must point to a JSON source path"),
+        description="result.file is not a .json path",
+        fix="`result.file` must end in '.json'. For a metric named 'file', use `patterns:`.",
+    ),
+    ErrorPattern(
+        category="config",
+        pattern=re.compile(r"monitor interval must be >= (\d+)ms"),
+        description="monitor interval below floor",
+        fix="Set monitor `interval` (ms) at or above the minimum (100ms).",
+    ),
+    ErrorPattern(
+        category="config",
+        pattern=re.compile(r"used_by_tasks refers to unknown task"),
+        description="monitor used_by_tasks references unknown task",
+        fix="Point monitor.resources.used_by_tasks at existing task names.",
+    ),
+    # Kubernetes
+    ErrorPattern(
+        category="kubernetes",
+        pattern=re.compile(r"ImagePullBackOff|ErrImagePull"),
+        description="Kubernetes image pull failed",
+        fix="Fix the k8s operator `image`; add `image_pull_secrets` for private registries.",
+    ),
+    ErrorPattern(
+        category="kubernetes",
+        pattern=re.compile(r"FailedScheduling|[Ii]nsufficient nvidia\.com/gpu"),
+        description="Pod could not be scheduled (no capacity / selector)",
+        fix="Check gpus_per_node vs real capacity, scheduling mode, node_selector/tolerations, and that gpus.count is a multiple of the node count.",
+    ),
+    ErrorPattern(
+        category="kubernetes",
+        pattern=re.compile(r"\(Forbidden\)|forbidden:|auth can-i|is not allowed"),
+        description="Kubernetes RBAC / preflight permission denied",
+        fix="Grant the required RBAC or use a namespace where you have it. Bypass with SFLOW_SKIP_K8S_PREFLIGHT=1.",
+    ),
+    ErrorPattern(
+        category="kubernetes",
+        pattern=re.compile(
+            r"Unable to connect to the server|connection to the server.*refused|namespaces \".+\" not found"
+        ),
+        description="Kubernetes cluster/namespace unreachable",
+        fix="Fix --kubeconfig/--kube-context/--kube-namespace; verify the cluster is reachable.",
+    ),
+    # Docker
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(r"Cannot connect to the Docker daemon"),
+        description="Docker daemon not reachable",
+        fix="Ensure Docker is running (`docker info`). For remote hosts check docker_host/context.",
+    ),
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(
+            r"could not select device driver|docker: Error response from daemon"
+        ),
+        description="docker run error (GPU driver / daemon)",
+        fix="For GPUs, install the NVIDIA container toolkit and set gpus_per_node. Check image, mounts, extra_args.",
+    ),
+    # Storage / uploads
+    ErrorPattern(
+        category="storage",
+        pattern=re.compile(r"requires boto3"),
+        description="S3 storage requires boto3",
+        fix="Install with: pip install 'sflow[s3]'",
+    ),
+    ErrorPattern(
+        category="storage",
+        pattern=re.compile(r"no AWS credentials detected"),
+        description="No AWS credentials for S3 upload",
+        fix="Provide credentials via the boto3 chain (env vars, ~/.aws/credentials, or IAM role). Never put secrets in YAML.",
+    ),
+    ErrorPattern(
+        category="storage",
+        pattern=re.compile(r"upload references unknown storage target"),
+        description="Upload target not declared",
+        fix="Declare a matching entry under top-level `storage:` or fix the upload `target:`.",
+    ),
+    ErrorPattern(
+        category="storage",
+        pattern=re.compile(r"upload 'to' must end with '/'"),
+        description="Glob upload 'to' must be a directory",
+        fix="End `to:` with '/' (or omit it) when `from:` is a glob.",
+    ),
     # Batch/CSV
     ErrorPattern(
         category="batch",
@@ -269,6 +378,9 @@ CATEGORY_LABELS = {
     "artifact": "Artifact Validation",
     "merge": "File Merge/Composition",
     "slurm": "SLURM Backend",
+    "kubernetes": "Kubernetes Backend",
+    "docker": "Docker Backend",
+    "storage": "Storage / Uploads",
     "runtime": "Runtime / Task Execution",
     "batch": "Batch / CSV Processing",
     "cli": "CLI Arguments",

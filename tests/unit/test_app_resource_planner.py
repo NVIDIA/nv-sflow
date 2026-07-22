@@ -13,7 +13,7 @@ from sflow.config.schema import (
     TaskConfig,
     WorkflowConfig,
 )
-from sflow.core.backend import Allocation, Backend
+from sflow.core.backend import Allocation, Backend, BackendCapabilities
 from sflow.core.compute_node import ComputeNode
 from sflow.core.operator import Operator
 from sflow.core.state import SflowState
@@ -203,3 +203,57 @@ def test_plan_resource_placements_reuses_inferred_task_completion_gpus():
     assert placements["worker_1"].cuda_visible_devices == "2,3"
     assert placements["worker_2"].cuda_visible_devices == "4,5"
     assert placements["worker_3"].cuda_visible_devices == "6,7"
+
+
+def test_plan_resource_placements_computes_gpu_slice_uniformly_for_non_gpu_env_backend():
+    # supports_gpu_env=False (e.g. Kubernetes): the planner computes the GPU slice
+    # uniformly (so node packing / oversubscription checks stay consistent across
+    # backends); it is simply not injected into the env (Backend.resource_env
+    # returns {}). The count is also carried on the placement.
+    backend = _FakeBackend(
+        "k8s",
+        allocation=Allocation(
+            allocation_id="kubernetes",
+            nodes=[
+                ComputeNode(name="k8s-node0", ip_address="", index=0, num_gpus=8)
+            ],
+            owned=False,
+        ),
+    )
+    backend.capabilities = BackendCapabilities(
+        supports_node_placement=False,
+        supports_gpu_env=False,
+        supports_host_path_mounts=False,
+        has_runtime_node_addresses=False,
+    )
+    state = SflowState(workflow=Workflow(name="wf", task_graph=TaskGraph()))
+    state.backends = {"k8s": backend}
+    state.default_backend = backend
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="serve",
+                    script=["python serve.py"],
+                    resources=ResourcesConfig(gpus=GpuResourceConfig(count=4)),
+                ),
+            ],
+        ),
+    )
+
+    placements = plan_resource_placements(
+        config,
+        state,
+        resolver=ExpressionResolver(),
+        ctx={"variables": {}, "workflow": {"name": "wf"}},
+        replica_names_by_base={"serve": ["serve"]},
+        replica_policy_by_base={"serve": "parallel"},
+    )
+
+    placement = placements["serve"]
+    assert placement.gpu_count == 4
+    # The slice is computed uniformly (not None); it just won't be injected as env.
+    assert placement.cuda_visible_devices == "0,1,2,3"
+    assert placement.assigned_nodes == []

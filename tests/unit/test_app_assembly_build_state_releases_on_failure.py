@@ -50,7 +50,9 @@ def test_build_state_releases_backends_when_build_task_graph_raises(monkeypatch)
         state.default_backend = backend
         return state
 
-    def _fake_resolve_backends(config: SflowConfig, state: SflowState) -> SflowState:
+    def _fake_resolve_backends(
+        config: SflowConfig, state: SflowState, *, kubectl_config=None
+    ) -> SflowState:
         # Keep as no-op; allocate_backends will populate backends.
         return state
 

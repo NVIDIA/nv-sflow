@@ -1,0 +1,88 @@
+version: "0.1"
+
+# Integration scenario for the new consolidated `result` task entry.
+# See docs/developer/dev-notes/result-parsing.md.
+#
+# Three tasks:
+#   - benchmark_log:       regex map -> parsed from task log
+#   - benchmark_file:      file source -> direct-write to $SFLOW_TASK_RESULT_FILE
+#   - verify:              downstream task asserting on result.json + results.json
+
+backends:
+  - name: local
+    type: local
+    default: true
+    nodes: 1
+
+workflow:
+  name: local_result
+
+  tasks:
+    - name: benchmark_log
+      script:
+        # Single block scalar so embedded `: ` in echoed text isn't parsed as a YAML mapping.
+        - |
+          echo "warming up"
+          echo "TTFT: 40.0 ms"
+          echo "TTFT: 42.5 ms"
+          echo "tok/s: 123.0"
+          echo "p99 latency: 88 ms"
+      result:
+        # Simple regex map: each entry compiles to {type: auto, aggregate: last,
+        # source: log, required: false}.
+        ttft: 'TTFT:\s*([0-9.]+)\s*ms'
+        tps: 'tok/s:\s*([0-9.]+)'
+        latency_p99: 'p99 latency:\s*([0-9.]+)\s*ms'
+
+    - name: benchmark_file
+      script:
+        # Tasks can also write canonical result.json directly via $SFLOW_TASK_RESULT_FILE.
+        # In this case the source path == the canonical path; sflow re-normalizes it.
+        # Whole line must be quoted because the JSON literal contains `: ` which
+        # YAML would otherwise interpret as a mapping indicator.
+        - |
+          echo '{"throughput": 999.5, "errors": 0}' > "$SFLOW_TASK_RESULT_FILE"
+      result:
+        file: result.json
+
+    - name: verify
+      depends_on: [benchmark_log, benchmark_file]
+      script:
+        - |
+          set -euo pipefail
+
+          log_result="$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_log/result.json"
+          file_result="$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_file/result.json"
+          index="$SFLOW_WORKFLOW_RESULT_FILE"
+
+          echo "Checking per-task result.json files..."
+          test -f "$log_result"
+          test -f "$file_result"
+
+          echo "Checking workflow-level results.json index..."
+          test -f "$index"
+
+          echo "Checking benchmark_log values (regex map, default aggregate=last)..."
+          grep -q '"schema_version": "sflow.result.v1"' "$log_result"
+          grep -q '"task": "benchmark_log"' "$log_result"
+          grep -q '"ttft": 42.5' "$log_result"
+          grep -q '"tps": 123.0' "$log_result"
+          grep -q '"latency_p99": 88' "$log_result"
+
+          echo "Checking benchmark_file values (file source)..."
+          grep -q '"schema_version": "sflow.result.v1"' "$file_result"
+          grep -q '"task": "benchmark_file"' "$file_result"
+          grep -q '"throughput": 999.5' "$file_result"
+          grep -q '"errors": 0' "$file_result"
+
+          echo "Checking workflow-level index references both tasks..."
+          grep -q '"schema_version": "sflow.results.v1"' "$index"
+          grep -q '"benchmark_log"' "$index"
+          grep -q '"benchmark_file"' "$index"
+
+          echo "Writing summary file..."
+          # printf (not heredoc) so the file is exactly "ALL_CHECKS_PASSED\n"
+          # without the leading whitespace that an indented heredoc body would
+          # inherit from the YAML block scalar.
+          printf 'ALL_CHECKS_PASSED\n' > "$SFLOW_TASK_OUTPUT_DIR/verify.txt"
+          cat "$SFLOW_TASK_OUTPUT_DIR/verify.txt"
