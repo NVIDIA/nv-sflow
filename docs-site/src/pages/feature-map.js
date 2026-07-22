@@ -4,7 +4,10 @@ import Layout from "@theme/Layout";
 import useBaseUrl from "@docusaurus/useBaseUrl";
 
 export default function FeatureMap() {
-  const featureMapUrl = useBaseUrl("/feature-map.html");
+  // NOTE: the embedded HTML is named `feature-map-embed.html`, not `feature-map.html`.
+  // On clean-URL hosts (e.g. `docusaurus serve`) `/feature-map.html` strips to `/feature-map`,
+  // which is THIS page's route — so embedding it would recurse into this page forever.
+  const featureMapUrl = useBaseUrl("/feature-map-embed.html");
 
   return (
     <Layout noFooter>
