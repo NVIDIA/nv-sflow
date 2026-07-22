@@ -74,26 +74,6 @@ html[data-theme="light"] {
   border-radius: 6px;
 }
 
-/* GitLab icon link in navbar */
-.header-gitlab-link {
-  font-size: 0; /* hide "GitLab" label visually */
-  padding: 0.25rem 0.5rem;
-  color: var(--ifm-navbar-link-color);
-}
-.header-gitlab-link::before {
-  content: "";
-  display: inline-block;
-  width: 20px;
-  height: 20px;
-  background-color: currentColor;
-  /* Use SVG as a mask so the icon automatically adapts to light/dark via `currentColor`. */
-  -webkit-mask: center / contain no-repeat url("/img/gitlab.svg");
-  mask: center / contain no-repeat url("/img/gitlab.svg");
-}
-.header-gitlab-link:hover {
-  color: var(--ifm-color-primary);
-}
-
 /* Links: subtle underline on hover */
 .markdown a {
   text-decoration-thickness: 1px;
