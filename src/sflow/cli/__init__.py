@@ -5,10 +5,59 @@
 SFLOW CLI - Command Line Interface for the sflow workflow orchestrator
 """
 
+from typing import Optional
+
 import typer
+
+from sflow import runtime_info
 
 # Documentation link shown in all --help messages
 DOCS_URL = "https://nvidia.github.io/nv-sflow/"
+
+
+def _git_info() -> str:
+    """Return branch and short hash from git, or empty string if unavailable."""
+    import subprocess
+
+    try:
+        branch = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            .decode()
+            .strip()
+        )
+        sha = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            .decode()
+            .strip()
+        )
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"],
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            .decode()
+            .strip()
+        )
+        suffix = ", dirty" if dirty else ""
+        return f" ({branch} {sha}{suffix})"
+    except Exception:
+        return ""
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(runtime_info.format_runtime_info())
+        raise typer.Exit()
+
 
 # Create the main CLI app
 app = typer.Typer(
@@ -18,6 +67,20 @@ app = typer.Typer(
     no_args_is_help=True,
     epilog=f"Documentation: {DOCS_URL}",
 )
+
+
+@app.callback()
+def main(
+    version: Optional[bool] = typer.Option(
+        None,
+        "--version",
+        "-V",
+        help="Show the version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """SFLOW - Workflow Orchestrator with Pluggable Backends"""
 
 
 def _register_commands() -> None:

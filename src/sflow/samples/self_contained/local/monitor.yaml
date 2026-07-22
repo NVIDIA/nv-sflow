@@ -1,0 +1,38 @@
+# Hardware monitoring demo (local backend, no GPU required).
+#
+# Demonstrates the built-in `monitor:` key at two scopes:
+#   - workflow.monitor : samples the whole pool for the full run
+#   - tasks[*].monitor : bound to the `work` task (cpu + memory only)
+#
+# After the run, see:
+#   <output_dir>/<run_id>/sflow_monitor.log        (terminal overview)
+#   <output_dir>/<run_id>/sflow_monitor/            (raw samples + per-monitor reports)
+#
+# The `gpu` scope degrades gracefully (writes an ERROR row) when nvidia-smi is absent.
+version: "0.1"
+
+workflow:
+  name: local_monitor
+  monitor:
+    interval: 1000
+    report:
+      enabled: true        # format defaults to [csv, svg]
+  tasks:
+    - name: warmup
+      script:
+        - echo "warming up"
+        - sleep 3
+
+    - name: work
+      depends_on: [warmup]
+      script:
+        - echo "doing work"
+        # Busy-loop for ~4s to produce some CPU load for the monitor to capture.
+        - end=$((SECONDS+4)); while [ "$SECONDS" -lt "$end" ]; do :; done
+        - echo "done"
+      monitor:
+        scopes:
+          cpu: {}
+          memory: {}
+        report:
+          enabled: true

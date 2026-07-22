@@ -9,11 +9,16 @@ Per-task subprocess output must always be written to the per-task logger
 ``SFLOW_TASK_STREAM_ATTR`` so sflow.log's file handler can drop it.
 """
 
+import asyncio
 import logging
+import os
 from contextlib import contextmanager
+
+import pytest
 
 import sflow.core.launcher as launcher_mod
 from sflow.core.launcher import (
+    SubprocessLauncher,
     _console_streams_task_output,
     _emit_task_output_line,
 )
@@ -103,6 +108,26 @@ def test_emit_without_output_logger_is_safe():
     assert len(root_cap.records) == 1
 
 
+def test_emit_to_file_false_streams_console_but_not_per_task_log():
+    """Transient progress snapshots stream to the console but not <task>.log."""
+    out_logger, task_cap = _make_output_logger()
+
+    with _capture_root_logger() as root_cap:
+        _emit_task_output_line(
+            "SNAPSHOT",
+            pfx="[t] ",
+            output_logger=out_logger,
+            stream_console=True,
+            to_file=False,
+        )
+
+    # Not written to the per-task log (file stays final-state-only)...
+    assert task_cap.records == []
+    # ...but streamed to the console/TUI, tagged + prefixed.
+    assert len(root_cap.records) == 1
+    assert root_cap.records[0].getMessage() == "[t] SNAPSHOT"
+
+
 def test_console_streams_task_output_follows_tty(monkeypatch):
     class _FakeStdout:
         def __init__(self, tty: bool) -> None:
@@ -116,3 +141,155 @@ def test_console_streams_task_output_follows_tty(monkeypatch):
 
     monkeypatch.setattr(launcher_mod.sys, "stdout", _FakeStdout(False))
     assert _console_streams_task_output() is False
+
+
+# ---------------------------------------------------------------------------
+# Integration: SubprocessLauncher.run_async wires subprocess output through
+# _emit_task_output_line (per-task log always; root only when streaming).
+#
+# The repo blocks real subprocesses in unit tests (pytest_subprocess), so we
+# fake pty/Popen to "run" a process that emits a single pre-written line --
+# the same technique used in tests/unit/test_core_command_log.py.
+# ---------------------------------------------------------------------------
+
+
+class _ExitedProcess:
+    returncode = 0
+
+    def poll(self) -> int:
+        return 0
+
+
+def _fake_one_line_subprocess(monkeypatch, line: bytes = b"ROUTEDLINE\n") -> None:
+    """Patch the launcher so run_async reads a single line without a real exec.
+
+    The pty "master" is the read end of a pipe pre-loaded with ``line`` and then
+    closed (so the launcher sees the line followed by EOF). run_async owns and
+    closes both fds it is handed.
+    """
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, line)
+    os.close(write_fd)
+    slave_fd = os.open(os.devnull, os.O_WRONLY)
+
+    monkeypatch.setattr(launcher_mod.pty, "openpty", lambda: (read_fd, slave_fd))
+    monkeypatch.setattr(
+        launcher_mod.subprocess, "Popen", lambda *a, **k: _ExitedProcess()
+    )
+    monkeypatch.setattr(launcher_mod, "record_active_command", lambda *a, **k: None)
+
+
+@pytest.mark.skipif(
+    launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
+)
+def test_run_async_streams_to_root_with_marker_and_per_task_log_when_tty(monkeypatch):
+    # Force the interactive-TTY decision so output is also echoed to the root logger.
+    monkeypatch.setattr(launcher_mod, "_console_streams_task_output", lambda: True)
+    _fake_one_line_subprocess(monkeypatch)
+
+    out_logger, task_cap = _make_output_logger()
+    with _capture_root_logger() as root_cap:
+        rc = asyncio.run(
+            SubprocessLauncher().run_async(
+                ["bash", "-c", "ignored-fake"],
+                output_logger=out_logger,
+                task_name="t",
+            )
+        )
+
+    assert rc == 0
+    # Per-task log always receives the subprocess output line.
+    assert any("ROUTEDLINE" in r.getMessage() for r in task_cap.records)
+    # TTY: it is also streamed to the root logger, tagged so file handlers drop it.
+    streamed = [r for r in root_cap.records if getattr(r, SFLOW_TASK_STREAM_ATTR, False)]
+    assert any(r.getMessage() == "[t] ROUTEDLINE" for r in streamed)
+
+
+@pytest.mark.skipif(
+    launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
+)
+def test_run_async_collapses_carriage_return_redraws_in_per_task_log(monkeypatch):
+    """A \\r progress line is recorded in <task>.log as its final state only."""
+    monkeypatch.setattr(launcher_mod, "_console_streams_task_output", lambda: False)
+    _fake_one_line_subprocess(
+        monkeypatch,
+        line=b"downloading 10%\rdownloading 50%\rdownloading 100%\ndone\n",
+    )
+
+    out_logger, task_cap = _make_output_logger()
+    with _capture_root_logger():
+        rc = asyncio.run(
+            SubprocessLauncher().run_async(
+                ["bash", "-c", "ignored-fake"],
+                output_logger=out_logger,
+                task_name="t",
+            )
+        )
+
+    assert rc == 0
+    msgs = [r.getMessage() for r in task_cap.records]
+    # Only the final state of the redrawn line is kept, plus the next line.
+    assert msgs == ["downloading 100%", "done"]
+    assert not any("10%" in m or "50%" in m for m in msgs)
+
+
+@pytest.mark.skipif(
+    launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
+)
+def test_run_async_streams_in_progress_progress_snapshot_without_newline(monkeypatch):
+    """An unterminated \\r progress line is surfaced live to the console, and its
+    final state is recorded once in <task>.log (no flood, no duplicate)."""
+    monkeypatch.setattr(launcher_mod, "_console_streams_task_output", lambda: True)
+    _fake_one_line_subprocess(
+        monkeypatch,
+        line=b"downloading 10%\rdownloading 99%",  # no trailing newline
+    )
+
+    out_logger, task_cap = _make_output_logger()
+    with _capture_root_logger() as root_cap:
+        rc = asyncio.run(
+            SubprocessLauncher().run_async(
+                ["bash", "-c", "ignored-fake"],
+                output_logger=out_logger,
+                task_name="t",
+            )
+        )
+
+    assert rc == 0
+    # Console got the live progress snapshot (final collapsed frame).
+    streamed = [
+        r.getMessage()
+        for r in root_cap.records
+        if getattr(r, SFLOW_TASK_STREAM_ATTR, False)
+    ]
+    assert "[t] downloading 99%" in streamed
+    assert not any("10%" in m for m in streamed)
+    # File recorded the final state exactly once (no intermediate frames, no dup).
+    file_msgs = [r.getMessage() for r in task_cap.records]
+    assert file_msgs == ["downloading 99%"]
+
+
+@pytest.mark.skipif(
+    launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
+)
+def test_run_async_keeps_output_off_root_when_not_tty(monkeypatch):
+    # Headless/batch: the per-task output must not reach the root logger at all.
+    monkeypatch.setattr(launcher_mod, "_console_streams_task_output", lambda: False)
+    _fake_one_line_subprocess(monkeypatch)
+
+    out_logger, task_cap = _make_output_logger()
+    with _capture_root_logger() as root_cap:
+        rc = asyncio.run(
+            SubprocessLauncher().run_async(
+                ["bash", "-c", "ignored-fake"],
+                output_logger=out_logger,
+                task_name="t",
+            )
+        )
+
+    assert rc == 0
+    # Per-task log still captures the line ...
+    assert any("ROUTEDLINE" in r.getMessage() for r in task_cap.records)
+    # ... but nothing per-task is streamed to the root logger.
+    streamed = [r for r in root_cap.records if getattr(r, SFLOW_TASK_STREAM_ATTR, False)]
+    assert streamed == []

@@ -1,0 +1,29 @@
+version: "0.1"
+
+variables:
+  MSG:
+    value: hello-from-apply
+
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    namespace: default
+    nodes: 1
+    gpus_per_node: 0
+
+operators:
+  - name: hello
+    type: k8s
+    image: ubuntu:22.04
+
+workflow:
+  name: k8s_apply_validate
+  tasks:
+    - name: hello
+      operator: hello
+      script:
+        - 'echo "MSG=$MSG"'
+        - echo "line 1 (streaming check)"
+        - sleep 3
+        - 'echo "line 2 after 3s -> proves LIVE streaming"'

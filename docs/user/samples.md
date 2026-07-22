@@ -14,11 +14,46 @@ This page contains sample workflow configurations that you can use as starting p
 sflow sample --list
 
 # Copy a sample to your current directory
-sflow sample local_hello_world
+sflow sample self_contained/local/hello_world
 
 # Copy with custom output path
-sflow sample local_dag --output my_workflow.yaml
+sflow sample self_contained/local/dag --output my_workflow.yaml
 ```
+
+> **Agent skills:** beyond samples, `sflow` bundles AI-agent skills for writing and debugging sflow YAML. Copy them into your project with `sflow skill` (`--list` to see them, `-o <dir>` to choose the output directory). See the [CLI reference](./cli.md#sflow-skill).
+
+## Sample catalog
+
+Two families ship with sflow:
+
+- **`self_contained/<backend>/<name>`** — one file, ready to run. Grouped below by backend.
+- **`modular/inference_x_v2`** — a composable recipe set (framework fragments + benchmarks + a CSV sweep). See [Modular inference recipe](#modular-inference-recipe-inference_x_v2).
+
+| Backend | `sflow sample <path>` | What it shows |
+|---------|-----------------------|---------------|
+| local | `self_contained/local/hello_world` | Minimal single task + a variable |
+| local | `self_contained/local/dag` | Multi-task DAG with `depends_on` |
+| local | `self_contained/local/variable_domain` | Variable `domain` (allowed-value validation) |
+| local | `self_contained/local/result_parsing` | Parse metrics from a log/JSON into `result.json` |
+| local | `self_contained/local/storage_upload` | Per-task `uploads:` to an S3 target |
+| local | `self_contained/local/storage_upload_all` | `upload_all:` — zip the whole run and upload |
+| local | `self_contained/local/monitor` | `monitor:` hardware telemetry (GPU/CPU/mem/net) |
+| docker | `self_contained/docker/hello_world` | Single container task via `docker_run` |
+| docker | `self_contained/docker/multi_node` | Multi-host Docker (`docker_host`/`context`) |
+| docker | `self_contained/docker/sglang_qwen3` | SGLang Qwen3 server + client in containers |
+| slurm | `self_contained/slurm/sglang_server_client` | Server + client on Slurm with readiness probes |
+| slurm | `self_contained/slurm/aiperf_template` | AIPerf benchmark template |
+| slurm | `self_contained/slurm/auto_replica` | Replica fan-out sized from a variable sweep |
+| slurm | `self_contained/slurm/resource_release_after` | `release_after` GPU/node lifetimes |
+| slurm | `self_contained/slurm/multi_backend` | One workflow spanning multiple backends |
+| slurm | `self_contained/slurm/trtllm_serve_disagg` | TRT-LLM disaggregated serving |
+| slurm | `self_contained/slurm/infmax_v1_ds_r1` | InfMax DeepSeek-R1 benchmark |
+| slurm | `self_contained/slurm/dynamo_{sglang,vllm,trtllm}_agg` | Dynamo aggregated inference (3 frameworks) |
+| slurm | `self_contained/slurm/dynamo_{sglang,vllm,trtllm}_disagg` | Dynamo prefill/decode disaggregated (3 frameworks) |
+| kubernetes | `self_contained/kubernetes/hello_world` | Single pod via the `k8s` operator |
+| kubernetes | `self_contained/kubernetes/dynamo_trtllm_disagg` | Multi-node MPI (`k8s_mpi`), RDMA, node reservation |
+
+Run `sflow sample --list` for the live list (it annotates each sample with node/GPU needs).
 
 ---
 
@@ -49,8 +84,8 @@ workflow:
 **Run it:**
 
 ```bash
-sflow sample local_hello_world
-sflow run -f local_hello_world.yaml
+sflow sample self_contained/local/hello_world
+sflow run -f hello_world.yaml
 ```
 
 ---
@@ -113,9 +148,163 @@ workflow:
 **Run it:**
 
 ```bash
-sflow sample local_dag
-sflow run -f local_dag.yaml --dry-run  # Validate
-sflow run -f local_dag.yaml            # Execute
+sflow sample self_contained/local/dag
+sflow run -f dag.yaml --dry-run  # Validate
+sflow run -f dag.yaml            # Execute
+```
+
+---
+
+### Result Parsing
+
+Demonstrates the consolidated [`task.result`](./results.md) entry: parsing
+metrics from a task log with a regex map, writing JSON directly to
+`$SFLOW_TASK_RESULT_FILE`, and a downstream task reading the per-task `result.json`
+and workflow-level `results.json` index.
+
+```yaml
+version: "0.1"
+
+backends:
+  - name: local
+    type: local
+    default: true
+    nodes: 1
+
+workflow:
+  name: local_result_parsing
+  tasks:
+    - name: benchmark_log
+      script:
+        - |
+          echo "TTFT: 40.0 ms"
+          echo "TTFT: 42.5 ms"
+          echo "tok/s: 123.0"
+          echo "p99 latency: 88 ms"
+      result:
+        ttft: 'TTFT:\s*([0-9.]+)\s*ms'      # last match wins -> 42.5
+        tps: 'tok/s:\s*([0-9.]+)'
+        latency_p99: 'p99 latency:\s*([0-9.]+)\s*ms'
+
+    - name: benchmark_file
+      script:
+        - |
+          echo '{"throughput": 999.5, "errors": 0}' > "$SFLOW_TASK_RESULT_FILE"
+      result:
+        file: result.json
+
+    - name: verify
+      depends_on: [benchmark_log, benchmark_file]
+      script:
+        - test -f "$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_log/result.json"
+        - test -f "$SFLOW_WORKFLOW_RESULT_FILE"
+```
+
+**Run it:**
+
+```bash
+sflow sample self_contained/local/result_parsing
+sflow run -f result_parsing.yaml
+```
+
+---
+
+### Variable Domain
+
+Sweeps a task across a variable's `domain` values, running one execution per value — a compact way to see replica sweeps without a cluster.
+
+```bash
+sflow sample self_contained/local/variable_domain
+sflow run -f variable_domain.yaml
+```
+
+---
+
+### Storage Upload
+
+Post-execution [uploads](./uploads.md): per-task `uploads:` specs ship logs and result files to a named `storage` target (e.g. S3). `storage_upload` uploads selected files; `storage_upload_all` uses `upload_all` to ship every task's outputs.
+
+```bash
+sflow sample self_contained/local/storage_upload
+sflow run -f storage_upload.yaml
+
+sflow sample self_contained/local/storage_upload_all
+sflow run -f storage_upload_all.yaml
+```
+
+> S3 uploads need the S3 extra: `pip install 'sflow[s3]'` (credentials come from the boto3 default chain).
+
+---
+
+### Workflow Monitor
+
+Attaches a hardware-utilization [monitor](./monitor.md) at the workflow level, sampling GPU/CPU usage during the run and (optionally) rendering charts.
+
+```bash
+sflow sample self_contained/local/monitor
+sflow run -f monitor.yaml
+```
+
+> PNG charts need the monitor extra: `pip install 'sflow[monitor]'`.
+
+---
+
+## Docker Samples
+
+These samples use the local **Docker backend** to run containerized workloads on
+your workstation. They require Docker on PATH (and, for GPU samples, an NVIDIA GPU
+plus the NVIDIA Container Toolkit so `--gpus all` works).
+
+### Hello World (Docker)
+
+The Docker counterpart of the local hello world: runs a one-line task inside a container using the `docker` backend and its default `docker_run` operator.
+
+```bash
+sflow sample self_contained/docker/hello_world
+sflow run -f hello_world.yaml
+```
+
+---
+
+### Multi-Node Docker Hosts
+
+Fans a single task out across an explicit pool of remote Docker hosts (one container per host), demonstrating multi-host placement without Slurm. See [Backends](./backends.md#multi-node-docker-hosts).
+
+```bash
+sflow sample self_contained/docker/multi_node
+sflow run -f multi_node.yaml
+```
+
+---
+
+### SGLang Serving Qwen3-0.6B (Local Container)
+
+`self_contained/docker/sglang_qwen3` is the local-container counterpart of
+`self_contained/slurm/sglang_server_client`: it stands up SGLang serving **Qwen3-0.6B** in a
+container, runs a tiny stdlib client against the OpenAI-compatible API, then runs
+an **AIPerf benchmark** at concurrency 8 — no Slurm required.
+
+Highlights:
+
+- **Local Docker backend** (`type: docker`) with one GPU; the `docker_run`
+  operator launches the SGLang image with `--gpus all --network host`.
+- A **readiness** `log_watch` probe releases downstream tasks only after SGLang
+  prints its "ready to roll" banner, plus a **failure** probe for `Traceback`.
+- The client is a `file://` artifact (stdlib `urllib`), so no extra packages are
+  installed; it reads the model name / prompt / port from sflow-injected env vars.
+- An **AIPerf** task (CPU-only `python:3.12-slim` container) `pip install`s aiperf
+  and benchmarks the server (`--concurrency 8`), mirroring the benchmark task in
+  `self_contained/slurm/dynamo_trtllm_agg`. Results land under the task's output dir.
+
+```bash
+sflow sample self_contained/docker/sglang_qwen3
+sflow run -f sglang_qwen3.yaml
+
+# Validate only
+sflow run -f sglang_qwen3.yaml --dry-run
+
+# Add hardware monitoring without editing the recipe
+sflow run -f sglang_qwen3.yaml --enable-workflow-monitor
 ```
 
 ---
@@ -130,7 +319,7 @@ Deploys an SGLang inference server with AIPerf benchmarking on Slurm.
 
 **Features:**
 - SGLang server with FP8 inference
-- GPU monitoring
+- Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - AIPerf benchmarking client
 - Readiness probes for service orchestration
 
@@ -265,29 +454,6 @@ workflow:
           timeout: 1200
           interval: 2
 
-    - name: gpu_monitor
-      operator: sglang_runtime
-      script:
-        - echo "Starting gpu monitor"
-        - >
-          nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,clocks.sm,clocks.mem,memory.total,memory.used 
-          --format=csv,noheader,nounits -lms 2000 | 
-          while IFS= read -r input || [ -n "$input" ] ; 
-          do timestamp=$(date +%s%3N); 
-          printf "%s.%s,%s\n" "${timestamp:0:10}" "${timestamp:10:3}" "${input}"; 
-          done 
-          >> ${SFLOW_TASK_OUTPUT_DIR}/gpu_monitor_node_${SLURM_NODEID}_${SLURMD_NODENAME}.log
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "Starting gpu monitor"
-      resources:
-        nodes:
-          indices: [0]
-      depends_on:
-        - load_image
-        - install_aiperf
-    
     - name: sglang_server
       operator: sglang_runtime
       replicas:
@@ -349,6 +515,15 @@ workflow:
       resources:
         nodes:
           indices: [0]
+      # Sample the SERVER's resources from this benchmark task (used_by_tasks),
+      # not the benchmark client's own node, so the report captures the server's
+      # GPU/CPU usage over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - sglang_server
+        report:
+          enabled: true
       depends_on:
         - sglang_server
         - install_aiperf
@@ -357,16 +532,16 @@ workflow:
 **Run it:**
 
 ```bash
-sflow sample slurm_sglang_server_client
+sflow sample self_contained/slurm/sglang_server_client
 
 # Validate configuration
-sflow run -f slurm_sglang_server_client.yaml \
+sflow run -f sglang_server_client.yaml \
   --set SLURM_ACCOUNT=your_account \
   --set SLURM_PARTITION=your_partition \
   --dry-run
 
 # Submit to Slurm
-sflow batch -f slurm_sglang_server_client.yaml \
+sflow batch -f sglang_server_client.yaml \
   -A your_account -p your_partition -N 1 -G 4 \
   --sbatch-path sglang_job.sh --submit
 ```
@@ -589,16 +764,16 @@ workflow:
 **Run it:**
 
 ```bash
-sflow sample slurm_dynamo_trtllm_disagg
+sflow sample self_contained/slurm/dynamo_trtllm_disagg
 
 # Validate configuration
-sflow run -f slurm_dynamo_trtllm_disagg.yaml \
+sflow run -f dynamo_trtllm_disagg.yaml \
   --set SLURM_ACCOUNT=your_account \
   --set SLURM_PARTITION=your_partition \
   --dry-run
 
 # Submit to Slurm
-sflow batch -f slurm_dynamo_trtllm_disagg.yaml \
+sflow batch -f dynamo_trtllm_disagg.yaml \
   -A your_account -p your_partition -N 1 -G 4 \
   --sbatch-path dynamo_job.sh --submit
 ```
@@ -613,7 +788,7 @@ Deploys a disaggregated inference setup with separate prefill and decode servers
 - Disaggregated prefill/decode architecture with `trtllm-serve`
 - Dynamic configuration using file-type artifacts with backend node IP resolution
 - Configurable tensor parallelism for prefill and decode servers
-- GPU monitoring task
+- Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - Sequential benchmark sweeps with variable domains
 - Failure probes for error detection
 
@@ -844,6 +1019,16 @@ workflow:
         policy: sequential
       script:
         - aiperf profile --concurrency ${CONCURRENCY} --url http://${HEAD_NODE_IP}:8000 ...
+      # Sample the prefill/decode SERVERS' resources from this benchmark task
+      # (used_by_tasks), not the benchmark client's own node, so the report
+      # captures the servers' GPU/CPU usage over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
       depends_on:
         - prefill_server
         - decode_server
@@ -853,16 +1038,16 @@ workflow:
 **Run it:**
 
 ```bash
-sflow sample slurm_trtllm_serve_disagg
+sflow sample self_contained/slurm/trtllm_serve_disagg
 
 # Validate configuration
-sflow run -f slurm_trtllm_serve_disagg.yaml \
+sflow run -f trtllm_serve_disagg.yaml \
   --set SLURM_ACCOUNT=your_account \
   --set SLURM_PARTITION=your_partition \
   --dry-run
 
 # Submit to Slurm
-sflow batch -f slurm_trtllm_serve_disagg.yaml \
+sflow batch -f trtllm_serve_disagg.yaml \
   -A your_account -p your_partition -N 1 -G 4 \
   --sbatch-path trtllm_disagg_job.sh --submit
 ```
@@ -877,7 +1062,7 @@ A production-ready multi-node disaggregated inference setup optimized for large 
 - Multi-node deployment (default 3 nodes with 4 GPUs each)
 - Disaggregated prefill/decode architecture with configurable parallelism
 - NATS and etcd for service discovery
-- GPU monitoring across all nodes
+- Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - MoE (Mixture of Experts) optimization parameters
 - Sequential benchmark sweeps with variable domains
 - File-type artifacts for dynamic server configuration
@@ -1005,18 +1190,6 @@ workflow:
             regex_pattern: "Image Loaded"
           timeout: 1200
 
-    - name: gpu_monitor
-      operator:
-        name: dynamo_trtllm
-        ntasks_per_node: 1
-      resources:
-        nodes:
-          count: ${{ variables.SLURM_NODES }}
-      script:
-        - nvidia-smi monitoring...
-      depends_on:
-        - load_image
-
     - name: nats_server
       operator: dynamo_trtllm
       script:
@@ -1116,6 +1289,16 @@ workflow:
         policy: sequential
       script:
         - aiperf profile --concurrency ${CONCURRENCY} ...
+      # Sample the prefill/decode SERVERS' resources from this benchmark task
+      # (used_by_tasks), not the benchmark client's own node, so the report
+      # captures the servers' GPU/CPU usage over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
       depends_on:
         - prefill_server
         - decode_server
@@ -1125,18 +1308,69 @@ workflow:
 **Run it:**
 
 ```bash
-sflow sample slurm_infmax_v1_ds_r1
+sflow sample self_contained/slurm/infmax_v1_ds_r1
 
 # Validate configuration
-sflow run -f slurm_infmax_v1_ds_r1.yaml \
+sflow run -f infmax_v1_ds_r1.yaml \
   --set SLURM_ACCOUNT=your_account \
   --set SLURM_PARTITION=your_partition \
   --dry-run
 
 # Submit to Slurm (multi-node)
-sflow batch -f slurm_infmax_v1_ds_r1.yaml \
+sflow batch -f infmax_v1_ds_r1.yaml \
   -A your_account -p your_partition -N 3 -G 4 \
   --sbatch-path infmax_job.sh --submit
+```
+
+---
+
+### More Slurm Samples
+
+Additional single-file Slurm workflows (copy with `sflow sample self_contained/slurm/<name>`, then `sflow run`/`sflow batch`):
+
+| Sample | Description |
+|--------|-------------|
+| `dynamo_sglang_agg` | Dynamo + SGLang **aggregated** serving (single server) with NATS/etcd/frontend and an AIPerf benchmark |
+| `dynamo_sglang_disagg` | Dynamo + SGLang **disaggregated** prefill/decode serving |
+| `dynamo_vllm_agg` | Dynamo + vLLM **aggregated** serving |
+| `dynamo_vllm_disagg` | Dynamo + vLLM **disaggregated** prefill/decode serving |
+| `dynamo_trtllm_agg` | Dynamo + TensorRT-LLM **aggregated** serving |
+| `multi_backend` | A single workflow spanning more than one backend |
+| `resource_release_after` | GPU `release_after` semantics for freeing resources between phases |
+| `auto_replica` | Auto replica detection with per-replica node/GPU assignment |
+| `aiperf_template` | Minimal single-task AIPerf benchmarking template |
+
+```bash
+sflow sample self_contained/slurm/dynamo_sglang_agg
+sflow run -f dynamo_sglang_agg.yaml \
+  --set SLURM_ACCOUNT=your_account --set SLURM_PARTITION=your_partition --dry-run
+```
+
+---
+
+## Kubernetes Samples
+
+These samples run on the **Kubernetes backend**, which reserves nodes and schedules each task as pod(s). Cluster selection and credentials are CLI flags (`--kubeconfig`, `--kube-context`, `--kube-namespace`, `--kube-node-selector`, …), so the recipe stays cluster-agnostic. See [Backends](./backends.md#kubernetes-backend).
+
+### Hello World (Kubernetes)
+
+A minimal pod task using a `k8s` operator (the workload image lives on the operator, since the backend has no image of its own).
+
+```bash
+sflow sample self_contained/kubernetes/hello_world
+sflow run -f hello_world.yaml \
+  --kube-namespace my-namespace --kube-node-selector tenant=my-pool
+```
+
+### Dynamo TRT-LLM Disaggregated (Kubernetes)
+
+The Kubernetes counterpart of the Slurm Dynamo TRT-LLM disaggregated sample: NATS/etcd/frontend plus prefill/decode servers scheduled as GPU pods, benchmarked with AIPerf.
+
+```bash
+sflow sample self_contained/kubernetes/dynamo_trtllm_disagg
+sflow run -f dynamo_trtllm_disagg.yaml \
+  -a LOCAL_MODEL_PATH=fs:///mnt/model-cache/your-model \
+  --kube-namespace my-namespace --kube-node-selector tenant=my-pool
 ```
 
 ---
@@ -1145,14 +1379,24 @@ sflow batch -f slurm_infmax_v1_ds_r1.yaml \
 
 | Sample | Concepts |
 |--------|----------|
-| `local_hello_world` | Variables, basic task execution |
-| `local_dag` | Task dependencies, parallel execution, built-in env vars |
-| `slurm_sglang_server_client` | Slurm backend, operators, probes, replicas, GPU resources |
-| `slurm_dynamo_trtllm_disagg` | Service discovery (NATS/etcd), retry policies, multi-process tasks |
-| `slurm_trtllm_serve_disagg` | Artifacts with backend IP resolution, failure probes, variable sweeps |
-| `slurm_infmax_v1_ds_r1` | Multi-node deployment, MoE optimization, GPU monitoring, file artifacts |
-| `slurm_auto_replica` | Auto replica detection, task context, node/GPU assignment |
-| `slurm_aiperf_template` | AIPerf benchmarking template, simple single-task workflow |
+| `self_contained/local/hello_world` | Variables, basic task execution |
+| `self_contained/local/dag` | Task dependencies, parallel execution, built-in env vars |
+| `self_contained/local/variable_domain` | Variable `domain` sweeps (one run per value) |
+| `self_contained/local/result_parsing` | Regex/JSON result parsing into `result.json` / `results.json` |
+| `self_contained/local/storage_upload` | Per-task `uploads:` to a storage target (e.g. S3) |
+| `self_contained/local/storage_upload_all` | `upload_all` to ship every task's outputs |
+| `self_contained/local/monitor` | Workflow-level hardware monitor and charts |
+| `self_contained/docker/hello_world` | Local Docker backend, `docker_run` operator |
+| `self_contained/docker/multi_node` | Multi-host Docker pool, one container per host |
+| `self_contained/docker/sglang_qwen3` | Local Docker backend, containerized LLM serving (SGLang + Qwen3-0.6B), readiness/failure probes, file:// client script |
+| `self_contained/slurm/sglang_server_client` | Slurm backend, operators, probes, replicas, GPU resources |
+| `self_contained/slurm/dynamo_trtllm_disagg` | Service discovery (NATS/etcd), retry policies, multi-process tasks |
+| `self_contained/slurm/trtllm_serve_disagg` | Artifacts with backend IP resolution, failure probes, variable sweeps |
+| `self_contained/slurm/infmax_v1_ds_r1` | Multi-node deployment, MoE optimization, GPU monitoring, file artifacts |
+| `self_contained/slurm/auto_replica` | Auto replica detection, task context, node/GPU assignment |
+| `self_contained/slurm/aiperf_template` | AIPerf benchmarking template, simple single-task workflow |
+| `self_contained/kubernetes/hello_world` | Kubernetes backend, `k8s` operator, pod scheduling |
+| `self_contained/kubernetes/dynamo_trtllm_disagg` | Disaggregated inference on Kubernetes GPU pods |
 
 ---
 
@@ -1181,11 +1425,21 @@ inference_x_v2/
 │   ├── prefill.yaml           # vLLM prefill server task (disaggregated)
 │   ├── decode.yaml            # vLLM decode server task (disaggregated)
 │   └── agg.yaml               # vLLM aggregated server task
-└── trtllm/
-    ├── prefill.yaml           # TRT-LLM prefill server task (disaggregated)
-    ├── decode.yaml            # TRT-LLM decode server task (disaggregated)
-    └── agg.yaml               # TRT-LLM aggregated server task
+├── trtllm/
+│   ├── prefill.yaml           # TRT-LLM prefill server task (disaggregated)
+│   ├── decode.yaml            # TRT-LLM decode server task (disaggregated)
+│   └── agg.yaml               # TRT-LLM aggregated server task
+└── composed_recipes/          # Pre-composed, ready-to-run single-file recipes
+    ├── trtllm_agg_benchmark_aiperf_1n_007.yaml
+    ├── trtllm_prefill_decode_benchmar_001.yaml
+    ├── vllm_prefill_decode_benchmark_005.yaml
+    ├── sglang_agg_benchmark_aiperf_2n_008.yaml
+    └── ...                    # one worked example per framework / topology
 ```
+
+The `composed_recipes/` folder holds fully-merged single-file recipes — the same
+artifacts a `--bulk-input` sweep produces from the fragments above. Use them as
+copy-paste starting points or to see exactly what deep-merge yields.
 
 The `bulk_input.csv` supports both disaggregated and aggregated workflows using the `missable_tasks` column:
 - Disagg rows include `prefill.yaml + decode.yaml` and set `missable_tasks=agg_server`
@@ -1194,7 +1448,7 @@ The `bulk_input.csv` supports both disaggregated and aggregated workflows using 
 **Copy the modular sample:**
 
 ```bash
-sflow sample inference_x_v2
+sflow sample modular/inference_x_v2
 ```
 
 **Usage Option A: Bulk batch (CSV-driven)**

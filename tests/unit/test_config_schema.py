@@ -104,6 +104,80 @@ class TestSflowConfigSchema:
         assert config.workflow.tasks[1].depends_on == ["other_task"]
         assert config.backends[0].default is True
 
+    def test_resource_release_after_accepts_independent_node_and_gpu_policies(self):
+        """resources.nodes/gpus.release_after should allow different policies."""
+        config = SflowConfig.model_validate({
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {
+                        "name": "t1",
+                        "script": ["echo 1"],
+                        "resources": {
+                            "nodes": {
+                                "indices": [0],
+                                "release_after": "workflow_completion",
+                            },
+                            "gpus": {
+                                "count": 8,
+                                "release_after": "task_completion",
+                            },
+                        },
+                    }
+                ],
+            },
+        })
+
+        resources = config.workflow.tasks[0].resources
+        assert resources.nodes.release_after == "workflow_completion"
+        assert resources.gpus.release_after == "task_completion"
+
+    def test_resource_release_after_defaults_to_workflow_completion(self):
+        """Unannotated resources retain the current conservative lifetime."""
+        config = SflowConfig.model_validate({
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {
+                        "name": "t1",
+                        "script": ["echo 1"],
+                        "resources": {
+                            "nodes": {"count": 1},
+                            "gpus": {"count": 1},
+                        },
+                    }
+                ],
+            },
+        })
+
+        resources = config.workflow.tasks[0].resources
+        assert resources.nodes.release_after == "workflow_completion"
+        assert resources.gpus.release_after == "workflow_completion"
+
+    def test_resource_release_after_rejects_invalid_policy(self):
+        """release_after only accepts documented resource lifetime policies."""
+        with pytest.raises(ValidationError, match="release_after"):
+            SflowConfig.model_validate({
+                "version": "0.1",
+                "workflow": {
+                    "name": "wf",
+                    "tasks": [
+                        {
+                            "name": "t1",
+                            "script": ["echo 1"],
+                            "resources": {
+                                "gpus": {
+                                    "count": 1,
+                                    "release_after": "after_launch",
+                                },
+                            },
+                        }
+                    ],
+                },
+            })
+
     def test_variable_config(self):
         """
         REQ-1.3: Variable System. Support strongly typed variables.
@@ -203,6 +277,27 @@ class TestSflowConfigSchema:
             ]
         )
         assert len(probes.readiness) == 2
+
+        # Backwards compatibility: the old single failure probe object is still valid.
+        failure_probe = ProbeConfig(
+            log_watch=LogWatchProbeConfig(match_pattern="Traceback")
+        )
+        probes = ProbesConfig(failure=failure_probe)
+        assert probes.failure == failure_probe
+
+        # Multiple failure probes are allowed and evaluated as an OR at runtime.
+        probes = ProbesConfig(
+            failure=[
+                ProbeConfig(log_watch=LogWatchProbeConfig(match_pattern="Traceback")),
+                ProbeConfig(
+                    log_watch=LogWatchProbeConfig(match_pattern="RuntimeError")
+                ),
+            ]
+        )
+        assert len(probes.failure) == 2
+
+        with pytest.raises(ValidationError, match="failure probe list cannot be empty"):
+            ProbesConfig(failure=[])
 
     def test_task_config_required_fields(self):
         """
@@ -305,6 +400,22 @@ class TestSflowConfigSchema:
         )
         assert cfg.backends is not None
         assert {b.type for b in cfg.backends} == {"slurm", "local"}
+
+    def test_legacy_docker_operator_type_rejected_with_hint(self):
+        """A legacy operator `type: docker` should raise a hint to use `docker_run`."""
+        with pytest.raises(ValidationError, match="docker_run"):
+            SflowConfig.model_validate(
+                {
+                    "version": "0.1",
+                    "operators": [
+                        {"name": "legacy", "type": "docker", "image": "nvcr.io/x/y:1"}
+                    ],
+                    "workflow": {
+                        "name": "wf",
+                        "tasks": [{"name": "t1", "script": ["echo 1"]}],
+                    },
+                }
+            )
 
     def test_retry_config(self):
         """
@@ -415,6 +526,21 @@ class TestValidateNodeExcludeIndices:
         )
         validate_node_exclude_indices(cfg)
 
+    def test_backend_planning_node_count_hook_used(self, monkeypatch):
+        """Exclude validation should use the backend config hook, not raw attr access."""
+        cfg = _make_config(nodes_val=3, exclude_val=[3])
+        backend = cfg.backends[0]
+        monkeypatch.setattr(
+            type(backend),
+            "planning_node_count",
+            lambda self: 3,
+            raising=False,
+        )
+        backend.nodes = None
+
+        with pytest.raises(ValueError, match="out of range for 3 allocated"):
+            validate_node_exclude_indices(cfg)
+
     def test_unresolvable_variable_skipped(self):
         """When the variable is not defined, validation is skipped."""
         cfg = _make_config(
@@ -512,3 +638,125 @@ class TestValidateNodeExcludeIndices:
         })
         with pytest.raises(ValueError, match="bad_task.*out of range"):
             validate_node_exclude_indices(cfg)
+
+
+def test_task_ports_accepts_int_expression_and_optional_name():
+    task = TaskConfig(
+        name="frontend",
+        script=["python serve.py"],
+        ports=[
+            {"name": "http", "port": 8000},
+            {"port": "${{ variables.PORT }}"},
+        ],
+    )
+    assert task.ports is not None
+    assert task.ports[0].name == "http"
+    assert task.ports[0].port == 8000
+    assert task.ports[1].name is None
+    assert task.ports[1].port == "${{ variables.PORT }}"
+
+
+def test_task_ports_rejects_unknown_field():
+    with pytest.raises(ValidationError):
+        TaskConfig(
+            name="frontend",
+            script=["echo hi"],
+            ports=[{"port": 8000, "protocol": "tcp"}],
+        )
+
+
+class TestRequiredBy:
+    """`required_by` is the reverse pointer of `depends_on` and is folded into
+    the targets' `depends_on` at validation time."""
+
+    @staticmethod
+    def _cfg(tasks):
+        return SflowConfig.model_validate(
+            {"version": "0.1", "workflow": {"name": "wf", "tasks": tasks}}
+        )
+
+    def _deps(self, cfg):
+        return {t.name: (t.depends_on or []) for t in cfg.workflow.tasks}
+
+    def test_required_by_folds_into_downstream_depends_on(self):
+        cfg = self._cfg(
+            [
+                {"name": "server", "script": ["s"], "required_by": ["benchmark"]},
+                {"name": "benchmark", "script": ["b"]},
+            ]
+        )
+        assert self._deps(cfg) == {"server": [], "benchmark": ["server"]}
+
+    def test_required_by_equivalent_to_depends_on(self):
+        """A workflow using required_by yields the same depends_on graph as the
+        equivalent depends_on workflow."""
+        via_required_by = self._deps(
+            self._cfg(
+                [
+                    {"name": "a", "script": ["a"], "required_by": ["c"]},
+                    {"name": "b", "script": ["b"], "required_by": ["c"]},
+                    {"name": "c", "script": ["c"]},
+                ]
+            )
+        )
+        via_depends_on = self._deps(
+            self._cfg(
+                [
+                    {"name": "a", "script": ["a"]},
+                    {"name": "b", "script": ["b"]},
+                    {"name": "c", "script": ["c"], "depends_on": ["a", "b"]},
+                ]
+            )
+        )
+        assert via_required_by == via_depends_on
+
+    def test_absent_target_is_skipped(self):
+        """A required_by target absent from the merged task set is dropped
+        silently (no validation error) -- this is what removes the need for
+        --missable-tasks in the forward direction."""
+        cfg = self._cfg(
+            [
+                {
+                    "name": "server",
+                    "script": ["s"],
+                    "required_by": ["benchmark", "not_included"],
+                },
+                {"name": "benchmark", "script": ["b"]},
+            ]
+        )
+        assert self._deps(cfg) == {"server": [], "benchmark": ["server"]}
+
+    def test_dedup_with_existing_depends_on(self):
+        cfg = self._cfg(
+            [
+                {"name": "a", "script": ["a"], "required_by": ["b"]},
+                {"name": "b", "script": ["b"], "depends_on": ["a"]},
+            ]
+        )
+        assert self._deps(cfg)["b"] == ["a"]
+
+    def test_self_reference_is_skipped(self):
+        """A task requiring itself must not create a self-cycle."""
+        cfg = self._cfg(
+            [{"name": "a", "script": ["a"], "required_by": ["a"]}]
+        )
+        assert self._deps(cfg)["a"] == []
+
+    def test_dict_form_tasks(self):
+        cfg = self._cfg(
+            {
+                "a": {"script": ["a"], "required_by": ["b"]},
+                "b": {"script": ["b"]},
+            }
+        )
+        assert self._deps(cfg)["b"] == ["a"]
+
+    def test_required_by_field_preserved(self):
+        cfg = self._cfg(
+            [
+                {"name": "a", "script": ["a"], "required_by": ["b"]},
+                {"name": "b", "script": ["b"]},
+            ]
+        )
+        by_name = {t.name: t for t in cfg.workflow.tasks}
+        assert by_name["a"].required_by == ["b"]

@@ -7,24 +7,40 @@ CLI command for generating sbatch scripts to run sflow in batch mode.
 
 import csv
 import json
+import os
 import shlex
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Annotated, Any, List, Optional
+from typing import Annotated, Any, List, Optional, Protocol
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import typer
+import yaml as _yaml
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
-from sflow.config.resolver import enrich_error_with_location
+from sflow.cli._args import (  # split_list_arg re-exported for back-compat
+    EnableTaskMonitorOption,
+    EnableWorkflowMonitorOption,
+    ExcludeNodesOption,
+    IncludeNodesOption,
+    split_list_arg,
+)
+from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
 from sflow.logging import configure_logging, get_logger
+from sflow.resolution import enrich_error_with_location
+from sflow.runtime_info import log_runtime_info
+from sflow.utils.extra_args import dedup_merge_extra_args
+from sflow.utils.slurm import emit_gpus_per_node_semantics_warning
 
 _logger = get_logger(__name__)
 
 _sflow_app = SflowApp()
+_DEFAULT_SFLOW_GIT_URL = "https://github.com/NVIDIA/nv-sflow.git"
 
 
 def _detect_slurm_account() -> str | None:
@@ -223,6 +239,90 @@ def _resolve_effective_sflow_version(sflow_version: str | None) -> str | None:
         return None
 
 
+def _sflow_git_install_url(sflow_version_or_url: str | None) -> str:
+    """Return a pip-compatible git URL for installing sflow."""
+    value = sflow_version_or_url or "main"
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        if parsed.scheme.startswith("git+"):
+            return value
+        return f"git+{value}"
+    return f"git+{_DEFAULT_SFLOW_GIT_URL}@{value}"
+
+
+def _sflow_pypi_requirement(sflow_version: str | None) -> str:
+    """Build the ``sflow`` requirement for a PyPI-index install (PyPI route).
+
+    ``sflow_version`` is a PEP 440 version/specifier already validated by
+    :func:`_sflow_version_error`: a bare version is pinned (``0.2.1`` ->
+    ``sflow==0.2.1``), an operator-led spec is kept (``>=0.2,<0.3`` ->
+    ``sflow>=0.2,<0.3``), and an empty value installs the latest (``sflow``).
+    """
+    spec = (sflow_version or "").strip()
+    if not spec:
+        return "sflow"
+    if spec[0] in "=<>!~":
+        return f"sflow{spec}"
+    return f"sflow=={spec}"
+
+
+def _sflow_version_error(sflow_version: str | None, *, registry: bool) -> str | None:
+    """Sanity-check ``--sflow-version`` for the active install route.
+
+    ``--sflow-version`` drives two mutually-exclusive routes:
+
+    * **git** (``registry=False``, i.e. no ``--sflow-index-url``): a git
+      branch/tag or a ``repo-url@ref``, installed as ``sflow @ git+...``.
+    * **PyPI index** (``registry=True``, ``--sflow-index-url`` set): a PEP 440
+      version (``0.2.1``) or specifier (``>=0.2,<0.3``), installed as
+      ``sflow==...`` from that index.
+
+    Returns an error message, or ``None`` when the value is acceptable. An empty
+    value is always accepted -- each route has a sensible default (git falls back
+    to the running env's ref; PyPI installs the latest).
+    """
+    spec = (sflow_version or "").strip()
+    if not spec:
+        return None
+
+    if not registry:
+        # Git route: refs and repo URLs never contain whitespace -- reject it as a
+        # likely mistake (a stray version spec, shell-quoted args, ...).
+        if any(ch.isspace() for ch in spec):
+            return (
+                f"--sflow-version '{sflow_version}' is not a valid git ref or repo URL "
+                "(whitespace is not allowed). Pass a branch/tag like 'main' or a "
+                "'repo-url@ref'; for a PyPI version, add --sflow-index-url."
+            )
+        return None
+
+    # PyPI route: a plain PEP 440 version/specifier only -- never a package name,
+    # URL or PEP 508 direct reference, which would otherwise be embedded verbatim
+    # into the generated install command. The structural reject of '@' / '://' /
+    # whitespace is unconditional; the PEP 440 parse needs ``packaging`` and is
+    # skipped (best-effort) when it is unavailable.
+    pypi_message = (
+        f"--sflow-version '{sflow_version}' is not a valid PyPI version specifier "
+        "(required with --sflow-index-url). Use a plain version like '0.2.1' or a "
+        "specifier like '>=0.2,<0.3'; package names, URLs and '@' direct references "
+        "are not allowed."
+    )
+    if "@" in spec or "://" in spec or any(ch.isspace() for ch in spec):
+        return pypi_message
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    except ImportError:
+        return None
+    # Bare versions ('0.2.1', '0.2.*') aren't specifiers on their own, so pin them
+    # with '==' before parsing; operator-led values are validated as written.
+    candidate = spec if spec[0] in "=<>!~" else f"=={spec}"
+    try:
+        SpecifierSet(candidate)
+    except InvalidSpecifier:
+        return pypi_message
+    return None
+
+
 def _resolve_sbatch_extra_args(
     extra_args: list[str],
     config_files: list[Path],
@@ -241,7 +341,7 @@ def _resolve_sbatch_extra_args(
     if not any("${{" in arg for arg in extra_args):
         return list(extra_args)
 
-    from sflow.config.resolver import ExpressionResolver
+    from sflow.resolution import ExpressionResolver
     from sflow.core.variable import build_variables_ctx_from_raw, extract_domains_from_raw_config
 
     var_map: dict[str, Any] = {}
@@ -281,6 +381,227 @@ def _resolve_sbatch_extra_args(
     return resolved
 
 
+@dataclass(frozen=True)
+class _ResolvedSlurmBackend:
+    """Resolved Slurm backend fields used for multi-backend sbatch generation."""
+
+    name: str
+    partition: str
+    account: str
+    nodes: int
+    time: str | None
+    extra_args: list[str]
+    gpus_per_node: int | None = None
+
+
+def _resolve_batch_backends(
+    config_files: list[Path],
+    set_var: list[str] | None,
+) -> list[Any] | None:
+    """Load + resolve a (composed) config's backend objects via the standard pipeline.
+
+    Runs ``ConfigLoader`` (merge + ``--set`` overrides) followed by
+    ``resolve_global_variables`` / ``resolve_backends`` so ``sflow batch`` classifies
+    backends exactly as ``sflow run`` does, instead of re-parsing YAML with a bespoke
+    resolver. Returns the resolved backend objects (``state.backends`` values), or
+    ``None`` when the config cannot be loaded/resolved -- callers fall back to their
+    own handling and the subsequent dry-run validation surfaces the underlying error.
+    """
+    try:
+        from sflow.app.assembly import resolve_backends, resolve_global_variables
+        from sflow.config.loader import ConfigLoader
+        from sflow.core.state import SflowState
+        from sflow.core.task_graph import TaskGraph
+        from sflow.core.workflow import Workflow
+
+        config = ConfigLoader().load_configs(list(config_files), set_var, None, None)
+        state = SflowState(
+            workflow=Workflow(name=config.workflow.name, task_graph=TaskGraph())
+        )
+        state = resolve_global_variables(config, state)
+        state = resolve_backends(config, state)
+    except Exception:
+        return None
+    return list(state.backends.values())
+
+
+def _resolve_slurm_backends(
+    config_files: list[Path],
+    set_var: list[str] | None,
+) -> list[_ResolvedSlurmBackend]:
+    """Resolve the Slurm backends declared by a (composed) config.
+
+    This reuses the standard config pipeline -- ``ConfigLoader`` (merge + ``--set``
+    overrides) followed by ``resolve_global_variables`` / ``resolve_backends`` --
+    so ``sflow batch`` sees exactly the same resolved backend objects as
+    ``sflow run``, instead of re-parsing YAML with a bespoke resolver. Only Slurm
+    backends are returned, in config-declaration order; non-Slurm backends
+    (docker/kubernetes/local) are ignored here and never receive Slurm-specific
+    handling.
+
+    The result drives whether ``sflow batch`` emits a multi-backend driver job:
+    a config with >=2 Slurm backends becomes one driver sbatch (sized to the
+    leader backend) and each backend runs its own salloc at runtime. Returns an
+    empty list when the config cannot be loaded/resolved; the subsequent dry-run
+    validation surfaces the underlying error with full context.
+    """
+    from sflow.plugins.backends.slurm import SlurmBackend
+
+    backends = _resolve_batch_backends(config_files, set_var)
+    if backends is None:
+        return []
+
+    resolved: list[_ResolvedSlurmBackend] = []
+    for backend in backends:
+        if not isinstance(backend, SlurmBackend):
+            continue
+        conf = backend.config
+        try:
+            nodes_int = int(conf.nodes)
+        except (TypeError, ValueError):
+            continue
+        try:
+            gpus_int: int | None = int(conf.gpus_per_node)
+        except (TypeError, ValueError):
+            gpus_int = None
+        resolved.append(
+            _ResolvedSlurmBackend(
+                name=str(conf.name),
+                partition=str(conf.partition),
+                account=str(conf.account),
+                nodes=nodes_int,
+                time=None if conf.time is None else str(conf.time),
+                extra_args=[str(a) for a in (conf.extra_args or [])],
+                gpus_per_node=gpus_int,
+            )
+        )
+    return resolved
+
+
+def _kubernetes_backend_names(
+    config_files: list[Path],
+    set_var: list[str] | None,
+) -> list[str]:
+    """Names of the Kubernetes backends declared by the (composed) config.
+
+    Resolved through the same pipeline as :func:`_resolve_slurm_backends`. Returns an
+    empty list when the config cannot be loaded/resolved -- the dry-run validation
+    (or the single-backend planner) then surfaces the real error with full context.
+    """
+    from sflow.plugins.backends.kubernetes import KubernetesBackend
+
+    backends = _resolve_batch_backends(config_files, set_var)
+    if backends is None:
+        return []
+    return [
+        str(backend.name)
+        for backend in backends
+        if isinstance(backend, KubernetesBackend)
+    ]
+
+
+def _reject_kubernetes_batch(
+    config_files: list[Path],
+    set_var: list[str] | None,
+) -> None:
+    """Fail fast when a config routed to ``sflow batch`` uses a Kubernetes backend.
+
+    ``sflow batch`` exists to generate a Slurm ``sbatch`` script; Kubernetes schedules
+    its own pods and has no batch/sbatch step, so a k8s workflow must run via
+    ``sflow run`` (which drives ``kubectl`` directly, optionally with ``--kube-*``
+    flags). Raises :class:`ValueError` naming the offending backend(s); the caller
+    turns it into a CLI error message + non-zero exit.
+    """
+    k8s_names = _kubernetes_backend_names(config_files, set_var)
+    if not k8s_names:
+        return
+    joined = ", ".join(sorted(k8s_names))
+    raise ValueError(
+        f"'sflow batch' does not support the Kubernetes backend "
+        f"(backend(s): {joined}). Kubernetes schedules its own pods, so there is no "
+        f"Slurm sbatch job to generate. Run the workflow directly with 'sflow run' "
+        f"instead (e.g. 'sflow run <config> [--kube-* ...]')."
+    )
+
+
+def _select_wrapper_backend(
+    slurm_backends: list[_ResolvedSlurmBackend],
+) -> _ResolvedSlurmBackend:
+    """Pick the most resource-heavy Slurm backend to own the driver sbatch.
+
+    The driver sbatch reserves this backend's nodes up front via normal Slurm
+    scheduling, and the lighter backends ``salloc`` nested inside it. Reserving
+    the largest footprint as the batch job (rather than nesting it) makes the
+    whole multi-backend allocation easier to schedule. Heaviness is compared by
+    node count, then total GPUs (``nodes * gpus_per_node``), then GPUs per node;
+    ties keep config-declaration order.
+    """
+
+    def weight(b: _ResolvedSlurmBackend) -> tuple[int, int, int]:
+        gpn = b.gpus_per_node or 0
+        return (b.nodes, b.nodes * gpn, gpn)
+
+    return max(slurm_backends, key=weight)
+
+
+def _build_multi_backend_driver_directives(
+    slurm_backends: list[_ResolvedSlurmBackend],
+    *,
+    job_name: str,
+    sbatch_output: str,
+    sbatch_error: str,
+    time: str | None,
+    leader_extra_args: list[str],
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Build #SBATCH directives + markers for a multi-backend driver job.
+
+    A config with >=2 Slurm backends is submitted as a single driver sbatch
+    sized to the **most resource-heavy** backend (see :func:`_select_wrapper_backend`).
+    Inside, ``sflow run`` lets that backend reuse this allocation while every
+    other backend runs its own ``salloc`` (so each backend gets a distinct Slurm
+    job id, which pyxis/enroot need for their per-job runtime dir to match the
+    node that provisioned it). Wrapping the heaviest backend in the batch job and
+    nesting the lighter ``salloc``s makes the whole allocation easier to schedule
+    and avoids the Slurm heterogeneous-job model, where all components share the
+    leader job id and pyxis fails on non-leader partitions.
+
+    Returns ``(directives, exports)`` where ``exports`` carry the
+    per-backend-salloc markers read by :meth:`SlurmBackend.allocate`.
+    """
+    leader = _select_wrapper_backend(slurm_backends)
+    directives: list[str] = [
+        f"#SBATCH --job-name={job_name}",
+        f"#SBATCH --output={sbatch_output}",
+        f"#SBATCH --error={sbatch_error}",
+        "#SBATCH --mem=0",
+        f"#SBATCH --partition={leader.partition}",
+        f"#SBATCH --account={leader.account}",
+        f"#SBATCH --nodes={leader.nodes}",
+    ]
+    component_time = leader.time or time
+    if component_time:
+        directives.append(f"#SBATCH --time={component_time}")
+    # Steer the driver allocation with the node filters (before extra_args wins).
+    if include_nodes:
+        directives.append(f"#SBATCH --nodelist={','.join(include_nodes)}")
+    if exclude_nodes:
+        directives.append(f"#SBATCH --exclude={','.join(exclude_nodes)}")
+    # #SBATCH directives carry only the LEADER backend's merged set (its own
+    # extra_args + the CLI --sbatch-extra-args, de-duped by option, CLI wins).
+    # The non-leader backends pick the CLI args up at runtime: the generated
+    # `sflow run` is invoked with `--extra-salloc-args`, which merges them into
+    # every backend's salloc independently (see _generate_sbatch_script).
+    for extra in dedup_merge_extra_args(leader.extra_args, leader_extra_args):
+        directives.append(f"#SBATCH {extra}")
+    exports: list[str] = [
+        "export SFLOW_SLURM_MULTI_BACKEND_SALLOC=1",
+        f"export SFLOW_SLURM_WRAPPER_BACKEND={shlex.quote(leader.name)}",
+    ]
+    return directives, exports
+
+
 def _generate_sbatch_script(
     *,
     files: list[Path],
@@ -301,8 +622,20 @@ def _generate_sbatch_script(
     sbatch_extra_args: list[str] | None,
     sflow_venv_path: Path | None,
     sflow_version: str | None,
+    sflow_source_path: Path | None = None,
+    sflow_index_url: str | None = None,
+    enable_workflow_monitor: bool = False,
+    enable_task_monitors: list[str] | None = None,
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
 ) -> str:
-    """Generate the content of an sbatch script that wraps ``sflow run``."""
+    """Generate the content of an sbatch script that wraps ``sflow run``.
+
+    When the (composed) config declares >=2 Slurm backends, a multi-backend
+    driver script is emitted (sized to the leader backend); inside, each backend
+    runs its own salloc so it binds to its own allocation/partition. Otherwise a
+    single-allocation script is generated.
+    """
     sflow_cmd_parts = ["sflow", "run"]
     for f in files:
         sflow_cmd_parts.extend(["--file", shlex.quote(str(f))])
@@ -319,6 +652,13 @@ def _generate_sbatch_script(
         for mt in missable_tasks:
             sflow_cmd_parts.extend(["--missable-tasks", shlex.quote(mt)])
 
+    if enable_workflow_monitor:
+        sflow_cmd_parts.append("--enable-workflow-monitor")
+
+    if enable_task_monitors:
+        for task_name in enable_task_monitors:
+            sflow_cmd_parts.extend(["--enable-task-monitor", shlex.quote(task_name)])
+
     if log_level != "info":
         sflow_cmd_parts.extend(["--log-level", log_level])
 
@@ -328,32 +668,80 @@ def _generate_sbatch_script(
     if output_dir:
         sflow_cmd_parts.extend(["--output-dir", shlex.quote(str(output_dir))])
 
-    sbatch_directives = [
-        f"#SBATCH --job-name={job_name}",
-        f"#SBATCH --output={sbatch_output}",
-        f"#SBATCH --error={sbatch_error}",
-        "#SBATCH --mem=0",
-        f"#SBATCH --partition={partition}",
-        f"#SBATCH --account={account}",
-    ]
+    # Forward node include/exclude to the inner `sflow run` so every backend
+    # applies them (the leader backend that reuses this allocation post-filters;
+    # backends that salloc themselves get --nodelist/--exclude at runtime).
+    for host in include_nodes or []:
+        sflow_cmd_parts.extend(["--include-nodes", shlex.quote(host)])
+    for host in exclude_nodes or []:
+        sflow_cmd_parts.extend(["--exclude-nodes", shlex.quote(host)])
 
-    if nodes is not None:
-        sbatch_directives.append(f"#SBATCH --nodes={nodes}")
+    resolved_extra_args = (
+        _resolve_sbatch_extra_args(sbatch_extra_args, files, set_var)
+        if sbatch_extra_args
+        else []
+    )
 
-    if time:
-        sbatch_directives.append(f"#SBATCH --time={time}")
+    # Thread the CLI extra args into the inner `sflow run` as --extra-salloc-args
+    # so each backend merges them into its OWN salloc at runtime (deduped by
+    # option, CLI wins). The leader backend reuses the driver allocation (no
+    # salloc), so this only takes effect for backends that salloc themselves.
+    for extra_arg in resolved_extra_args:
+        sflow_cmd_parts.extend(["--extra-salloc-args", shlex.quote(extra_arg)])
 
-    if sbatch_extra_args:
-        resolved_extra_args = _resolve_sbatch_extra_args(
-            sbatch_extra_args, files, set_var
+    # A config with >=2 Slurm backends is submitted as a single driver sbatch
+    # sized to the leader backend; inside, each backend runs its own salloc (the
+    # leader reuses this allocation) so every backend gets a distinct Slurm job
+    # id. Single-backend configs keep the original single-allocation script.
+    slurm_backends = _resolve_slurm_backends(files, set_var)
+    multi_backend_exports: list[str] = []
+    if len(slurm_backends) >= 2:
+        sbatch_directives, multi_backend_exports = (
+            _build_multi_backend_driver_directives(
+                slurm_backends,
+                job_name=job_name,
+                sbatch_output=sbatch_output,
+                sbatch_error=sbatch_error,
+                time=time,
+                leader_extra_args=resolved_extra_args,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
+            )
         )
-        for extra_arg in resolved_extra_args:
+        generated_by = (
+            f"# Generated by: sflow batch "
+            f"(multi-backend: {len(slurm_backends)} backends, per-backend salloc)"
+        )
+    else:
+        sbatch_directives = [
+            f"#SBATCH --job-name={job_name}",
+            f"#SBATCH --output={sbatch_output}",
+            f"#SBATCH --error={sbatch_error}",
+            "#SBATCH --mem=0",
+            f"#SBATCH --partition={partition}",
+            f"#SBATCH --account={account}",
+        ]
+        if nodes is not None:
+            sbatch_directives.append(f"#SBATCH --nodes={nodes}")
+        if time:
+            sbatch_directives.append(f"#SBATCH --time={time}")
+        # Steer the driver allocation with the node filters (before extra_args so an
+        # explicit --sbatch-extra-args --nodelist/--exclude still wins).
+        if include_nodes:
+            sbatch_directives.append(f"#SBATCH --nodelist={','.join(include_nodes)}")
+        if exclude_nodes:
+            sbatch_directives.append(f"#SBATCH --exclude={','.join(exclude_nodes)}")
+        # Include the (single) slurm backend's extra_args, merged with the CLI
+        # --sbatch-extra-args and de-duped by option (CLI wins on conflict).
+        backend_extra_args = slurm_backends[0].extra_args if slurm_backends else []
+        for extra_arg in dedup_merge_extra_args(backend_extra_args, resolved_extra_args):
             sbatch_directives.append(f"#SBATCH {extra_arg}")
+        generated_by = "# Generated by: sflow batch"
 
     script_lines = [
         "#!/bin/bash",
         "#",
-        "# Generated by: sflow batch",
+        generated_by,
         f"# Workflow file(s): {', '.join(str(f) for f in files)}",
         "#",
         "",
@@ -361,83 +749,125 @@ def _generate_sbatch_script(
         "",
         "set -x",
         "",
-        "# sbatch defaults to --export=ALL, so an activated virtualenv from the submitting",
-        "# shell leaks into the job. Drop it from PATH and the environment so the venv is",
-        "# bootstrapped with a real system interpreter for the compute node's architecture",
-        "# (a wrong-arch caller venv otherwise fails with 'Exec format error').",
+        "# sbatch's default --export=ALL leaks the submitter's env into the job.",
+        "# Drop VIRTUAL_ENV/PATH (a caller venv may be the wrong arch -> 'Exec format",
+        "# error') and PYTHONPATH (an sflow src tree on it would shadow the per-job",
+        "# editable install), so the job uses only its fresh per-job venv.",
         'if [ -n "${VIRTUAL_ENV:-}" ]; then',
         "    PATH=$(printf '%s' \"$PATH\" | tr ':' '\\n' | grep -vxF \"$VIRTUAL_ENV/bin\" | paste -sd ':' -)",
         "    export PATH",
         "fi",
-        "unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT PYTHONHOME",
+        "unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT PYTHONHOME PYTHONPATH",
         "",
     ]
 
     if sflow_venv_path:
-        activate_script = sflow_venv_path / ".sflow_venv" / "bin" / "activate"
+        # Explicit parent: bake the resolved absolute path.
+        venv_parent_str = shlex.quote(str(Path(sflow_venv_path).resolve()))
     else:
-        activate_script = Path.cwd() / ".sflow_venv" / "bin" / "activate"
+        # No explicit parent: resolve compute-node-local scratch at RUNTIME so it
+        # honors the cluster's per-node $TMPDIR (often a per-job dir that is
+        # auto-cleaned) and falls back to /tmp. Node-local scratch is the right
+        # home for a disposable, job-id-keyed venv -- fast small-file I/O, no
+        # shared-FS metadata contention, and no home/project quota use. The quotes
+        # are emitted literally so $TMPDIR expands on the compute node.
+        venv_parent_str = '"${TMPDIR:-/tmp}/sflow_compute_node_venv"'
 
-    activate_path_str = shlex.quote(str(activate_script))
-    venv_parent = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent))
-    effective_sflow_version = _resolve_effective_sflow_version(sflow_version)
-    git_ref = effective_sflow_version if effective_sflow_version else "main"
-
-    lock_file = shlex.quote(str(Path(activate_script).resolve().parent.parent.parent / ".sflow_venv.lock"))
-
-    sflow_install_cmd = f"'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@{git_ref}' --prerelease=allow"
-
-    script_lines.extend(
-        [
-            f"SFLOW_ACTIVATE={activate_path_str}",
-            f"SFLOW_LOCK={lock_file}",
-            "",
-            "# Use flock to prevent concurrent venv creation/install across Slurm jobs",
-            f"mkdir -p {venv_parent}",
-            '(flock -w 600 9 || { echo "ERROR: timed out waiting for sflow venv lock"; exit 1; }',
-            "",
-            'if [ -f "$SFLOW_ACTIVATE" ]; then',
-            "    # Activate existing Python virtual environment for sflow",
-            '    source "$SFLOW_ACTIVATE"',
+    # How sflow is installed into the fresh per-job venv. Two main routes share
+    # --sflow-version, plus a dev-only source override; all mutually exclusive
+    # (enforced + sanity-checked at the CLI layer):
+    #   - Route 1 (git, the default): install the resolved git ref from the repo.
+    #   - Route 2 (--sflow-index-url): install a released wheel from a private PyPI
+    #     index, with --sflow-version as the version/specifier.
+    #   - --sflow-source-path (dev): editable install from a per-job copy of a
+    #     local checkout.
+    if sflow_source_path is not None:
+        source_path_str = shlex.quote(str(Path(sflow_source_path).resolve()))
+        # A single shared source tree cannot be reused across concurrent jobs: an
+        # editable build rewrites setuptools-scm's _version.py and the *.egg-info
+        # back into the tree (a warm uv cache does NOT skip these writes), so
+        # concurrent installs would race on those files. Give every job its own
+        # copy instead -- copy the checkout into a per-job dir (heavy/generated
+        # paths excluded; .git kept so setuptools-scm can resolve the version) and
+        # install editable from there. Fully isolated, so it needs no lock.
+        #
+        # The per-job venv/source dirs (.sflow_venv*, .sflow_src*) MUST be excluded
+        # for correctness, not just size: when --sflow-venv-path is the source
+        # checkout itself (the under-dev e2e passes --sflow-venv-path and
+        # --sflow-source-path both = $REPO_DIR), SFLOW_SRC_DIR lands *inside* the
+        # copy source. Without these excludes the copy would recurse into its own
+        # destination and into every concurrent job's growing copy -- a runaway
+        # that fills the filesystem and never finishes. The remaining excludes are
+        # size/speed only. The same --exclude=PATTERN syntax works for both rsync
+        # and the tar fallback, so one list drives both copy paths.
+        copy_excludes = [
+            ".venv",
+            "venv",
+            ".sflow_venv*",
+            ".sflow_src*",
+            "sflow_compute_node_venv",
+            "sflow_output",
+            "build",
+            "dist",
+            "*.egg-info",
+            "__pycache__",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".mypy_cache",
+            ".tox",
+            "node_modules",
+            "docs-site",
+            "htmlcov",
+            ".coverage",
+            "coverage.xml",
+            ".gitnexus",
         ]
-    )
-    if effective_sflow_version:
-        script_lines.append(
-            f'    "$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}'
+        copy_exclude_args = " ".join(
+            f"--exclude={shlex.quote(p)}" for p in copy_excludes
         )
-    script_lines.extend(
-        [
+        sflow_install_lines = [
+            "# Per-job copy of the local checkout (rsync, or tar when rsync is",
+            "# absent), then editable install from the copy.",
+            'SFLOW_SRC_DIR="$SFLOW_VENV_PARENT/.sflow_src-${SLURM_JOB_ID:-$$}"',
+            'rm -rf "$SFLOW_SRC_DIR"',
+            'mkdir -p "$SFLOW_SRC_DIR"',
+            "if command -v rsync >/dev/null 2>&1; then",
+            f'    rsync -a {copy_exclude_args} {source_path_str}/ "$SFLOW_SRC_DIR/"',
             "else",
-            "    # Venv not found; create from scratch and install sflow",
-            f"    cd {venv_parent}",
-            "    # Resolve a real system python3 for venv creation. Prefer well-known",
-            "    # absolute locations, then fall back to PATH (already cleaned of the",
-            "    # caller venv above) so nodes that install python outside /usr/bin work.",
-            '    SFLOW_BOOTSTRAP_PYTHON=""',
-            '    for _candidate in /usr/bin/python3 /usr/local/bin/python3 "$(command -v python3 || true)"; do',
-            '        if [ -n "$_candidate" ] && [ -x "$_candidate" ]; then',
-            '            SFLOW_BOOTSTRAP_PYTHON="$_candidate"',
-            "            break",
-            "        fi",
-            "    done",
-            '    if [ -z "$SFLOW_BOOTSTRAP_PYTHON" ]; then',
-            '        echo "ERROR: could not locate a system python3 to bootstrap the sflow venv"',
-            "        exit 1",
-            "    fi",
-            '    "$SFLOW_BOOTSTRAP_PYTHON" -m venv .sflow_venv',
-            "    source .sflow_venv/bin/activate",
-            '    "$VIRTUAL_ENV/bin/pip" install uv',
-            f'    "$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}',
-            '    "$VIRTUAL_ENV/bin/sflow" --help',
+            f'    tar -C {source_path_str} {copy_exclude_args} -cf - . | tar -C "$SFLOW_SRC_DIR" -xf -',
             "fi",
-            "",
-            ') 9>"$SFLOW_LOCK"',
-            "",
-            "# Activate venv outside the lock (lock is only for creation/install)",
-            'source "$SFLOW_ACTIVATE"',
-            "",
+            'cd "$SFLOW_SRC_DIR"',
+            '"$VIRTUAL_ENV/bin/uv" pip install -e ".[dev]"',
         ]
-    )
+    elif sflow_index_url is not None:
+        # Route 2 -- PyPI private index: install a released sflow wheel
+        # (--sflow-version is the version/specifier, validated at the CLI layer).
+        # --extra-index-url keeps the default index available for sflow's deps,
+        # since the private repo typically holds only sflow. Credentials come from
+        # the compute node (~/.netrc or a credential helper); the URL is checked
+        # for embedded credentials at the CLI layer.
+        requirement = _sflow_pypi_requirement(sflow_version)
+        sflow_install_cmd = (
+            f"{shlex.quote(requirement)} "
+            f"--extra-index-url {shlex.quote(sflow_index_url)} "
+            "--prerelease=allow"
+        )
+        sflow_install_lines = [
+            "set +x",
+            f'"$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}',
+            "set -x",
+        ]
+    else:
+        # Route 1 -- git: install the resolved ref (--sflow-version, or the running
+        # env's ref / 'main' when omitted) from the sflow git repo.
+        effective_sflow_version = _resolve_effective_sflow_version(sflow_version)
+        sflow_install_cmd = (
+            f"{shlex.quote(f'sflow @ {_sflow_git_install_url(effective_sflow_version)}')} "
+            "--prerelease=allow"
+        )
+        sflow_install_lines = [
+            f'"$VIRTUAL_ENV/bin/uv" pip install {sflow_install_cmd}',
+        ]
 
     effective_output_dir = (
         shlex.quote(str(output_dir))
@@ -448,33 +878,427 @@ def _generate_sbatch_script(
             else str(Path.cwd() / "sflow_output")
         )
     )
+    # cp lines (run inside the on-exit finalize fn) for each config file, copied
+    # into the resolved workflow output dir. Indented for the shell function body.
+    config_copy_lines = [
+        f'    cp {shlex.quote(str(f))} "$SFLOW_WF_DIR/" 2>/dev/null || true'
+        for f in files
+    ]
 
     script_lines.extend(
         [
-            f"cd {shlex.quote(str(workspace_dir))}",
+            f"SFLOW_VENV_PARENT={venv_parent_str}",
+            'mkdir -p "$SFLOW_VENV_PARENT"',
             "",
-            "# Run sflow workflow",
-            shlex.quote(str(activate_script.resolve().parent / "sflow"))
-            + " "
-            + " ".join(sflow_cmd_parts[1:]),
+            "# Fresh per-job venv keyed on the Slurm job id (PID fallback off-Slurm),",
+            "# so concurrent jobs never collide -- no shared venv, no flock.",
+            'SFLOW_VENV_DIR="$SFLOW_VENV_PARENT/.sflow_venv-${SLURM_JOB_ID:-$$}"',
             "",
-            "# Copy sbatch logs and sflow config(s) to workflow output directory for reference",
-            f'SFLOW_WF_DIR=$(find {effective_output_dir} -maxdepth 1 -type d -name "${{SLURM_JOB_ID}}-*" 2>/dev/null | head -1)',
-            'if [ -n "$SFLOW_WF_DIR" ] && [ -d "$SFLOW_WF_DIR" ]; then',
-            f"    SBATCH_OUT={effective_output_dir}/${{SLURM_JOB_ID}}-sflow-submit.out",
-            f"    SBATCH_ERR={effective_output_dir}/${{SLURM_JOB_ID}}-sflow-submit.err",
+            "# Run on exit AND on the signals Slurm uses for timeout/cancel/preempt",
+            "# (a bare EXIT trap does not fire on an untrapped signal). It ALWAYS",
+            "# copies the sbatch .out/.err and config(s) into the workflow output dir",
+            "# -- using a <job id>-sflow-submit dir if the run never created one -- so",
+            "# a failed bootstrap or run still leaves a full debug picture, then",
+            "# removes the disposable per-job venv/source copy.",
+            "_sflow_finalize() {",
+            "    # Best-effort: capture the incoming rc FIRST (before any other command",
+            "    # changes $?), then disarm all traps so a signal arriving mid-cleanup --",
+            "    # or the EXIT trap firing after a signal-triggered run -- cannot re-enter",
+            "    # this handler. Then disable errexit and guard every step so a failed",
+            "    # copy/cleanup never changes the job's exit status.",
+            "    _sflow_rc=$?",
+            "    trap - EXIT INT TERM HUP",
+            "    set +e",
+            f"    SBATCH_OUT_PATTERN={shlex.quote(sbatch_output)}",
+            f"    SBATCH_ERR_PATTERN={shlex.quote(sbatch_error)}",
+            '    SBATCH_OUT="${SBATCH_OUT_PATTERN//%j/$SLURM_JOB_ID}"',
+            '    SBATCH_ERR="${SBATCH_ERR_PATTERN//%j/$SLURM_JOB_ID}"',
+            f'    SFLOW_WF_DIR=$(find {effective_output_dir} -maxdepth 1 -type d -name "${{SLURM_JOB_ID}}-*" 2>/dev/null | head -1)',
+            f'    [ -n "$SFLOW_WF_DIR" ] || SFLOW_WF_DIR={effective_output_dir}/"${{SLURM_JOB_ID}}-sflow-submit"',
+            '    mkdir -p "$SFLOW_WF_DIR" 2>/dev/null || true',
             '    cp "$SBATCH_OUT" "$SFLOW_WF_DIR/" 2>/dev/null || true',
             '    cp "$SBATCH_ERR" "$SFLOW_WF_DIR/" 2>/dev/null || true',
-            *[
-                f'    cp {shlex.quote(str(f))} "$SFLOW_WF_DIR/" 2>/dev/null || true'
-                for f in files
-            ],
+            *config_copy_lines,
+            '    rm -rf "$SFLOW_VENV_DIR" ${SFLOW_SRC_DIR:+"$SFLOW_SRC_DIR"} 2>/dev/null || true',
+            "    # exit (not return): on a trapped signal this terminates the job instead",
+            "    # of resuming the interrupted bootstrap/run; traps are disarmed above so",
+            "    # this exit cannot re-enter the handler.",
+            '    exit "$_sflow_rc"',
+            "}",
+            "trap _sflow_finalize EXIT INT TERM HUP",
+            "",
+            "# Fail fast during bootstrap so we never run sflow from a half-built venv;",
+            "# re-disabled once ready so post-run steps (e.g. log copy) still execute.",
+            "set -e",
+            "",
+            "# Resolve a real system python3 for venv creation: well-known absolute",
+            "# locations first, then PATH (already cleaned of the caller venv).",
+            'SFLOW_BOOTSTRAP_PYTHON=""',
+            'for _candidate in /usr/bin/python3 /usr/local/bin/python3 "$(command -v python3 || true)"; do',
+            '    if [ -n "$_candidate" ] && [ -x "$_candidate" ]; then',
+            '        SFLOW_BOOTSTRAP_PYTHON="$_candidate"',
+            "        break",
+            "    fi",
+            "done",
+            'if [ -z "$SFLOW_BOOTSTRAP_PYTHON" ]; then',
+            '    echo "ERROR: could not locate a system python3 to bootstrap the sflow venv" >&2',
+            "    exit 1",
             "fi",
+            "",
+            "# Create the fresh per-job venv and install sflow into it.",
+            '"$SFLOW_BOOTSTRAP_PYTHON" -m venv "$SFLOW_VENV_DIR"',
+            'source "$SFLOW_VENV_DIR/bin/activate"',
+            '"$VIRTUAL_ENV/bin/pip" install uv',
+            *sflow_install_lines,
+            '"$VIRTUAL_ENV/bin/sflow" --help',
+            "set +e",
+            "",
+        ]
+    )
+
+    run_prelude = [
+        f"cd {shlex.quote(str(workspace_dir))}",
+        "",
+        'export SFLOW_RUN_ID_PREFIX="$SLURM_JOB_ID"',
+        "",
+    ]
+    # Forward the per-task log offload decision (set by --offload-task-logs or the
+    # environment) into the job so the inner `sflow run` sees it even under
+    # `--export=NONE`.
+    _offload_env = os.environ.get(OFFLOAD_TASK_LOGS_ENV)
+    if _offload_env is not None:
+        run_prelude.append(
+            f"export {OFFLOAD_TASK_LOGS_ENV}={shlex.quote(_offload_env)}"
+        )
+        run_prelude.append("")
+    if multi_backend_exports:
+        run_prelude.append(
+            "# Multi-backend: the leader reuses this allocation; other backends each"
+        )
+        run_prelude.append("# run their own salloc (see SlurmBackend.allocate).")
+        run_prelude.extend(multi_backend_exports)
+        run_prelude.append("")
+
+    script_lines.extend(
+        [
+            *run_prelude,
+            "# Run sflow workflow",
+            '"$SFLOW_VENV_DIR/bin/sflow" ' + " ".join(sflow_cmd_parts[1:]),
+            "SFLOW_RUN_RC=$?",
+            "",
+            "# Exit with the workflow's status (set -e was disabled above) so Slurm",
+            "# and downstream --dependency=afterok see a failed run. The finalize trap",
+            "# copies the .out/.err + config(s) and cleans up regardless of this rc.",
+            'exit "$SFLOW_RUN_RC"',
             "",
         ]
     )
 
     return "\n".join(script_lines)
+
+
+@dataclass(frozen=True)
+class BatchLauncherRequest:
+    """Inputs needed to generate a persistent launcher artifact."""
+
+    files: list[Path]
+    set_var: list[str] | None
+    artifact: list[str] | None
+    missable_tasks: list[str] | None
+    log_level: str
+    workspace_dir: Path | None
+    output_dir: Path | None
+    job_name: str
+    sbatch_output: str
+    sbatch_error: str
+    partition: str
+    account: str
+    time: str | None
+    nodes: int | None
+    gpus_per_node: int | None
+    sbatch_extra_args: list[str] | None
+    sflow_venv_path: Path | None
+    sflow_version: str | None
+    sflow_source_path: Path | None = None
+    sflow_index_url: str | None = None
+    enable_workflow_monitor: bool = False
+    enable_task_monitors: list[str] | None = None
+    include_nodes: list[str] | None = None
+    exclude_nodes: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class BatchPlanRequest:
+    """Inputs the launch strategy needs to plan a batch submission."""
+
+    files: list[Path]
+    set_var: list[str] | None
+    cli_nodes: int | None
+    cli_gpus_per_node: int | None
+
+
+@dataclass(frozen=True)
+class BatchPlan:
+    """Strategy-produced plan for a batch submission.
+
+    The launch strategy owns all backend-specific decisions (e.g. Slurm
+    heterogeneous jobs and node/gpu derivation). The ``batch`` entry point only
+    echoes ``messages``, aborts on ``error``, and feeds the resolved values back
+    into the launcher request (``nodes``/``gpus_per_node``) and the dry-run
+    inputs (``dry_run_nodes``/``dry_run_gpus_per_node``).
+    """
+
+    messages: list[str]
+    error: str | None
+    nodes: int | None
+    gpus_per_node: int | None
+    dry_run_nodes: int | None
+    dry_run_gpus_per_node: int | None
+
+
+class BatchLaunchStrategy(Protocol):
+    backend_type: str
+
+    def plan(self, request: BatchPlanRequest) -> BatchPlan:
+        """Resolve backend-specific node/gpu/multi-backend planning."""
+        ...
+
+    def generate(self, request: BatchLauncherRequest) -> str:
+        """Generate a persistent launcher that eventually invokes ``sflow run``."""
+        ...
+
+    def submit(self, script_path: Path) -> str:
+        """Submit the generated launcher and return backend submission output."""
+        ...
+
+
+class SlurmBatchLaunchStrategy:
+    backend_type = "slurm"
+
+    def plan(self, request: BatchPlanRequest) -> BatchPlan:
+        """Plan a Slurm batch submission (single-allocation vs multi-backend driver).
+
+        A config with >=2 Slurm backends is submitted as a single driver sbatch
+        (sized to the leader backend); each backend runs its own salloc, so
+        nodes/gpus/partition are per-backend rather than a single value: report
+        the per-backend plan and do not apply (or require) the single CLI
+        ``-N``/``-G``. A single Slurm backend keeps the original behavior,
+        deriving nodes/gpus from the config when they are not supplied on the CLI.
+        """
+        messages: list[str] = []
+        slurm_backends = _resolve_slurm_backends(request.files, request.set_var)
+
+        if len(slurm_backends) >= 2:
+            wrapper = _select_wrapper_backend(slurm_backends)
+            messages.append(
+                f"  Info: {len(slurm_backends)} Slurm backends detected -> generating a "
+                "multi-backend driver job (driver wraps the heaviest backend; the rest salloc):"
+            )
+            for b in slurm_backends:
+                gpn = "unset" if b.gpus_per_node is None else str(b.gpus_per_node)
+                role = (
+                    "driver/leader, reuses sbatch allocation"
+                    if b.name == wrapper.name
+                    else "own salloc at runtime"
+                )
+                messages.append(
+                    f"          [{b.name}] partition={b.partition}, "
+                    f"nodes={b.nodes}, gpus_per_node={gpn} ({role})"
+                )
+            messages.append(
+                "        The driver sbatch is sized to the leader backend; other backends "
+                "salloc at runtime. CLI -p/--partition and -N/--nodes single values are not applied."
+            )
+            if request.cli_nodes is not None or request.cli_gpus_per_node is not None:
+                messages.append(
+                    "  Warning: --nodes/--gpus-per-node are ignored for multi-backend "
+                    "jobs; each backend uses its own config values."
+                )
+            # gpus_per_node is planning-only regardless of het; warn once per
+            # distinct configured value so the note isn't tied to a single
+            # misleading number.
+            for gpn_value in sorted(
+                {b.gpus_per_node for b in slurm_backends if b.gpus_per_node}
+            ):
+                emit_gpus_per_node_semantics_warning(
+                    gpn_value, messages.append, prefix="  Warning: "
+                )
+            return BatchPlan(
+                messages=messages,
+                error=None,
+                nodes=request.cli_nodes,
+                gpus_per_node=request.cli_gpus_per_node,
+                dry_run_nodes=None,
+                dry_run_gpus_per_node=None,
+            )
+
+        nodes = request.cli_nodes
+        if nodes is None:
+            nodes = _derive_nodes(request.files, cli_overrides=request.set_var)
+            if nodes is not None:
+                messages.append(
+                    f"  Info: --nodes not specified, derived from config: {nodes}"
+                )
+            else:
+                return BatchPlan(
+                    messages=messages,
+                    error="--nodes not specified and could not be derived from config backends.",
+                    nodes=None,
+                    gpus_per_node=request.cli_gpus_per_node,
+                    dry_run_nodes=request.cli_nodes,
+                    dry_run_gpus_per_node=request.cli_gpus_per_node,
+                )
+
+        gpus_per_node = request.cli_gpus_per_node
+        if gpus_per_node is None:
+            gpus_per_node = _derive_gpus_per_node(
+                request.files, cli_overrides=request.set_var
+            )
+            if gpus_per_node is not None:
+                messages.append(
+                    f"  Info: --gpus-per-node not specified, derived from config: {gpus_per_node}"
+                )
+        emit_gpus_per_node_semantics_warning(
+            gpus_per_node, messages.append, prefix="  Warning: "
+        )
+        return BatchPlan(
+            messages=messages,
+            error=None,
+            nodes=nodes,
+            gpus_per_node=gpus_per_node,
+            dry_run_nodes=request.cli_nodes,
+            dry_run_gpus_per_node=request.cli_gpus_per_node,
+        )
+
+    def generate(self, request: BatchLauncherRequest) -> str:
+        return _generate_sbatch_script(
+            files=request.files,
+            set_var=request.set_var,
+            artifact=request.artifact,
+            missable_tasks=request.missable_tasks,
+            log_level=request.log_level,
+            workspace_dir=request.workspace_dir,
+            output_dir=request.output_dir,
+            job_name=request.job_name,
+            sbatch_output=request.sbatch_output,
+            sbatch_error=request.sbatch_error,
+            partition=request.partition,
+            account=request.account,
+            time=request.time,
+            nodes=request.nodes,
+            gpus_per_node=request.gpus_per_node,
+            sbatch_extra_args=request.sbatch_extra_args,
+            sflow_venv_path=request.sflow_venv_path,
+            sflow_version=request.sflow_version,
+            sflow_source_path=request.sflow_source_path,
+            sflow_index_url=request.sflow_index_url,
+            enable_workflow_monitor=request.enable_workflow_monitor,
+            enable_task_monitors=request.enable_task_monitors,
+            include_nodes=request.include_nodes,
+            exclude_nodes=request.exclude_nodes,
+        )
+
+    def submit(self, script_path: Path) -> str:
+        return _submit_sbatch(script_path)
+
+
+def _batch_launch_strategy(backend_type: str = "slurm") -> BatchLaunchStrategy:
+    if backend_type == "slurm":
+        return SlurmBatchLaunchStrategy()
+    if backend_type in {"docker", "kubernetes"}:
+        raise NotImplementedError(
+            f"{backend_type} persistent launcher strategy is defined by the batch "
+            "interface but not implemented yet"
+        )
+    raise ValueError(f"Unknown batch backend strategy: {backend_type}")
+
+
+def _write_slurm_dry_run_config(
+    *,
+    files: list[Path],
+    variable_overrides: list[str] | None,
+    artifact_overrides: list[str] | None,
+    missable_tasks: list[str] | None,
+    nodes: int | None,
+    gpus_per_node: int | None,
+    directory: Path,
+) -> Path | None:
+    """Write a composed dry-run config with Slurm batch overrides applied."""
+    if nodes is None and gpus_per_node is None:
+        return None
+
+    from sflow.config.loader import ConfigLoader
+
+    config = ConfigLoader().load_configs(
+        files,
+        variable_overrides,
+        artifact_overrides,
+        missable_tasks,
+    )
+    updated_backends = []
+    changed = False
+    for backend_conf in config.backends or []:
+        if getattr(backend_conf, "type", None) != "slurm":
+            updated_backends.append(backend_conf)
+            continue
+        updates: dict[str, int] = {}
+        if nodes is not None:
+            updates["nodes"] = nodes
+        if gpus_per_node is not None:
+            updates["gpus_per_node"] = gpus_per_node
+        updated_backends.append(backend_conf.model_copy(update=updates))
+        changed = True
+
+    if not changed:
+        return None
+
+    dry_run_config = config.model_copy(update={"backends": updated_backends})
+    data = dry_run_config.model_dump(mode="json", exclude_none=True)
+    # `backends` is typed as the base BackendConfig, so the model-level dump above
+    # serializes each backend with only base fields and silently drops
+    # subclass-specific ones (e.g. slurm account/partition/time/nodes), producing
+    # a config that then fails re-validation. Re-dump each backend via its
+    # concrete type to preserve all of its fields.
+    data["backends"] = [
+        backend.model_dump(mode="json", exclude_none=True)
+        for backend in updated_backends
+    ]
+    # `operators` is likewise typed as the base OperatorConfig, so its subclass
+    # fields (e.g. srun name/container_image) are dropped by the model-level dump;
+    # re-dump each operator via its concrete type as well.
+    operators = getattr(dry_run_config, "operators", None)
+    if operators:
+        data["operators"] = [
+            operator.model_dump(mode="json", exclude_none=True)
+            for operator in operators
+        ]
+    path = directory / "sflow-batch-dry-run.yaml"
+    path.write_text(_yaml.safe_dump(data, sort_keys=False))
+    return path
+
+
+def _slurm_dry_run_inputs(
+    *,
+    files: list[Path],
+    variable_overrides: list[str] | None,
+    artifact_overrides: list[str] | None,
+    missable_tasks: list[str] | None,
+    nodes: int | None,
+    gpus_per_node: int | None,
+    directory: Path,
+) -> tuple[list[Path], list[str] | None, list[str] | None, list[str] | None]:
+    override_file = _write_slurm_dry_run_config(
+        files=files,
+        variable_overrides=variable_overrides,
+        artifact_overrides=artifact_overrides,
+        missable_tasks=missable_tasks,
+        nodes=nodes,
+        gpus_per_node=gpus_per_node,
+        directory=directory,
+    )
+    if override_file is None:
+        return files, variable_overrides, artifact_overrides, missable_tasks
+    return [override_file], None, None, None
 
 
 _RESERVED_CSV_COLUMNS = frozenset({"sflow_config_file", "job_name", "missable_tasks"})
@@ -1164,7 +1988,7 @@ def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
     Supports:
     - Explicit file paths (``workflow.yaml``)
     - Directories (scanned for ``*.yaml`` / ``*.yml``)
-    - Glob patterns (``examples/slurm_*``, ``configs/**/*.yaml``)
+    - Glob patterns (``examples/self_contained/slurm/*``, ``configs/**/*.yaml``)
     """
     import glob as _glob
 
@@ -1218,9 +2042,15 @@ def _run_bulk_submit(
     sbatch_extra_args: list[str] | None,
     sflow_venv_path: Path | None,
     sflow_version: str | None,
+    sflow_source_path: Path | None = None,
+    sflow_index_url: str | None = None,
     submit: bool,
     missable_tasks: list[str] | None = None,
     resolve: bool = False,
+    enable_workflow_monitor: bool = False,
+    enable_task_monitors: list[str] | None = None,
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
 ) -> None:
     """Process multiple self-contained sflow YAML configs as individual batch jobs."""
     import re as _re
@@ -1285,6 +2115,11 @@ def _run_bulk_submit(
         # Derive gpus_per_node: config value wins over CLI
         config_gpus = _derive_gpus_per_node([yaml_file], cli_overrides=cli_set_var)
         row_gpus = config_gpus if config_gpus is not None else gpus_per_node
+        emit_gpus_per_node_semantics_warning(
+            row_gpus,
+            lambda message: typer.echo(message, err=True),
+            prefix="  Warning: ",
+        )
         if (
             gpus_per_node is not None
             and config_gpus is not None
@@ -1298,18 +2133,37 @@ def _run_bulk_submit(
 
         # Dry-run validation
         try:
-            _sflow_app.run(
-                file=[yaml_file],
-                dry_run=True,
-                quiet=True,
-                variable_overrides=list(cli_set_var) if cli_set_var else None,
-                artifact_overrides=list(cli_artifact) if cli_artifact else None,
-                missable_tasks=missable_tasks,
-                slurm_nodes=nodes,
-                slurm_gpus_per_node=row_gpus,
-                workspace_dir=workspace_dir,
-                output_dir=output_dir,
+            # sflow batch is Slurm-only; a Kubernetes-backed config has no sbatch
+            # step. Reject it here so it is reported as a per-config failure (use
+            # `sflow run` for k8s) instead of emitting a meaningless script.
+            _reject_kubernetes_batch(
+                [yaml_file], list(cli_set_var) if cli_set_var else None
             )
+            with tempfile.TemporaryDirectory(prefix="sflow-batch-dry-run-") as tmp:
+                dry_files, dry_vars, dry_artifacts, dry_missable = _slurm_dry_run_inputs(
+                    files=[yaml_file],
+                    variable_overrides=list(cli_set_var) if cli_set_var else None,
+                    artifact_overrides=list(cli_artifact) if cli_artifact else None,
+                    missable_tasks=missable_tasks,
+                    nodes=nodes,
+                    gpus_per_node=None if config_gpus is not None else gpus_per_node,
+                    directory=Path(tmp),
+                )
+                _sflow_app.run(
+                    file=dry_files,
+                    dry_run=True,
+                    variable_overrides=dry_vars,
+                    artifact_overrides=dry_artifacts,
+                    missable_tasks=dry_missable,
+                    workspace_dir=workspace_dir,
+                    output_dir=output_dir,
+                    sbatch_output=sbatch_output,
+                    sbatch_error=sbatch_error,
+                    enable_workflow_monitor=enable_workflow_monitor,
+                    enable_task_monitors=enable_task_monitors,
+                    include_nodes=include_nodes,
+                    exclude_nodes=exclude_nodes,
+                )
         except Exception as e:
             failed_count += 1
             err_short = str(e).split("\n")[0]
@@ -1353,25 +2207,33 @@ def _run_bulk_submit(
             except Exception:
                 pass
 
-        script = _generate_sbatch_script(
-            files=[yaml_file],
-            set_var=cli_set_var,
-            artifact=cli_artifact,
-            missable_tasks=missable_tasks,
-            log_level=log_level,
-            workspace_dir=workspace_dir,
-            output_dir=output_dir,
-            job_name=job_name,
-            sbatch_output=sbatch_output,
-            sbatch_error=sbatch_error,
-            partition=partition,
-            account=account,
-            time=time,
-            nodes=row_nodes,
-            gpus_per_node=row_gpus,
-            sbatch_extra_args=sbatch_extra_args,
-            sflow_venv_path=sflow_venv_path,
-            sflow_version=sflow_version,
+        script = _batch_launch_strategy("slurm").generate(
+            BatchLauncherRequest(
+                files=[yaml_file],
+                set_var=cli_set_var,
+                artifact=cli_artifact,
+                missable_tasks=missable_tasks,
+                log_level=log_level,
+                workspace_dir=workspace_dir,
+                output_dir=output_dir,
+                job_name=job_name,
+                sbatch_output=sbatch_output,
+                sbatch_error=sbatch_error,
+                partition=partition,
+                account=account,
+                time=time,
+                nodes=row_nodes,
+                gpus_per_node=row_gpus,
+                sbatch_extra_args=sbatch_extra_args,
+                sflow_venv_path=sflow_venv_path,
+                sflow_version=sflow_version,
+                sflow_source_path=sflow_source_path,
+                sflow_index_url=sflow_index_url,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitors,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
+            )
         )
         script_path = bulk_dir / f"{job_name}.sh"
         script_path.write_text(script)
@@ -1390,6 +2252,8 @@ def _run_bulk_submit(
                 resolve=resolve,
                 missable_tasks=missable_tasks,
                 quiet_missable=True,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitors,
             )
             yaml_path = bulk_dir / f"{job_name}.yaml"
             yaml_path.write_text(yaml_output)
@@ -1404,7 +2268,7 @@ def _run_bulk_submit(
         job_id = ""
         if submit:
             try:
-                msg = _submit_sbatch(script_path)
+                msg = _batch_launch_strategy("slurm").submit(script_path)
                 status = msg
                 m = _SBATCH_JOB_ID_RE.search(msg)
                 if m:
@@ -1453,12 +2317,15 @@ def _run_bulk_submit(
             "sflow_config_file",
             "job_name",
             "slurm_job_id",
+            "backend_job_id",
             "sflow_output_dir",
             "sflow_batch_dir",
             "status",
         ]
         if resolve:
             fieldnames.append("composed_sflow_config")
+        for rr in result_rows:
+            rr["backend_job_id"] = rr.get("slurm_job_id", "")
         with open(results_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -1491,10 +2358,16 @@ def _run_bulk_edit(
     sbatch_extra_args: list[str] | None,
     sflow_venv_path: Path | None,
     sflow_version: str | None,
+    sflow_source_path: Path | None = None,
+    sflow_index_url: str | None = None,
     submit: bool,
     row_selectors: list[str] | None = None,
     resolve: bool = False,
     missable_tasks: list[str] | None = None,
+    enable_workflow_monitor: bool = False,
+    enable_task_monitors: list[str] | None = None,
+    include_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
 ) -> None:
     """Generate (and optionally submit) one sbatch job per CSV row.
 
@@ -1579,11 +2452,19 @@ def _run_bulk_edit(
         overrides_desc = ", ".join(f"{k}={v}" for k, v in all_overrides.items())
 
         result_row = dict(row)
+        for name, value in {**cli_var_map, **cli_art_map}.items():
+            if name in result_row:
+                result_row[name] = value
         effective_missable = row_missable(row, missable_tasks)
 
         # Derive gpus_per_node: config/CSV value wins over CLI
         config_gpus = _derive_gpus_per_node(config_files, cli_overrides=set_var)
         row_gpus = config_gpus if config_gpus is not None else gpus_per_node
+        emit_gpus_per_node_semantics_warning(
+            row_gpus,
+            lambda message: typer.echo(message, err=True),
+            prefix="  Warning: ",
+        )
         if (
             gpus_per_node is not None
             and config_gpus is not None
@@ -1596,18 +2477,35 @@ def _run_bulk_edit(
             )
 
         try:
-            _sflow_app.run(
-                file=config_files,
-                dry_run=True,
-                quiet=True,
-                variable_overrides=set_var or None,
-                artifact_overrides=artifacts or None,
-                missable_tasks=effective_missable,
-                slurm_nodes=nodes,
-                slurm_gpus_per_node=row_gpus,
-                workspace_dir=workspace_dir,
-                output_dir=output_dir,
-            )
+            # sflow batch is Slurm-only; a Kubernetes-backed config has no sbatch
+            # step. Reject it here so it is reported as a per-row failure (use
+            # `sflow run` for k8s) instead of emitting a meaningless script.
+            _reject_kubernetes_batch(config_files, set_var or None)
+            with tempfile.TemporaryDirectory(prefix="sflow-batch-dry-run-") as tmp:
+                dry_files, dry_vars, dry_artifacts, dry_missable = _slurm_dry_run_inputs(
+                    files=config_files,
+                    variable_overrides=set_var or None,
+                    artifact_overrides=artifacts or None,
+                    missable_tasks=effective_missable,
+                    nodes=nodes,
+                    gpus_per_node=None if config_gpus is not None else gpus_per_node,
+                    directory=Path(tmp),
+                )
+                _sflow_app.run(
+                    file=dry_files,
+                    dry_run=True,
+                    variable_overrides=dry_vars,
+                    artifact_overrides=dry_artifacts,
+                    missable_tasks=dry_missable,
+                    workspace_dir=workspace_dir,
+                    output_dir=output_dir,
+                    sbatch_output=sbatch_output,
+                    sbatch_error=sbatch_error,
+                    enable_workflow_monitor=enable_workflow_monitor,
+                    enable_task_monitors=enable_task_monitors,
+                    include_nodes=include_nodes,
+                    exclude_nodes=exclude_nodes,
+                )
         except Exception as e:
             failed_count += 1
             err_short = str(e).split("\n")[0]
@@ -1633,6 +2531,8 @@ def _run_bulk_edit(
                 resolve=resolve,
                 missable_tasks=effective_missable,
                 quiet_missable=True,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitors,
             )
         except Exception as e:
             typer.echo(
@@ -1661,25 +2561,33 @@ def _run_bulk_edit(
             composed_config_path = str(merged_yaml_path)
 
         script_path = bulk_dir / f"{row_name}.sh"
-        script = _generate_sbatch_script(
-            files=config_files,
-            set_var=set_var or None,
-            artifact=artifacts or None,
-            missable_tasks=effective_missable,
-            log_level=log_level,
-            workspace_dir=workspace_dir,
-            output_dir=output_dir,
-            job_name=row_name,
-            sbatch_output=sbatch_output,
-            sbatch_error=sbatch_error,
-            partition=partition,
-            account=account,
-            time=time,
-            nodes=row_nodes,
-            gpus_per_node=row_gpus,
-            sbatch_extra_args=sbatch_extra_args,
-            sflow_venv_path=sflow_venv_path,
-            sflow_version=sflow_version,
+        script = _batch_launch_strategy("slurm").generate(
+            BatchLauncherRequest(
+                files=config_files,
+                set_var=set_var or None,
+                artifact=artifacts or None,
+                missable_tasks=effective_missable,
+                log_level=log_level,
+                workspace_dir=workspace_dir,
+                output_dir=output_dir,
+                job_name=row_name,
+                sbatch_output=sbatch_output,
+                sbatch_error=sbatch_error,
+                partition=partition,
+                account=account,
+                time=time,
+                nodes=row_nodes,
+                gpus_per_node=row_gpus,
+                sbatch_extra_args=sbatch_extra_args,
+                sflow_venv_path=sflow_venv_path,
+                sflow_version=sflow_version,
+                sflow_source_path=sflow_source_path,
+                sflow_index_url=sflow_index_url,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitors,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
+            )
         )
         script_path.write_text(script)
         script_path.chmod(0o755)
@@ -1688,7 +2596,7 @@ def _run_bulk_edit(
         job_id = ""
         if submit:
             try:
-                msg = _submit_sbatch(script_path)
+                msg = _batch_launch_strategy("slurm").submit(script_path)
                 status = msg
                 m = _SBATCH_JOB_ID_RE.search(msg)
                 if m:
@@ -1730,12 +2638,18 @@ def _run_bulk_edit(
 
     if result_rows:
         results_csv = bulk_dir / "results.csv"
-        result_columns = columns + ["slurm_job_id", "sflow_output_dir", "sflow_batch_dir"]
+        result_columns = columns + [
+            "slurm_job_id",
+            "backend_job_id",
+            "sflow_output_dir",
+            "sflow_batch_dir",
+        ]
         if resolve:
             result_columns.append("composed_sflow_config")
         for rr in result_rows:
             if not rr.get("slurm_job_id"):
                 rr["slurm_job_id"] = "not submitted" if not submit else ""
+            rr["backend_job_id"] = rr.get("slurm_job_id", "")
             if not rr.get("sflow_output_dir"):
                 rr["sflow_output_dir"] = "not submitted" if not submit else ""
         with open(results_csv, "w", newline="") as f:
@@ -1791,6 +2705,10 @@ def batch(
             help="Override artifact URI (format: NAME=URI, can be used multiple times)",
         ),
     ] = None,
+    enable_workflow_monitor: EnableWorkflowMonitorOption = False,
+    enable_task_monitor: EnableTaskMonitorOption = None,
+    include_nodes: IncludeNodesOption = None,
+    exclude_nodes: ExcludeNodesOption = None,
     log_level: Annotated[
         str,
         typer.Option(
@@ -1904,21 +2822,64 @@ def batch(
         typer.Option(
             "--sflow-venv-path",
             "-v",
-            help="Path to Python virtual environment for sflow (e.g., /path/to/.venv). "
-            "The script will activate this venv before running sflow, pay extra attention to the arch of python ( x86 / arm ) when using existing venv.",
+            help="Parent directory in which each Slurm job creates its OWN fresh, "
+            "disposable per-job virtualenv (.sflow_venv-<job id>/) and installs sflow "
+            "into it -- from the git ref resolved via --sflow-version, or editable from "
+            "--sflow-source-path. The venv is built on the compute node with a resolved "
+            "system python3, so it always matches the node's architecture (x86/arm), and "
+            "is removed when the job exits. This is the venv parent dir, NOT an existing "
+            "venv to reuse. Defaults to compute-node-local scratch resolved at run time "
+            "(${TMPDIR:-/tmp}/sflow_compute_node_venv); pass a (shared-filesystem) path "
+            "to override.",
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
         ),
-    ] = Path.cwd() / "sflow_compute_node_venv",
+    ] = None,
     sflow_version: Annotated[
         Optional[str],
         typer.Option(
             "--sflow-version",
-            help="Git ref (branch or tag) to install from the GitHub repo (e.g., 'main', 'v0.1.0'). "
+            help="Git ref (branch or tag) to install from the GitHub repo (e.g., 'main', 'v0.1.0'), "
+            "or a repository URL with an @ref suffix "
+            "(e.g., 'https://git.example.com/example/sflow.git@develop'). "
             "If not specified, generated scripts default to the currently executing sflow environment's "
             "installed git ref when available, otherwise the installed package version, and only fall back "
-            "to 'main' when neither can be determined.",
+            "to 'main' when neither can be determined. Mutually exclusive with --sflow-source-path. "
+            "When --sflow-index-url is set, this is instead interpreted as a PyPI version "
+            "specifier (e.g. '0.2.1' or '>=0.2,<0.3'); see --sflow-index-url.",
+        ),
+    ] = None,
+    sflow_index_url: Annotated[
+        Optional[str],
+        typer.Option(
+            "--sflow-index-url",
+            help="Install sflow from a private PyPI index (e.g. an Artifactory registry "
+            "such as https://<host>/artifactory/api/pypi/<repo>/simple) instead of "
+            "from git. When set, --sflow-version is treated as a PyPI version specifier: a "
+            "bare version is pinned ('0.2.1' -> 'sflow==0.2.1'), an operator spec is passed "
+            "through ('>=0.2,<0.3'), and omitting it installs the latest available. The index "
+            "is added via uv's --extra-index-url so dependencies still resolve from the "
+            "default index. Credentials must be available on the compute node (e.g. ~/.netrc) "
+            "or via a credential helper; URLs containing embedded credentials are rejected. "
+            "Mutually exclusive with --sflow-source-path.",
+        ),
+    ] = None,
+    sflow_source_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--sflow-source-path",
+            help="Path to a local sflow source checkout. When set, each job copies this "
+            "checkout (via rsync) into its own per-job dir and installs sflow editable "
+            "from the copy (`uv pip install -e \".[dev]\"`, dev extras) instead of from "
+            "the git repo; the per-job copy keeps concurrent jobs from racing on the "
+            "setuptools-scm build artifacts written during an editable build. The path "
+            "must be readable from the compute node, which must have rsync. Mutually "
+            "exclusive with --sflow-version.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
         ),
     ] = None,
     missable_tasks: Annotated[
@@ -1995,8 +2956,20 @@ def batch(
             "-B",
             help="File path(s), folder(s), or glob pattern(s) of self-contained sflow YAML configs. "
             "Each valid YAML is processed as a standalone batch job (no merging). "
-            "Folders are scanned for *.yaml/*.yml files. Glob patterns (e.g. 'examples/slurm_*') are expanded. "
+            "Folders are scanned for *.yaml/*.yml files. Glob patterns (e.g. 'examples/self_contained/slurm/*') are expanded. "
             "CLI flags (--set, --artifact, --partition, etc.) are applied to every config.",
+        ),
+    ] = None,
+    offload_task_logs: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--offload-task-logs/--no-offload-task-logs",
+            help="Have each task write its own log via the operator (srun --output, "
+            "or a host-side shell redirect for local/docker) through a compute-side "
+            "prefixer, instead of streaming it through the sflow driver inside the job. "
+            "ON by default for local/docker/slurm in non-interactive runs; pass "
+            "--no-offload-task-logs to force streaming. Overrides the backend's "
+            "offload_task_logs; no-op for k8s/ssh.",
         ),
     ] = None,
 ):
@@ -2098,11 +3071,84 @@ def batch(
         sflow batch -B ./examples/ --set SLURM_NODES=2 --partition gpu --submit
     """
     configure_logging(level=log_level, console=True)
+    log_runtime_info()
+
+    # Accept comma- and/or whitespace-separated task names (and repeated flags).
+    enable_task_monitor = split_list_arg(enable_task_monitor)
+    include_nodes = split_list_arg(include_nodes)
+    exclude_nodes = split_list_arg(exclude_nodes)
+
+    # Per-invocation override for the per-task log offload. Setting it here makes
+    # the in-process dry-run plan reflect the choice; _generate_sbatch_script also
+    # exports it into the generated job so the inner `sflow run` applies it.
+    if offload_task_logs is not None:
+        os.environ[OFFLOAD_TASK_LOGS_ENV] = "1" if offload_task_logs else "0"
+
+    # sflow batch only targets Slurm. For the single-job path, reject a
+    # Kubernetes-backed config NOW -- before Slurm partition/account auto-detection --
+    # so a k8s recipe gets the clear "use sflow run" hint instead of a confusing
+    # "could not auto-detect a Slurm partition" error. The bulk paths reject k8s per
+    # row/config inside their runners (where each row's files are known).
+    if bulk_input is None and bulk_submit is None:
+        single_job_files = list(src_files or []) + list(file or [])
+        if not single_job_files:
+            single_job_files = [Path("sflow.yaml").resolve()]
+        try:
+            _reject_kubernetes_batch(single_job_files, set_var)
+        except ValueError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
 
     partition, account = _resolve_slurm_defaults(partition, account)
 
     if row and bulk_input is None:
         typer.echo("Error: --row requires --bulk-input.", err=True)
+        raise typer.Exit(code=1)
+
+    if sflow_version is not None and sflow_source_path is not None:
+        typer.echo(
+            "Error: --sflow-version and --sflow-source-path are mutually exclusive; "
+            "pass at most one.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if sflow_index_url is not None and sflow_source_path is not None:
+        typer.echo(
+            "Error: --sflow-index-url and --sflow-source-path are mutually exclusive; "
+            "pass at most one.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if sflow_index_url is not None:
+        parsed_sflow_index_url = urlparse(sflow_index_url)
+        if (
+            parsed_sflow_index_url.username is not None
+            or parsed_sflow_index_url.password is not None
+        ):
+            typer.echo(
+                "Error: --sflow-index-url must not contain embedded credentials; "
+                "use ~/.netrc or a credential helper on the compute node instead.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if parsed_sflow_index_url.query or parsed_sflow_index_url.fragment:
+            typer.echo(
+                "Error: --sflow-index-url must not include query parameters or fragments; "
+                "use ~/.netrc or a credential helper on the compute node instead.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+    # Sanity-check --sflow-version for whichever install route is active: a git
+    # ref/URL by default, or a PyPI version/specifier when --sflow-index-url is
+    # set. This is the single source of truth -- script generation trusts it.
+    version_error = _sflow_version_error(
+        sflow_version, registry=sflow_index_url is not None
+    )
+    if version_error is not None:
+        typer.echo(f"Error: {version_error}", err=True)
         raise typer.Exit(code=1)
 
     # --- Bulk-edit mode ---
@@ -2127,10 +3173,16 @@ def batch(
                 sbatch_extra_args=sbatch_extra_args,
                 sflow_venv_path=sflow_venv_path,
                 sflow_version=sflow_version,
+                sflow_source_path=sflow_source_path,
+                sflow_index_url=sflow_index_url,
                 submit=submit,
                 row_selectors=row,
                 resolve=resolve,
                 missable_tasks=missable_tasks,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitor,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         except ValueError as e:
             typer.echo(f"Error: {e}", err=True)
@@ -2188,9 +3240,15 @@ def batch(
                 sbatch_extra_args=sbatch_extra_args,
                 sflow_venv_path=sflow_venv_path,
                 sflow_version=sflow_version,
+                sflow_source_path=sflow_source_path,
+                sflow_index_url=sflow_index_url,
                 submit=submit,
                 missable_tasks=missable_tasks,
                 resolve=resolve,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitor,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
             )
         except ValueError as e:
             typer.echo(f"Error: {e}", err=True)
@@ -2224,45 +3282,59 @@ def batch(
         )
         raise typer.Exit(code=1)
 
-    # Derive nodes from config if not given via CLI
-    if nodes is None:
-        nodes = _derive_nodes(files, cli_overrides=set_var)
-        if nodes is not None:
-            typer.echo(
-                f"  Info: --nodes not specified, derived from config: {nodes}",
-                err=True,
-            )
-        else:
-            typer.echo(
-                "Error: --nodes not specified and could not be derived from config backends.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
+    cli_nodes = nodes
+    cli_gpus_per_node = gpus_per_node
 
-    # Derive gpus_per_node from config if not given via CLI
-    if gpus_per_node is None:
-        gpus_per_node = _derive_gpus_per_node(files, cli_overrides=set_var)
-        if gpus_per_node is not None:
-            typer.echo(
-                f"  Info: --gpus-per-node not specified, derived from config: {gpus_per_node}",
-                err=True,
-            )
+    # Backend-specific planning -- single-allocation vs multi-backend driver, plus
+    # node/gpu derivation -- is owned by the launch strategy so this entry point
+    # stays backend-type agnostic and does not reason about Slurm specifics itself.
+    strategy = _batch_launch_strategy("slurm")
+    batch_plan = strategy.plan(
+        BatchPlanRequest(
+            files=files,
+            set_var=set_var,
+            cli_nodes=cli_nodes,
+            cli_gpus_per_node=cli_gpus_per_node,
+        )
+    )
+    for message in batch_plan.messages:
+        typer.echo(message, err=True)
+    if batch_plan.error is not None:
+        typer.echo(f"Error: {batch_plan.error}", err=True)
+        raise typer.Exit(code=1)
+    nodes = batch_plan.nodes
+    gpus_per_node = batch_plan.gpus_per_node
 
     # Run dry-run validation before generating sbatch script
     typer.echo("Running dry-run validation before generating sbatch script...")
     try:
-        _sflow_app.run(
-            file=files,
-            dry_run=True,
-            quiet=True,
-            variable_overrides=set_var,
-            artifact_overrides=artifact,
-            missable_tasks=missable_tasks,
-            slurm_nodes=nodes,
-            slurm_gpus_per_node=gpus_per_node,
-            workspace_dir=workspace_dir,
-            output_dir=output_dir,
-        )
+        with tempfile.TemporaryDirectory(prefix="sflow-batch-dry-run-") as tmp:
+            # Honor the strategy's plan: a multi-backend job keeps each backend's
+            # own nodes/gpus, so the single CLI -N/-G must not override them here.
+            dry_files, dry_vars, dry_artifacts, dry_missable = _slurm_dry_run_inputs(
+                files=files,
+                variable_overrides=set_var,
+                artifact_overrides=artifact,
+                missable_tasks=missable_tasks,
+                nodes=batch_plan.dry_run_nodes,
+                gpus_per_node=batch_plan.dry_run_gpus_per_node,
+                directory=Path(tmp),
+            )
+            _sflow_app.run(
+                file=dry_files,
+                dry_run=True,
+                variable_overrides=dry_vars,
+                artifact_overrides=dry_artifacts,
+                missable_tasks=dry_missable,
+                workspace_dir=workspace_dir,
+                output_dir=output_dir,
+                sbatch_output=sbatch_output,
+                sbatch_error=sbatch_error,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitor,
+                include_nodes=include_nodes,
+                exclude_nodes=exclude_nodes,
+            )
         typer.echo("✓ Dry-run validation passed\n")
     except ValueError as e:
         msg = enrich_error_with_location(str(e), files)
@@ -2278,25 +3350,33 @@ def batch(
         typer.echo("Aborting sbatch generation due to validation errors.", err=True)
         raise typer.Exit(code=1)
 
-    script_content = _generate_sbatch_script(
-        files=files,
-        set_var=set_var,
-        artifact=artifact,
-        missable_tasks=missable_tasks,
-        log_level=log_level,
-        workspace_dir=workspace_dir,
-        output_dir=output_dir,
-        job_name=job_name,
-        sbatch_output=sbatch_output,
-        sbatch_error=sbatch_error,
-        partition=partition,
-        account=account,
-        time=time,
-        nodes=nodes,
-        gpus_per_node=gpus_per_node,
-        sbatch_extra_args=sbatch_extra_args,
-        sflow_venv_path=sflow_venv_path,
-        sflow_version=sflow_version,
+    script_content = strategy.generate(
+        BatchLauncherRequest(
+            files=files,
+            set_var=set_var,
+            artifact=artifact,
+            missable_tasks=missable_tasks,
+            log_level=log_level,
+            workspace_dir=workspace_dir,
+            output_dir=output_dir,
+            job_name=job_name,
+            sbatch_output=sbatch_output,
+            sbatch_error=sbatch_error,
+            partition=partition,
+            account=account,
+            time=time,
+            nodes=nodes,
+            gpus_per_node=gpus_per_node,
+            sbatch_extra_args=sbatch_extra_args,
+            sflow_venv_path=sflow_venv_path,
+            sflow_version=sflow_version,
+            sflow_source_path=sflow_source_path,
+            sflow_index_url=sflow_index_url,
+            enable_workflow_monitor=enable_workflow_monitor,
+            enable_task_monitors=enable_task_monitor,
+            include_nodes=include_nodes,
+            exclude_nodes=exclude_nodes,
+        )
     )
 
     # Generate composed/resolved YAML alongside the sbatch script
@@ -2312,6 +3392,8 @@ def batch(
                 resolve=resolve,
                 missable_tasks=missable_tasks,
                 quiet_missable=True,
+                enable_workflow_monitor=enable_workflow_monitor,
+                enable_task_monitors=enable_task_monitor,
             )
             yaml_path = sbatch_path.with_suffix(".yaml")
             yaml_path.write_text(yaml_output)
@@ -2327,7 +3409,7 @@ def batch(
 
         if submit:
             try:
-                msg = _submit_sbatch(sbatch_path)
+                msg = strategy.submit(sbatch_path)
                 typer.echo(f"✓ Job submitted: {msg}")
             except RuntimeError as e:
                 typer.echo(f"✗ {e}", err=True)

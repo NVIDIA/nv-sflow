@@ -12,8 +12,9 @@ import typer
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
-from sflow.config.resolver import enrich_error_with_location
-from sflow.logging import get_logger
+from sflow.logging import configure_logging, get_logger
+from sflow.resolution import enrich_error_with_location
+from sflow.runtime_info import log_runtime_info
 
 _logger = get_logger(__name__)
 
@@ -128,6 +129,9 @@ def visualize(
         sflow visualize --file workflow.yaml --format svg --output dag.svg
     """
     try:
+        configure_logging(console=True)
+        log_runtime_info()
+
         files = list(src_files or []) + list(file or [])
         if not files:
             files = [Path("sflow.yaml").resolve()]

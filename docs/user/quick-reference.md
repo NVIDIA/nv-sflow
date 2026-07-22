@@ -14,8 +14,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `version` | Yes | string | — | Schema version. Must be `"0.1"`. |
 | `variables` | | dict / list | — | Global variables available to expressions and task env. |
 | `artifacts` | | dict / list | — | Named resources referenced by URI. |
-| `backends` | | dict / list | — | Compute backends (`local`, `slurm`). |
-| `operators` | | dict / list | — | Task execution operators (`bash`, `srun`, `docker`, `ssh`, `python`). |
+| `backends` | | dict / list | — | Compute backends (`local`, `slurm`, `docker`, `kubernetes`). |
+| `operators` | | dict / list | — | Task execution operators (`bash`, `srun`, `docker_run`, `ssh`, `python`, `k8s`, `k8s_mpi`). |
 | `workflow` | Yes | object | — | Workflow definition containing name and tasks. |
 
 ## Variables
@@ -45,9 +45,9 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 
 | Field | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
-| `type` | Yes | string | — | `local` or `slurm`. |
+| `type` | Yes | string | — | `local`, `slurm`, `docker`, or `kubernetes`. |
 | `default` | | bool | `false` | Mark as the default backend (only one allowed). |
-| `gpus_per_node` | | int / expr | `null` | GPUs per node for allocation / packing. |
+| `gpus_per_node` | | int / expr | `null` | GPUs per node for sflow planning / packing. Does not add Slurm GPU allocation flags. |
 
 ## Backends — Local
 
@@ -67,8 +67,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `partition` | Yes | string / expr | — | Slurm partition. |
 | `time` | Yes | string / expr | — | Time limit (e.g. `00:30:00`). |
 | `nodes` | Yes | int / expr | — | Number of nodes. |
-| `gpus_per_node` | Yes | int / expr | — | GPUs per node. |
-| `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`). |
+| `gpus_per_node` | Yes | int / expr | — | GPUs per node for planning. Set to `0` for CPU-only partitions; tasks that request `resources.gpus` against a zero-capacity backend will be rejected. |
+| `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`, `--gpus-per-node=8`). |
 | `job_name` | | string | `null` | Job name; defaults to workflow name. |
 
 ## Operators — Common Fields
@@ -77,7 +77,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 
 | Field | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
-| `type` | Yes | string | — | Operator type: `bash`, `srun`, `docker`, `ssh`, or `python`. |
+| `type` | Yes | string | — | Operator type: `bash`, `srun`, `docker_run`, `ssh`, `python`, `k8s`, or `k8s_mpi`. |
 
 ## Operators — srun
 
@@ -120,9 +120,9 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `mpi` | | string | `null` | MPI type (e.g. `pmix`, `ucx`). |
 | `extra_args` | | list[string] | `[]` | Extra CLI arguments. |
 
-## Operators — Docker
+## Operators — Docker Run
 
-> Additional fields when `type: docker`
+> Additional fields when `type: docker_run`
 
 | Field | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
@@ -154,6 +154,49 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `python_exec` | | string | `"python"` | Python executable. |
 | `extra_args` | | list[string] | `[]` | Extra Python arguments. |
 
+## Operators — Kubernetes (`k8s`)
+
+> Additional fields when `type: k8s`. The workload **image lives on the operator**
+> (the `kubernetes` backend has none). See [Backends](./backends.md#kubernetes-backend)
+> for the complete pod/container passthrough list.
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `image` | Yes | string | — | Container image for the pod. |
+| `image_pull_policy` | | string | `null` | `Always` / `IfNotPresent` / `Never` (else cluster default). |
+| `restart` | | string | `"Never"` | Pod `restartPolicy`. |
+| `host_network` | | bool | inherit backend | Pod IP == node IP (needed by some RDMA paths). |
+| `node_selector` | | map | inherit backend | Constrain the pod to nodes with these labels. |
+| `run_as_root` | | bool | `false` | Force `runAsUser/Group=0` (root-owned PVCs, MPI/sshd bootstrap). |
+| `pass_envs` | | bool | `true` | Create + mount the env Secret. |
+| `shm_size` | | string | `null` | Cap for RAM-backed `/dev/shm` (e.g. `64Gi`); unset = node-RAM-bounded tmpfs. |
+| `tty` | | bool | `false` | Allocate a pseudo-TTY so `\r` progress bars stream live. |
+| `cpu` / `memory` | | int/string | `null` | Container resource **requests**. |
+| `cpu_limit` / `memory_limit` | | int/string | `null` | Optional hard caps (unset = requests-only). |
+| `env` | | list[dict] | `null` | Raw k8s `EnvVar` entries (only way to use `valueFrom`). |
+| `security_context` | | map | `null` | Container `securityContext` (deep-merged; caps union-merged). |
+| `device_class` / `device_selectors` | | string/list | inherit backend | DRA overrides (ignored under `device_plugin`). |
+| `container_overrides` / `pod_overrides` | | map | `null` | Raw escape hatches, deep-merged **last** (they win). |
+
+## Operators — Kubernetes MPI (`k8s_mpi`)
+
+> Additional fields when `type: k8s_mpi` — any MPI (`mpirun`) job, single- or multi-node.
+> Inherits every `k8s` field above and adds an `mpi:` block. Write an explicit
+> `mpirun -np N ... <workload>` and sflow builds the MPI world either way, injecting the
+> SSH keypair, hostfile, and launcher wiring. Use plain `k8s` for non-MPI, single-pod workloads.
+
+| `mpi.` field | Type | Default | Description |
+|--------------|------|---------|-------------|
+| `route` | `auto`\|`operator`\|`pods` | `auto` | MPIJob CR (Kubeflow MPI Operator) vs plain-pods bootstrap; `auto` detects the CRD. |
+| `slots_per_worker` | int/string | per-node GPU count | Slots advertised per worker. |
+| `run_launcher_as_worker` | bool | `true` | Launcher pod also runs a rank. |
+| `launcher_creation_policy` | `AtStartup`\|`WaitForWorkersReady` | `WaitForWorkersReady` | When the launcher starts. |
+| `ssh_port` | int | `2222` | Port for the injected sshd. |
+| `mpi_implementation` | `OpenMPI`\|`Intel`\|`MPICH` | `OpenMPI` | Selects hostfile/env conventions. |
+| `ensure_sshd` | bool | `true` | Install `openssh-server` if the image lacks sshd. |
+| `forward_env_prefixes` | list[string] | `[]` | Extra env-namespace prefixes forwarded to remote ranks. |
+| `omp_num_threads` | int | `8` | Injected `OMP_NUM_THREADS` per rank; `null`/`0` keeps the image default. |
+
 ## Workflow
 
 > YAML path: `workflow`
@@ -182,7 +225,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `replicas` | | object | `null` | Replication configuration. |
 | `retries` | | object | `null` | Retry configuration. |
 | `probes` | | object | `null` | Readiness and failure probes. |
-| `outputs` | | list | `null` | Output parsing configuration. |
+| `outputs` | | list | `null` | Output parsing configuration (legacy MVP). |
+| `result` | | map / object | `null` | Consolidated result parsing (regex map, `patterns`, or `file`). Writes `result.json` + workflow `results.json`. |
 
 ## Task Resources
 
@@ -193,7 +237,11 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `nodes.indices` | | list[int / expr] | `null` | Specific node indices (e.g. `[0]`). |
 | `nodes.count` | | int / expr | `null` | Number of nodes. |
 | `nodes.exclude` | | int / list[int] / expr | `null` | Node indices to remove from the placement pool before `indices`, `count`, or GPU packing. |
+| `nodes.release_after` | | string | inferred | When node reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. |
 | `gpus.count` | If `gpus` is set | int / expr | — | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). |
+| `gpus.release_after` | | string | inferred | When GPU reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. |
+
+For nodes, `release_after` only creates an exclusive node reservation when explicitly set; omitted `nodes.indices` and `nodes.count` are placement constraints and may overlap with other planned tasks. For GPUs, omitted `release_after` is inferred: tasks without readiness probes release GPUs after task completion for downstream dependents, while tasks with readiness probes keep GPUs until workflow completion unless explicitly set to `task_ready`. `task_ready` releases after readiness succeeds. `task_completion` releases after any terminal task status (`COMPLETED`, `FAILED`, `TIMEOUT`, or `CANCELLED`). Dry-run rehearses these resource lifetimes across the DAG.
 
 ## Task Replicas
 
@@ -249,6 +297,35 @@ Exactly one probe type must be set per probe:
 | `metrics.<key>.type` | | string | `null` | Metric type. |
 | `metrics.<key>.aggregate` | | string | `null` | Aggregation hint. |
 
+## Task Result
+
+> YAML path: `workflow.tasks[].result`. Accepts a simple `name: regex` map, an object with `patterns:`, or an object with `file:`. See [Results](./results.md).
+
+> `patterns` and `file` are mutually exclusive.
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `patterns` | | list | `null` | Advanced regex patterns (see below). Mutually exclusive with `file`. |
+| `file` | | string | `null` | Relative path to a JSON source file ending in `.json` (e.g. `result.json`). Normalized into `result.json`. |
+| `source` | | string | `"log"` | Source selector. Only `log` is implemented. |
+
+`result.patterns[]`:
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `name` | Yes | string | — | Result key under `values`. |
+| `regex` | Yes | string | — | Python regex; prefer one capture group or a named `value` group. |
+| `type` | | string | `"auto"` | `auto`, `string`, `int`, `float`, `bool`, or `json`. |
+| `unit` | | string | `null` | Optional metadata unit (e.g. `ms`). |
+| `aggregate` | | string | `"last"` | `first`, `last`, `list`, `count`, `min`, `max`, `avg`, or `sum`. |
+| `required` | | bool | `false` | If `true`, a missing match marks the result `ok: false`. |
+| `source` | | string | inherited | Per-pattern source override; only `log` is implemented. |
+| `group` | | string / int | `value` then `1` | Capture group name or index to extract. |
+
+A simple `name: regex` map is shorthand for `patterns` with `type: auto`, `aggregate: last`, `required: false`, `source: log`.
+
+To publish a metric literally named `file`, use `patterns:`; a top-level `file:` key is reserved for JSON file-source results.
+
 ## Expression Syntax
 
 Fields marked **int / expr** or **string / expr** support `${{ ... }}` expressions:
@@ -273,16 +350,24 @@ These are automatically set by sflow and available in every task script.
 | `SFLOW_OUTPUT_DIR` | Global output root directory (default `./sflow_output`). |
 | `SFLOW_WORKFLOW_OUTPUT_DIR` | Output directory for the current workflow run (e.g. `sflow_output/<run-id>`). |
 | `SFLOW_TASK_OUTPUT_DIR` | Output directory for the current task replica (e.g. `sflow_output/<run-id>/my_task_0`). |
+| `SFLOW_TASK_RESULT_FILE` | Canonical per-task result file path (`${SFLOW_TASK_OUTPUT_DIR}/result.json`). Write JSON here to publish results directly. |
+| `SFLOW_WORKFLOW_RESULT_FILE` | Workflow-level results index path (`${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json`). |
 | `SFLOW_REPLICA_INDEX` | Zero-based replica index (`0`, `1`, `2`, ...). |
 | `SFLOW_TASK_ASSIGNED_NODE_NAMES` | Comma-separated hostnames of nodes assigned to this task. |
 | `SFLOW_TASK_ASSIGNED_NODE_IPS` | Comma-separated IP addresses of nodes assigned to this task. |
+| `SFLOW_BACKEND_JOB_ID` | Backend allocation/job id when available. For Slurm this mirrors `SLURM_JOB_ID` / `SLURM_JOBID`. |
+| `SFLOW_BACKEND_NODELIST` | Backend allocation nodelist when available. For Slurm this mirrors `SLURM_JOB_NODELIST` / `SLURM_NODELIST`. |
+| `SFLOW_BACKEND_NUM_NODES` | Number of nodes in the backend allocation when available. For Slurm this mirrors `SLURM_NNODES`. |
 | `CUDA_VISIBLE_DEVICES` | Comma-separated GPU indices allocated to this task (set when `resources.gpus.count` is used). |
 
 In addition, all resolved `variables` and `artifacts` paths are injected as environment variables accessible via `${VAR_NAME}` in scripts.
 
+> Avoid naming a variable after a reserved `SFLOW_*` / `CUDA_VISIBLE_DEVICES` env var above — sflow injects and owns these at launch, so a same-named variable collides and causes undefined behavior. `sflow run --dry-run` prints a **Reserved env collisions** section listing any such variables so you can rename them before a real run.
+
 ### Read by sflow from the host environment
 
 sflow reads these to detect an existing Slurm allocation and skip `salloc`.
+When a Slurm controller provides `SLURM_*` / `SLURMD_*` variables, sflow preserves those controller values in task environments even if workflow variables use the same names.
 
 | Variable | Description |
 |----------|-------------|
@@ -291,10 +376,14 @@ sflow reads these to detect an existing Slurm allocation and skip `salloc`.
 
 ### Provided by Slurm at runtime
 
-These are set by Slurm (not by sflow) and commonly used in task scripts.
+These are set by Slurm (not by sflow) and commonly used in task scripts. The `srun` operator also maps common Slurm step/rank variables into backend-agnostic aliases.
 
-| Variable | Description |
-|----------|-------------|
-| `SLURM_NODEID` | Node index within the allocation (useful for `NODE_RANK`). |
-| `SLURMD_NODENAME` | Hostname of the node running the task. |
-| `SLURM_SUBMIT_DIR` | Directory from which the job was submitted. |
+| Slurm variable | SFLOW alias | Description |
+|----------------|-------------|-------------|
+| `SLURM_STEP_ID` | `SFLOW_BACKEND_STEP_ID` | Slurm step id for the current `srun` step. |
+| `SLURMD_NODENAME` | `SFLOW_TASK_NODE_NAME` | Hostname of the node running the task process. |
+| `SLURM_NODEID` | `SFLOW_TASK_NODE_INDEX` | Node index within the allocation (useful for `NODE_RANK`). |
+| `SLURM_PROCID` | `SFLOW_TASK_PROCESS_ID` | Global process/rank id within the step. |
+| `SLURM_LOCALID` | `SFLOW_TASK_LOCAL_PROCESS_ID` | Local process/rank id on the node. |
+| `SLURM_NTASKS` | `SFLOW_TASK_NUM_PROCESSES` | Number of tasks/processes in the step. |
+| `SLURM_SUBMIT_DIR` | — | Directory from which the job was submitted. |

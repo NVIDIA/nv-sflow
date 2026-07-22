@@ -26,6 +26,28 @@ def prepend_envs(script: list[str], envs: dict[str, str]) -> list[str]:
     return exports + script
 
 
+_FAIL_FAST_MARKER = "# sflow: fail-fast"
+
+
+def prepend_fail_fast(script: list[str]) -> list[str]:
+    """Prepend ``set -e`` so a failed command fails the task.
+
+    sflow runs a task's shell script fail-fast by default: if ANY command exits
+    non-zero (a failed ``pip install``, a server that never launched, a benchmark
+    that errored) the task exits non-zero instead of the failure being masked by a
+    later successful command (classically a trailing ``echo "done"`` -> exit 0 ->
+    the workflow "succeeds" despite the real failure).
+
+    Idempotent (guarded by a marker line). Only applied to shell operators (see
+    :meth:`sflow.core.operator.Operator.runs_shell_script`) -- never the ``python``
+    operator, whose script is Python source, not shell. Opt out per task with
+    ``fail_fast: false`` in the YAML, or by making a script line ``set +e``.
+    """
+    if not script or script[0].strip() == _FAIL_FAST_MARKER:
+        return script
+    return [_FAIL_FAST_MARKER, "set -e", *script]
+
+
 def ensure_line_buffered(script: list[str]) -> list[str]:
     """Ensure the script is line buffered.
 

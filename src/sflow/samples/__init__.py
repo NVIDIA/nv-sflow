@@ -18,28 +18,44 @@ def get_samples_dir() -> Path:
 
 
 def list_samples() -> list[str]:
-    """List all available sample YAML files (top-level only)."""
+    """List all self-contained sample workflows as relative subpath names (no
+    ``.yaml`` suffix), e.g. ``self_contained/slurm/auto_replica``.
+
+    Samples live under ``self_contained/<backend>/[<app>/]<name>.yaml``. Falls back
+    to the legacy flat layout (``<name>.yaml`` at the package root) if present.
+    """
     samples_dir = get_samples_dir()
-    return sorted([f.name for f in samples_dir.glob("*.yaml")])
+    sc_dir = samples_dir / "self_contained"
+    if sc_dir.is_dir():
+        return sorted(
+            f.relative_to(samples_dir).with_suffix("").as_posix()
+            for f in sc_dir.rglob("*.yaml")
+        )
+    # Legacy flat layout.
+    return sorted(f.stem for f in samples_dir.glob("*.yaml"))
 
 
 def list_modular_samples() -> dict[str, list[str]]:
-    """List modular sample sets organized in subdirectories.
+    """List modular sample bundles under ``modular/``.
 
-    Returns a dict mapping folder name to the list of YAML filenames within it.
+    Returns a dict mapping the bundle's relative subpath (e.g.
+    ``modular/inference_x_v2``) to the YAML files within it (relative to the
+    bundle, no ``.yaml`` suffix).
     """
     samples_dir = get_samples_dir()
+    modular_root = samples_dir / "modular"
     result: dict[str, list[str]] = {}
-    _skip = {"__pycache__", "sflow_output", ".git"}
-    for subdir in sorted(samples_dir.iterdir()):
-        if (
-            subdir.is_dir()
-            and not subdir.name.startswith("_")
-            and subdir.name not in _skip
-        ):
-            yamls = sorted([f.name for f in subdir.glob("*.yaml")])
-            if yamls:
-                result[subdir.name] = yamls
+    if not modular_root.is_dir():
+        return result
+    for bundle in sorted(p for p in modular_root.iterdir() if p.is_dir()):
+        if bundle.name.startswith("_"):
+            continue
+        yamls = sorted(
+            f.relative_to(bundle).with_suffix("").as_posix()
+            for f in bundle.rglob("*.yaml")
+        )
+        if yamls:
+            result[bundle.relative_to(samples_dir).as_posix()] = yamls
     return result
 
 

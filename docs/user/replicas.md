@@ -27,9 +27,15 @@ This creates 4 parallel workers (`worker_0`, `worker_1`, `worker_2`, `worker_3`)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `count` | int or expression | 1 | Number of replicas to create |
-| `policy` | `parallel` or `sequential` | `parallel` | How replicas are scheduled |
-| `variables` | list of variable names | none | Variables to sweep over (creates Cartesian product) |
+| `count` | positive int or `${{ }}` expression | `null` | Number of replicas to create. Has no numeric default — when omitted, the count is taken from the `variables` sweep size (below). `0`/negative are rejected. |
+| `policy` | `parallel` \| `sequential` \| `${{ }}` expression | `parallel` | How replicas are scheduled. May be an expression that resolves to `parallel`/`sequential`. |
+| `variables` | list of variable names | none | Variables to sweep over (creates a Cartesian product) |
+
+:::note `count` and `variables`
+Provide `count`, `variables`, or both. With `variables` only, the replica count equals
+the size of the swept `domain`(s). With both, the sizes must match (see [Combining Count
+and Variables](#combining-count-and-variables)).
+:::
 
 ## Replica Naming
 
@@ -46,6 +52,16 @@ Each replica receives these environment variables:
 
 - **`SFLOW_REPLICA_INDEX`**: Zero-based index of the replica (0, 1, 2, ...)
 - Any swept variables from the `variables` list
+
+## Replica Fan-Out Summary
+
+| Mode | Config | Resulting replica names | Per-replica env | `CUDA_VISIBLE_DEVICES` |
+|------|--------|-------------------------|-----------------|------------------------|
+| Count only | `count: 4` | `t_0`, `t_1`, `t_2`, `t_3` | `SFLOW_REPLICA_INDEX` | each replica gets its own contiguous slice of size `resources.gpus.count` |
+| Single-var sweep | `variables: [BATCH_SIZE]` with `domain: [16, 32]` | `t_16`, `t_32` | `SFLOW_REPLICA_INDEX` + `BATCH_SIZE` | same per-replica slicing |
+| Multi-var Cartesian | `variables: [LR, BATCH_SIZE]` | `t_0_001_32`, `t_0_001_64`, … (values joined with `_`) | `SFLOW_REPLICA_INDEX` + every swept variable | same per-replica slicing |
+
+Per-replica `CUDA_VISIBLE_DEVICES` slicing applies on the **local**, **slurm**, and **docker** backends — replica *N* gets the *N*-th contiguous GPU slice (e.g. `count: 2` → replica 0 sees `0,1`, replica 1 sees `2,3`). On **Kubernetes**, GPUs are assigned per pod and `CUDA_VISIBLE_DEVICES` is not set.
 
 ## Replica Policies
 
@@ -93,6 +109,12 @@ This runs benchmarks one at a time: `benchmark_0` → `benchmark_1` → `benchma
 ## Variable Sweeps
 
 The `variables` field enables parameter sweeps. Each variable must have a `domain` defined, and sflow creates replicas for the Cartesian product of all domain values.
+
+:::note `value` must be in `domain`
+When a variable declares a `domain`, its `value` must be one of the domain members —
+sflow rejects the config otherwise. The `value` acts as the default (e.g. for a non-swept
+run or `--set` override); the full `domain` drives the sweep.
+:::
 
 ### Single Variable Sweep
 
@@ -187,6 +209,13 @@ Each replica gets 2 GPUs:
 - `worker_1`: CUDA_VISIBLE_DEVICES=2,3
 - `worker_2`: CUDA_VISIBLE_DEVICES=4,5
 - `worker_3`: CUDA_VISIBLE_DEVICES=6,7
+
+:::note Kubernetes
+Per-replica `CUDA_VISIBLE_DEVICES` slicing applies to the **local**, **slurm**, and
+**docker** backends. On **Kubernetes**, DRA or the device plugin assigns GPUs to each
+replica's pod and `CUDA_VISIBLE_DEVICES` is not set — see
+[Resources: GPUs on Kubernetes](./resources.md#gpus-on-kubernetes).
+:::
 
 ## Real-World Examples
 

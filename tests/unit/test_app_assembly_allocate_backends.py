@@ -66,6 +66,8 @@ def test_allocate_backends_allocates_all_unallocated_and_sets_default_backend():
     assert b2.allocate_calls == 1
     assert b1.allocation is not None
     assert b2.allocation is not None
+    # Each backend gets its own allocation (distinct Slurm job ids in practice).
+    assert b1.allocation.allocation_id != b2.allocation.allocation_id
 
     # Second call should be a no-op (idempotent)
     asyncio.run(allocate_backends(state))

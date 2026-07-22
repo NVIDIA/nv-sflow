@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=69.0.0", "wheel"]
+requires = ["setuptools>=69.0.0", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sflow"
-version = "0.2.1"
+dynamic = ["version"]
 description = "A Python CLI tool designed to automate and manage benchmarking workflows on multiple backends."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.11.10",
     "pyyaml>=6.0.3",
     "rich>=13.7.0",
+    "textual>=8.2.7",
     "typer>=0.19.2",
 ]
 
@@ -47,10 +48,24 @@ sflow = "sflow.cli:app"
 [project.optional-dependencies]
 dev = [
     "ipython>=8.37.0",
+    "matplotlib>=3.8.0",
+    "moto>=5.0.0",
     "pytest>=8.4.2",
+    "pytest-asyncio>=0.23.0",
     "pytest-cov>=7.0.0",
     "pytest-subprocess>=1.5.3",
 ]
+s3 = [
+    "boto3>=1.34.0",
+]
+# Optional PNG timelines for the `monitor:` feature. CSV monitor reports and the
+# terminal sflow_monitor.log overview work without this; only PNG rendering needs it.
+monitor = [
+    "matplotlib>=3.8.0",
+]
+
+[tool.setuptools_scm]
+version_file = "src/sflow/_version.py"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -59,18 +74,17 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"sflow.samples" = ["*.yaml", "*.csv"]
-"sflow.samples.inference_x_v2" = ["*.yaml", "*.csv"]
-"sflow.samples.inference_x_v2.trtllm" = ["*.yaml"]
-"sflow.samples.inference_x_v2.vllm" = ["*.yaml"]
-"sflow.samples.inference_x_v2.sglang" = ["*.yaml"]
-"sflow.samples.inference_x_v2.composed_recipes" = ["*.yaml"]
+"sflow.samples" = ["**/*.yaml", "**/*.csv", "**/*.md"]
 "sflow.skills" = ["*.md", "**/*.md", "**/*.py"]
+"sflow.monitoring" = ["*.py"]
 
 [dependency-groups]
 dev = [
     "ipython>=8.37.0",
+    "matplotlib>=3.8.0",
+    "moto>=5.0.0",
     "pytest>=8.4.2",
+    "pytest-asyncio>=0.23.0",
     "pytest-cov>=7.0.0",
     "pytest-subprocess>=1.5.3",
 ]

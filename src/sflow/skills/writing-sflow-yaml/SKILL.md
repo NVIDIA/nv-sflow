@@ -2,187 +2,286 @@
 name: writing-sflow-yaml
 description: >-
   Write, create, and modify sflow YAML workflow configuration files. Covers schema structure,
-  variable declarations, task DAGs, backends, operators, probes, replicas, artifacts, and
-  modular composition. Use when the user asks to create an sflow YAML, configure a workflow,
-  set up inference serving, or asks about sflow YAML syntax.
+  variables, task DAGs, backends (local, slurm, docker, kubernetes), operators, probes,
+  replicas, artifacts, result parsing, storage/uploads (S3), hardware monitoring, and modular
+  composition.
+  Use when the user asks to create an sflow YAML, configure a workflow, set up inference
+  serving on Slurm or Kubernetes, or asks about sflow YAML syntax.
 ---
 
 # Writing sflow YAML Configurations
 
-## Minimal Examples
+sflow turns **one portable recipe** — tasks, wiring, resources — into backend-native
+execution on `local` / `slurm` / `docker` / `kubernetes`. Write recipes **shape-first**:
+get the DAG right, *then* fill in scripts, scaling, resources, and backend specifics.
 
-**Local:**
+**Follow the steps below in order.** The most common mistake is jumping straight to GPU
+counts and backend flags before the workflow shape is correct. Don't. Design the DAG first;
+everything else hangs off it.
 
-```yaml
-version: "0.1"
-variables:
-  WHO:
-    value: "World"
-workflow:
-  name: hello
-  tasks:
-    - name: greet
-      script:
-        - echo "Hello ${WHO}"
-```
+> Deep field reference → [schema-reference.md](schema-reference.md). Runnable, annotated
+> recipes → [examples.md](examples.md) (cited per step). Full docs →
+> [nvidia.github.io/nv-sflow/docs/user/intro](https://nvidia.github.io/nv-sflow/docs/user/intro).
 
-**SLURM with container:**
+## The shared skeleton
+
+Every recipe has the same top-level shape. You design `workflow.tasks` first; the rest is
+optional scaffolding you add only when a step calls for it.
 
 ```yaml
-version: "0.1"
-variables:
-  SLURM_ACCOUNT: { value: my_account }
-  SLURM_PARTITION: { value: my_partition }
-backends:
-  - name: slurm_cluster
-    type: slurm
-    default: true
-    nodes: 1
-    partition: ${{ variables.SLURM_PARTITION }}
-    account: ${{ variables.SLURM_ACCOUNT }}
-    gpus_per_node: 8
-operators:
-  - name: my_container
-    type: srun
-    container_image: nvcr.io/nvidia/pytorch:24.07-py3
-    container_writable: true
-    mpi: pmix
+version: "0.1"        # schema version (NOT the sflow release) — required in EVERY file
+variables: { ... }    # optional — ${{ variables.X }} in YAML, ${X} in scripts
+artifacts: [ ... ]    # optional — named paths/URIs, auto-mounted at the same path
+backends:  [ ... ]    # optional — omit ⇒ a default `local` backend
+operators: [ ... ]    # optional — reusable launch presets
+storage:   [ ... ]    # optional — S3 upload targets
 workflow:
-  name: my_workflow
-  tasks:
-    - name: train
-      operator: my_container
-      script:
-        - python train.py
+  name: ...
+  tasks: [ ... ]      # THE DAG — design this first (Step 1)
 ```
 
-## Key Concepts
+Omit `backends`/`operators` and you get `local` + `bash` — enough to prototype a DAG on a
+laptop before touching a cluster.
 
-| Section     | Required | Purpose                                    |
-|-------------|----------|--------------------------------------------|
-| `version`   | Yes      | Must be `"0.1"`                            |
-| `variables` | No       | Parameters: `${{ variables.X }}` / `${X}`  |
-| `artifacts` | No       | Named URIs (`fs://`, `file://`)            |
-| `backends`  | No       | Compute: `local` or `slurm`               |
-| `operators` | No       | Execution: `bash` or `srun` (containers)  |
-| `workflow`  | Yes      | Name, timeout, and task list               |
+---
 
-For complete field reference, see [schema-reference.md](schema-reference.md).
-For full docs: [configuration](https://nvidia.github.io/nv-sflow/docs/user/configuration),
-[variables](https://nvidia.github.io/nv-sflow/docs/user/variables),
-[artifacts](https://nvidia.github.io/nv-sflow/docs/user/artifacts),
-[backends](https://nvidia.github.io/nv-sflow/docs/user/backends),
-[operators](https://nvidia.github.io/nv-sflow/docs/user/operators),
-[probes](https://nvidia.github.io/nv-sflow/docs/user/probes),
-[replicas](https://nvidia.github.io/nv-sflow/docs/user/replicas),
-[resources](https://nvidia.github.io/nv-sflow/docs/user/resources),
-[modular-workflows](https://nvidia.github.io/nv-sflow/docs/user/modular-workflows).
+## Step 1 — Shape the DAG (do this first)
 
-## Essential Patterns
+The DAG *is* the recipe. Decide **what the tasks are and how they connect** before writing
+any script body.
 
-### Variables: Two Access Modes
+1. **List the tasks** — one node per logical step or service (`etcd`, `frontend`,
+   `prefill`, `decode`, `benchmark`, …).
+2. **Wire them** with `depends_on` (a task lists the upstreams it waits for). A dependent
+   starts once every upstream is **READY** (if that upstream has a readiness probe, Step 3)
+   or **COMPLETED** (if it has none).
+3. **Identify the terminal task** — the one whose completion ends the run (usually the
+   client/`benchmark`). Long-running servers never "complete"; sflow stops them when the
+   terminal task finishes.
+4. **Reusable fragments wire in reverse** with `required_by:` — a module attaches itself to
+   a shared hub (e.g. `benchmark`) without editing the hub or adding cross-file `depends_on`.
 
-- **YAML** (plan-time): `${{ variables.NAME }}`
-- **Scripts** (runtime env var): `${NAME}`
+Canonical serving shape (Dynamo-style — see examples.md Example 3):
 
-Expressions support Jinja2 filters: `${{ variables.TP_SIZE * variables.DP_SIZE }}`,
-`${{ [variables.X, 1] | max }}`, `${{ 8180 if variables.Y > 1 else 8000 }}`.
+```text
+infra (nats, etcd) ──▶ frontend ──▶ workers (prefill + decode | agg) ──▶ benchmark ──▶ end
+```
 
-When using arithmetic or comparisons in expressions, set the variable `type` correctly
-(`integer`, `string`, etc.) -- otherwise values default to strings and operations like
-`*` or `>` will produce unexpected results.
+Write the wiring skeleton first — **script bodies come in Step 2**:
 
-### file:// Artifacts for Helper Scripts
+```yaml
+workflow:
+  name: serve_and_bench
+  tasks:
+    - { name: etcd }
+    - { name: frontend,  depends_on: [etcd] }
+    - { name: worker,    depends_on: [frontend] }
+    - { name: benchmark, depends_on: [worker] }        # terminal task ⇒ run ends here
+```
 
-Always use `file://` artifacts with `content` for multi-line scripts. Never embed Python
-in YAML via heredocs or `python3 -c` -- quoting breaks when YAML -> shell -> Python nests.
+Sanity-check the shape now: *does anything start before its inputs exist? is there exactly
+one clear end? do "parallel" branches actually need to be concurrent?* Fixing shape is cheap
+here and expensive later.
+
+## Step 2 — Write the task scripts
+
+- `script:` is a **list of lines joined into one bash script** (the `python` operator instead
+  runs the lines as Python *source* via `python -c`).
+- **Multi-line helpers / configs → a `file://` artifact with `content:`.** Never embed Python
+  via heredocs or `python3 -c` — quoting breaks when YAML → shell → Python nests.
+- **Declare every path you touch as an artifact** (helper script, config, model dir, dataset).
+  An artifact *resolves* the path **and auto-mounts it at the same absolute path** inside
+  containers on every backend — so `${{ artifacts.X.path }}` (YAML) and `${X}` (script) agree,
+  and you never hand-write `container_mounts` / `-v` / k8s `volumes` for it.
+- **Reference values:** `${{ variables.X }}` in YAML (plan-time), `${X}` in scripts (runtime).
+  For arithmetic/comparison, set the variable's `type` (`integer`, …) or it stays a string.
 
 ```yaml
 artifacts:
-  - name: MY_SCRIPT
-    uri: file://helper.py
+  - name: LAUNCH
+    uri: file://launch.py            # relative → resolves against SFLOW_WORKSPACE_DIR
     content: |
-      import sys
-      print(f"Hello from {sys.argv[1]}")
+      import sys; print("serving", sys.argv[1])
 workflow:
   tasks:
-    - name: run_helper
+    - name: worker
+      depends_on: [frontend]
       script:
-        - python3 ${{ artifacts.MY_SCRIPT.path }} "world"
+        - python3 ${{ artifacts.LAUNCH.path }} ${{ variables.MODEL }}
 ```
 
-### Container Reuse
+See examples.md Examples 1–2; artifact schemes in schema-reference.md.
 
-Use `container_name` + `--container-image` in `extra_args`. The first task pulls the image;
-subsequent tasks attach by name instantly:
+## Step 3 — Gate the wiring with probes
+
+`depends_on` alone only waits for a process to *start*. For services, wait for **ready**.
+
+- **Every long-running server gets a `readiness` probe** so dependents wait for real up-ness:
+  `log_watch` (server logs a ready line), `tcp_port` (port open), or `http_get`/`http_post`
+  (health endpoint).
+- **Add a `failure` probe** on servers — `failure.log_watch` for
+  `"Traceback (most recent call last)"` fails the run fast instead of hanging until timeout.
+- `log_watch` matches **literally** by default (parentheses/dots aren't special); prefix
+  `re:` / `regex:` for real regex.
+- **Don't probe short-lived one-shot tasks** (benchmarks, setup steps).
+- Defaults: `timeout` 1200 s (readiness deadline only), `interval` 5, `each_check_timeout`
+  30, `success_threshold` 1, `failure_threshold` 3.
 
 ```yaml
+- name: frontend
+  depends_on: [etcd]
+  script: [ "python -m my.frontend --port 8000" ]
+  probes:
+    readiness: { tcp_port: { port: 8000 } }
+    failure:   { log_watch: { regex_pattern: "Traceback (most recent call last)" } }
+```
+
+(On **kubernetes**, tcp/http probes run from an in-cluster probe pod automatically — the
+driver host usually can't route to the pod network.) See the probes doc.
+
+## Step 4 — Scale with replicas & sweeps
+
+- **Replicate a task:** `replicas: { count: N, policy: parallel|sequential }`.
+  `parallel` = all at once (downstream waits for all); `sequential` = one-by-one (sweeps).
+- **Parameter sweep:** `replicas.variables: [X]` where `X` declares a `domain:` → one replica
+  per value (Cartesian product across multiple swept vars). Each replica gets
+  `SFLOW_REPLICA_INDEX` and the swept values in its env; omit `count` and it equals the sweep
+  size.
+
+See examples.md Example 5; the replicas doc.
+
+## Step 5 — Place on nodes & GPUs
+
+- **Pin placement** with `resources.nodes` (`indices` / `count` / `exclude`; negative indices
+  count from the end). **Request GPUs** with `resources.gpus.count`.
+- On `local`/`slurm`/`docker`, sflow slices `CUDA_VISIBLE_DEVICES` per task/replica — set the
+  backend's `gpus_per_node` so it can pack.
+- **GPU planning:** `GPUs/worker = TP × DP × PP` (framework-dependent — some use attention-DP
+  / expert parallelism), `total = GPUs/worker × replicas`, `nodes = ceil(total / gpus_per_node)`.
+  When unsure of a framework's parallelism, ask the user.
+- Use `resources.*.release_after` (`task_ready` / `task_completion` / `workflow_completion`)
+  to let later tasks reuse a reservation.
+
+See the resources doc.
+
+## Step 6 — Backend-specific handling
+
+Pick a backend and apply *its* rules. Start `local`, move to a cluster once the DAG is proven.
+
+**`local`** — no config needed (default). `bash` operator. Set `nodes: N` to simulate a
+multi-node placement on one machine.
+
+**`slurm`** — default operator `srun`. Backend needs `partition`, `account`, `time`
+(HH:MM:SS or int minutes), `nodes`, `gpus_per_node`. Containers: put `container_image` /
+`container_name` on an `srun` operator (reuse the image across tasks by `container_name`).
+Keep models / workspace / **output dir** on **shared storage** (Lustre/GPFS/NFS) so an
+`fs://` artifact auto-mounts at the same path on every node.
+
+```yaml
+backends:
+  - name: slurm
+    type: slurm
+    default: true
+    nodes: 1
+    partition: ${{ variables.PART }}      # block style: ${{ }} values can't sit in a { } flow map
+    account: ${{ variables.ACCT }}
+    time: "01:00:00"                       # HH:MM:SS or int minutes
+    gpus_per_node: 8
 operators:
-  - name: my_runtime
-    type: srun
-    container_name: my_container
-    container_writable: true
-    mpi: pmix
-    extra_args:
-      - --container-image=${{ variables.MY_IMAGE }}
+  - { name: ctr, type: srun, container_image: nvcr.io/nvidia/pytorch:24.07-py3,
+      container_writable: true, mpi: pmix }
 ```
 
-### Probes
+**`docker`** — backend is `type: docker`, its launch operator is `type: docker_run` (mind
+the naming). The `image` can live on the backend or the operator. Remote/multi-host via a
+`hosts:` list.
 
-| Type       | Use For              | Key Fields                            |
-|------------|----------------------|---------------------------------------|
-| `tcp_port` | Infra services       | `port`, `timeout`, `interval`         |
-| `log_watch`| Server readiness     | `regex_pattern`, `timeout`, `interval`|
+**`kubernetes`** — the workload **`image` lives on the `k8s` operator**, never the backend
+(the backend reserves + pins nodes with placeholder pods). Rules that bite:
+- Cluster access is **CLI-only** (`--kubeconfig` / `--kube-context` / `--kube-namespace`) so
+  recipes stay cluster-agnostic; `namespace` is a backend field (one namespace per backend).
+- `resources.gpus.count` is a per-task **total**, split evenly across the task's nodes → must
+  be a multiple of the node count. sflow does **not** set `CUDA_VISIBLE_DEVICES`.
+- A single-node task → one pod; a `resources.nodes` task → one pod per node (leader = index 0).
+- **Cluster data → a PVC**: declare it under backend `volumes:` at a `mount_path`, then point
+  an `fs://` artifact at a path *under* that mount. Output dirs are ephemeral `emptyDir` — for
+  persistence use a PVC or `uploads:` (Step 7).
+- **Any MPI workload** (`mpirun`-launched, e.g. TRT-LLM `trtllm-llmapi-launch`) → `type: k8s_mpi`,
+  and write the `mpirun -np N …` **explicitly** in the script: sflow reads it to set up the MPI
+  world for **both single- and multi-node** and injects the keypair/hostfile/sshd/`-x` env
+  forwarding. Reserve plain `k8s` for non-MPI, single-pod workloads.
 
-Always add `failure.log_watch` for `"Traceback (most recent call last)"` on server tasks.
+```yaml
+backends:
+  - { name: k8s, type: kubernetes, default: true, namespace: default, nodes: 1,
+      gpus_per_node: 8, scheduling: device_plugin }   # device_plugin default; dra is WIP
+operators:
+  - { name: gpu_op, type: k8s, image: nvcr.io/nvidia/pytorch:24.12-py3 }
+```
 
-### Replicas & Sweeps
+See the backends doc; examples.md Examples 8 (k8s), 10 (k8s + PVC), 11 (slurm + Lustre).
 
-- `policy: "parallel"` -- all at once; downstream waits for all
-- `policy: "sequential"` -- one after another; good for sweeps
-- `variables` with `domain` -- Cartesian product sweep
+## Step 7 — Capture outputs
 
-### Modular Composition
+- **Metrics:** add `result:` (a regex map, `patterns:`, or a JSON `file:`) to parse a task's
+  log/output into `${SFLOW_TASK_OUTPUT_DIR}/result.json` plus a workflow `results.json`.
+  Prefer it over the legacy `outputs:`. A task isn't `COMPLETED` until parsing finishes.
+- **Ship files:** name `storage:` S3 targets, then per-task `uploads:` (fire on `COMPLETED`)
+  or `workflow.upload_all` (zip the whole run). Credentials come from the **boto3 default
+  chain** — never put secrets in YAML; needs the `sflow[s3]` extra.
+- **Telemetry:** `monitor:` samples GPU/CPU/mem/net on `local`/`slurm`/`docker` (not k8s yet),
+  or enable it without editing the recipe via `--enable-workflow-monitor` /
+  `--enable-task-monitor`.
+
+See examples.md Examples 12 (result parsing), 7 (monitor), 9 (uploads); the results / uploads / monitor docs.
+
+## Step 8 — Validate before running
+
+Run the one-command preflight before every real run (static schema + reference checks + GPU
+plan + `sflow --dry-run`, with a root-cause explanation on failure). **Exit 0 = ready.**
 
 ```bash
-sflow run -f slurm.yaml -f common.yaml -f sglang/agg.yaml -f bench.yaml \
-  --missable-tasks prefill_server --missable-tasks decode_server
+python scripts/preflight.py my_workflow.yaml
+python scripts/preflight.py slurm.yaml common.yaml sglang/agg.yaml --set TP_SIZE=8   # composed
 ```
 
-Merge rules: version must match, named items merge (later wins), tasks concatenate.
-
-### GPU Resource Planning
-
-```
-GPUs per worker = TP * DP * PP  (common default, but varies by framework)
-Total GPU slots = GPUs_per_worker * replicas (per task)
-Nodes needed    = ceil(total_slots / gpus_per_node)
-```
-
-The `TP * DP * PP` formula is a common pattern but not universal -- some frameworks
-calculate GPU requirements differently (e.g., attention DP, expert parallelism). When
-unsure, ask the user or check the framework's documentation for the correct GPU count.
-
-## Common Pitfalls
-
-1. Missing `version: "0.1"` in every file (including fragments)
-2. Using `${{ task.X.nodes }}` in YAML fields (only works in scripts)
-3. `--set` with undeclared variable (must exist in config first)
-4. Forgetting `depends_on` (tasks run immediately without it)
-5. GPU oversubscription (sum of GPU counts > nodes * gpus_per_node)
-6. Probe on short-lived tasks (don't probe benchmarks)
-7. Missing `--missable-tasks` when composing without all task files
-
-## Validation
+Standalone steps when you want just one:
 
 ```bash
-python scripts/validate_sflow_yaml.py my_workflow.yaml
-python scripts/check_gpu_plan.py my_workflow.yaml
-sflow run -f my_workflow.yaml --dry-run
+python scripts/validate_sflow_yaml.py my_workflow.yaml   # schema, refs, k8s volumes
+python scripts/check_gpu_plan.py     my_workflow.yaml    # GPU plan + oversubscription
+sflow run -f my_workflow.yaml --dry-run                  # full plan + expression resolution
 ```
 
-## Additional Resources
+---
 
-- Field reference: [schema-reference.md](schema-reference.md)
-- Annotated examples: [examples.md](examples.md)
-- Full docs: https://nvidia.github.io/nv-sflow/docs/user/intro
+## Modular composition (when splitting across files)
+
+Pass fragments directly: `sflow run -f slurm.yaml -f common.yaml -f sglang/agg.yaml`.
+Files are combined with a **recursive deep merge keyed on `name`** — `version` must match;
+`variables` / `artifacts` / `backends` / `operators` / `storage` and same-name
+`workflow.tasks` are deep-merged (one definition can be scattered across files); leaf
+scalars/lists are last-file-wins with a warning. Prefer `required_by:` on optional fragments
+(absent targets skip silently) over `--missable-tasks`. See examples.md Example 4.
+
+## Pitfalls checklist
+
+1. Missing `version: "0.1"` in **every** file (including fragments).
+2. `${{ task.X.nodes }}` in a YAML field — task context works only in scripts.
+3. Forgetting `depends_on` — tasks run immediately without it.
+4. GPU oversubscription: Σ GPU counts > `nodes × gpus_per_node`.
+5. Probing a short-lived one-shot task (don't probe benchmarks).
+6. Expecting `log_watch` to be regex — it's **literal** unless prefixed `re:` / `regex:`.
+7. Docker: the operator is `type: docker_run` (the backend is `type: docker`).
+8. Putting the workload `image` on the **kubernetes backend** — it belongs on the `k8s`/`k8s_mpi` **operator**.
+9. K8s: an `fs://` path no `volumes:` PVC covers and the node lacks → the pod fails (hostPath). Use a PVC.
+10. Expecting K8s task outputs to persist — the output dir is an ephemeral `emptyDir`; use a PVC or `uploads:`.
+11. Multi-node Slurm with models/workspace/output on **node-local** storage — same-path mounts break; use shared storage.
+12. S3 secrets in YAML (use the boto3 chain) or forgetting the `sflow[s3]` extra.
+13. Hand-writing mounts for a path already declared as an artifact — redundant; artifacts auto-mount same-path.
+
+## Additional resources
+
+- Field reference & merge rules → [schema-reference.md](schema-reference.md)
+- 12 annotated, runnable recipes → [examples.md](examples.md)
+- Full user docs → [nvidia.github.io/nv-sflow/docs/user/intro](https://nvidia.github.io/nv-sflow/docs/user/intro)

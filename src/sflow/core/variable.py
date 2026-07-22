@@ -161,6 +161,22 @@ class VariableValue:
     def __getitem__(self, key: Any) -> Any:
         return self._value[key]
 
+    # -- Method/attribute delegation -----------------------------------------
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes/methods to the wrapped value.
+
+        Only reached when normal lookup misses: ``value``/``domain`` and the
+        operator dunders resolve normally and never arrive here. This lets string
+        and list methods used in expressions -- ``${{ variables.MODEL.split('/') }}``,
+        ``${{ variables.NAME.upper() }}`` -- work on a wrapped value exactly as on
+        the raw one. Underscore/dunder names are excluded so ``_value`` never
+        recurses and copy/pickle/Jinja internals keep their default behavior.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._value, name)
+
 
 # ---------------------------------------------------------------------------
 # Context builders — single ground-truth for wrapping variables for Jinja

@@ -5,13 +5,17 @@ sidebar_position: 1
 
 `sflow` is a **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_.
 
+:::tip Find the right feature
+Not sure where to start? Open the [Feature Map](/feature-map) to choose a goal, see which sflow features apply, and jump to the relevant docs. Building with an AI coding agent? See [Agent Skills](/docs/agents/intro).
+:::
+
 An application's deployment steps are usually logically the same regardless of the underlying infrastructure. Take [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) as an example: you start etcd and NATS, launch a frontend server, spin up workers that register to the frontend, and the service is up. That logical flow never changes — but making it actually run on Slurm, Docker Compose, or Kubernetes requires a different set of infrastructure-specific scripts, resource management, and networking tweaks each time, and the effort must be repeated for every new platform.
 
 `sflow` is trying to eliminate this duplication. You describe the workflow once in a portable YAML format — tasks, dependencies, resources, and launch methods — and `sflow` delegates execution to the target infrastructure through swappable backends, leveraging each platform's native ecosystem rather than reimplementing it (e.g. Kubernetes, Helm charts, Argo Workflows).
 
 Pluggable extensions such as probes and artifacts integrate naturally without coupling your workflow to any specific platform. Write one `sflow.yaml` and run it across environments with minimal changes.
 
-The current focus is **Slurm**, which — unlike Kubernetes or Docker — lacks a built-in workflow orchestration layer, making multi-step deployments especially cumbersome. Docker and Kubernetes backends are planned to follow.
+The current focus is **Slurm**, which — unlike Kubernetes or Docker — lacks a built-in workflow orchestration layer, making multi-step deployments especially cumbersome. As of the v0.3.0 release, the Docker and Kubernetes backends ship as well, alongside `local` and `slurm`. Kubernetes support is new in v0.3.0 and has known limitations (interactive `sflow run` only, `monitor:` not yet supported, tested on bare-metal Kubernetes and GKE) — see [Backends](./backends.md#kubernetes-backend).
 
 ![sflow TUI](/img/sflow_tui.gif)
 
@@ -57,12 +61,10 @@ graph TD
     benchmark_0 -- Completed --> benchmark_1
   end
 
-  gpu_monitor["gpu_monitor"]
   nats_server["nats_server"]
   etcd_server["etcd_server"]
   frontend_server["frontend_server"]
 
-  start --> gpu_monitor
   start --> nats_server
   start --> etcd_server
 
@@ -78,7 +80,6 @@ graph TD
   decode_server_0 -- Ready --> benchmark_0
   decode_server_1 -- Ready --> benchmark_0
 
-  gpu_monitor -- Completed --> stop
   benchmark_1 -- Completed --> stop
 
 ```
@@ -101,11 +102,13 @@ Use the `local` backend with the `bash` operator to validate your DAG and script
 |---------|-------------|
 | **Workflow** | A set of tasks wired into a DAG via `depends_on`. |
 | **Task** | An executable unit. The key field is `script` — a list of lines joined into a bash script. |
-| **Backend** | Where compute comes from. Built-ins: `slurm` (allocates via `salloc`) and `local` (simulates nodes on the local machine). |
-| **Operator** | How a task is launched. Built-ins: `bash`, `srun`, `docker`, `ssh`, `python`. Named operators let you preset flags and reuse them across tasks. |
+| **Backend** | Where compute comes from. Built-ins: `local` (simulates nodes on the local machine), `slurm` (allocates via `salloc`), `docker` (launches tasks via `docker run`), and `kubernetes` (schedules tasks as pods). |
+| **Operator** | How a task is launched. Built-ins: `bash`, `srun`, `docker_run`, `k8s`, `k8s_mpi`, `ssh`, `python`. Named operators let you preset flags and reuse them across tasks. |
 | **Variable** | A named value referenced as `${{ variables.NAME }}` in YAML or `${NAME}` in scripts. Override from the CLI with `--set`. |
 | **Expression** | Jinja2-based `${{ ... }}` syntax inside YAML to reference variables, backend info, task metadata, and more (e.g. `${{ backends.slurm.nodes[0].ip_address }}`). Supports filters (`${{ [a, b] \| min }}`), conditionals, and list indexing. |
 | **Artifact** | A named external resource (model, config, dataset) referenced by URI and resolved to a local path at runtime. |
+| **Storage** | A named post-execution upload target (e.g. S3). Per-task `uploads:` specs ship logs and result files to the target when a task completes. |
+| **Result** | A task's small structured outputs (metrics, scores). A `result:` entry parses them from the task log or a JSON file into a canonical `result.json` plus a workflow-level `results.json` index. |
 | **Probe** | A health-check gate. Readiness probes block dependents until a service is live; failure probes terminate the workflow when a fatal condition is detected. |
 | **Replica** | A task can be replicated N times (parallel or sequential) with per-replica variable overrides for sweeps. |
 
@@ -160,17 +163,21 @@ flowchart TD
 
 ### Config Merging Rules
 
-When multiple YAML files are provided:
+When multiple YAML files are provided, they are combined with a **recursive deep merge** keyed on `name`, so a single definition can be scattered across files:
 
 | Section | Merge Strategy |
 |---------|---------------|
 | `version` | Must match across all files |
-| `variables` | Merge by name (later overrides earlier) |
-| `artifacts` | Merge by name |
-| `backends` | Merge by name |
-| `operators` | Merge by name |
-| `workflow.tasks` | Concatenated (later files append tasks) |
-| `workflow.name` | Last non-null wins |
+| `variables` | Deep-merge by name (same-name entries merge; on a conflicting leaf value the last file wins, with a warning) |
+| `artifacts` | Deep-merge by name |
+| `backends` | Deep-merge by name |
+| `operators` | Deep-merge by name |
+| `storage` | Deep-merge by name |
+| `workflow.tasks` | Deep-merge by name, preserving first-seen order (a task can be split across files; duplicate task names no longer error) |
+| `workflow.name` | Last non-null wins (a differing name no longer errors — it warns) |
+| `workflow.monitor` / `upload_all` | Carried across files and deep-merged |
+
+Tasks can also wire the DAG in reverse with `required_by` (the inverse of `depends_on`): `A required_by: [B]` makes B run after A. Targets that are absent from the merged workflow are skipped silently, so modular fragments self-wire without `--missable-tasks`. See [Modular Workflows](./modular-workflows.md).
 
 ## Expression System
 
@@ -204,13 +211,15 @@ This user guide reflects actual code behavior. Not all planned features may be a
 | Run a minimal example | [Quickstart](./quickstart.md) |
 | Variables, expressions, env injection | [Variables](./variables.md) |
 | Named inputs (paths, images, etc.) | [Artifacts](./artifacts.md) |
-| Compute backends (local, Slurm) | [Backends](./backends.md) |
+| Compute backends (local, Slurm, Docker, Kubernetes) | [Backends](./backends.md) |
 | Task launch methods (bash, srun, containers) | [Operators](./operators.md) |
 | Node/GPU placement, CUDA_VISIBLE_DEVICES | [Resources](./resources.md) |
 | Parallel/sequential replicas, sweeps | [Replicas](./replicas.md) |
 | Composable configs, sweeps, missable tasks | [Modular Workflows](./modular-workflows.md) |
 | Readiness/failure gates for services | [Probes](./probes.md) |
+| Post-execution uploads to S3 | [Uploads](./uploads.md) |
 | Log and output directory structure | [Outputs & Logs](./outputs.md) |
+| Capture task metrics & structured results | [Results](./results.md) |
 | Full sflow.yaml schema | [Configuration](./configuration.md) |
 | CLI options | [CLI Reference](./cli.md) |
 | Frequently asked questions | [FAQ](./faq.md) |

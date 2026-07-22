@@ -2,12 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .artifact import Artifact
 from .backend import Backend
 from .variable import Variable
 from .workflow import Workflow
+
+if TYPE_CHECKING:
+    from .monitor import MonitorConsumer, MonitorRegistry
+    from .storage import StorageTarget
+    from .uploads import ResolvedWorkflowUpload
 
 
 @dataclass
@@ -21,6 +26,11 @@ class SflowState:
     artifacts: dict[str, Artifact] = field(default_factory=dict)
     backends: dict[str, Backend] = field(default_factory=dict)
     default_backend: Backend | None = None
+    storage_targets: dict[str, "StorageTarget"] = field(default_factory=dict)
+    workflow_upload: "ResolvedWorkflowUpload | None" = None
+    # Hardware monitor schedule (computed at plan time; fired at runtime).
+    monitor_registry: "MonitorRegistry | None" = None
+    workflow_monitor: "MonitorConsumer | None" = None
 
     def add_variable(self, variable: Variable) -> None:
         """
@@ -39,6 +49,12 @@ class SflowState:
         Add a backend to the state.
         """
         self.backends[backend.name] = backend
+
+    def add_storage_target(self, target: "StorageTarget") -> None:
+        """
+        Add a storage target to the state.
+        """
+        self.storage_targets[target.name] = target
 
     def to_context_dict(self) -> dict[str, Any]:
         """

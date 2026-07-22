@@ -2,7 +2,7 @@ name: Deploy Docs to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "docs/**"
       - "docs-site/**"
@@ -15,12 +15,14 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      deploy_pages: ${{ steps.deploy_eligibility.outputs.deploy }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,12 +57,51 @@ jobs:
           npm run prepare:versions
           npm run build:site
 
+      - name: Detect deploy eligibility
+        id: deploy_eligibility
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          deploy=false
+
+          if [ "$REF_NAME" = "main" ]; then
+            deploy=true
+          elif [ "$REF_NAME" = "develop" ] && [ "$EVENT_NAME" = "push" ]; then
+            base="$BEFORE_SHA"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="HEAD^"
+            fi
+
+            changed_files="$(git diff --name-only "$base" "$CURRENT_SHA")"
+            has_changes=false
+            only_user_docs=true
+            while IFS= read -r changed_file; do
+              [ -z "$changed_file" ] && continue
+              has_changes=true
+              case "$changed_file" in
+                docs/user/*) ;;
+                *) only_user_docs=false ;;
+              esac
+            done <<< "$changed_files"
+
+            if [ "$has_changes" = true ] && [ "$only_user_docs" = true ]; then
+              deploy=true
+            fi
+          fi
+
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
       - name: Upload Pages artifact
+        if: steps.deploy_eligibility.outputs.deploy == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs-site/build
 
   deploy:
+    if: needs.build.outputs.deploy_pages == 'true'
     needs: build
     runs-on: ubuntu-latest
     environment:

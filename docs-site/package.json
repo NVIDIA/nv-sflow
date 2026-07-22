@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "scripts": {
     "prepare:versions": "node scripts/prepare-versioned-docs.js",
+    "test": "node --test",
     "test:versions": "node --test scripts/prepare-versioned-docs.test.js",
     "build:site": "docusaurus build",
     "start": "npm run prepare:versions && docusaurus start --host 0.0.0.0 --port 3000",

@@ -1,0 +1,55 @@
+# Dynamo + SGLang aggregated server (backend-agnostic).
+#
+# Provides only the GPU `server` task; NATS/etcd/frontend come from
+# dynamo_common.yaml. Like the other Dynamo workloads, the server declares
+# `required_by: [benchmark]` to wire itself to the benchmark hub.
+#
+# SGLang aggregation here is single-worker (intra-node tensor parallelism), so run
+# it on backends/k8s.yaml or backends/slurm.yaml with SERVER_GPUS <= GPUS_PER_NODE.
+# (Cross-node SGLang needs its multi-node --dist-init-addr/--nnodes/--node-rank
+# wiring, which is out of scope for this minimal sample.)
+
+version: "0.1"
+
+variables:
+  SERVER_IMAGE:
+    description: "Dynamo SGLang runtime image"
+    value: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+  MODEL_PATH:
+    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
+    value: /models/Qwen3-0.6B
+  SERVER_GPUS:
+    description: "GPUs per server (tensor-parallel size)"
+    type: integer
+    value: 4
+
+workflow:
+  name: modular_inference
+  tasks:
+    - name: server
+      operator: server
+      script:
+        - set -x
+        - >
+          python3 -m dynamo.sglang
+          --model-path ${{ variables.MODEL_PATH }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --tensor-parallel-size ${{ variables.SERVER_GPUS }}
+          --skip-tokenizer-init
+          --trust-remote-code
+      resources:
+        gpus:
+          count: ${{ variables.SERVER_GPUS }}
+      depends_on:
+        - frontend_server
+      required_by:
+        - benchmark
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          interval: 20

@@ -1,0 +1,800 @@
+# sflow K8s recipe golden manifests -- DO NOT EDIT BY HAND.
+# recipe: examples/self_contained/kubernetes/dynamo_sglang_disagg.yaml
+# Rendered offline with a deterministic placeholder allocation (no cluster).
+# Merge followers are omitted; their containers run in the leader's merged pod.
+# Regenerate: SFLOW_UPDATE_GOLDEN=1 pytest tests/unit/test_k8s_recipe_golden_manifests.py
+---
+# task: nats_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: nats-server -js
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: nats-server-kubernetes
+    name: nats-server-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: nats-server-kubernetes
+    name: nats-server-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: nats-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+      name: nats-server-kubernetes
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /cache
+        name: kernel-cache
+        readOnly: false
+        subPath: sflow-kernel-cache
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: nats-server-kubernetes-cfg
+      name: sflow-scripts
+    - emptyDir:
+        medium: Memory
+      name: dshm
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: kernel-cache
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: false
+kind: List
+---
+# task: etcd_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'etcd --listen-client-urls "http://0.0.0.0:2379" --advertise-client-urls "http://0.0.0.0:2379"
+      --listen-peer-urls "http://0.0.0.0:2380" --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+      --initial-cluster "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd
+
+      '
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: etcd-server-kubernetes
+    name: etcd-server-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: etcd-server-kubernetes
+    name: etcd-server-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: etcd-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+      name: etcd-server-kubernetes
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /cache
+        name: kernel-cache
+        readOnly: false
+        subPath: sflow-kernel-cache
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: etcd-server-kubernetes-cfg
+      name: sflow-scripts
+    - emptyDir:
+        medium: Memory
+      name: dshm
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: kernel-cache
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: false
+kind: List
+---
+# task: frontend_server (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'python3 -m dynamo.frontend --http-port 8000 '
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: frontend-server-kubernetes
+    name: frontend-server-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: frontend-server-kubernetes
+    name: frontend-server-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: frontend-server-kubernetes-env
+      image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+      name: frontend-server-kubernetes
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /cache
+        name: kernel-cache
+        readOnly: false
+        subPath: sflow-kernel-cache
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: frontend-server-kubernetes-cfg
+      name: sflow-scripts
+    - emptyDir:
+        medium: Memory
+      name: dshm
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: kernel-cache
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: false
+kind: List
+---
+# task: prefill_server_0 (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "set -uo pipefail\nif [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n_sflow_rc_dir=\"\
+      $(mktemp -d)\"\n_sflow_run() {\n  _name=\"$1\"; _cvd=\"$2\"; _script=\"$3\"; _envf=\"$4\"\n  (\n\
+      \    export CUDA_VISIBLE_DEVICES=\"$_cvd\"\n    export NVIDIA_VISIBLE_DEVICES=\"$_cvd\"\n    if\
+      \ [ -f \"$_envf\" ]; then . \"$_envf\"; fi\n    bash -l \"$_script\"\n    echo \"$?\" > \"$_sflow_rc_dir/$_name\"\
+      \n  ) 2>&1 | while IFS= read -r _sflow_line || [ -n \"$_sflow_line\" ]; do\n      printf '[[sflow-mux:%s]]\
+      \ %s\\n' \"$_name\" \"$_sflow_line\"\n    done &\n}\n_sflow_run prefill_server_0 0,1,2,3,4,5,6,7\
+      \ /sflow/merge_prefill_server_0.sh /sflow/menv/prefill-server-0/envsh\n_sflow_run prefill_server_1\
+      \ 1,0,2,3,4,5,6,7 /sflow/merge_prefill_server_1.sh /sflow/menv/prefill-server-1/envsh\n_sflow_run\
+      \ prefill_server_2 2,0,1,3,4,5,6,7 /sflow/merge_prefill_server_2.sh /sflow/menv/prefill-server-2/envsh\n\
+      _sflow_run prefill_server_3 3,0,1,2,4,5,6,7 /sflow/merge_prefill_server_3.sh /sflow/menv/prefill-server-3/envsh\n\
+      _sflow_run prefill_server_4 4,0,1,2,3,5,6,7 /sflow/merge_prefill_server_4.sh /sflow/menv/prefill-server-4/envsh\n\
+      _sflow_run prefill_server_5 5,0,1,2,3,4,6,7 /sflow/merge_prefill_server_5.sh /sflow/menv/prefill-server-5/envsh\n\
+      _sflow_run prefill_server_6 6,0,1,2,3,4,5,7 /sflow/merge_prefill_server_6.sh /sflow/menv/prefill-server-6/envsh\n\
+      _sflow_run prefill_server_7 7,0,1,2,3,4,5,6 /sflow/merge_prefill_server_7.sh /sflow/menv/prefill-server-7/envsh\n\
+      wait\n_sflow_rc=0\nfor _f in \"$_sflow_rc_dir\"/*; do\n  _c=\"$(cat \"$_f\" 2>/dev/null || echo\
+      \ 1)\"\n  [ \"$_c\" = \"0\" ] || _sflow_rc=\"$_c\"\ndone\nexit \"$_sflow_rc\""
+    merge_prefill_server_0.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_1.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_2.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_3.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_4.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_5.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_6.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+    merge_prefill_server_7.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((8998 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${CTX_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${CTX_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 1 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 64 --max-prefill-tokens 4096  --disaggregation-mode prefill --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --load-balance-method round_robin --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 64 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_PREFILL_ARGS}"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-prefill-server-bb95e3-kubernetes
+    name: merged-prefill-server-bb95e3-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-prefill-server-bb95e3-kubernetes
+    name: merged-prefill-server-bb95e3-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+      name: merged-prefill-server-bb95e3-kubernetes
+      resources:
+        limits:
+          nvidia.com/gpu: '8'
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /cache
+        name: kernel-cache
+        readOnly: false
+        subPath: sflow-kernel-cache
+      - mountPath: /sflow/menv/prefill-server-0
+        name: sflow-menv-0
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-1
+        name: sflow-menv-1
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-2
+        name: sflow-menv-2
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-3
+        name: sflow-menv-3
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-4
+        name: sflow-menv-4
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-5
+        name: sflow-menv-5
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-6
+        name: sflow-menv-6
+        readOnly: true
+      - mountPath: /sflow/menv/prefill-server-7
+        name: sflow-menv-7
+        readOnly: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: merged-prefill-server-bb95e3-kubernetes-cfg
+      name: sflow-scripts
+    - emptyDir:
+        medium: Memory
+      name: dshm
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: kernel-cache
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: false
+    - name: sflow-menv-0
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-0
+    - name: sflow-menv-1
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-1
+    - name: sflow-menv-2
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-2
+    - name: sflow-menv-3
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-3
+    - name: sflow-menv-4
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-4
+    - name: sflow-menv-5
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-5
+    - name: sflow-menv-6
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-6
+    - name: sflow-menv-7
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-prefill-server-bb95e3-kubernetes-menv-7
+kind: List
+---
+# task: decode_server_0 (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: "set -uo pipefail\nif [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n_sflow_rc_dir=\"\
+      $(mktemp -d)\"\n_sflow_run() {\n  _name=\"$1\"; _cvd=\"$2\"; _script=\"$3\"; _envf=\"$4\"\n  (\n\
+      \    export CUDA_VISIBLE_DEVICES=\"$_cvd\"\n    export NVIDIA_VISIBLE_DEVICES=\"$_cvd\"\n    if\
+      \ [ -f \"$_envf\" ]; then . \"$_envf\"; fi\n    bash -l \"$_script\"\n    echo \"$?\" > \"$_sflow_rc_dir/$_name\"\
+      \n  ) 2>&1 | while IFS= read -r _sflow_line || [ -n \"$_sflow_line\" ]; do\n      printf '[[sflow-mux:%s]]\
+      \ %s\\n' \"$_name\" \"$_sflow_line\"\n    done &\n}\n_sflow_run decode_server_0 0,1,2,3,4,5,6,7\
+      \ /sflow/merge_decode_server_0.sh /sflow/menv/decode-server-0/envsh\n_sflow_run decode_server_1\
+      \ 4,5,6,7,0,1,2,3 /sflow/merge_decode_server_1.sh /sflow/menv/decode-server-1/envsh\nwait\n_sflow_rc=0\n\
+      for _f in \"$_sflow_rc_dir\"/*; do\n  _c=\"$(cat \"$_f\" 2>/dev/null || echo 1)\"\n  [ \"$_c\" =\
+      \ \"0\" ] || _sflow_rc=\"$_c\"\ndone\nexit \"$_sflow_rc\""
+    merge_decode_server_0.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((6557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8182 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((9098 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${GEN_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29600 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${GEN_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 4 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 256 --max-prefill-tokens 4096  --disaggregation-mode decode --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --prefill-round-robin-balance --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 256 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_DECODE_ARGS}"
+    merge_decode_server_1.sh: "set -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"${NET_DEBUG}\" == \"1\" ];\
+      \ then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export UCX_LOG_LEVEL=info\n\
+      fi\n\nif [ \"${KV_NVLINK}\" == \"1\" ]; then\n  export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK\n\
+      \  export MC_FORCE_MNNVL=True\n  export MC_TE_METRIC=true\n  export NCCL_MNNVL_ENABLE=1\n  export\
+      \ NCCL_CUMEM_ENABLE=1\n  export NCCL_IB_DISABLE=1\n  export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000\n\
+      \  export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000\n  export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000\n\
+      fi\nexport SGLANG_DISAGG_STAGING_BUFFER=1\nexport SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=512\nexport\
+      \ NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}\nexport FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS}\
+      \ | cut -d',' -f1)\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((6557 + ${SFLOW_REPLICA_INDEX:-0} * 8))\n\
+      export DYN_SYSTEM_PORT=$((8182 + ${SFLOW_REPLICA_INDEX:-0}))\nexport BOOTSTRAP_PORT=$((9098 + ${SFLOW_REPLICA_INDEX:-0}))\n\
+      export SFLOW_KERNEL_CACHE=/cache\nexport XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg\nexport SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang\n\
+      export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\nexport DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm\n\
+      export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep\nexport TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton\n\
+      export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor\nmkdir -p \"$XDG_CACHE_HOME\" \"$SGLANG_CACHE_DIR\"\
+      \ \"$DG_JIT_CACHE_DIR\" \"$EP_JIT_CACHE_DIR\" \"$TRITON_CACHE_DIR\" \"$TORCHINDUCTOR_CACHE_DIR\"\
+      \nif [ \"${GEN_NODES_PER_WORKER}\" -gt 1 ]; then\n  export MULTI_NODE_EXTRA_ARGS=\"--dist-init-addr\
+      \ ${FIRST_NODE_IP}:$((29600 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${GEN_NODES_PER_WORKER} --node-rank\
+      \ ${NODE_RANK}\"\nelse\n  export MULTI_NODE_EXTRA_ARGS=\"\"\nfi\n\npython3 -m dynamo.sglang --model-path\
+      \ /models/Qwen3-8B-FP8 --served-model-name Qwen3-8B-FP8 --tensor-parallel-size 4 --pipeline-parallel-size\
+      \ 1 --data-parallel-size 1 --expert-parallel-size 1 --moe-dense-tp-size 1 --max-running-requests\
+      \ 256 --max-prefill-tokens 4096  --disaggregation-mode decode --disaggregation-bootstrap-port ${BOOTSTRAP_PORT}\
+      \ --disaggregation-transfer-backend nixl --prefill-round-robin-balance --trust-remote-code --skip-tokenizer-init\
+      \ --cuda-graph-max-bs 256 ${MULTI_NODE_EXTRA_ARGS} --host 0.0.0.0 ${EXTRA_DECODE_ARGS}"
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-0d3ace-kubernetes
+    name: merged-decode-server-0d3ace-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: merged-decode-server-0d3ace-kubernetes
+    name: merged-decode-server-0d3ace-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+      name: merged-decode-server-0d3ace-kubernetes
+      resources:
+        limits:
+          nvidia.com/gpu: '8'
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /cache
+        name: kernel-cache
+        readOnly: false
+        subPath: sflow-kernel-cache
+      - mountPath: /sflow/menv/decode-server-0
+        name: sflow-menv-0
+        readOnly: true
+      - mountPath: /sflow/menv/decode-server-1
+        name: sflow-menv-1
+        readOnly: true
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node1
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: merged-decode-server-0d3ace-kubernetes-cfg
+      name: sflow-scripts
+    - emptyDir:
+        medium: Memory
+      name: dshm
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: kernel-cache
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: false
+    - name: sflow-menv-0
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-decode-server-0d3ace-kubernetes-menv-0
+    - name: sflow-menv-1
+      secret:
+        items:
+        - key: envsh
+          path: envsh
+        secretName: merged-decode-server-0d3ace-kubernetes-menv-1
+kind: List
+---
+# task: benchmark_512 (operator: K8sOperator)
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    entrypoint.sh: 'pip install aiperf==0.3.0
+
+      set -x
+
+      export COLUMNS=200
+
+      aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY} --model
+      Qwen3-8B-FP8 --tokenizer /models/Qwen3-8B-FP8 --endpoint-type chat --endpoint /v1/chat/completions
+      --streaming --url http://0.0.0.1:8000 --synthetic-input-tokens-mean 1024 --synthetic-input-tokens-stddev
+      0 --output-tokens-mean 1024 --output-tokens-stddev 0 --extra-inputs "max_tokens:1024" --extra-inputs
+      "min_tokens:1024" --extra-inputs "ignore_eos:true" --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+      --extra-inputs "repetition_penalty:1.0" --extra-inputs "temperature: 0.0" --concurrency ${CONCURRENCY}
+      --request-count $((8*${CONCURRENCY})) --warmup-request-count ${CONCURRENCY} --num-dataset-entries
+      $((8*${CONCURRENCY})) --random-seed 100 -H ''Authorization: Bearer NOT USED'' -H ''Accept: text/event-stream''
+      --record-processors 8 --ui simple
+
+      echo "Benchmarking finished"'
+  kind: ConfigMap
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: benchmark-512-kubernetes
+    name: benchmark-512-kubernetes-cfg
+    namespace: mlperf-sflow
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    labels:
+      sflow.ai/allocation: kubernetes
+      sflow.ai/task: benchmark-512-kubernetes
+    name: benchmark-512-kubernetes
+    namespace: mlperf-sflow
+  spec:
+    containers:
+    - command:
+      - bash
+      - -l
+      - /sflow/entrypoint.sh
+      envFrom:
+      - secretRef:
+          name: benchmark-512-kubernetes-env
+      image: python:3.12-slim
+      name: benchmark-512-kubernetes
+      volumeMounts:
+      - mountPath: /sflow
+        name: sflow-scripts
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-store
+        readOnly: true
+      - mountPath: /cache
+        name: kernel-cache
+        readOnly: false
+        subPath: sflow-kernel-cache
+    hostNetwork: true
+    nodeSelector:
+      kubernetes.io/hostname: k8s_cluster-node0
+    restartPolicy: Never
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - configMap:
+        name: benchmark-512-kubernetes-cfg
+      name: sflow-scripts
+    - emptyDir:
+        medium: Memory
+      name: dshm
+    - name: model-store
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: true
+    - name: kernel-cache
+      persistentVolumeClaim:
+        claimName: your-model-pvc
+        readOnly: false
+kind: List

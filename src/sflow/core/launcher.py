@@ -2,17 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import errno
 import logging
 import os
-import pty
+import re
 import shlex
 import subprocess
 import sys
 from typing import Mapping, Optional
 
+try:
+    import pty
+except ImportError:  # pragma: no cover - exercised by Windows import tests.
+    pty = None
+
 from sflow.logging import SFLOW_TASK_STREAM_ATTR, get_logger
 
 from .command import Command, format_command
+from .command_log import record_active_command
 
 _logger = get_logger(__name__)
 
@@ -37,26 +44,47 @@ def _emit_task_output_line(
     pfx: str,
     output_logger: Optional[logging.Logger],
     stream_console: bool,
+    to_file: bool = True,
 ) -> None:
     """Route a single line of task (subprocess) output.
 
-    Always writes to the per-task logger (``output_logger`` -> ``<task>.log``).
-    Only additionally echoes to the root ``sflow`` logger (console / Slurm
-    stdout) when ``stream_console`` is True, tagging the record with
-    ``SFLOW_TASK_STREAM_ATTR`` so sflow.log's file handler drops it.
+    Writes to the per-task logger (``output_logger`` -> ``<task>.log``) unless
+    ``to_file`` is False. Only additionally echoes to the root ``sflow`` logger
+    (console / Slurm stdout / TUI) when ``stream_console`` is True, tagging the
+    record with ``SFLOW_TASK_STREAM_ATTR`` so sflow.log's file handler drops it.
+
+    Transient progress-bar snapshots pass ``to_file=False`` so they animate live
+    on the console/TUI without polluting the persistent per-task log, which keeps
+    only completed (final-state) lines.
     """
-    if output_logger:
+    if output_logger and to_file:
         output_logger.info(line_str)
     if stream_console:
         _logger.info(f"{pfx}{line_str}", extra={SFLOW_TASK_STREAM_ATTR: True})
 
 
+# How often an in-progress (carriage-return) line is surfaced to the console/TUI
+# while it keeps redrawing without a newline (e.g. docker pull / pip / aiperf).
+_PARTIAL_FLUSH_INTERVAL = 0.4
+
+# Max 64KB PTY reads drained per event-loop wakeup before yielding back to the
+# loop. Draining the whole buffer in one wakeup lets a single chatty stream (e.g.
+# a high-volume server log delivering a backlog burst) monopolize the loop and
+# starve every other coroutine -- including the K8s pod-status watches and the
+# orchestrator's DAG poll, which is what delays detecting that a task (and the
+# workflow) has finished. Capping reads per wakeup keeps those responsive; the
+# reader stays registered, so any remaining data is drained on the next tick.
+_MAX_PTY_READS_PER_LOOP = 8
+
+
+# Compiled once at import time: recompiling per line was a measurable cost when
+# task output is chatty (this runs for every line of every task's stdout/stderr).
+_ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
 def _strip_ansi(text: str) -> str:
     """Strip ANSI escape sequences from text."""
-    import re
-
-    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-    return ansi_escape.sub("", text)
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 class SubprocessLauncher:
@@ -146,6 +174,8 @@ class SubprocessLauncher:
 
         # Use PTY to make subprocess think it's connected to a terminal
         # This prevents output buffering issues with progress bars
+        if pty is None:
+            raise OSError("PTY subprocess launching is not available on this platform")
         master_fd, slave_fd = pty.openpty()
 
         try:
@@ -157,6 +187,7 @@ class SubprocessLauncher:
                 env=proc_env,
                 close_fds=True,
             )
+            record_active_command(command, task_name=task_name, shell=shell)
         except Exception as e:
             os.close(master_fd)
             os.close(slave_fd)
@@ -173,65 +204,156 @@ class SubprocessLauncher:
         fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
         loop = asyncio.get_event_loop()
+        # The PTY master becomes readable (and yields EOF / EIO) once the child
+        # closes the slave on exit. We drive reads off event-loop readiness via
+        # ``add_reader`` instead of hopping every chunk to a thread-pool and
+        # polling on a 50ms sleep, which serialized/contended under many chatty
+        # tasks. ``done`` is set when the PTY reaches EOF.
+        done: asyncio.Event = asyncio.Event()
+        buffer = b""
+        # The most recent in-progress (carriage-return) frame surfaced to the
+        # console/TUI, and when, so live progress bars keep updating on a throttle
+        # without emitting every redraw frame (and without writing to <task>.log).
+        partial_text: str | None = None
+        partial_at = 0.0
+
+        def _feed(data: bytes) -> None:
+            # Append new bytes and emit any newly-completed lines, keeping the
+            # incomplete trailing line in ``buffer`` for the next read.
+            nonlocal buffer, partial_text, partial_at
+            buffer += data
+            # Only split on real newlines; a carriage return rewrites the CURRENT
+            # line in place (progress bars), it does not start a new one.
+            text = buffer.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            lines = text.split("\n")
+            # Keep the trailing incomplete physical line for the next read. Collapse
+            # its in-place \r redraws now so a pure progress bar (which only emits
+            # \r until it finishes) can't grow the buffer without bound.
+            buffer = lines[-1].rsplit("\r", 1)[-1].encode("utf-8")
+            for line_str in lines[:-1]:
+                # Terminal semantics: \r returns to the start of the line and the
+                # text after it overwrites what came before. Keep only the final
+                # state so a completed progress line renders once, not per redraw.
+                line_str = _strip_ansi(line_str.rsplit("\r", 1)[-1]).rstrip()
+                if not line_str:
+                    continue
+                if line_str == partial_text:
+                    # Identical to the snapshot already streamed to the console:
+                    # still record the final state in <task>.log (snapshots are not
+                    # written there), but don't duplicate it on the console.
+                    if output_logger is not None:
+                        output_logger.info(line_str)
+                    partial_text = None
+                    continue
+                _emit_task_output_line(
+                    line_str,
+                    pfx=pfx,
+                    output_logger=output_logger,
+                    stream_console=stream_console,
+                )
+                # A completed line supersedes any tracked in-progress snapshot.
+                partial_text = None
+
+            # Surface the still-incomplete line periodically so progress bars that
+            # only redraw with \r (no newline) keep animating on the console/TUI.
+            # These transient snapshots are NOT written to <task>.log (to_file=False);
+            # the file gets the final line when the real newline arrives. They exist
+            # purely for live display, so skip the decode/strip work entirely when
+            # nothing consumes them (batch / non-TTY / offload, where stream_console
+            # is False and the emit would be a no-op anyway).
+            if stream_console:
+                snapshot = _strip_ansi(
+                    buffer.decode("utf-8", errors="replace")
+                ).rstrip()
+                now = loop.time()
+                if (
+                    snapshot
+                    and snapshot != partial_text
+                    and (now - partial_at) >= _PARTIAL_FLUSH_INTERVAL
+                ):
+                    _emit_task_output_line(
+                        snapshot,
+                        pfx=pfx,
+                        output_logger=output_logger,
+                        stream_console=stream_console,
+                        to_file=False,
+                    )
+                    partial_text = snapshot
+                    partial_at = now
+
+        def _flush_tail() -> None:
+            nonlocal buffer, partial_text
+            if buffer:
+                line_str = _strip_ansi(
+                    buffer.decode("utf-8", errors="replace").rsplit("\r", 1)[-1]
+                ).rstrip()
+                # Persist the final state to <task>.log (unless it just duplicates
+                # the last streamed snapshot).
+                if line_str and line_str != partial_text:
+                    _emit_task_output_line(
+                        line_str,
+                        pfx=pfx,
+                        output_logger=output_logger,
+                        stream_console=stream_console,
+                    )
+                elif line_str and output_logger is not None:
+                    # Already streamed to the console as a snapshot; just record the
+                    # final state in the per-task log so the file is complete.
+                    output_logger.info(line_str)
+                buffer = b""
+                partial_text = None
+
+        def _on_readable() -> None:
+            # Drain a BOUNDED amount, then return so the event loop can service
+            # other coroutines (pod-status watches, the orchestrator, other tasks'
+            # streams) before we read more. Draining the whole PTY buffer in one
+            # wakeup lets a single chatty stream monopolize the loop and starve
+            # everything else. A read of b"" (or EIO on the PTY master) means the
+            # child closed the slave: stop watching and signal completion.
+            try:
+                for _ in range(_MAX_PTY_READS_PER_LOOP):
+                    try:
+                        chunk = os.read(master_fd, 65536)
+                    except BlockingIOError:
+                        # No more data right now; wait for the next readiness.
+                        return
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            chunk = b""  # PTY slave closed (child exited).
+                        else:
+                            raise
+                    if not chunk:
+                        break
+                    _feed(chunk)
+                else:
+                    # Hit the per-wakeup read cap with data likely still buffered.
+                    # Yield to the loop; the reader stays registered, so this fires
+                    # again next tick after other tasks have had a turn.
+                    return
+            except OSError:
+                # Treat any unexpected read error as EOF so we never hang.
+                pass
+            try:
+                loop.remove_reader(master_fd)
+            except Exception:
+                pass
+            _flush_tail()
+            done.set()
 
         try:
-            buffer = b""
-            while True:
-                # Check if process has exited
-                ret = process.poll()
-
-                try:
-                    # Non-blocking read from PTY master
-                    chunk = await loop.run_in_executor(
-                        None, lambda: self._read_pty_chunk(master_fd)
-                    )
-                except OSError:
-                    # PTY closed (process exited)
-                    chunk = b""
-
-                if chunk:
-                    buffer += chunk
-
-                    # Split on both \n and \r to handle progress bars
-                    text = buffer.decode("utf-8", errors="replace")
-                    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-                    # Split into lines, keeping incomplete line in buffer
-                    lines = text.split("\n")
-                    buffer = lines[-1].encode("utf-8")
-
-                    for line_str in lines[:-1]:
-                        # Strip ANSI escape sequences for cleaner logs
-                        line_str = _strip_ansi(line_str).rstrip()
-                        if line_str:
-                            _emit_task_output_line(
-                                line_str,
-                                pfx=pfx,
-                                output_logger=output_logger,
-                                stream_console=stream_console,
-                            )
-
-                if ret is not None and not chunk:
-                    # Process exited and no more data
-                    if buffer:
-                        line_str = _strip_ansi(
-                            buffer.decode("utf-8", errors="replace")
-                        ).rstrip()
-                        if line_str:
-                            _emit_task_output_line(
-                                line_str,
-                                pfx=pfx,
-                                output_logger=output_logger,
-                                stream_console=stream_console,
-                            )
-                    break
-
-                if not chunk:
-                    # No data available, yield control briefly
-                    await asyncio.sleep(0.05)
-
+            loop.add_reader(master_fd, _on_readable)
+            await done.wait()
+            # PTY EOF means the child closed its stdio (i.e. it is exiting). Poll
+            # briefly until it is reaped so we return the real exit code; using
+            # poll() (not a blocking wait) keeps the event loop responsive.
+            while process.poll() is None:
+                await asyncio.sleep(0.01)
             return process.returncode
         except asyncio.CancelledError:
+            try:
+                loop.remove_reader(master_fd)
+            except Exception:
+                pass
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -240,21 +362,24 @@ class SubprocessLauncher:
                 process.wait()
             raise
         finally:
+            # The per-task FileHandler coalesces flushes, so a just-finished
+            # task may still have its tail buffered. Flush now (the subprocess
+            # has exited) so post-completion readers - result/output parsing in
+            # the orchestrator's finalize step - see the complete log.
+            if output_logger is not None:
+                for handler in list(getattr(output_logger, "handlers", []) or []):
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+            try:
+                loop.remove_reader(master_fd)
+            except Exception:
+                pass
             try:
                 os.close(master_fd)
             except OSError:
                 pass
-
-    def _read_pty_chunk(self, fd: int, size: int = 4096) -> bytes:
-        """Read a chunk from PTY file descriptor, returns empty bytes if no data."""
-        try:
-            return os.read(fd, size)
-        except BlockingIOError:
-            return b""
-        except OSError as e:
-            if e.errno == 5:  # EIO - PTY closed
-                return b""
-            raise
 
     # async def run_pipe_async(
     #     self,

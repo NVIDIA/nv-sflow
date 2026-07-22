@@ -120,7 +120,7 @@ class TestSkillsCopy:
         (output_dir / "other_skill.txt").write_text("keep me")
         result = runner.invoke(app, ["skill", "-o", str(output_dir), "--force"], input="y\n")
         assert result.exit_code == 0
-        assert agents_md.read_text() != "customized"
+        assert agents_md.read_text(encoding="utf-8") != "customized"
         assert (output_dir / "other_skill.txt").read_text() == "keep me"
 
     def test_copy_merges_into_existing_skill_subdir(self, tmp_path):
@@ -139,6 +139,90 @@ class TestSkillsCopy:
         result = runner.invoke(app, ["skill", "-o", str(output_dir)], input="y\n")
         assert result.exit_code == 0
         assert not (output_dir / "__init__.py").exists()
+
+    def test_copy_excludes_pycache_and_pyc(self, tmp_path):
+        """Bytecode caches are never copied, at any depth (they can exist in scripts/)."""
+        output_dir = tmp_path / "skills"
+        result = runner.invoke(app, ["skill", "-o", str(output_dir)], input="y\n")
+        assert result.exit_code == 0
+        assert not list(output_dir.rglob("__pycache__"))
+        assert not list(output_dir.rglob("*.pyc"))
+
+
+class TestSkillsTargets:
+    """Tests for `sflow skill --target` (direct install into agent folders)."""
+
+    def test_target_claude_installs_to_dot_claude_skills(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        # No input piped: --target must not prompt.
+        result = runner.invoke(app, ["skill", "--target", "claude"])
+        assert result.exit_code == 0, result.output
+        skills = tmp_path / ".claude" / "skills"
+        assert (skills / "writing-sflow-yaml" / "SKILL.md").exists()
+        assert (skills / "AGENTS.md").exists()
+
+    def test_target_skips_confirmation_prompt(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["skill", "-t", "claude"])
+        assert result.exit_code == 0
+        assert "Proceed?" not in result.output
+
+    def test_target_cursor_and_codex_folders(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["skill", "-t", "cursor", "-t", "codex"])
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / ".cursor" / "skills" / "writing-sflow-yaml" / "SKILL.md").exists()
+        assert (tmp_path / ".codex" / "skills" / "writing-sflow-yaml" / "SKILL.md").exists()
+        # Only the requested targets are written.
+        assert not (tmp_path / ".claude").exists()
+
+    def test_target_all_installs_three(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["skill", "--target", "all"])
+        assert result.exit_code == 0, result.output
+        for tool in (".claude", ".cursor", ".codex"):
+            assert (tmp_path / tool / "skills" / "sflow-error-analysis" / "SKILL.md").exists()
+
+    def test_target_global_uses_home_dir(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        result = runner.invoke(app, ["skill", "-t", "codex", "--global"])
+        assert result.exit_code == 0, result.output
+        assert (home / ".codex" / "skills" / "writing-sflow-yaml" / "SKILL.md").exists()
+        # Nothing written into the project dir.
+        assert not (tmp_path / ".codex").exists()
+
+    def test_target_cursor_global_falls_back_to_project(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        result = runner.invoke(app, ["skill", "-t", "cursor", "--global"])
+        assert result.exit_code == 0, result.output
+        # Cursor has no global dir -> project install, with a note.
+        assert (tmp_path / ".cursor" / "skills" / "writing-sflow-yaml" / "SKILL.md").exists()
+        assert not (home / ".cursor").exists()
+        assert "no user-level skills dir" in result.output
+
+    def test_target_and_output_mutually_exclusive(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(
+            app, ["skill", "-t", "claude", "-o", str(tmp_path / "x")]
+        )
+        assert result.exit_code != 0
+        assert "not both" in result.output
+
+    def test_target_merges_and_preserves_existing(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        skill_dir = tmp_path / ".claude" / "skills" / "writing-sflow-yaml"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "my_notes.txt").write_text("notes")
+        result = runner.invoke(app, ["skill", "-t", "claude"])
+        assert result.exit_code == 0, result.output
+        assert (skill_dir / "my_notes.txt").read_text() == "notes"
+        assert (skill_dir / "SKILL.md").exists()
 
 
 class TestSkillsModule:
@@ -170,7 +254,7 @@ class TestSkillsModule:
         for skill_name in list_skills():
             skill_md = skills_dir / skill_name / "SKILL.md"
             if skill_md.exists():
-                content = skill_md.read_text()
+                content = skill_md.read_text(encoding="utf-8")
                 assert content.startswith("---"), f"{skill_name}/SKILL.md missing frontmatter"
                 assert "name:" in content, f"{skill_name}/SKILL.md missing name field"
                 assert "description:" in content, f"{skill_name}/SKILL.md missing description field"
@@ -181,7 +265,7 @@ class TestSkillsModule:
 
     def test_agents_md_references_skills(self):
         skills_dir = get_skills_dir()
-        content = (skills_dir / "AGENTS.md").read_text()
+        content = (skills_dir / "AGENTS.md").read_text(encoding="utf-8")
         assert "writing-sflow-yaml" in content
         assert "sflow-error-analysis" in content
         assert "nvidia.github.io/nv-sflow" in content

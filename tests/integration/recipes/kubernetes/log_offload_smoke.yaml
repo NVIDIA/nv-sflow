@@ -1,0 +1,175 @@
+version: "0.1"
+
+# Smoke test for the Kubernetes log OFFLOAD + prompt DAG cut-over, covering BOTH
+# offload paths in one run:
+#   * SINGLE-pod offload  -- one pod, `kubectl logs -f` redirected straight to
+#     <task>.log (driver never in the per-line path); console via a bounded tailer.
+#   * MERGE-pod offload   -- several co-located GPU tasks packed into ONE pod; the
+#     one container log is tag-demuxed (offloaded to `kubectl | demuxer`) into each
+#     member's <task>.log. This is the path the dynamo prefill/decode servers use.
+#
+# WHAT IT VERIFIES
+#   1. Offload works: a chatty log BURST does not saturate/freeze the sflow driver
+#      -- the burst goes to disk off the event loop; the console tailer is bounded
+#      (drops excess, keeps the file complete) instead of blocking the loop.
+#   2. DAG cut-over is status-authoritative: the burst tasks produce a lot of logs
+#      at burst but EXIT immediately. sflow must complete them (and tear the
+#      workflow down) the instant the pod/container is terminal -- NOT after the log
+#      stream finishes draining to the console.
+#   3. Complete-log guarantee: even though the console drops most of the burst,
+#      every <task>.log ends up with ALL its lines (on-terminal re-fetch/finalize)
+#      -- for both the single pod AND each merged member (re-split by the mux tag).
+#
+# GPUs: the merged tasks CLAIM GPUs (to force co-location + merging) but never use
+# them -- they just print logs. So any image works; no CUDA needed.
+#
+# LAYOUT (1 node)
+#   * log_service   : CPU, long-lived chatty streamer (like a decode server); must
+#                     be torn down PROMPTLY once the DAG's leaves complete.
+#   * single_burst  : CPU, single pod; floods ${BURST_LINES} lines then exits.
+#   * merged_burst  : ${MERGE_MEMBERS} GPU replicas (${GPU_PER_MEMBER} GPU each) ->
+#                     packed onto the one node -> MERGED into a single pod; every
+#                     replica floods ${BURST_LINES} lines then exits.
+#
+# HOW TO RUN
+#   sflow run tests/integration/recipes/kubernetes/log_offload_smoke.yaml -s K8S_NAMESPACE=mlperf-sflow
+#   # bigger burst = starker fixed-vs-broken gap:
+#   sflow run tests/integration/recipes/kubernetes/log_offload_smoke.yaml -s K8S_NAMESPACE=mlperf-sflow -s BURST_LINES=1000000
+#
+# WHAT "CORRECT" LOOKS LIKE  (offload + cut-over working)
+#   * The run FINISHES within a few seconds of the console printing the last
+#     "BURST_DONE" -- not after slowly scrolling the whole burst.
+#   * During the bursts the console keeps interleaving "[log_service] tick ..." and
+#     shows "... (N console lines omitted; full log in <task>.log) ..." drop notes
+#     (tailers bounded, driver responsive), and log_service is stopped right after.
+#   Check afterwards (OUT = the printed output folder; on-disk lines may carry a
+#   kubectl "[pod/...]" prefix for the single pod, so match tags as substrings):
+#     # (a) single-pod complete on disk despite console drops -> == BURST_LINES:
+#     grep -c '\[sburst\] line' "$OUT/single_burst/single_burst.log"
+#     # (b) merged members each complete AND cleanly split (no cross-contamination):
+#     for i in $(seq 0 $(( ${MERGE_MEMBERS:-4} - 1 ))); do
+#       echo -n "merged_burst_$i own=";  grep -c "\[mburst r$i\]" "$OUT/merged_burst_$i/merged_burst_$i.log"
+#     done   # each 'own' count == BURST_LINES; a replica's file has only its own r<i> tag
+#     # (c) cut-over was prompt -- gap between BURST_DONE and COMPLETED is a few s:
+#     grep -E '(single_burst|merged_burst).*(SUBMITTED|COMPLETED)' "$OUT/sflow_summary.log"
+#     # (d) the container-terminal cut-over fired (if the pod phase lagged):
+#     grep 'container terminated' "$OUT/sflow.log"
+#
+# WHAT "BROKEN" LOOKED LIKE  (pre-offload / drain-gated completion)
+#   The run would hang for ~ BURST_LINES / ~1300 seconds after BURST_DONE, draining
+#   the burst to the console before completing; the console would freeze on the
+#   burst while the pod was already gone.
+
+variables:
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for the pods (override per cluster, e.g. mlperf-sflow)"
+    value: default
+  GPUS_PER_NODE:
+    description: "GPUs sflow uses per node (must be >= MERGE_MEMBERS * GPU_PER_MEMBER)"
+    type: integer
+    value: 4
+  MERGE_MEMBERS:
+    description: "Number of GPU replicas that co-locate and MERGE into one pod"
+    type: integer
+    value: 4
+  GPU_PER_MEMBER:
+    description: "GPUs each merged replica claims (claimed only, never used)"
+    type: integer
+    value: 1
+  BURST_LINES:
+    description: "Lines each burst task floods before it exits (bigger = starker gap)"
+    type: integer
+    value: 200000
+
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: 1
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # Their cluster uses the nvidia.com/gpu device plugin (see the dynamo disagg
+    # example). This field is a literal (no ${{ }} substitution); set 'dra' here if
+    # your cluster uses the DRA driver instead.
+    scheduling: device_plugin
+    # No RDMA / host networking needed -- this is a pure log-plumbing smoke test.
+    rdma: disable
+
+operators:
+  - name: py
+    type: k8s
+    # The kubernetes backend has no image; the workload image lives on the operator.
+    # debian-based slim image -> bash + coreutils `seq` (with -f) + date; no CUDA
+    # needed since the merged tasks only CLAIM the GPU, they never use it.
+    image: python:3.11-slim
+
+workflow:
+  name: k8s_log_offload_smoke
+
+  tasks:
+    # A long-lived, chatty streamer (stand-in for a decode/prefill server). It must
+    # keep streaming live during the bursts (proving the driver stays responsive)
+    # and be torn down PROMPTLY once the burst leaves complete.
+    - name: log_service
+      operator: py
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - |
+          echo "SERVICE_READY"
+          echo "[log_service] streaming continuously until the DAG completes and I am torn down"
+          i=0
+          while true; do
+            i=$((i + 1))
+            seq -f "[log_service] tick ${i} line-%.0f at $(date -u +%H:%M:%S)" 1 20
+            sleep 0.1
+          done
+      probes:
+        # Off-disk readiness: the driver watches the offloaded <task>.log for the
+        # sentinel (no port needed), so dependents unblock once the stream is live.
+        readiness:
+          log_watch:
+            match_pattern: "SERVICE_READY"
+          interval: 2
+          timeout: 120
+
+    # SINGLE-pod offload: one CPU pod bursts a lot of logs, then exits immediately.
+    - name: single_burst
+      operator: py
+      resources:
+        nodes:
+          indices: [0]
+      depends_on:
+        - log_service
+      script:
+        - |
+          echo "[single_burst] warming up for 5s so log_service is visibly streaming..."
+          sleep 5
+          echo "[single_burst] BURST_START ts=$(date -u +%H:%M:%S) lines=${BURST_LINES}"
+          seq -f "[sburst] line %.0f of ${BURST_LINES}  payload........................................................" 1 ${BURST_LINES}
+          echo "[single_burst] BURST_DONE ts=$(date -u +%H:%M:%S) -- pod exits now; the task/DAG should COMPLETE within a few seconds"
+
+    # MERGE-pod offload: N GPU replicas co-locate on the one node and are MERGED
+    # into a single pod (like the dynamo prefill/decode servers). Each replica
+    # bursts concurrently; the one container log is tag-demuxed (kubectl | demuxer,
+    # off the event loop) into each replica's own <task>.log. GPUs are claimed but never
+    # used -- the replicas only print logs.
+    - name: merged_burst
+      operator: py
+      replicas:
+        count: ${{ variables.MERGE_MEMBERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPU_PER_MEMBER }}
+      depends_on:
+        - log_service
+      script:
+        - |
+          echo "[merged_burst r${SFLOW_REPLICA_INDEX}] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-none} (claimed, not used)"
+          echo "[merged_burst r${SFLOW_REPLICA_INDEX}] warming up for 5s so log_service is visibly streaming..."
+          sleep 5
+          echo "[merged_burst r${SFLOW_REPLICA_INDEX}] BURST_START ts=$(date -u +%H:%M:%S) lines=${BURST_LINES}"
+          seq -f "[mburst r${SFLOW_REPLICA_INDEX}] line %.0f of ${BURST_LINES}  payload........................................................" 1 ${BURST_LINES}
+          echo "[merged_burst r${SFLOW_REPLICA_INDEX}] BURST_DONE ts=$(date -u +%H:%M:%S) -- replica exits; merged pod is done once all replicas exit"

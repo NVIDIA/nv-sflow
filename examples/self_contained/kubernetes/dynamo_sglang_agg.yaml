@@ -1,0 +1,470 @@
+version: "0.1"
+
+# Kubernetes port of examples/slurm/self_contained/dynamo_sglang_agg.yaml.
+#
+# Aggregated (non-disaggregated) SGLang recipe: a single aggregated worker serves
+# both prefill and decode.
+#
+# Native Kubernetes recipe: a `kubernetes` backend (scheduling: device_plugin)
+# reserves and discovers nodes, then each task runs as its own scheduler-placed
+# pod whose GPUs come from the legacy nvidia.com/gpu device plugin. The operators
+# are `type: k8s` and carry the workload images (DYNAMO_IMAGE / AIPERF_IMAGE).
+#
+# Cluster assumptions: NVIDIA gpu-operator (nvidia.com/gpu device plugin). The
+# backend reserves real nodes with placeholder pods that hold the node GPUs,
+# discovers their node names + InternalIPs, pins each task pod via nodeSelector,
+# and hands the GPUs to the GPU tasks via the create-before-destroy handoff.
+# CPU-only infra (etcd/nats/frontend) overlaps on node 0 without consuming GPUs.
+# Set `scheduling: dra` to use DRA (nvidia-dra-driver-gpu, Kubernetes 1.34+,
+# resource.k8s.io/v1, DeviceClass gpu.nvidia.com) instead of the device plugin.
+#
+# SGLang notes (what differs from the vllm/trtllm ports):
+#   * Multi-node worker (AGG_GPUS_PER_WORKER > GPUS_PER_NODE): SGLang does NOT use
+#     Ray. resources.gpus.count auto-expands the task to one pod per node and
+#     EVERY pod runs `python3 -m dynamo.sglang` with a shared
+#     `--dist-init-addr <rank0-ip>:<port> --nnodes N --node-rank
+#     ${SFLOW_TASK_NODE_INDEX}` -- rank 0 is the head, the rest join its TP group.
+#   * host_network shares node ports, so each replica derives unique
+#     VLLM_NIXL_SIDE_CHANNEL_PORT / DYN_SYSTEM_PORT / dist-init ports from
+#     SFLOW_REPLICA_INDEX. The Slurm trick of offsetting by the first
+#     CUDA_VISIBLE_DEVICES index does NOT work here: the device plugin gives each
+#     pod its own GPUs seen as 0,1,..., so that index is always 0.
+
+variables:
+  # --- Kubernetes backend configuration ---
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    # PVCs are namespace-scoped, so this must be the namespace that holds
+    # MODEL_PVC_CLAIM. Override both together per cluster, e.g.:
+    #   -s K8S_NAMESPACE=your-namespace -s MODEL_PVC_CLAIM=shared-storage
+    value: mlperf-sflow
+  MODEL_PVC_CLAIM:
+    description: "Existing PVC that holds the model weights (mounted read-only at /models); override per cluster"
+    value: your-model-pvc
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 8
+  NUM_NODES:
+    description: "Number of nodes"
+    value: 1
+
+  # --- Persistent kernel/JIT cache PVC (reused across runs) ---
+  # DeepGEMM / DeepEP / Triton / torch.compile JIT-compile kernels on first use,
+  # which is slow at every startup. Persisting them lets later runs reuse the compiled
+  # kernels instead of recompiling. The GPU worker scripts point the cache env vars
+  # (SGLANG_DG_CACHE_DIR / EP_JIT_CACHE_DIR / TRITON_CACHE_DIR / ...) at the
+  # LOCAL_CACHE_PATH artifact -- the writable `kernel-cache` PVC (/cache) by default, or
+  # override to a node-local dir with -a LOCAL_CACHE_PATH=fs://...
+  CACHE_PVC_CLAIM:
+    description: "RWX PVC that stores the kernel cache (defaults to the model PVC; set a dedicated RWX cache PVC if you have one)"
+    value: ${{ variables.MODEL_PVC_CLAIM }}
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: Qwen3-8B-FP8
+  MODEL_NAME:
+    description: "Model path"
+    value: Qwen/Qwen3-8B-FP8
+
+  # Aggregated Server Configuration
+  NUM_AGG_SERVERS:
+    description: "Number of aggregated servers"
+    type: integer
+    value: 8
+  AGG_TP_SIZE:
+    description: "Aggregated tensor parallel size"
+    type: integer
+    value: 1
+  AGG_DP_SIZE:
+    description: "Aggregated data parallel size"
+    type: integer
+    value: 1
+  AGG_EP_SIZE:
+    description: "Aggregated expert parallel size"
+    type: integer
+    value: 1
+  AGG_MOE_TP_SIZE:
+    description: "Aggregated MOE tensor parallel size"
+    type: integer
+    value: 1
+  AGG_PP_SIZE:
+    description: "Aggregated pipeline parallel size"
+    type: integer
+    value: 1
+  AGG_GPUS_PER_WORKER:
+    description: "GPUs per aggregated worker"
+    type: integer
+    value: ${{ (variables.AGG_TP_SIZE * variables.AGG_DP_SIZE * variables.AGG_PP_SIZE) if variables.AGG_ENABLE_ATTENTION_DP == '' else (variables.AGG_TP_SIZE * variables.AGG_PP_SIZE) }}
+  AGG_NODES_PER_WORKER:
+    description: "Nodes per aggregated worker"
+    type: integer
+    value: ${{ [variables.AGG_GPUS_PER_WORKER // variables.GPUS_PER_NODE, 1] | max }}
+  AGG_BATCH_SIZE:
+    description: "Aggregated batch size"
+    type: integer
+    value: ${{ [(variables.CONCURRENCY.domain | max) // variables.NUM_AGG_SERVERS, variables.AGG_TP_SIZE] | max }}
+  AGG_MAX_NUM_TOKENS:
+    description: "Aggregated max number of tokens"
+    type: integer
+    value: 4096
+  AGG_MAX_SEQ_LEN:
+    description: "Aggregated max sequence length"
+    type: integer
+    value: 1280
+  AGG_FREE_GPU_MEMORY_FRACTION:
+    description: "Aggregated free GPU memory fraction"
+    value: 0.9
+  AGG_ENABLE_ATTENTION_DP:
+    description: "Aggregated enable attention DP (empty, or --enable-dp-attention)"
+    value: ""
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+
+  # Extra Arguments - You can append any optional arguments to the dynamo.sglang command
+  EXTRA_FRONTEND_ARGS:
+    description: "Extra frontend arguments"
+    value: ""
+  EXTRA_AGG_ARGS:
+    description: "Extra aggregated server arguments"
+    value: ""
+
+  # Network transport debugging. NET_DEBUG=1 makes each GPU worker log the
+  # transport NCCL and UCX/NIXL actually pick, so you can confirm the
+  # tensor-parallel (NCCL) traffic uses RDMA and not a TCP/Ethernet fallback.
+  # Grep the agg_server logs for:
+  #   * NCCL: "NET/IB" (RDMA/RoCE) vs "NET/Socket" (TCP)
+  #   * UCX/NIXL: "rc_mlx5"/"rc_verbs" (RDMA) vs "tcp"
+  # Set NET_DEBUG=0 to silence the extra logging.
+  NET_DEBUG:
+    description: "Log NCCL/UCX transport selection (1=on, 0=off) to verify RDMA vs TCP"
+    value: "1"
+
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 512
+    domain: [512]
+
+  # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+  DYNAMO_IMAGE:
+    description: "Dynamo SGLang container image"
+    value: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+
+artifacts:
+  # On Kubernetes, artifacts are injected into the task pods the native way (not via
+  # the controller's filesystem), accessible as `${{ artifacts.NAME.path }}`:
+  #   * file:// + inline `content` -> mounted into the pod from a ConfigMap.
+  #   * fs:// -> made visible inside the pod, two ways:
+  #       1. PVC-backed (recommended for models/large data): declare a PVC under the
+  #          backend's `volumes:` and point the fs:// path at a location under its
+  #          `mount_path` (see the `volumes:` on the k8s_cluster backend).
+  #       2. hostPath: if no PVC covers the path, fs:// is hostPath-mounted at the
+  #          same path, so it must be NODE-accessible (e.g. an NFS/shared filesystem
+  #          mounted on every node). A missing node path fails the pod loudly.
+  #
+  # SGLang passes everything on the command line, so there are no engine-config
+  # artifacts -- only the model + the JIT/kernel cache, both as fs:// artifacts so they
+  # can be overridden at runtime (-a LOCAL_MODEL_PATH=... / -a LOCAL_CACHE_PATH=...).
+  - name: LOCAL_MODEL_PATH
+    # Lives inside the read-only `model-store` PVC (mounted at /models); see backend volumes.
+    # Override to serve from anywhere: -a LOCAL_MODEL_PATH=fs:///var/tmp/models/Qwen3-8B-FP8
+    uri: fs:///models/Qwen3-8B-FP8
+  - name: LOCAL_CACHE_PATH
+    # The finalized JIT/kernel cache dir (writable). Default lives inside the writable
+    # `kernel-cache` PVC (mounted at /cache); override to a node-local disk for speed:
+    #   -a LOCAL_CACHE_PATH=fs:///var/tmp/sflow-cache
+    uri: fs:///cache
+
+backends:
+  # A kubernetes backend with device-plugin scheduling. No `image` field --
+  # workload images come from the operators (DYNAMO_IMAGE / AIPERF_IMAGE) below.
+  - name: k8s_cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so peers can be addressed by the node InternalIPs that
+    # reservation returns (etcd/NATS registration mirrors the Slurm path). It also
+    # lets a multi-node SGLang worker address its rank-0 by a reachable node IP.
+    host_network: true
+    # Request GPUs via the legacy nvidia.com/gpu device plugin; use 'dra' for
+    # DRA (nvidia-dra-driver-gpu, DeviceClass gpu.nvidia.com).
+    scheduling: device_plugin
+    # RDMA fast path (default 'auto'): on GKE multi-NIC RDMA nodes, task GPU pods
+    # get scoped RDMA device access -- a per-pod slice of the node's
+    # networking.gke.io.networks/rdma-N NICs (sized to the pod's GPU count) plus
+    # CAP_IPC_LOCK -- and a matching UCX_NET_DEVICES/NCCL_IB_HCA, so the
+    # cross-node tensor-parallel NCCL traffic runs over RoCE instead of TCP.
+    # Use 'disable' to turn RDMA off cleanly; or force a provider with
+    # 'gke' | 'shared_device_plugin' | 'host_device' (default 'auto' detects).
+    rdma: auto
+    # Pre-existing PersistentVolumeClaims to mount into task pods. Use this to make
+    # cluster-resident data (e.g. a model staged on shared storage) available to
+    # pods without a node-local hostPath. The PVC + its data must already exist in
+    # the namespace; sflow only references it. A PVC is mounted into a task's pod(s)
+    # only when the task references a path under its mount_path (so e.g. the model
+    # is not mounted into the etcd/nats pods). Use read_only + an ROX/RWX PVC to
+    # share one model across the aggregated worker's pods on multiple nodes.
+    #
+    # `your-model-pvc` is a dedicated RWX Lustre PVC (in the mlperf-sflow
+    # namespace); the Qwen model is staged at its root, so LOCAL_MODEL_PATH points
+    # at /models/Qwen3-8B-FP8.
+    volumes:
+      - name: model-store
+        claim: ${{ variables.MODEL_PVC_CLAIM }}
+        mount_path: /models
+        read_only: true
+      # Writable cache PVC: persists the JIT/kernel cache (DeepGEMM/DeepEP/Triton/
+      # torch.compile) across runs so kernels are compiled once and then reused.
+      # Defaults to the model PVC under a `sflow-kernel-cache` sub_path; must be RWX so
+      # all worker pods (incl. multi-node) can share it. Mounted read-write at /cache --
+      # the LOCAL_CACHE_PATH artifact default (override it to a node-local path to use the
+      # node disk instead; the PVC is then simply unused).
+      - name: kernel-cache
+        claim: ${{ variables.CACHE_PVC_CLAIM }}
+        mount_path: /cache
+        sub_path: sflow-kernel-cache
+        read_only: false
+    reservation:
+      timeout: 1200
+
+operators:
+  # Native kubernetes operators carry the workload image. A single-node task
+  # becomes one pod; a multi-node task becomes one pod per node.
+  - name: dynamo
+    type: k8s
+    image: ${{ variables.DYNAMO_IMAGE }}
+    # Persist the JIT/kernel cache (LOCAL_CACHE_PATH): the writable PVC subPath (or a
+    # node-local dir) is typically root-owned, so run as root to write it.
+    run_as_root: true
+  - name: aiperf
+    type: k8s
+    image: ${{ variables.AIPERF_IMAGE }}
+
+workflow:
+  name: dynamo_sglang_agg
+  timeout: 115m
+
+  variables:
+    # Workflow level variables will overwrite the variables defined in global variables section if using same name
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.k8s_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: nats_server
+      operator: dynamo
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          interval: 2
+
+    - name: etcd_server
+      operator: dynamo
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          interval: 2
+
+    - name: frontend_server
+      operator: dynamo
+      script:
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 300
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: agg_server
+      operator: dynamo
+      replicas:
+        count: ${{ variables.NUM_AGG_SERVERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        # Network transport logging (NET_DEBUG=1): make NCCL and UCX/NIXL print
+        # the transport they pick so you can confirm RDMA vs a TCP fallback --
+        # NCCL "NET/IB" vs "NET/Socket", UCX "rc_mlx5"/"rc_verbs" vs "tcp".
+        - >
+          if [ "${NET_DEBUG}" == "1" ]; then
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=NET
+            export UCX_LOG_LEVEL=info
+          fi
+        # SFLOW_TASK_NODE_INDEX is the portable SLURM_NODEID (0 on the rank-0 pod,
+        # 1..N-1 on the others); unset for single-node workers -> default 0.
+        - export NODE_RANK=${SFLOW_TASK_NODE_INDEX:-0}
+        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        # Per-replica ports (host_network shares node ports). On k8s each pod sees
+        # its GPUs as 0,1,..., so offset by SFLOW_REPLICA_INDEX, not the first CUDA
+        # index. The NIXL stride is GPUS_PER_NODE so a worker's per-rank ports stay
+        # within its own slot; the dist-init port is shared by all of a worker's
+        # pods (same replica index) and unique across replicas.
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0} * ${{ variables.GPUS_PER_NODE }}))
+        - export DYN_SYSTEM_PORT=$((8082 + ${SFLOW_REPLICA_INDEX:-0}))
+        # --- Persistent JIT/kernel cache (LOCAL_CACHE_PATH artifact) ---
+        # Point SGLang/DeepGEMM/DeepEP/Triton/torch.compile (+ flashinfer via XDG) caches
+        # at the LOCAL_CACHE_PATH dir so kernels compile ONCE and future runs reuse them.
+        # SGLang honors SGLANG_DG_CACHE_DIR; DeepGEMM/DeepEP honor DG_JIT_CACHE_DIR
+        # / EP_JIT_CACHE_DIR. Every node's pod runs the server, so all set these.
+        - export SFLOW_KERNEL_CACHE=${{ artifacts.LOCAL_CACHE_PATH.path }}
+        - export XDG_CACHE_HOME=${SFLOW_KERNEL_CACHE}/xdg
+        - export SGLANG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/sglang
+        - export SGLANG_DG_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm
+        - export DG_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_gemm
+        - export EP_JIT_CACHE_DIR=${SFLOW_KERNEL_CACHE}/deep_ep
+        - export TRITON_CACHE_DIR=${SFLOW_KERNEL_CACHE}/triton
+        - export TORCHINDUCTOR_CACHE_DIR=${SFLOW_KERNEL_CACHE}/inductor
+        - mkdir -p "$XDG_CACHE_HOME" "$SGLANG_CACHE_DIR" "$DG_JIT_CACHE_DIR" "$EP_JIT_CACHE_DIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
+        - >
+          if [ "${AGG_NODES_PER_WORKER}" -gt 1 ]; then
+            export MULTI_NODE_EXTRA_ARGS="--dist-init-addr ${FIRST_NODE_IP}:$((29500 + ${SFLOW_REPLICA_INDEX:-0})) --nnodes ${AGG_NODES_PER_WORKER} --node-rank ${NODE_RANK}"
+          else
+            export MULTI_NODE_EXTRA_ARGS=""
+          fi
+        # Every pod (all node-ranks) runs the SGLang server: rank 0 is the head,
+        # the others join its TP group over --dist-init-addr (no Ray leader/idle).
+        - >
+          python3 -m dynamo.sglang
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --tensor-parallel-size ${{ variables.AGG_TP_SIZE }}
+          --pipeline-parallel-size ${{ variables.AGG_PP_SIZE }}
+          --data-parallel-size ${{ variables.AGG_DP_SIZE }}
+          --expert-parallel-size ${{ variables.AGG_EP_SIZE }}
+          --moe-dense-tp-size ${{ variables.AGG_MOE_TP_SIZE }}
+          --max-running-requests ${{ variables.AGG_BATCH_SIZE }}
+          --max-prefill-tokens ${{ variables.AGG_MAX_NUM_TOKENS }}
+          ${{ variables.AGG_ENABLE_ATTENTION_DP }}
+          --trust-remote-code
+          --skip-tokenizer-init
+          --cuda-graph-max-bs ${{ variables.AGG_BATCH_SIZE }}
+          ${MULTI_NODE_EXTRA_ARGS}
+          --host 0.0.0.0
+          ${EXTRA_AGG_ARGS}
+      resources:
+        gpus:
+          count: ${{ variables.AGG_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          - http_post:
+              url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+              headers:
+                Content-Type: "application/json"
+              body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+            timeout: 1200
+            each_check_timeout: 20
+            interval: 20
+          - log_watch:
+              match_pattern: "re:Registering model with endpoint types|Model registration succeeded"
+              match_count: 1
+            timeout: 1200
+            interval: 10
+
+    - name: benchmark
+      operator: aiperf
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # aggregated SERVER's resources (used_by_tasks), not the benchmark client's
+      # own node. NOTE: node-level hardware monitoring is not implemented on the
+      # kubernetes backend yet, so sflow skips it (with a log hint) -- this block
+      # stays for parity with the Slurm recipe and takes effect on backends that
+      # support host monitoring.
+      monitor:
+        resources:
+          used_by_tasks:
+            - agg_server
+        report:
+          enabled: true
+      depends_on:
+        - agg_server
+        - frontend_server

@@ -9,8 +9,8 @@ from pydantic import ValidationError
 
 from fnmatch import fnmatch
 
-from sflow.config.resolver import ExpressionResolver
 from sflow.logging import get_logger
+from sflow.resolution import ExpressionResolver
 
 from .schema import SflowConfig
 
@@ -116,11 +116,254 @@ def _tasks_to_list(tasks: Any) -> list:
     return []
 
 
-def _extract_value(entry: Any) -> Any:
-    """Extract the display value from a section entry for override messages."""
-    if isinstance(entry, dict):
-        return entry.get("value", entry.get("uri", entry))
-    return entry
+def _render_plain_scalar(value: Any) -> str:
+    """Render simple YAML scalar values back to their plain text form."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _normalize_script_plain_mappings(config_data: Dict[str, Any]) -> None:
+    """Recover script commands that YAML parsed as mappings due to ``: ``.
+
+    YAML treats an unquoted list item like ``- echo "x: y"`` as a mapping.
+    ``script`` only accepts command strings, so a one-entry mapping there is
+    interpreted as the original shell line rather than a structured object.
+    """
+    workflow = config_data.get("workflow")
+    if not isinstance(workflow, dict):
+        return
+
+    tasks = workflow.get("tasks")
+    if isinstance(tasks, list):
+        task_items = tasks
+    elif isinstance(tasks, dict):
+        task_items = tasks.values()
+    else:
+        return
+
+    for task in task_items:
+        if not isinstance(task, dict):
+            continue
+        script = task.get("script")
+        if not isinstance(script, list):
+            continue
+
+        normalized: list[Any] = []
+        changed = False
+        for item in script:
+            if isinstance(item, dict) and len(item) == 1:
+                key, value = next(iter(item.items()))
+                if not isinstance(value, (dict, list)):
+                    rendered_value = _render_plain_scalar(value)
+                    suffix = f" {rendered_value}" if rendered_value else ""
+                    normalized.append(f"{key}:{suffix}")
+                    changed = True
+                    continue
+            normalized.append(item)
+
+        if changed:
+            task["script"] = normalized
+
+
+# Top-level and workflow-level sections that are collections of *named* entries.
+# These merge by ``name`` (scattered definitions of the same name are deep-merged,
+# new names are appended). Everything else is a plain dict/leaf handled generically.
+_NAMED_SECTION_KEYS = ("variables", "artifacts", "backends", "operators", "storage")
+
+
+def _record_origins(
+    value: Any, path: str, label: str, origin: Dict[str, str]
+) -> None:
+    """Record the originating file label for every leaf under ``value``.
+
+    Used so a later override can report where the previous value came from.
+    """
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _record_origins(v, f"{path}.{k}" if path else str(k), label, origin)
+    else:
+        origin[path] = label
+
+
+def _deep_merge(
+    base: Any,
+    incoming: Any,
+    *,
+    path: str,
+    label: str,
+    origin: Dict[str, str],
+    warns: List[str],
+) -> Any:
+    """Recursively merge ``incoming`` onto ``base`` (non-mutating).
+
+    Dicts are merged key-by-key. Anything else (scalars, lists, or a
+    dict-vs-scalar type mismatch) is a leaf: the incoming value wins, and a
+    warning is recorded when it differs from the previous value. This is the
+    "conflicts only on the root-down leaf value" rule.
+    """
+    if isinstance(base, dict) and isinstance(incoming, dict):
+        result = dict(base)
+        for k, v in incoming.items():
+            child = f"{path}.{k}" if path else str(k)
+            if k in result:
+                result[k] = _deep_merge(
+                    result[k], v, path=child, label=label, origin=origin, warns=warns
+                )
+            else:
+                result[k] = v
+                _record_origins(v, child, label, origin)
+        return result
+
+    if base != incoming:
+        prev = origin.get(path)
+        prev_note = f" (previously from {prev})" if prev else ""
+        warns.append(
+            f"{path}: overridden by {label}{prev_note}, "
+            f"value: {base!r} -> {incoming!r}"
+        )
+    origin[path] = label
+    return incoming
+
+
+def _merge_named_section(
+    base_section: Any,
+    incoming_section: Any,
+    *,
+    section_path: str,
+    label: str,
+    origin: Dict[str, str],
+    warns: List[str],
+) -> Dict[str, Any]:
+    """Merge a named section (variables/artifacts/backends/operators/storage).
+
+    Returns a name-keyed dict; entries with the same name are deep-merged so a
+    definition can be scattered across files (e.g. the operator's ``type`` in
+    one file, an override in another).
+    """
+    merged = _section_to_merge_dict(base_section)
+    incoming = _section_to_merge_dict(incoming_section)
+    for name, entry in incoming.items():
+        if name in merged:
+            merged[name] = _deep_merge(
+                merged[name],
+                entry,
+                path=f"{section_path}.{name}",
+                label=label,
+                origin=origin,
+                warns=warns,
+            )
+        else:
+            merged[name] = entry
+            _record_origins(entry, f"{section_path}.{name}", label, origin)
+    return merged
+
+
+def _merge_tasks(
+    base_tasks: Any,
+    incoming_tasks: Any,
+    *,
+    label: str,
+    origin: Dict[str, str],
+    warns: List[str],
+) -> List[Dict[str, Any]]:
+    """Merge ``workflow.tasks`` by name, preserving first-seen order.
+
+    Same-name tasks are deep-merged (scattered task definitions); new names are
+    appended. Tasks with no ``name`` cannot be merged by name, so they are kept
+    (appended after the named tasks) rather than silently dropped -- schema
+    validation then raises a clear "name required" error instead of the task
+    vanishing. Returns a list of task dicts.
+    """
+    merged: Dict[str, Any] = {}
+    order: List[str] = []
+    unnamed: List[Any] = []
+    for t in _tasks_to_list(base_tasks):
+        name = t.get("name") if isinstance(t, dict) else None
+        if name is None:
+            unnamed.append(t)
+            continue
+        merged[name] = t
+        order.append(name)
+    for t in _tasks_to_list(incoming_tasks):
+        name = t.get("name") if isinstance(t, dict) else None
+        if name is None:
+            unnamed.append(t)
+            continue
+        if name in merged:
+            merged[name] = _deep_merge(
+                merged[name],
+                t,
+                path=f"workflow.tasks.{name}",
+                label=label,
+                origin=origin,
+                warns=warns,
+            )
+        else:
+            merged[name] = t
+            order.append(name)
+            _record_origins(t, f"workflow.tasks.{name}", label, origin)
+    return [merged[n] for n in order] + unnamed
+
+
+def _merge_workflow(
+    base_wf: Dict[str, Any],
+    inc_wf: Dict[str, Any],
+    *,
+    label: str,
+    origin: Dict[str, str],
+    warns: List[str],
+) -> Dict[str, Any]:
+    """Merge a ``workflow`` section: name (last non-null wins), variables and
+    tasks (by name), and every other key (timeout/upload_all/monitor/...) via
+    generic deep merge."""
+    result = dict(base_wf)
+
+    if inc_wf.get("name") is not None:
+        prev = result.get("name")
+        if prev is not None and prev != inc_wf["name"]:
+            warns.append(
+                f"workflow.name: overridden by {label} (previously '{prev}'), "
+                f"value: {prev!r} -> {inc_wf['name']!r}"
+            )
+        result["name"] = inc_wf["name"]
+
+    if inc_wf.get("variables") is not None:
+        result["variables"] = _merge_named_section(
+            result.get("variables"),
+            inc_wf["variables"],
+            section_path="workflow.variables",
+            label=label,
+            origin=origin,
+            warns=warns,
+        )
+
+    if inc_wf.get("tasks") is not None:
+        result["tasks"] = _merge_tasks(
+            result.get("tasks"),
+            inc_wf["tasks"],
+            label=label,
+            origin=origin,
+            warns=warns,
+        )
+
+    for k, v in inc_wf.items():
+        if k in ("name", "variables", "tasks") or v is None:
+            continue
+        child = f"workflow.{k}"
+        if k in result:
+            result[k] = _deep_merge(
+                result[k], v, path=child, label=label, origin=origin, warns=warns
+            )
+        else:
+            result[k] = v
+            _record_origins(v, child, label, origin)
+
+    return result
 
 
 def merge_config_dicts(
@@ -130,13 +373,18 @@ def merge_config_dicts(
 ) -> Dict[str, Any]:
     """Merge multiple raw YAML config dicts into a single config dict.
 
-    Merge strategy:
-      - version: must be consistent across files
-      - variables / artifacts / backends / operators: merge by name (later wins)
-      - workflow.name: must be consistent across files
-      - workflow.timeout: last non-None wins
-      - workflow.variables: merge by name (later wins)
-      - workflow.tasks: concatenated in file order
+    Merge strategy (recursive deep merge keyed on the distinguishing ``name``):
+      - version: must be consistent across files (hard error on conflict)
+      - variables / artifacts / backends / operators / storage: merge by name;
+        same-name entries are deep-merged so a definition can be scattered
+        across files
+      - workflow.name: last non-null wins (no restriction; warning on change)
+      - workflow.variables: merge by name
+      - workflow.tasks: merge by name (same-name tasks deep-merged), preserving
+        first-seen order
+      - workflow.timeout / upload_all / monitor and any other key: deep-merged
+      - leaf scalars and value-lists (script, depends_on, ...): last file wins,
+        with an override warning
 
     Args:
         config_dicts: Raw YAML dicts to merge.
@@ -144,7 +392,7 @@ def merge_config_dicts(
         override_warnings: If provided, override messages are appended here.
 
     Raises:
-        ValueError: On version/name conflicts or incomplete merged result.
+        ValueError: On version conflicts or incomplete merged result.
     """
     if not config_dicts:
         raise ValueError("No configuration data provided for merging")
@@ -155,22 +403,18 @@ def merge_config_dicts(
     labels = source_labels or [f"config[{i}]" for i in range(len(config_dicts))]
     merged: Dict[str, Any] = {}
 
-    # Track which source label originally defined each key
-    origin: Dict[str, Dict[str, str]] = {
-        "variables": {},
-        "artifacts": {},
-        "backends": {},
-        "operators": {},
-    }
-    wf_var_origin: Dict[str, str] = {}
-    timeout_origin: Optional[str] = None
+    # Maps a dotted leaf path (e.g. "variables.X.value") to the file label that
+    # last set it, so override warnings can report the previous source.
+    origin: Dict[str, str] = {}
 
     warns = override_warnings if override_warnings is not None else []
 
     for idx, cfg in enumerate(config_dicts):
+        if not isinstance(cfg, dict):
+            continue
         label = labels[idx]
 
-        if "version" in cfg and cfg["version"] is not None:
+        if cfg.get("version") is not None:
             if "version" in merged and merged["version"] != cfg["version"]:
                 raise ValueError(
                     f"Version conflict: '{merged['version']}' vs "
@@ -178,80 +422,25 @@ def merge_config_dicts(
                 )
             merged["version"] = cfg["version"]
 
-        for key in ("variables", "artifacts", "backends", "operators"):
-            if key in cfg and cfg[key] is not None:
-                existing = _section_to_merge_dict(merged.get(key))
-                incoming = _section_to_merge_dict(cfg[key])
-                for name, new_entry in incoming.items():
-                    if name in existing and name in origin[key]:
-                        old_val = _extract_value(existing[name])
-                        new_val = _extract_value(new_entry)
-                        if old_val != new_val:
-                            warns.append(
-                                f"{key}.{name}: overridden by {label} "
-                                f"(previously from {origin[key][name]}), "
-                                f"value: {old_val!r} -> {new_val!r}"
-                            )
-                        else:
-                            warns.append(
-                                f"{key}.{name}: redefined by {label} "
-                                f"(same value as {origin[key][name]})"
-                            )
-                    origin[key][name] = label
-                existing.update(incoming)
-                merged[key] = existing
-
-        if "workflow" in cfg and cfg["workflow"] is not None:
-            if "workflow" not in merged:
-                merged["workflow"] = {}
-            wf = merged["workflow"]
-            inc = cfg["workflow"]
-
-            if "name" in inc and inc["name"] is not None:
-                if "name" in wf and wf["name"] != inc["name"]:
-                    raise ValueError(
-                        f"Workflow name conflict: '{wf['name']}' vs "
-                        f"'{inc['name']}' (from {label})"
-                    )
-                wf["name"] = inc["name"]
-
-            if "timeout" in inc:
-                if "timeout" in wf and timeout_origin is not None:
-                    if wf["timeout"] != inc["timeout"]:
-                        warns.append(
-                            f"workflow.timeout: overridden by {label} "
-                            f"(previously from {timeout_origin}), "
-                            f"value: {wf['timeout']!r} -> {inc['timeout']!r}"
-                        )
-                timeout_origin = label
-                wf["timeout"] = inc["timeout"]
-
-            if "variables" in inc and inc["variables"] is not None:
-                wf_vars = _section_to_merge_dict(wf.get("variables"))
-                inc_vars = _section_to_merge_dict(inc["variables"])
-                for name, new_entry in inc_vars.items():
-                    if name in wf_vars and name in wf_var_origin:
-                        old_val = _extract_value(wf_vars[name])
-                        new_val = _extract_value(new_entry)
-                        if old_val != new_val:
-                            warns.append(
-                                f"workflow.variables.{name}: overridden by {label} "
-                                f"(previously from {wf_var_origin[name]}), "
-                                f"value: {old_val!r} -> {new_val!r}"
-                            )
-                        else:
-                            warns.append(
-                                f"workflow.variables.{name}: redefined by {label} "
-                                f"(same value as {wf_var_origin[name]})"
-                            )
-                    wf_var_origin[name] = label
-                wf_vars.update(inc_vars)
-                wf["variables"] = wf_vars
-
-            if "tasks" in inc and inc["tasks"] is not None:
-                wf["tasks"] = _tasks_to_list(wf.get("tasks")) + _tasks_to_list(
-                    inc["tasks"]
+        for key in _NAMED_SECTION_KEYS:
+            if cfg.get(key) is not None:
+                merged[key] = _merge_named_section(
+                    merged.get(key),
+                    cfg[key],
+                    section_path=key,
+                    label=label,
+                    origin=origin,
+                    warns=warns,
                 )
+
+        if cfg.get("workflow") is not None:
+            merged["workflow"] = _merge_workflow(
+                merged.get("workflow") or {},
+                cfg["workflow"],
+                label=label,
+                origin=origin,
+                warns=warns,
+            )
 
     errors: list[str] = []
     if "version" not in merged:
@@ -281,7 +470,7 @@ def _extract_file_contributions(
     result: List[Dict[str, Any]] = []
     for cfg, path in zip(config_dicts, paths):
         contrib: Dict[str, Any] = {"path": path, "sections": []}
-        for key in ("variables", "artifacts", "backends", "operators"):
+        for key in _NAMED_SECTION_KEYS:
             items = cfg.get(key)
             if items:
                 names = list(_section_to_merge_dict(items).keys())
@@ -359,6 +548,8 @@ class ConfigLoader:
         if config_data is None:
             raise ValueError(f"Configuration file is empty: {path}")
 
+        _normalize_script_plain_mappings(config_data)
+
         syntax = self._resolver.validate_syntax(config_data, location=str(path))
         if not syntax.valid:
             details = "\n".join(str(e) for e in syntax.errors)
@@ -418,6 +609,8 @@ class ConfigLoader:
                 raise ValueError(f"Error parsing YAML configuration ({path}): {e}")
             if data is None:
                 raise ValueError(f"Configuration file is empty: {path}")
+
+            _normalize_script_plain_mappings(data)
 
             syntax = self._resolver.validate_syntax(data, location=str(path))
             if not syntax.valid:

@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import Field
 
 from sflow.core.command import Command
+from sflow.core.log_offload import unsupported_offload_warning
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.operator_registry import register_operator
 
@@ -20,12 +21,20 @@ class PythonOperatorConfig(OperatorConfig):
     python_exec: str = "python"
     extra_args: list[str] = Field(default_factory=list)
 
+    def runtime_warnings(self) -> list[str]:
+        return unsupported_offload_warning(self.type)
+
 
 @register_operator("python", PythonOperatorConfig)
 class PythonOperator(Operator):
     def __init__(self, config: PythonOperatorConfig):
         super().__init__(config)
         self.config: PythonOperatorConfig
+
+    def runs_shell_script(self) -> bool:
+        # The script is Python source (`python -c`), not shell -- a `set -e`
+        # prelude would be a SyntaxError, so opt out of shell fail-fast.
+        return False
 
     def build_command(
         self,
@@ -36,6 +45,12 @@ class PythonOperator(Operator):
     ) -> Command:
         c = self.config
         code = "\n".join(list(script))
+        # TODO(log-offload): per-task log offload is not implemented for this
+        # operator yet (logs stream through the sflow driver). To add it, follow
+        # the bash operator (sflow.core.log_offload): when offload_enabled(...) is
+        # True, run the code via a `bash -c` wrapper built with
+        # wrap_with_prefixer(..., redirect_to=task_log_path(envs, task_name)) and
+        # override writes_own_task_log().
         # Env is injected by SubprocessLauncher(env=...) to avoid leaking env values into logs
         # and to avoid shell quoting issues.
         cmd = Command(exec=c.python_exec)

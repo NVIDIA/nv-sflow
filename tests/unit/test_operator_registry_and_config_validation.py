@@ -22,8 +22,9 @@ def _minimal_cfg_dict(**extra):
 def test_operator_registry_has_builtins():
     ensure_builtin_operators_registered()
     reg = get_operator_registry()
-    for t in ["bash", "srun", "ssh", "docker", "python"]:
+    for t in ["bash", "srun", "ssh", "docker_run", "python", "k8s"]:
         assert t in reg
+    assert "docker" not in reg
 
 
 def test_config_validates_registered_operator_config_from_dict_form():
@@ -31,14 +32,19 @@ def test_config_validates_registered_operator_config_from_dict_form():
         _minimal_cfg_dict(
             operators={
                 "op_bash": {"type": "bash"},
+                "op_docker_run": {"type": "docker_run", "image": "ubuntu:22.04"},
                 "op_python": {"type": "python", "python_exec": "python3"},
             }
         )
     )
 
     assert cfg.operators is not None
-    assert {o.name for o in cfg.operators} == {"op_bash", "op_python"}
-    assert {o.type for o in cfg.operators} == {"bash", "python"}
+    assert {o.name for o in cfg.operators} == {
+        "op_bash",
+        "op_docker_run",
+        "op_python",
+    }
+    assert {o.type for o in cfg.operators} == {"bash", "docker_run", "python"}
 
 
 def test_config_rejects_unknown_operator_type():

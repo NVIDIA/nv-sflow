@@ -1,0 +1,414 @@
+version: "0.1"
+
+# Kubernetes aggregated TensorRT-LLM + Dynamo server. The GPU worker runs on the
+# sflow `k8s_mpi` operator by DEFAULT, so the SAME recipe covers BOTH single-node
+# (AGG_GPUS_PER_WORKER <= GPUS_PER_NODE) and cross-node (the worker spans
+# SERVER_NODES nodes) aggregation as ONE MPI world -- the operator injects all the
+# SSH/hostfile/sshd/wait glue so the recipe keeps a plain
+# `mpirun ... trtllm-llmapi-launch python3 -m dynamo.trtllm`.
+#
+#   * mpi.route: auto (default) emits a Kubeflow MPIJob when the mpijobs.kubeflow.org
+#     CRD is present (the mpi-operator owns the keypair/hostfile/sshd), else falls
+#     back to plain pods with sflow's injected MPI bootstrap preamble. Force one
+#     with mpi.route: operator | pods.
+#   * trtllm-llmapi-launch bootstraps the TRT-LLM LLM-API MPI session across the
+#     ranks and runs dynamo.trtllm on rank 0 (which registers with etcd/NATS and
+#     serves); the other ranks are TRT-LLM workers. rank 0 lands on reserved node 0
+#     (the k8s_mpi launcher is pinned there), co-located with etcd/NATS/frontend.
+#
+# Only the GPU worker changes vs the base recipe; the infra tasks
+# (nats/etcd/frontend) and the benchmark stay `type: k8s` on node 0.
+#
+# Prerequisites (operator route): the Kubeflow mpi-operator controller + CRD, and
+# an image that provides sshd (or keep mpi.ensure_sshd: true to apt-install it).
+# The tensorrtllm-runtime image ships ssh/mpirun/orted but not sshd, so keep
+# ensure_sshd + run_as_root on.
+
+variables:
+  # --- Kubernetes backend configuration ---
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods (must hold MODEL_PVC_CLAIM)"
+    value: mlperf-sflow
+  MODEL_PVC_CLAIM:
+    description: "Existing PVC that holds the model weights; override per cluster"
+    value: your-model-pvc
+  GPUS_PER_NODE:
+    description: "GPUs per node. Default 4 (GB300 NVL72) so the TP=8 worker spans 2 nodes."
+    type: integer
+    value: 4
+  COMPUTE_DOMAIN_CHANNEL:
+    description: "IMEX ComputeDomain channel for cross-node MNNVL: a channel TEMPLATE name, 'auto' (claim the sole existing domain), or 'disable'/empty for none. Override per cluster: -s COMPUTE_DOMAIN_CHANNEL=<name>. A NAMED channel on a cluster without a ComputeDomain fails preflight (unset it or use 'disable')."
+    value: auto
+
+  # Model Configuration
+  SERVED_MODEL_NAME:
+    description: "Served model name"
+    value: Qwen3-8B-FP8
+  MODEL_NAME:
+    description: "Model path"
+    value: Qwen/Qwen3-8B-FP8
+
+  # Aggregated Server Configuration
+  NUM_AGG_SERVERS:
+    description: "Number of aggregated servers (each spans SERVER_NODES nodes)"
+    type: integer
+    value: 1
+  AGG_TP_SIZE:
+    description: "Aggregated tensor parallel size. Default 8 => spans 2 nodes at GPUS_PER_NODE=4 (cross-node MPI)."
+    type: integer
+    value: 8
+  AGG_DP_SIZE:
+    description: "Aggregated data parallel size"
+    type: integer
+    value: 1
+  AGG_EP_SIZE:
+    description: "Aggregated expert parallel size"
+    type: integer
+    value: 8
+  AGG_MOE_TP_SIZE:
+    description: "Aggregated MOE tensor parallel size"
+    type: integer
+    value: 1
+  AGG_PP_SIZE:
+    description: "Aggregated pipeline parallel size"
+    type: integer
+    value: 1
+  AGG_GPUS_PER_WORKER:
+    description: "GPUs per aggregated worker == the MPI world size (TP*DP*PP)."
+    type: integer
+    value: ${{ variables.AGG_TP_SIZE * variables.AGG_DP_SIZE * variables.AGG_PP_SIZE }}
+  SERVER_NODES:
+    description: "Nodes the worker spans: ceil(AGG_GPUS_PER_WORKER / GPUS_PER_NODE)."
+    type: integer
+    value: ${{ ((variables.AGG_GPUS_PER_WORKER / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+  NUM_NODES:
+    description: "Reserved nodes == SERVER_NODES (infra + rank 0 co-locate on node 0)."
+    type: integer
+    value: ${{ variables.SERVER_NODES + 1 }}
+  AGG_BATCH_SIZE:
+    description: "Aggregated batch size"
+    type: integer
+    value: 1024
+  AGG_MAX_NUM_TOKENS:
+    description: "Aggregated max number of tokens"
+    type: integer
+    value: 6144
+  AGG_MAX_SEQ_LEN:
+    description: "Aggregated max sequence length"
+    type: integer
+    value: 24576
+  AGG_FREE_GPU_MEMORY_FRACTION:
+    description: "Aggregated free GPU memory fraction"
+    value: 0.95
+  AGG_ENABLE_ATTENTION_DP:
+    description: "Aggregated enable attention DP"
+    value: true
+  KV_CACHE_DTYPE:
+    description: "KV cache dtype"
+    value: fp8
+
+  # Extra Arguments - You can append any optional arguments to the dynamo.trtllm command
+  EXTRA_FRONTEND_ARGS:
+    description: "Extra frontend arguments"
+    value: ""
+  EXTRA_AGG_ARGS:
+    description: "Extra aggregated server arguments"
+    value: ""
+  NET_DEBUG:
+    description: "Log NCCL/UCX transport selection (1=on, 0=off) to verify RDMA/NVLink vs TCP"
+    value: "1"
+
+  # Benchmark Configuration
+  ISL:
+    description: "Input sequence length"
+    value: 1024
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency"
+    value: 512
+    domain: [512]
+
+  # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
+  DYNAMO_IMAGE:
+    description: "Dynamo TRTLLM container image"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///mnt/model-cache/your-model-dir
+  - name: AGG_CONFIG
+    uri: file://agg_config.yaml
+    content: |
+      backend: pytorch
+      tensor_parallel_size: ${{ variables.AGG_TP_SIZE }}
+      pipeline_parallel_size: ${{ variables.AGG_PP_SIZE }}
+      moe_expert_parallel_size: ${{ variables.AGG_EP_SIZE }}
+      max_batch_size: ${{ variables.AGG_BATCH_SIZE }}
+      max_num_tokens: ${{ variables.AGG_MAX_NUM_TOKENS }}
+      max_seq_len: ${{ variables.AGG_MAX_SEQ_LEN }}
+      print_iter_log: true
+      enable_iter_perf_stats: true
+      return_perf_metrics: true
+      enable_layerwise_nvtx_marker: false
+      enable_chunked_prefill: true
+      stream_interval: 20
+      scheduler_config:
+        capacity_scheduler_policy: MAX_UTILIZATION
+        context_chunking_policy: FIRST_COME_FIRST_SERVED
+      kv_cache_config:
+        dtype: fp8
+        free_gpu_memory_fraction: ${{ variables.AGG_FREE_GPU_MEMORY_FRACTION }}
+        enable_block_reuse: false
+      enable_attention_dp: ${{ variables.AGG_ENABLE_ATTENTION_DP }}
+      moe_config:
+        backend: CUTEDSL
+      cuda_graph_config:
+        enable_padding: true
+        batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 640, 768, 896, 1024]
+      cache_transceiver_config:
+        backend: UCX
+      attention_dp_config:
+        enable_balance: true
+        batching_wait_iters: 10
+        timeout_iters: 500
+
+backends:
+  - name: k8s_cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so peers can be addressed by node InternalIPs and the
+    # cross-node MPI hostfile (built by sflow from the assigned node IPs) works.
+    host_network: true
+    host_ipc: true
+    scheduling: device_plugin
+    node_selector:
+      tenant: your-node-tenant
+    # Cross-node collectives ride RDMA (RoCE/IB) when usable; if unusable in-pod,
+    # sflow auto-detects and uses the IB/RoCE fabric if present. On a GB300 NVL72 rack the
+    # cross-node fast path is the MNNVL NVLink fabric via the IMEX ComputeDomain below, so IB
+    # is not the cross-node path anyway. If the cluster's IB is down/absent, force RDMA off
+    # per run with `--kube-rdma disable` rather than hard-coding `disable` in the recipe.
+    rdma: auto
+    # Multi-Node NVLink (IMEX ComputeDomain) -- independent of GPU scheduling, so it
+    # is a top-level block (not under `dra:`). Join an existing domain's channel.
+    compute_domain:
+      channel: ${{ variables.COMPUTE_DOMAIN_CHANNEL }}
+    reservation:
+      timeout: 1200
+
+operators:
+  # Multi-node MPI worker: one operator, two routes (auto-detected). All SSH/MPI
+  # glue is injected by sflow -- the agg_server task carries only its mpirun line.
+  - name: dynamo
+    type: k8s_mpi
+    image: ${{ variables.DYNAMO_IMAGE }}
+    # 8-way NCCL/MPI shared memory needs a large /dev/shm (K8s default is 64Mi).
+    shm_size: 64Gi
+    # sshd host keys / /run/sshd / ~/.ssh need root (the image default user is non-root).
+    run_as_root: true
+    mpi:
+      route: auto                                       # auto | operator | pods
+      slots_per_worker: ${{ variables.GPUS_PER_NODE }}  # ranks per node in the hostfile
+      run_launcher_as_worker: true                      # launcher node also runs ranks (rank 0 serves)
+      launcher_creation_policy: WaitForWorkersReady
+      ssh_port: 2222
+      ensure_sshd: true                                 # tensorrtllm-runtime lacks sshd; install it
+      # OPTIONAL, ADDITIVE: app env namespaces to forward to remote ranks. sflow
+      # always forwards its built-in transport/system set (NCCL_/UCX_/GLOO_/
+      # NVSHMEM_/OMPI_MCA_/SFLOW_ + PATH/LD_LIBRARY_PATH); this only adds to it.
+  # Plain container operators for CPU-only infra + the benchmark client.
+  - name: k8s
+    type: k8s
+    image: ${{ variables.DYNAMO_IMAGE }}
+  - name: aiperf
+    type: k8s
+    image: ${{ variables.AIPERF_IMAGE }}
+
+workflow:
+  name: dynamo_trtllm_agg
+  timeout: 115m
+
+  variables:
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      description: "ETCD endpoints"
+      value: "${{ backends.k8s_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      description: "NATS server URL"
+      value: "nats://${{ backends.k8s_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: nats_server
+      operator: k8s
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          interval: 2
+
+    - name: etcd_server
+      operator: k8s
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://0.0.0.0:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          interval: 2
+
+    - name: frontend_server
+      operator: k8s
+      script:
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 300
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: agg_server
+      operator: dynamo
+      replicas:
+        count: ${{ variables.NUM_AGG_SERVERS }}
+        policy: "parallel"
+      resources:
+        # AGG_GPUS_PER_WORKER GPUs -> spans SERVER_NODES nodes as ONE MPI world.
+        gpus:
+          count: ${{ variables.AGG_GPUS_PER_WORKER }}
+      # This is the LAUNCH command only -- no keypair, hostfile, sshd, wait loop, or
+      # -x list. sflow's k8s_mpi operator injects all of that (operator route: the
+      # Kubeflow mpi-operator; pods route: an injected bootstrap preamble). The
+      # `mpirun` here is transparently wrapped so it just works on both routes, and
+      # sflow auto-`exec`s the launch (so the recipe writes a plain `mpirun ...`).
+      script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_SERVER_DISABLE_GC=1
+        - export TRTLLM_WORKER_DISABLE_GC=1
+        - export OMPI_MCA_coll_ucc_enable=0
+        - export TRTLLM_ENABLE_PDL=0
+        - export TLLM_PROFILE_START_STOP=12000-12100
+        # Pin UCX to the reservation-detected primary NIC (falls back to eth0).
+        - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
+        - unset UCX_TLS
+        - >
+          if [ "${NET_DEBUG}" == "1" ]; then
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=GRAPH,NET
+            export UCX_LOG_LEVEL=info
+          fi
+        # ONE cross-node MPI world across SERVER_NODES nodes (TP spans nodes):
+        # trtllm-llmapi-launch bootstraps the TRT-LLM LLM-API MPI session and runs
+        # dynamo.trtllm on rank 0; the other ranks are TRT-LLM workers.
+        - >
+          mpirun -np ${{ variables.AGG_GPUS_PER_WORKER }} --allow-run-as-root
+          trtllm-llmapi-launch
+          python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --extra-engine-args ${{ artifacts.AGG_CONFIG.path }} ${EXTRA_AGG_ARGS}
+      depends_on:
+        - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.k8s_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          each_check_timeout: 20
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: benchmark
+      operator: aiperf
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_TASK_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --request-timeout-seconds 1200
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count 10
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [-1]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      monitor:
+        resources:
+          used_by_tasks:
+            - agg_server
+        report:
+          enabled: true
+      depends_on:
+        - agg_server
+        - frontend_server

@@ -56,6 +56,29 @@ def test_compose_two_files_outputs_valid_yaml_to_stdout(tmp_path: Path):
     assert len(merged["workflow"]["tasks"]) == 1
 
 
+def test_compose_preserves_plain_script_command_with_colon(tmp_path: Path):
+    f = tmp_path / "colon_script.yaml"
+    f.write_text(
+        """
+version: "0.1"
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo "My GPUs: $CUDA_VISIBLE_DEVICES"
+""".lstrip()
+    )
+
+    result = runner.invoke(app, ["compose", str(f)], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    merged = yaml.safe_load(result.output)
+    assert merged["workflow"]["tasks"][0]["script"] == [
+        'echo "My GPUs: $CUDA_VISIBLE_DEVICES"'
+    ]
+
+
 def test_compose_writes_to_output_file(tmp_path: Path):
     f1 = _write_yaml(
         tmp_path / "a.yaml",
@@ -147,7 +170,7 @@ def test_compose_rejects_invalid_merged_config(tmp_path: Path):
 def test_compose_real_disagg_example_files(tmp_path: Path):
     """Compose the real disagg example files and validate the output is loadable."""
     repo_root = Path(__file__).resolve().parents[2]
-    examples_dir = repo_root / "examples" / "inference_x_v2"
+    examples_dir = repo_root / "examples" / "modular" / "inference_x_v2"
     if not examples_dir.exists():
         return
 

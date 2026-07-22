@@ -358,6 +358,133 @@ def test_cli_run_bulk_input_negative_out_of_range(mock_sflow_app, csv_file):
     assert "out of range" in result.output.lower() or "Row" in result.output
 
 
+def _min_workflow(tmp_path) -> Path:
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "workflow:\n"
+        "  name: t\n"
+        "  tasks:\n"
+        "    - name: hello\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    return wf
+
+
+def test_cli_run_extra_salloc_args_routed_to_slurm(mock_sflow_app, tmp_path):
+    """--extra-salloc-args is threaded to SflowApp.run under the 'slurm' type."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        ["run", "-f", str(wf), "--dry-run", "--extra-salloc-args", "--gpus-per-node=4"],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_sflow_app.run.call_args.kwargs["backend_extra_args_by_type"] == {
+        "slurm": ["--gpus-per-node=4"]
+    }
+
+
+def test_cli_run_extra_docker_args_routed_to_docker(mock_sflow_app, tmp_path):
+    """--extra-docker-args is threaded to SflowApp.run under the 'docker' type."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        ["run", "-f", str(wf), "--dry-run", "--extra-docker-args", "--shm-size=16g"],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_sflow_app.run.call_args.kwargs["backend_extra_args_by_type"] == {
+        "docker": ["--shm-size=16g"]
+    }
+
+
+def test_cli_run_extra_args_generic_fans_out_to_all_channels(mock_sflow_app, tmp_path):
+    """--extra-args is generic: it fans out to the slurm salloc, docker run, and
+    kubectl channels so whichever backend the recipe uses picks it up."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        ["run", "-f", str(wf), "--dry-run", "--extra-args", "--foo=1"],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kwargs = mock_sflow_app.run.call_args.kwargs
+    assert kwargs["backend_extra_args_by_type"] == {
+        "slurm": ["--foo=1"],
+        "docker": ["--foo=1"],
+    }
+    assert kwargs["kubectl_config"].extra_args == ["--foo=1"]
+
+
+def test_cli_run_extra_args_short_flag_is_generic(mock_sflow_app, tmp_path):
+    """The -e short flag still works and maps to the generic --extra-args."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        ["run", "-f", str(wf), "--dry-run", "-e", "--bar=2"],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kwargs = mock_sflow_app.run.call_args.kwargs
+    assert kwargs["backend_extra_args_by_type"] == {
+        "slurm": ["--bar=2"],
+        "docker": ["--bar=2"],
+    }
+    assert kwargs["kubectl_config"].extra_args == ["--bar=2"]
+
+
+def test_cli_run_specific_extra_args_override_generic(mock_sflow_app, tmp_path):
+    """A specific --extra-salloc-args overrides --extra-args on a conflicting option;
+    channels without a specific override keep the generic value."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "run", "-f", str(wf), "--dry-run",
+            "--extra-args", "--gres=gpu:1",
+            "--extra-salloc-args", "--gres=gpu:8",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    by_type = mock_sflow_app.run.call_args.kwargs["backend_extra_args_by_type"]
+    # slurm: the specific --extra-salloc-args wins on the conflicting --gres option.
+    assert by_type["slurm"] == ["--gres=gpu:8"]
+    # docker: no docker-specific override, so it keeps the generic value.
+    assert by_type["docker"] == ["--gres=gpu:1"]
+
+
+def test_cli_run_generic_extra_args_flagged_generic_for_kubectl(mock_sflow_app, tmp_path):
+    """Generic --extra-args routed to kubectl are flagged as generic-origin so the
+    k8s backend can warn they are being applied as kubectl global flags."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        ["run", "-f", str(wf), "--dry-run", "--extra-args", "--gpus-per-node=4"],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kube_cfg = mock_sflow_app.run.call_args.kwargs["kubectl_config"]
+    assert kube_cfg.extra_args == ["--gpus-per-node=4"]
+    assert kube_cfg.generic_extra_args == ["--gpus-per-node=4"]
+
+
+def test_cli_run_explicit_kubectl_args_not_flagged_generic(mock_sflow_app, tmp_path):
+    """An explicit --extra-kubectl-args value is intentional, so it is NOT flagged
+    as generic-origin (no misrouting warning). A generic arg on a different option
+    is still flagged."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "run", "-f", str(wf), "--dry-run",
+            "--extra-args", "--foo=1",
+            "--extra-kubectl-args", "--request-timeout=30s",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kube_cfg = mock_sflow_app.run.call_args.kwargs["kubectl_config"]
+    assert kube_cfg.extra_args == ["--foo=1", "--request-timeout=30s"]
+    # Only the generic --foo is flagged; the explicit --request-timeout is not.
+    assert kube_cfg.generic_extra_args == ["--foo=1"]
+
+
 # -- Shared batch helper unit tests --
 
 

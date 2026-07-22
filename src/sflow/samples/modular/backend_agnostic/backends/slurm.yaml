@@ -1,0 +1,67 @@
+# Slurm backend fragment for the modular samples.
+#
+# Binds the logical operator names used by the workload fragments
+# (server / helper / client) to concrete `srun` operators, and names the backend
+# `cluster` so workloads can reference `${{ backends.cluster.nodes[0].ip_address }}`
+# uniformly across backends.
+#
+# Compose with a workload + benchmark, e.g.:
+#   sflow run -f backends/slurm.yaml \
+#             -f workloads/dynamo_common.yaml -f workloads/dynamo_trtllm.yaml \
+#             -f benchmark.yaml --dry-run
+
+version: "0.1"
+
+variables:
+  SLURM_ACCOUNT:
+    description: "Slurm account"
+    value: your_account
+  SLURM_PARTITION:
+    description: "Slurm partition"
+    value: your_partition
+  SLURM_TIME:
+    description: "Slurm time limit (minutes or HH:MM:SS)"
+    value: 120
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 8
+  NUM_NODES:
+    description: "Number of nodes to allocate"
+    type: integer
+    value: 1
+
+backends:
+  - name: cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  # Model server launcher. `ntasks` = ranks (one per GPU) so intra/inter-node
+  # tensor parallelism runs under pmix; SERVER_GPUS comes from the workload.
+  - name: server
+    type: srun
+    container_name: server_image
+    container_writable: true
+    mpi: pmix
+    ntasks: ${{ variables.SERVER_GPUS }}
+    ntasks_per_node: ${{ [ variables.SERVER_GPUS, variables.GPUS_PER_NODE ] | min }}
+    extra_args:
+      - --container-image=${{ variables.SERVER_IMAGE }}
+  # CPU-only infra helpers (nats / etcd / frontend) share the server image.
+  - name: helper
+    type: srun
+    container_name: server_image
+    container_writable: true
+    extra_args:
+      - --container-image=${{ variables.SERVER_IMAGE }}
+  # Benchmark client.
+  - name: client
+    type: srun
+    container_image: ${{ variables.CLIENT_IMAGE }}
+    container_writable: true

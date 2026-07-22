@@ -21,7 +21,7 @@ A typical disaggregated inference workflow needs: Slurm backend config, shared i
 Split the workflow into logical building blocks:
 
 ```
-inference_x_v2/
+modular/inference_x_v2/
 ├── slurm_config.yaml          # Slurm backend (shared)
 ├── common_workflow.yaml       # Infrastructure tasks (shared)
 ├── benchmark_aiperf.yaml      # AIPerf benchmark (swappable)
@@ -53,16 +53,20 @@ inference_x_v2/
 
 ### Composing files
 
-When multiple YAML files are passed to `sflow compose` or `sflow run`, they are merged using these rules:
+When multiple YAML files are passed to `sflow compose` or `sflow run`, they are combined with a **recursive deep merge**. The only key that distinguishes entries within a collection is their `name`, so definitions can be *scattered* across files and are merged globally:
 
-- **`version`**: must be consistent across files
-- **`variables`**: merged by name (later file wins on conflict)
-- **`artifacts`**: merged by name (later file wins)
-- **`backends`**: merged by name (later file wins)
-- **`operators`**: merged by name (later file wins)
-- **`workflow.name`**: must be consistent across files
-- **`workflow.variables`**: merged by name (later file wins)
-- **`workflow.tasks`**: concatenated in file order
+| Section | Merge key | Conflict rule |
+|---------|-----------|---------------|
+| `version` | — | Must be consistent across all files |
+| `variables` · `artifacts` · `backends` · `operators` · `storage` | `name` | Same-name entries deep-merge (e.g. a backend's `type` in one file, `host_network` in another) |
+| `workflow.variables` | `name` | Deep-merge by name |
+| `workflow.tasks` | `name` | Same-name tasks deep-merge, **first-seen order** preserved (e.g. `script` in one file, `operator` override in another) |
+| `workflow.name` | — | Last non-null wins (warns if it changes — no longer an error) |
+| `workflow.timeout` · `upload_all` · `monitor` | — | Carried across files and deep-merged |
+| **Leaf values** (scalars & value-lists like `script`, `depends_on`) | — | **Last file wins**, with an override warning — lists are *replaced*, not concatenated |
+
+The last row is the one to watch: two files that each set a task's `script:` don't
+concatenate — the later file's list replaces the earlier one.
 
 This means you compose a workflow by listing the files in order:
 
@@ -76,7 +80,7 @@ The result is a single valid YAML with all components merged.
 
 ### File order matters
 
-Tasks are concatenated in file order. Since tasks use `depends_on` to define the DAG, the order doesn't affect execution -- but it does affect readability. A recommended convention:
+Tasks are merged by name in first-seen order. Since tasks use `depends_on` (or `required_by`) to define the DAG, the order doesn't affect execution -- but it does affect readability, and on a leaf-value conflict the **last** file wins. A recommended convention:
 
 1. Backend/infrastructure config first (`slurm_config.yaml`)
 2. Shared workflow and tasks (`common_workflow.yaml`)
@@ -106,9 +110,49 @@ CTX_NODES_PER_WORKER:
 
 Here `GPUS_PER_NODE` comes from `slurm_config.yaml`, and `CTX_GPUS_PER_WORKER` is computed within the same module. The chained reference works because sflow resolves variables iteratively across all modules.
 
+## Reverse dependencies (`required_by`) — preferred for modular fragments
+
+`required_by` is the reverse pointer of `depends_on`, and is the cleanest way to
+wire modular fragments **without cross-file references**:
+
+- `A depends_on: [B]` → A runs after B.
+- `A required_by: [B]` → B runs after A (equivalent to `B depends_on: [A]`).
+
+sflow folds `required_by` into the targets' `depends_on` at load time, and
+**targets that are absent from the merged workflow are skipped silently**. So a
+shared hub task (e.g. `benchmark`) can stay dependency-free, and each optional
+server fragment points *itself* at the hub:
+
+```yaml
+# disagg/prefill.yaml
+- name: prefill_server
+  script: [ ... ]
+  required_by: [benchmark]
+
+# agg/agg.yaml
+- name: agg_server
+  script: [ ... ]
+  required_by: [benchmark]
+```
+
+Now composing either mode just works, with **no `--missable-tasks` needed**:
+
+```bash
+# Disaggregated: only prefill/decode fragments contribute their edges
+sflow compose base.yaml disagg/prefill.yaml disagg/decode.yaml benchmark.yaml -o disagg.yaml
+
+# Aggregated: only agg contributes its edge
+sflow compose base.yaml agg/agg.yaml benchmark.yaml -o agg.yaml
+```
+
+Because the dependency declaration lives on the fragment that may or may not be
+included, omitting a fragment simply omits its edge -- there is never a dangling
+reference to strip.
+
 ## Handling missing tasks (`--missable-tasks`)
 
-When composing modular files, a task in one file may declare `depends_on` referencing a task from another file that wasn't included. A common example is switching between **disaggregated** (separate prefill + decode servers) and **aggregated** (single server) inference modes. Each mode defines different tasks, but the benchmark may reference tasks from both:
+`required_by` (above) is preferred, but `--missable-tasks` remains supported for
+configs that keep `depends_on` on a hub task. When composing modular files, a task in one file may declare `depends_on` referencing a task from another file that wasn't included. A common example is switching between **disaggregated** (separate prefill + decode servers) and **aggregated** (single server) inference modes. Each mode defines different tasks, but the benchmark may reference tasks from both:
 
 - `disagg/prefill.yaml` defines `prefill_server`, `disagg/decode.yaml` defines `decode_server`
 - `agg/agg.yaml` defines `agg_server`

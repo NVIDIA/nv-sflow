@@ -97,11 +97,21 @@ class TestMergeConfigDicts:
         names = [t["name"] for t in merged["workflow"]["tasks"]]
         assert names == ["t1", "t2"]
 
-    def test_workflow_name_must_be_consistent(self):
+    def test_workflow_name_last_wins(self):
+        """The same-workflow-name restriction is gone; last non-null name wins."""
         a = {"version": "0.1", "workflow": {"name": "wf1", "tasks": [{"name": "t", "script": ["echo"]}]}}
         b = {"workflow": {"name": "wf2", "tasks": [{"name": "t2", "script": ["echo"]}]}}
-        with pytest.raises(ValueError, match="Workflow name conflict"):
-            merge_config_dicts([a, b])
+        warns: list[str] = []
+        merged = merge_config_dicts([a, b], source_labels=["a.yaml", "b.yaml"], override_warnings=warns)
+        assert merged["workflow"]["name"] == "wf2"
+        assert any("workflow.name" in w for w in warns)
+
+    def test_workflow_name_from_fragment_without_name(self):
+        """A fragment omitting the name inherits the earlier file's name."""
+        a = {"version": "0.1", "workflow": {"name": "wf1", "tasks": [{"name": "t", "script": ["echo"]}]}}
+        b = {"workflow": {"tasks": [{"name": "t2", "script": ["echo"]}]}}
+        merged = merge_config_dicts([a, b])
+        assert merged["workflow"]["name"] == "wf1"
 
     def test_version_must_be_consistent(self):
         a = {"version": "0.1"}
@@ -172,14 +182,13 @@ class TestMergeConfigDicts:
         assert "previously from a.yaml" in warns[0]
         assert "1" in warns[0] and "99" in warns[0]
 
-    def test_override_warnings_variable_same_value(self):
+    def test_override_warnings_variable_same_value_is_silent(self):
+        """Identical redefinition is not a conflict -> no warning (deep merge)."""
         a = {"version": "0.1", "variables": {"X": {"value": 1}}, **self._WF}
         b = {"variables": {"X": {"value": 1}}}
         warns: list[str] = []
         merge_config_dicts([a, b], source_labels=["a.yaml", "b.yaml"], override_warnings=warns)
-        assert len(warns) == 1
-        assert "redefined by b.yaml" in warns[0]
-        assert "same value as a.yaml" in warns[0]
+        assert warns == []
 
     def test_override_warnings_timeout(self):
         a = {"version": "0.1", "workflow": {"name": "wf", "timeout": "30m", "tasks": [{"name": "t", "script": ["echo"]}]}}
@@ -328,9 +337,14 @@ workflow:
         with pytest.raises(ValueError, match="No configuration file"):
             ConfigLoader().load_configs([])
 
-    def test_duplicate_task_names_across_files_raises(self, tmp_path):
+    def test_same_task_name_across_files_scatter_merges(self, tmp_path):
+        """Same task name across files is now deep-merged (scattered definition):
+        the script comes from one file, the operator from another."""
         a = _write(tmp_path, "a.yaml", """
 version: "0.1"
+operators:
+  op1:
+    type: srun
 workflow:
   name: wf
   tasks:
@@ -343,11 +357,14 @@ workflow:
   name: wf
   tasks:
     - name: t1
-      script:
-        - echo b
+      operator: op1
 """)
-        with pytest.raises(ValueError, match="Duplicate task names"):
-            ConfigLoader().load_configs([a, b])
+        config = ConfigLoader().load_configs([a, b])
+        task_names = [t.name for t in config.workflow.tasks]
+        assert task_names == ["t1"]
+        t1 = config.workflow.tasks[0]
+        assert t1.script == ["echo a"]
+        assert t1.operator == "op1"
 
     def test_missing_dependency_across_files_raises(self, tmp_path):
         a = _write(tmp_path, "a.yaml", """
@@ -386,3 +403,105 @@ workflow:
 """)
         config = ConfigLoader().load_configs([a, b])
         assert config.workflow.tasks[1].depends_on == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# Scattered / recursive deep-merge behavior
+# ---------------------------------------------------------------------------
+
+class TestScatteredDeepMerge:
+    def test_task_resources_deep_merge_preserves_siblings(self):
+        """Different nested keys of the same task combine rather than replace."""
+        a = {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {"name": "t", "script": ["echo"], "resources": {"nodes": {"count": 1}}}
+                ],
+            },
+        }
+        b = {"workflow": {"tasks": [{"name": "t", "resources": {"gpus": {"count": 2}}}]}}
+        merged = merge_config_dicts([a, b])
+        task = merged["workflow"]["tasks"][0]
+        assert task["resources"]["nodes"]["count"] == 1
+        assert task["resources"]["gpus"]["count"] == 2
+
+    def test_leaf_conflict_last_wins_with_warning(self):
+        a = {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {"name": "t", "script": ["echo"], "resources": {"gpus": {"count": 1}}}
+                ],
+            },
+        }
+        b = {"workflow": {"tasks": [{"name": "t", "resources": {"gpus": {"count": 8}}}]}}
+        warns: list[str] = []
+        merged = merge_config_dicts([a, b], source_labels=["a.yaml", "b.yaml"], override_warnings=warns)
+        assert merged["workflow"]["tasks"][0]["resources"]["gpus"]["count"] == 8
+        assert any("workflow.tasks.t.resources.gpus.count" in w for w in warns)
+        assert any("previously from a.yaml" in w for w in warns)
+
+    def test_value_list_last_wins(self):
+        """A leaf list (e.g. script) is replaced wholesale, not concatenated."""
+        a = {
+            "version": "0.1",
+            "workflow": {"name": "wf", "tasks": [{"name": "t", "script": ["one"]}]},
+        }
+        b = {"workflow": {"tasks": [{"name": "t", "script": ["two", "three"]}]}}
+        merged = merge_config_dicts([a, b])
+        assert merged["workflow"]["tasks"][0]["script"] == ["two", "three"]
+
+    def test_backend_scatter_merge(self):
+        """A backend can be defined type-first in one file and tuned in another."""
+        a = {
+            "version": "0.1",
+            "backends": {"k8s": {"type": "kubernetes", "namespace": "ns"}},
+            **{"workflow": {"name": "wf", "tasks": [{"name": "t", "script": ["echo"]}]}},
+        }
+        b = {"backends": {"k8s": {"host_network": True}}}
+        merged = merge_config_dicts([a, b])
+        assert merged["backends"]["k8s"]["type"] == "kubernetes"
+        assert merged["backends"]["k8s"]["namespace"] == "ns"
+        assert merged["backends"]["k8s"]["host_network"] is True
+
+    def test_storage_section_merged(self):
+        """`storage` is now merged across files (previously dropped after file 1)."""
+        a = {
+            "version": "0.1",
+            "storage": {"s3main": {"type": "s3", "bucket": "b"}},
+            "workflow": {"name": "wf", "tasks": [{"name": "t", "script": ["echo"]}]},
+        }
+        b = {"storage": {"s3alt": {"type": "s3", "bucket": "c"}}}
+        merged = merge_config_dicts([a, b])
+        assert "s3main" in merged["storage"]
+        assert "s3alt" in merged["storage"]
+
+    def test_workflow_monitor_merged(self):
+        """`workflow.monitor` is now deep-merged (previously dropped)."""
+        a = {
+            "version": "0.1",
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "t", "script": ["echo"]}],
+            },
+        }
+        b = {"workflow": {"monitor": {"interval": 1000}}}
+        merged = merge_config_dicts([a, b])
+        assert merged["workflow"]["monitor"]["interval"] == 1000
+
+    def test_unnamed_task_preserved_not_silently_dropped(self):
+        """A task without a `name` cannot be merged by name, but must be KEPT (so
+        schema validation raises a clear "name required" error) rather than silently
+        dropped from the merged result."""
+        a = {
+            "version": "0.1",
+            "workflow": {"name": "wf", "tasks": [{"name": "t", "script": ["echo"]}]},
+        }
+        b = {"workflow": {"tasks": [{"script": ["echo nameless"]}]}}
+        merged = merge_config_dicts([a, b])
+        tasks = merged["workflow"]["tasks"]
+        assert len(tasks) == 2
+        assert [t.get("name") for t in tasks] == ["t", None]

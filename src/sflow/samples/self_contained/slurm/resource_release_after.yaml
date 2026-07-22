@@ -1,0 +1,153 @@
+version: "0.1"
+
+variables:
+  # Slurm configuration. These can be overridden by `sflow batch` / `sflow run`.
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: "00:10:00"
+  SLURM_NODES:
+    description: "Number of Slurm nodes"
+    value: 1
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    value: 4
+
+artifacts:
+  # Declared so sample/bulk tests can override the standard sample artifact.
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # extra_args:
+    #   - --gpus-per-node=${{ variables.GPUS_PER_NODE }}
+
+workflow:
+  name: resource_release_after
+  tasks:
+    - name: check_entire_env
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_NODE }}
+          # No readiness probe: sflow infers task_completion, so downstream
+          # workers can reuse these GPUs after this task exits.
+      script:
+        - echo "check_entire_env GPUs: $CUDA_VISIBLE_DEVICES"
+        - nvidia-smi
+
+    - name: persistent_worker
+      replicas:
+        count: 1
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+      script:
+        - echo "worker ${SFLOW_REPLICA_INDEX} GPUs: $CUDA_VISIBLE_DEVICES"
+        - nvidia-smi
+        - echo setup_done
+        - sleep 60
+      depends_on:
+        - check_entire_env
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "setup_done"
+          interval: 1
+          timeout: 10
+    
+    - name: worker_release_after_ready
+      replicas:
+        count: 1
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+          release_after: task_ready
+      script:
+        - echo "worker ${SFLOW_REPLICA_INDEX} GPUs: $CUDA_VISIBLE_DEVICES"
+        - nvidia-smi
+        - sleep 10
+        - echo setup_done
+        - sleep 60
+      depends_on:
+        - check_entire_env
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "setup_done"
+          interval: 1
+          timeout: 30
+
+    - name: worker_release_after_completion
+      replicas:
+        count: 2
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+          # No readiness probe: sflow infers task_completion for reuse by batch_2_worker.
+      script:
+        - echo "worker ${SFLOW_REPLICA_INDEX} GPUs: $CUDA_VISIBLE_DEVICES"
+        - nvidia-smi
+      depends_on:
+        - check_entire_env
+
+    - name: batch_2_worker
+      replicas:
+        count: 2
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+      script:
+        - echo "batch_2_worker ${SFLOW_REPLICA_INDEX} GPUs: $CUDA_VISIBLE_DEVICES"
+        - nvidia-smi
+      depends_on:
+        - worker_release_after_completion
+        - persistent_worker
+
+    - name: batch_3_worker
+      replicas:
+        count: 1
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+      script:
+        - echo "batch_3_worker ${SFLOW_REPLICA_INDEX} GPUs: $CUDA_VISIBLE_DEVICES"
+        - nvidia-smi
+      depends_on:
+        - persistent_worker
+        - worker_release_after_ready
+        - worker_release_after_completion
+    
+    - name: client
+      depends_on:
+        - batch_2_worker
+        - batch_3_worker
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - echo "Client Task Nodes - ${{ task.client.nodes }}"
+        - echo "Persistent Worker 0 GPUs - ${{ task.persistent_worker[0].gpus }}"
+        - echo "Worker Release After Ready 0 GPUs - ${{ task.worker_release_after_ready[0].gpus }}"
+        - echo "Worker Release After Completion 0 GPUs - ${{ task.worker_release_after_completion[0].gpus }}"
+        - echo "Worker Release After Completion 1 GPUs - ${{ task.worker_release_after_completion[1].gpus }}"
+        - echo "Second Batch Worker 0 GPUs - ${{ task.batch_2_worker[0].gpus }}"
+        - echo "Second Batch Worker 1 GPUs - ${{ task.batch_2_worker[1].gpus }}"
+        - echo "Third Batch Worker 0 GPUs - ${{ task.batch_3_worker[0].gpus }}"

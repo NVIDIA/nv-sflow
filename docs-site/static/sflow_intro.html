@@ -4,8 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>sflow — Declarative Workflow Descriptor</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Archivo+Black&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-snap-type:y mandatory;scroll-behavior:smooth;height:100%;overflow-x:hidden}
@@ -17,10 +15,13 @@ body{font-family:'Consolas',monospace;background:#060a10;color:#dce3ed;height:10
   --t:clamp(2rem,5.5vw,4.5rem);--h:clamp(1.6rem,3.8vw,3.0rem);
   --b:clamp(1.2rem,2vw,1.5rem);--s:clamp(.72rem,1.1vw,.95rem);
   --pad:clamp(1rem,4vw,4rem);--gap:clamp(.5rem,1.8vw,1.6rem);
+  --font-display:'Syne','Bahnschrift','Segoe UI',sans-serif;
+  --font-heavy:'Archivo Black','Arial Black','Segoe UI Black','Bahnschrift',sans-serif;
 }
-.sec{width:100vw;min-height:100vh;height:100dvh;overflow:hidden;scroll-snap-align:start;position:relative;display:flex;align-items:center;justify-content:center}
+.sec{width:100vw;min-height:100vh;height:100dvh;overflow:hidden;scroll-snap-align:start;position:relative;display:flex;align-items:center;justify-content:center;content-visibility:auto;contain-intrinsic-size:100vh;contain:layout paint style}
+.legacy-hidden{display:none!important}
 .inner{position:relative;z-index:2;width:100%;max-width:1200px;padding:var(--pad);display:flex;flex-direction:column;gap:var(--gap)}
-h1{font-family:'Syne',sans-serif;font-weight:800;font-size:var(--t);letter-spacing:-.03em;line-height:1.1;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+h1{font-family:var(--font-display);font-weight:800;font-size:var(--t);letter-spacing:-.03em;line-height:1.1;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 h2{font-family:'Consolas',monospace;font-weight:700;font-size:var(--h);color:var(--txt);line-height:1.2}
 h3{font-family:'Consolas',monospace;font-weight:600;font-size:clamp(.95rem,1.4vw,1.15rem);color:var(--txt);margin-bottom:.15rem}
 p,li{font-size:var(--b);color:var(--dim);line-height:1.6}
@@ -35,6 +36,11 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 @keyframes pi{from{opacity:0;transform:scale(.4)}to{opacity:1;transform:scale(1)}}
 @keyframes bl{0%,100%{opacity:1}50%{opacity:0}}
 @keyframes ri{from{opacity:0;transform:translateX(-30px)}to{opacity:1;transform:translateX(0)}}
+@keyframes filltxt{from{width:0}to{width:100%}}
+@keyframes scanhi{0%,100%{filter:drop-shadow(0 0 0 rgba(0,212,255,0));opacity:.65}50%{filter:drop-shadow(0 0 8px rgba(118,255,2,.45));opacity:1}}
+@keyframes dagready{from{opacity:.12;transform:translateY(8px) scale(.97);filter:saturate(.3)}to{opacity:1;transform:translateY(0) scale(1);filter:saturate(1)}}
+@keyframes dagflow{from{opacity:.12;color:#3d444d;transform:scaleY(.2)}to{opacity:1;color:var(--gr);transform:scaleY(1)}}
+@keyframes xflowmove{from{offset-distance:0%}to{offset-distance:100%}}
 
 .r{opacity:0;animation-fill-mode:forwards;animation-play-state:paused}
 .sec.on .r{animation-play-state:running}
@@ -46,6 +52,12 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .d0{animation-delay:0s}.d1{animation-delay:.12s}.d2{animation-delay:.24s}
 .d3{animation-delay:.36s}.d4{animation-delay:.48s}.d5{animation-delay:.6s}
 .d6{animation-delay:.72s}.d7{animation-delay:.84s}.d8{animation-delay:.96s}
+.xflow-dot{offset-rotate:0deg;animation:xflowmove 2.4s linear infinite}
+.xflow-recipe{offset-path:path("M200,110 C245,110 268,110 288,110");animation-duration:1.8s}
+.xflow-local{offset-path:path("M377,100 C420,85 454,25 500,25");animation-delay:.1s}
+.xflow-docker{offset-path:path("M377,105 C425,98 455,75 500,75");animation-delay:.5s}
+.xflow-slurm{offset-path:path("M377,115 C425,122 455,125 500,125");animation-delay:.9s}
+.xflow-k8s{offset-path:path("M377,120 C420,135 454,175 500,175");animation-delay:1.3s}
 
 /* === BACKGROUNDS (static — no animated blur or grid movement) === */
 .gbg{position:absolute;inset:0;z-index:0;background-image:linear-gradient(rgba(0,212,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.03) 1px,transparent 1px);background-size:60px 60px}
@@ -58,6 +70,138 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .fg{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(.5rem,1.2vw,1rem)}
 @media(max-width:900px){.fg{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:550px){.fg{grid-template-columns:1fr}}
+
+/* === FEATURE LIFECYCLE === */
+@keyframes phasein{from{opacity:.12;transform:translateY(12px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+.lifecycle-flow{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr);gap:clamp(.4rem,1.2vw,.9rem);align-items:stretch}
+.phase{position:relative;background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:clamp(.7rem,1.6vw,1.15rem);opacity:.12;overflow:hidden}
+.phase::before{content:attr(data-step);position:absolute;right:clamp(.35rem,.8vw,.65rem);top:calc(-1 * clamp(.25rem,.5vw,.4rem));font-family:var(--font-heavy);font-size:clamp(2.6rem,6vw,5rem);color:rgba(0,212,255,.06)}
+.phase h3{color:var(--cy);font-family:var(--font-display);font-size:clamp(1rem,1.8vw,1.35rem);margin-bottom:clamp(.35rem,.7vw,.6rem)}
+.phase.execute h3{color:var(--gr)}.phase.understand h3{color:#e3b341}
+.phase-item{display:flex;align-items:center;gap:clamp(.3rem,.7vw,.55rem);padding:clamp(.28rem,.55vw,.45rem) 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:clamp(.58rem,.9vw,.74rem);color:var(--dim)}
+.phase-item:last-child{border-bottom:0}.phase-item b{color:var(--txt);font-weight:600}
+.phase-icon{flex:0 0 auto;width:clamp(1.35rem,2.5vw,1.85rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;color:var(--cy);font-size:clamp(.55rem,.9vw,.72rem)}
+.execute .phase-icon{color:var(--gr)}.understand .phase-icon{color:#e3b341}
+.flow-arrow{align-self:center;color:#3d444d;font-size:clamp(1rem,2vw,1.5rem);opacity:.2}
+.sec.on .phase{animation:phasein .55s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--phase-delay)}
+.sec.on .flow-arrow{animation:dagflow .3s ease forwards;animation-delay:var(--phase-delay)}
+@media(max-width:760px){.lifecycle-flow{grid-template-columns:1fr}.flow-arrow{transform:rotate(90deg)}.phase{padding:clamp(.45rem,1vw,.7rem)}}
+
+/* === BACKEND ADAPTER MAP === */
+@keyframes adapterin{from{opacity:.12;transform:translateY(10px);border-color:#2b3544}to{opacity:1;transform:translateY(0);border-color:currentColor}}
+.contract-strip,.output-strip{align-self:center;width:min(92vw,900px);padding:clamp(.5rem,1vw,.75rem);border:1px solid var(--cy);border-radius:8px;background:#0d1420;text-align:center;color:var(--txt);font-size:clamp(.6rem,1vw,.82rem)}
+.contract-strip b{color:var(--cy)}.output-strip{border-color:var(--gr);color:var(--gr)}
+.backend-lanes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(.45rem,1vw,.8rem)}
+.backend-lane{border:1px solid #2b3544;border-radius:8px;background:#0d1117;padding:clamp(.55rem,1.1vw,.8rem);text-align:center;color:var(--cy);opacity:.12}
+.backend-lane:nth-child(2){color:var(--gr)}.backend-lane:nth-child(3){color:#e3b341}.backend-lane:nth-child(4){color:var(--cy)}
+.backend-symbol{width:clamp(2rem,4vw,3rem);aspect-ratio:1;margin:0 auto clamp(.25rem,.55vw,.45rem);display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;font-size:clamp(.8rem,1.5vw,1.1rem);box-shadow:inset 0 0 10px currentColor}
+.backend-lane h3{color:currentColor;margin-bottom:clamp(.15rem,.35vw,.3rem)}.backend-lane p{font-size:clamp(.5rem,.78vw,.66rem);line-height:1.35}
+.sec.on .backend-lane{animation:adapterin .5s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--adapter-delay)}
+@media(max-width:760px){.backend-lanes{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* === PROBLEM: DUPLICATED PLATFORM PLUMBING === */
+@keyframes copycell{from{opacity:.28;transform:translateX(calc(-1 * clamp(.3rem,.8vw,.6rem)));border-color:#2b3544}to{opacity:1;transform:translateX(0);border-color:#ff7b72}}
+.problem-source{align-self:center;width:min(86vw,760px);padding:clamp(.55rem,1.2vw,.85rem);border:1px solid var(--cy);border-radius:8px;background:var(--card);text-align:center;color:var(--txt);font-size:clamp(.62rem,1vw,.82rem)}
+.problem-source b{color:var(--cy)}
+.dup-matrix{display:grid;grid-template-columns:minmax(6.8rem,.8fr) repeat(3,minmax(0,1fr));gap:clamp(.22rem,.55vw,.4rem);width:100%;max-width:1040px;align-self:center}
+.dup-head{padding:clamp(.25rem,.5vw,.4rem);border-bottom:1px solid rgba(255,123,114,.35);color:#ff7b72;text-align:center;font-family:var(--font-display);font-size:clamp(.62rem,1vw,.82rem)}
+.dup-corner{color:var(--dim);text-align:left;font-family:'Consolas',monospace;font-size:clamp(.48rem,.72vw,.6rem)}
+.dup-label{display:flex;align-items:center;padding:clamp(.28rem,.55vw,.42rem);border-left:2px solid rgba(255,123,114,.45);color:var(--txt);font-size:clamp(.54rem,.82vw,.68rem);font-weight:700}
+.dup-cell{position:relative;min-width:0;padding:clamp(.28rem,.58vw,.44rem) clamp(.35rem,.7vw,.55rem);border:1px solid rgba(255,123,114,.58);border-radius:5px;background:rgba(255,123,114,.07);color:#ff7b72;opacity:.68;overflow:hidden}
+.dup-cell::after{content:"COPY";position:absolute;right:clamp(.18rem,.4vw,.3rem);top:clamp(.12rem,.3vw,.22rem);color:rgba(255,123,114,.42);font-size:clamp(.38rem,.56vw,.46rem);font-weight:700}
+.dup-cell code{display:block;padding-right:clamp(1.6rem,3vw,2.4rem);color:#a99296;font-size:clamp(.46rem,.68vw,.56rem);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dup-total{align-self:center;width:min(90vw,820px);display:flex;justify-content:center;gap:clamp(.4rem,1vw,.8rem);padding:clamp(.42rem,.85vw,.65rem);border:1px solid rgba(255,123,114,.55);border-radius:8px;background:rgba(255,123,114,.035);color:var(--dim);font-size:clamp(.56rem,.86vw,.7rem)}
+.dup-total b{color:#ff7b72}
+.sec.on .dup-cell{animation:copycell .42s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--copy-delay)}
+@media(max-width:720px){.dup-matrix{grid-template-columns:minmax(5.5rem,.7fr) repeat(3,minmax(0,1fr))}.dup-cell::after{display:none}.dup-cell code{padding-right:0}}
+
+/* === MERGE-POD BEFORE / AFTER === */
+@keyframes mergeglow{from{opacity:.55;box-shadow:none}to{opacity:1;box-shadow:0 0 20px rgba(118,255,2,.25)}}
+.merge-topology{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1.15fr);gap:clamp(.65rem,1.5vw,1.2rem);align-items:center}
+.topology-panel{border:1px solid var(--bdr);border-radius:10px;background:var(--card);padding:clamp(.65rem,1.3vw,.95rem)}
+.topology-panel h3{font-family:var(--font-display);margin-bottom:clamp(.35rem,.7vw,.6rem)}
+.pod-pair{display:grid;grid-template-columns:1fr auto 1fr;gap:clamp(.3rem,.65vw,.5rem);align-items:center}
+.pod-box{border:1px solid #ff7b72;border-radius:7px;padding:clamp(.45rem,.9vw,.7rem);text-align:center;color:#ff7b72;font-size:clamp(.55rem,.85vw,.7rem)}
+.pod-box span{display:block;color:var(--dim);font-size:clamp(.45rem,.68vw,.56rem);margin-top:.25em}
+.slow-link{color:#ff7b72;font-size:clamp(.48rem,.72vw,.6rem);text-align:center}
+.merge-action{color:var(--gr);text-align:center;font-size:clamp(.58rem,.95vw,.78rem);font-weight:700}
+.merged-topology{border-color:var(--gr);opacity:.55}
+.worker-row,.shared-gpus{display:flex;gap:clamp(.35rem,.8vw,.6rem);justify-content:center;flex-wrap:wrap}
+.worker-tag{padding:.25em .65em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);font-size:clamp(.5rem,.75vw,.62rem)}
+.shared-gpus{margin-top:clamp(.45rem,.9vw,.7rem);padding:clamp(.4rem,.8vw,.6rem);border:1px solid rgba(118,255,2,.35);border-radius:7px}
+.shared-gpu{width:clamp(2.1rem,4vw,3rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid var(--gr);border-radius:5px;color:var(--gr);font-size:clamp(.48rem,.72vw,.6rem)}
+.nvlink-bus{text-align:center;color:var(--gr);font-size:clamp(.5rem,.78vw,.64rem);margin-top:clamp(.3rem,.6vw,.5rem)}
+.merge-assumption{margin-top:clamp(.45rem,1vw,.75rem);padding:clamp(.4rem,.8vw,.6rem);border-left:3px solid #e3b341;color:var(--dim);font-size:clamp(.58rem,.86vw,.7rem)}
+.sec.on .merged-topology{animation:mergeglow .75s ease forwards 1.1s}
+@media(max-width:760px){.merge-topology{grid-template-columns:1fr}.merge-action{transform:rotate(90deg)}}
+
+/* === MODULAR RECIPE ASSEMBLY === */
+@keyframes treebranch{from{opacity:.18;transform:translateX(calc(-1 * clamp(.35rem,.9vw,.7rem)))}to{opacity:1;transform:translateX(0)}}
+@keyframes leafselect{from{border-color:#2b3544;box-shadow:none;color:var(--dim)}to{border-color:var(--gr);box-shadow:0 0 13px rgba(118,255,2,.24);color:var(--gr)}}
+@keyframes flowhop{from{opacity:.12;transform:translateX(calc(-1 * clamp(.3rem,.8vw,.6rem)));color:var(--dim)}to{opacity:1;transform:translateX(0);color:var(--gr)}}
+.recipe-tree{display:grid;grid-template-columns:minmax(7.5rem,.65fr) minmax(0,2.35fr);gap:clamp(.9rem,2.2vw,1.7rem);width:100%;max-width:1040px;align-self:center;align-items:center}
+.tree-root{position:relative;padding:clamp(.8rem,1.5vw,1.1rem);border:1px solid var(--cy);border-radius:9px;background:var(--card);text-align:center;color:var(--cy);font-family:var(--font-heavy);font-size:clamp(1rem,2vw,1.5rem);box-shadow:0 0 14px rgba(0,212,255,.12)}
+.tree-root small{display:block;margin-top:clamp(.18rem,.4vw,.3rem);color:var(--dim);font-family:'Consolas',monospace;font-size:clamp(.46rem,.68vw,.56rem);font-weight:400}
+.tree-root::after{content:"";position:absolute;left:100%;top:50%;width:clamp(.9rem,2.2vw,1.7rem);height:1px;background:var(--cy);opacity:.45}
+.tree-branches{display:grid;gap:clamp(.28rem,.65vw,.48rem);padding-left:clamp(.75rem,1.8vw,1.35rem);border-left:1px solid rgba(0,212,255,.45)}
+.tree-branch{position:relative;display:grid;grid-template-columns:minmax(7.5rem,.8fr) minmax(0,2fr);gap:clamp(.4rem,.9vw,.7rem);align-items:center;opacity:.68}
+.tree-branch::before{content:"";position:absolute;right:100%;top:50%;width:clamp(.75rem,1.8vw,1.35rem);height:1px;background:rgba(0,212,255,.45)}
+.branch-label{padding:clamp(.36rem,.72vw,.55rem);border:1px solid var(--bdr);border-radius:6px;background:#0d1117;color:var(--txt);font-size:clamp(.56rem,.85vw,.7rem);font-weight:700}
+.branch-label code{color:var(--cy)}
+.tree-leaves{display:flex;flex-wrap:wrap;gap:clamp(.25rem,.55vw,.42rem)}
+.tree-leaf{padding:clamp(.24rem,.48vw,.36rem) clamp(.38rem,.72vw,.56rem);border:1px solid #2b3544;border-radius:999px;background:rgba(255,255,255,.015);color:var(--dim);font-size:clamp(.48rem,.72vw,.6rem);white-space:nowrap}
+.tree-leaf.selected{border-color:rgba(118,255,2,.6);box-shadow:0 0 8px rgba(118,255,2,.14);color:var(--gr)}
+.tree-leaf.fixed{border-style:dashed;color:var(--cy)}
+.tree-selection{text-align:center;color:var(--gr);font-size:clamp(.52rem,.8vw,.66rem)}
+.compose-result{align-self:center;width:min(88vw,760px);padding:clamp(.55rem,1.05vw,.8rem);border:1px solid var(--gr);border-radius:8px;text-align:center;color:var(--gr);background:#0d1420;font-size:clamp(.62rem,.95vw,.78rem)}
+.sec.on .tree-branch{animation:treebranch .48s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--branch-delay)}
+.sec.on .tree-leaf.selected{animation:leafselect .45s ease forwards;animation-delay:var(--leaf-delay)}
+@media(max-width:780px){.recipe-tree{grid-template-columns:minmax(6.2rem,.55fr) minmax(0,2.45fr);gap:clamp(.55rem,1.3vw,.9rem)}.tree-root::after{width:clamp(.55rem,1.3vw,.9rem)}.tree-branch{grid-template-columns:minmax(6.4rem,.7fr) minmax(0,2fr)}}
+
+/* === DEVELOPER EXPERIENCE LOOP === */
+.agent-loop-shell{position:relative;display:grid;gap:clamp(.45rem,1vw,.75rem);padding:clamp(.42rem,.85vw,.65rem) clamp(.48rem,1vw,.8rem)}
+.dev-flow{position:relative;z-index:2;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr);gap:clamp(.35rem,.8vw,.65rem);align-items:center}
+.dev-step{position:relative;min-height:clamp(8.2rem,14vw,10.5rem);border:1px solid var(--bdr);border-radius:9px;background:var(--card);padding:clamp(.62rem,1.15vw,.88rem);text-align:left;opacity:.12;overflow:hidden}
+.dev-step .step-num{position:absolute;right:clamp(.35rem,.7vw,.55rem);top:calc(-1 * clamp(.25rem,.5vw,.4rem));color:rgba(0,212,255,.08);font-family:var(--font-heavy);font-size:clamp(2.3rem,5vw,3.8rem)}
+.dev-step h3{position:relative;font-family:var(--font-display);color:var(--txt);font-size:clamp(.78rem,1.25vw,1rem);margin-bottom:clamp(.35rem,.7vw,.55rem)}
+.dev-step:nth-child(5) h3{color:#e3b341}.dev-step:nth-child(7) h3{color:var(--gr)}
+.dev-context{position:relative;display:grid;gap:clamp(.2rem,.42vw,.32rem)}
+.dev-context span{display:block;padding:clamp(.18rem,.36vw,.27rem) clamp(.28rem,.55vw,.42rem);border-left:2px solid var(--cy);background:rgba(0,212,255,.035);color:var(--dim);font-size:clamp(.46rem,.68vw,.56rem);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dev-step:nth-child(3) .dev-context span{border-color:var(--gr)}.dev-step:nth-child(5) .dev-context span{border-color:#e3b341}.dev-step:nth-child(7) .dev-context span{border-color:var(--gr)}
+.dev-arrow{color:var(--gr);opacity:.12;font-size:clamp(.9rem,1.5vw,1.2rem)}
+.agent-feedback{position:relative;z-index:2;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:clamp(.45rem,1vw,.8rem);align-items:center;width:min(94vw,980px);justify-self:center;padding:clamp(.45rem,.85vw,.65rem);border:1px dashed rgba(0,212,255,.42);border-radius:999px;background:rgba(6,10,16,.88);color:var(--dim);font-size:clamp(.5rem,.76vw,.62rem);overflow:hidden}
+.agent-feedback-orbit{position:absolute;inset:0;width:100%;height:100%;z-index:3;overflow:visible;pointer-events:none}
+.agent-loop-arrow{offset-path:path("M48 8 H952 Q992 8 992 50 Q992 92 952 92 H48 Q8 92 8 50 Q8 8 48 8 Z");offset-rotate:auto;animation:xflowmove 5s linear infinite;fill:var(--gr);filter:drop-shadow(0 0 7px rgba(118,255,2,.9))}
+.agent-chip{position:relative;z-index:1;padding:clamp(.2rem,.4vw,.3rem) clamp(.4rem,.75vw,.58rem);border:1px solid var(--gr);border-radius:999px;color:var(--gr);font-weight:700}
+.feedback-evidence{position:relative;z-index:1;display:flex;justify-content:center;gap:clamp(.25rem,.55vw,.42rem);flex-wrap:wrap}
+.feedback-evidence span{padding:clamp(.14rem,.3vw,.22rem) clamp(.3rem,.58vw,.45rem);border:1px solid var(--bdr);border-radius:999px;background:#0d1117}
+.feedback-action{position:relative;z-index:1;color:var(--cy);white-space:nowrap}
+.sec.on .dev-step{animation:treebranch .5s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--dev-delay)}
+.sec.on .dev-arrow:nth-child(2){animation:flowhop .35s ease forwards .42s}.sec.on .dev-arrow:nth-child(4){animation:flowhop .35s ease forwards .67s}.sec.on .dev-arrow:nth-child(6){animation:flowhop .35s ease forwards .92s}
+@media(max-width:780px){.dev-flow{grid-template-columns:repeat(2,minmax(0,1fr))}.dev-arrow{display:none}.dev-step{min-height:clamp(6.8rem,18vw,8.5rem)}.agent-feedback{grid-template-columns:auto 1fr}.feedback-action{grid-column:1/-1;text-align:center}}
+@media(prefers-reduced-motion:reduce){.agent-loop-arrow{display:none}}
+
+/* === VISION ROUTING MOTION === */
+.vision-route-dot{offset-rotate:0deg;animation:xflowmove 2s linear infinite}
+.vision-prefill-dot{offset-path:path("M360,62 C400,50 440,35 500,35")}
+.vision-decode-dot{offset-path:path("M360,78 C400,90 440,105 500,105")}
+
+/* === TRY IT / RESOURCE LINKS === */
+.try-layout{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(0,.88fr);gap:clamp(.7rem,2vw,1.5rem);align-items:stretch}
+.install-panel{font-size:clamp(.52rem,.82vw,.7rem);line-height:1.55;white-space:pre-wrap}
+.install-panel .section{color:var(--dim)}.install-panel .command{color:var(--cy)}.install-panel .success{color:var(--gr)}
+.try-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(.4rem,.9vw,.7rem)}
+.try-link{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:clamp(.35rem,.75vw,.55rem);align-items:center;padding:clamp(.55rem,1vw,.8rem);border:1px solid var(--bdr);border-radius:8px;background:var(--card);color:var(--txt);text-decoration:none;transition:transform .25s,border-color .25s,box-shadow .25s}
+.try-link:hover{transform:translateY(-3px);border-color:var(--cy);box-shadow:0 0 16px rgba(0,212,255,.16)}
+.try-link-icon{width:clamp(1.8rem,3.5vw,2.6rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;color:var(--cy);font-size:clamp(.46rem,.7vw,.58rem);font-weight:700}
+.try-link:nth-child(even) .try-link-icon{color:var(--gr)}
+.try-link b{display:block;font-family:var(--font-display);font-size:clamp(.66rem,1vw,.82rem)}
+.try-link small{display:block;margin-top:clamp(.12rem,.25vw,.2rem);color:var(--dim);font-size:clamp(.44rem,.64vw,.54rem);line-height:1.35}
+.try-link-arrow{color:var(--gr)}
+.try-footer{display:flex;justify-content:center;gap:clamp(.35rem,.8vw,.6rem);flex-wrap:wrap;color:var(--dim);font-size:clamp(.5rem,.75vw,.62rem)}
+.try-footer span{padding:clamp(.16rem,.32vw,.24rem) clamp(.35rem,.65vw,.5rem);border:1px solid var(--bdr);border-radius:999px}
+@media(max-width:760px){.try-layout{grid-template-columns:1fr}.try-links{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-height:600px){.install-panel{font-size:clamp(.46rem,.72vw,.6rem);line-height:1.42}.try-link{padding:clamp(.42rem,.78vw,.6rem)}}
 
 /* === COMPONENTS === */
 .pill{display:inline-block;padding:.2em .8em;border-radius:999px;font-size:var(--b);font-weight:500;border:1px solid}
@@ -72,6 +216,37 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .term{background:#0d1117;border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.2rem);font-family:'Consolas',monospace;font-size:clamp(.6rem,1vw,.88rem);line-height:1.55;color:#8b949e;position:relative;overflow:hidden;white-space:pre;overflow-x:auto}
 .term .hi{color:var(--txt)}.term .cy{color:var(--cy)}.term .gr{color:var(--gr)}
 .term .rd{color:#ff7b72}.term .yl{color:#e3b341}.term .wh{color:#c9d1d9}
+.livebar{display:inline-block;width:30ch;position:relative;color:transparent;vertical-align:bottom}
+.livebar::after{content:attr(data-bar);position:absolute;left:0;top:0;width:0;overflow:hidden;white-space:nowrap;color:var(--gr)}
+.livebar.cy::after{color:var(--cy)}
+.spark{display:inline-block;position:relative;color:transparent;vertical-align:bottom}
+.spark::after{content:attr(data-spark);position:absolute;left:0;top:0;width:0;overflow:hidden;white-space:nowrap;color:var(--gr)}
+.spark.cy::after{color:var(--cy)}
+.term .livebar.cy,.term .spark.cy{color:transparent}
+.runline{display:block;opacity:.45;transform:translateX(-8px)}
+.sec.on .runline{animation:ri .5s ease forwards,scanhi 2.5s ease-in-out infinite .6s}
+.sec.on .runline:nth-of-type(1){animation-delay:.1s,.7s}
+.sec.on .runline:nth-of-type(2){animation-delay:.24s,.9s}
+.sec.on .runline:nth-of-type(3){animation-delay:.38s,1.1s}
+.sec.on .runline:nth-of-type(4){animation-delay:.52s,1.3s}
+.sec.on .runline:nth-of-type(5){animation-delay:.66s,1.5s}
+.sec.on .runline.summary-row{animation-delay:.1s,.7s}
+.sec.on .livebar.prefill::after,.sec.on .livebar.decode::after,.sec.on .livebar.benchmark::after{animation:filltxt 4s steps(30,end) forwards}
+.sec.on .livebar:not(.prefill):not(.decode):not(.benchmark)::after{animation:filltxt 2.4s steps(30,end) forwards}
+.sec.on .spark::after{animation:filltxt 3s steps(10,end) forwards,scanhi 2.2s ease-in-out infinite 3s}
+
+/* === OBSERVABILITY HARDWARE CHARTS === */
+@keyframes obspulse{0%,100%{opacity:.76;filter:drop-shadow(0 0 3px rgba(0,212,255,.18))}50%{opacity:1;filter:drop-shadow(0 0 8px rgba(118,255,2,.42))}}
+.obs-chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(.45rem,1vw,.8rem);width:100%}
+.obs-chart-card{min-height:clamp(4.2rem,10vh,6rem);padding:clamp(.45rem,.9vw,.7rem);border:1px solid var(--bdr);border-radius:8px;background:#0d1117;overflow:hidden}
+.obs-chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:clamp(.35rem,.8vw,.6rem)}
+.obs-chart-label{color:var(--cy);font-size:clamp(.5rem,.76vw,.64rem);font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+.obs-chart-card:nth-child(2) .obs-chart-label{color:var(--gr)}.obs-chart-card:nth-child(3) .obs-chart-label{color:#e3b341}
+.obs-chart-value{color:var(--txt);font-family:var(--font-heavy);font-size:clamp(.9rem,2vw,1.5rem);line-height:1}
+.obs-line-chart{width:100%;height:clamp(1.55rem,4.8vh,2.7rem);margin-top:clamp(.2rem,.45vw,.35rem)}
+.obs-line-chart path{fill:none;stroke-width:4;stroke-linecap:round;opacity:.82}
+.sec.on .obs-line-chart path{animation:obspulse 2.2s ease-in-out infinite}
+@media(max-height:600px){.obs-chart-card{min-height:clamp(3.6rem,9vh,4.7rem);padding:clamp(.32rem,.65vw,.5rem)}.obs-line-chart{height:clamp(1.2rem,3.8vh,1.9rem)}}
 
 /* === DAG FLOWCHART === */
 .dag{display:flex;flex-direction:column;align-items:center;gap:clamp(.3rem,.6vw,.5rem);font-family:'Consolas',monospace;font-size:clamp(.6rem,1vw,.85rem)}
@@ -79,11 +254,37 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .dag-node{border:1px solid #3d444d;border-radius:4px;padding:.25em .7em;color:#c9d1d9;background:#161b22;white-space:nowrap;transition:border-color .3s,box-shadow .3s}
 .dag-node:hover{border-color:var(--cy);box-shadow:0 0 10px rgba(0,212,255,.15)}
 .dag-arrow{color:#3d444d;font-size:clamp(.6rem,1vw,.8rem);display:flex;justify-content:center}
+.dag-stage{opacity:.12;transform:translateY(8px) scale(.97)}
+.dag-link{opacity:.12;transform:scaleY(.2);transform-origin:top}
+.sec.on .dag-stage{animation:dagready .42s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--dag-delay)}
+.sec.on .dag-link{animation:dagflow .24s ease forwards;animation-delay:var(--dag-delay)}
+
+/* === TOPOLOGY-AWARE GPU ALLOCATION === */
+@keyframes gpuassign{from{opacity:.12;transform:scale(.82) translateY(8px);border-color:#2b3544;box-shadow:none}to{opacity:1;transform:scale(1) translateY(0);border-color:currentColor;box-shadow:0 0 12px currentColor}}
+.planner-node{align-self:center;min-width:min(72vw,420px);padding:clamp(.45rem,1vw,.75rem);border:1px solid var(--gr);border-radius:8px;background:#0d1420;text-align:center;color:var(--gr);font-size:clamp(.72rem,1.2vw,.95rem);font-weight:700;box-shadow:0 0 14px rgba(118,255,2,.12)}
+.planner-node small{display:block;color:var(--dim);font-size:clamp(.52rem,.82vw,.7rem);font-weight:400;margin-top:clamp(.12rem,.3vw,.25rem)}
+.alloc-arrow{text-align:center;color:var(--gr);font-size:clamp(.8rem,1.5vw,1.15rem);line-height:1}
+.alloc-board{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(.7rem,2vw,1.5rem);width:100%;max-width:980px;align-self:center}
+.compute-node{background:var(--card);border:1px solid var(--bdr);border-radius:8px;padding:clamp(.55rem,1.25vw,.9rem)}
+.node-head{display:flex;align-items:center;justify-content:space-between;gap:clamp(.3rem,.8vw,.6rem);margin-bottom:clamp(.4rem,.8vw,.65rem);font-size:clamp(.65rem,1vw,.82rem)}
+.node-head strong{color:var(--txt)}.node-head span{color:var(--dim)}
+.gpu-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(.35rem,.8vw,.6rem)}
+.task-allocation{position:relative;border:1px solid #3d444d;border-radius:8px;padding:clamp(.55rem,1vw,.75rem);background:rgba(227,179,65,.025)}
+.task-allocation-label{position:absolute;top:calc(-1 * clamp(.5rem,1vw,.72rem));left:clamp(.45rem,1vw,.75rem);padding:0 clamp(.3rem,.6vw,.5rem);background:var(--card);color:#e3b341;font-size:clamp(.48rem,.75vw,.64rem);font-weight:700}
+@keyframes taskgroup{from{opacity:.4;border-color:#3d444d;box-shadow:none}to{opacity:1;border-color:#e3b341;box-shadow:0 0 18px rgba(227,179,65,.28)}}
+.decode-allocation{opacity:.4}
+.sec.on .decode-allocation{animation:taskgroup .55s ease forwards 1.3s}
+.gpu-slot{display:flex;align-items:center;gap:clamp(.3rem,.7vw,.55rem);min-width:0;padding:clamp(.35rem,.7vw,.55rem);border:1px solid #2b3544;border-radius:6px;background:#0d1117;opacity:.12;color:var(--cy)}
+.gpu-slot.decode{color:#e3b341}
+.gpu-chip-icon{flex:0 0 auto;width:clamp(1.35rem,2.8vw,2rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid currentColor;border-radius:4px;font-size:clamp(.42rem,.7vw,.58rem);font-weight:700;box-shadow:inset 0 0 8px currentColor}
+.gpu-copy{min-width:0}.gpu-copy b{display:block;color:var(--txt);font-size:clamp(.55rem,.85vw,.72rem);white-space:nowrap}.gpu-copy span{display:block;color:currentColor;font-size:clamp(.45rem,.7vw,.6rem);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sec.on .gpu-slot{animation:gpuassign .55s cubic-bezier(.34,1.56,.64,1) forwards;animation-delay:var(--assign-delay)}
+@media(max-width:700px){.alloc-board{grid-template-columns:1fr}.gpu-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.gpu-slot{flex-direction:column;text-align:center}.gpu-copy span{display:none}.task-allocation{padding-top:clamp(.65rem,1.4vw,.9rem)}}
 
 /* === MINI TABLE === */
 .mtbl{border-collapse:collapse;font-size:var(--s);width:100%}
 .mtbl th,.mtbl td{padding:clamp(.25rem,.5vw,.4rem) clamp(.4rem,.8vw,.7rem);text-align:left;border-bottom:1px solid var(--bdr)}
-.mtbl th{color:var(--cy);font-family:'Syne',sans-serif;font-weight:600}
+.mtbl th{color:var(--cy);font-family:var(--font-display);font-weight:600}
 .mtbl code{background:#161b22;padding:.1em .4em;border-radius:3px;font-size:.85em}
 .sec.on .mtbl tbody tr{animation:ri .5s ease forwards;opacity:0}
 .sec.on .mtbl tbody tr:nth-child(1){animation-delay:.2s}
@@ -106,15 +307,20 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .dot{width:5px;height:5px;border-radius:50%;background:var(--dim);opacity:.2;cursor:pointer;border:none;padding:0;transition:all .4s cubic-bezier(.34,1.56,.64,1)}
 .dot.on{background:var(--cy);opacity:1;height:18px;border-radius:3px;box-shadow:0 0 10px rgba(0,212,255,.5)}
 .badge{position:fixed;bottom:clamp(.6rem,2vh,1.2rem);left:50%;transform:translateX(-50%);z-index:300;background:rgba(0,0,0,.75);border:1px solid var(--bdr);border-radius:999px;padding:.3em 1em;font-size:var(--s);color:var(--dim);opacity:0;transition:opacity .3s;pointer-events:none}
-.doc-btn{display:inline-flex;align-items:center;justify-content:center;margin-top:var(--gap);padding:.6em 1.6em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--b);font-family:'Syne',sans-serif;font-weight:600;transition:all .3s;cursor:pointer;z-index:10;position:relative;height:clamp(2.4rem,4vw,3.2rem);line-height:1}
+.doc-btn{display:inline-flex;align-items:center;justify-content:center;margin-top:var(--gap);padding:.6em 1.6em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--b);font-family:var(--font-display);font-weight:600;transition:all .3s;cursor:pointer;z-index:10;position:relative;height:clamp(2.4rem,4vw,3.2rem);line-height:1}
 .doc-btn:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.3)}
 .doc-btn svg{flex-shrink:0}
-.gh-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(.6rem,2vw,1.2rem);z-index:400;padding:.3em .5em;border:1px solid rgba(255,255,255,.2);border-radius:50%;color:rgba(255,255,255,.6);text-decoration:none;background:rgba(255,255,255,.06);backdrop-filter:blur(8px);transition:all .3s;display:flex;align-items:center;justify-content:center}
+.gh-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(.6rem,2vw,1.2rem);z-index:400;padding:.3em .5em;border:1px solid rgba(255,255,255,.2);border-radius:50%;color:rgba(255,255,255,.6);text-decoration:none;background:rgba(6,10,16,.92);transition:all .3s;display:flex;align-items:center;justify-content:center}
 .gh-corner:hover{border-color:#fff;color:#fff;background:rgba(255,255,255,.15);box-shadow:0 0 12px rgba(255,255,255,.15)}
-.doc-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(3.2rem,6vw,4.5rem);z-index:400;padding:.35em .9em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--s);font-family:'Syne',sans-serif;font-weight:600;background:rgba(0,212,255,.08);backdrop-filter:blur(8px);transition:all .3s;box-shadow:0 0 8px rgba(0,212,255,.15)}
+.corner-links{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(3.2rem,6vw,4.5rem);z-index:400;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.doc-corner,.map-corner{padding:.35em .9em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s;box-shadow:0 0 8px rgba(0,212,255,.15)}
+.map-corner{border-color:var(--gr);color:var(--gr);background:rgba(6,10,16,.92);box-shadow:0 0 8px rgba(118,255,2,.15)}
 .doc-corner:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.35)}
+.map-corner:hover{background:var(--gr);color:#060a10;box-shadow:0 0 20px rgba(118,255,2,.3)}
 .mb{margin-bottom:var(--gap)}.ms{margin-bottom:calc(var(--gap)*.4)}
 @media(max-height:700px){:root{--pad:clamp(.6rem,2.5vw,1.5rem);--gap:clamp(.3rem,1vw,.7rem);--t:clamp(1.5rem,4.5vw,2.8rem);--h:clamp(1.3rem,3.2vw,2.1rem)}}
+@media(max-height:600px){:root{--pad:clamp(.5rem,2vw,1.2rem);--gap:clamp(.25rem,.8vw,.55rem);--t:clamp(1.25rem,4vw,2.2rem);--h:clamp(1.05rem,2.8vw,1.65rem);--b:clamp(.72rem,1.3vw,.95rem)}}
+@media(max-height:500px){:root{--pad:clamp(.4rem,1.6vw,.9rem);--gap:clamp(.2rem,.6vw,.4rem);--t:clamp(1.1rem,3.5vw,1.7rem);--h:clamp(.9rem,2.4vw,1.3rem);--b:clamp(.65rem,1vw,.82rem)}}
 @media(max-height:550px){.dots{display:none}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.15s!important}html{scroll-behavior:auto}}
 </style>
@@ -123,25 +329,29 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <a href="https://github.com/NVIDIA/nv-sflow" class="gh-corner" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="GitHub">
 <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
 </a>
-<a href="docs/user/intro" class="doc-corner" onclick="event.stopPropagation()">Docs &rarr;</a>
+<div class="corner-links">
+<a href="docs/user/intro" class="doc-corner" target="_top" onclick="event.stopPropagation()">Docs &rarr;</a>
+<a href="feature-map" class="map-corner" target="_top" onclick="event.stopPropagation()">Feature Map &rarr;</a>
+</div>
 <div class="prog" id="prog"></div>
 <div class="tmr" id="tmr"></div>
 <nav class="dots" id="dots"></nav>
-<div class="badge" id="badge">click or press P to enable auto-scroll</div>
+<div class="badge" id="badge">press P to enable auto-scroll</div>
 
 <!-- 1: Title -->
 <section class="sec" id="s1">
 <div class="gbg"></div>
 <div class="orb oc" style="width:450px;height:450px;top:-120px;left:-120px"></div>
 <div class="orb og" style="width:320px;height:320px;bottom:-80px;right:-80px"></div>
-<span class="sn">01 / 12</span>
+<span class="sn">01 / 13</span>
 <div class="inner" style="align-items:center;text-align:center">
-<img class="logo r as d0" src="img/sflow-logo.jpg" alt="sflow logo">
-<h1 class="r as d1" style="font-family:'Archivo Black',sans-serif;font-size:clamp(2.5rem,7vw,5.5rem);text-transform:uppercase;letter-spacing:.02em">NV-sflow</h1>
+<img class="logo r as d0" src="img/sflow-logo.jpg" alt="sflow logo" decoding="async" fetchpriority="high">
+<h1 class="r as d1" style="font-family:var(--font-heavy);font-size:clamp(2.5rem,7vw,5.5rem);text-transform:uppercase;letter-spacing:.02em">NV-sflow</h1>
 <h2 class="r au d2" style="font-size:var(--h)">Declarative Workflow Descriptor</h2>
 <p class="r au d3" style="font-size:var(--b);color:var(--dim);margin-top:var(--gap)">Describe once. Run anywhere.<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
 <div class="r au d4" style="display:flex;gap:clamp(.5rem,1.5vw,1rem);flex-wrap:wrap;justify-content:center;margin-top:var(--gap)">
-<a href="docs/user/intro" class="doc-btn" onclick="event.stopPropagation()">View Documentation &rarr;</a>
+<a href="docs/user/intro" class="doc-btn" target="_top" onclick="event.stopPropagation()">View Documentation &rarr;</a>
+<a href="feature-map" class="doc-btn" target="_top" onclick="event.stopPropagation()">Explore Feature Map &rarr;</a>
 <a href="https://github.com/NVIDIA/nv-sflow" class="doc-btn gh-btn" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;margin-right:.4em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
 </div>
 </div>
@@ -151,12 +361,20 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s2">
 <div class="gbg"></div>
 <div class="orb oc" style="width:280px;height:280px;top:60%;right:-60px"></div>
-<span class="sn">02 / 12</span>
+<span class="sn">02 / 13</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">The Problem</span>
-<h2 class="r al d1 mb">Same workflow. Different infra. Rewrite everything.</h2>
-<p class="r au d2" style="max-width:720px">Take <span class="accent">NVIDIA Dynamo</span> &mdash; start etcd &amp; NATS, launch a frontend, spin up workers, service is up. That logical flow never changes.</p>
-<p class="r au d3" style="max-width:720px;margin-top:var(--gap)">But making it run on <span class="accent">Slurm</span>, <span class="accent">Docker Compose</span>, or <span class="accent">Kubernetes</span> requires platform-specific scripts, networking, and resource management &mdash; repeated for every new platform.</p>
+<h2 class="r al d1 ms">The workload stays the same. The plumbing multiplies.</h2>
+<div class="problem-source r as d2"><b>Stable workflow:</b> etcd → NATS → frontend → GPU workers → benchmark</div>
+<div class="dup-matrix r as d3">
+  <div class="dup-head dup-corner">repeated concern</div><div class="dup-head">Slurm</div><div class="dup-head">Docker</div><div class="dup-head">Kubernetes</div>
+  <div class="dup-label">Launch</div><div class="dup-cell" style="--copy-delay:.35s"><code>sbatch + srun</code></div><div class="dup-cell" style="--copy-delay:.45s"><code>docker run</code></div><div class="dup-cell" style="--copy-delay:.55s"><code>Pod / Job</code></div>
+  <div class="dup-label">GPU placement</div><div class="dup-cell" style="--copy-delay:.5s"><code>GPU flags</code></div><div class="dup-cell" style="--copy-delay:.6s"><code>device mapping</code></div><div class="dup-cell" style="--copy-delay:.7s"><code>claims + affinity</code></div>
+  <div class="dup-label">Networking</div><div class="dup-cell" style="--copy-delay:.65s"><code>hostlists + ports</code></div><div class="dup-cell" style="--copy-delay:.75s"><code>host network</code></div><div class="dup-cell" style="--copy-delay:.85s"><code>Service + DNS</code></div>
+  <div class="dup-label">Readiness</div><div class="dup-cell" style="--copy-delay:.8s"><code>shell polling</code></div><div class="dup-cell" style="--copy-delay:.9s"><code>healthcheck</code></div><div class="dup-cell" style="--copy-delay:1s"><code>probes</code></div>
+  <div class="dup-label">Logs + cleanup</div><div class="dup-cell" style="--copy-delay:.95s"><code>sacct + files</code></div><div class="dup-cell" style="--copy-delay:1.05s"><code>docker logs</code></div><div class="dup-cell" style="--copy-delay:1.15s"><code>relay + lifecycle</code></div>
+</div>
+<div class="dup-total r au d4"><b>5 concerns × 3 platforms</b><span>the same orchestration work, repeated around one stable workflow</span></div>
 </div>
 </section>
 
@@ -164,13 +382,13 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s3">
 <div class="gbg"></div>
 <div class="orb og" style="width:350px;height:350px;top:15%;right:-100px"></div>
-<span class="sn">03 / 12</span>
+<span class="sn">03 / 13</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">The Solution</span>
-<h2 class="r al d1 mb">Separate <span class="accent">what</span> to deploy from <span class="green">where</span></h2>
+<span class="pill pg r ap d0 ms">Cross-Backend Transplanting</span>
+<h2 class="r al d1 mb">Keep <span class="accent">what</span>. Swap <span class="green">where</span>. Change only a few lines.</h2>
 <div class="fg">
 <div class="fc r au d2"><span class="ic">&#9998;</span><h3>Describe Once</h3><p>Portable YAML &mdash; tasks, deps, resources, launch methods</p></div>
-<div class="fc r au d3"><span class="ic">&#8644;</span><h3>Swappable Backends</h3><p>Slurm now. Docker &amp; K8S planned.</p></div>
+<div class="fc r au d3"><span class="ic">&#8644;</span><h3>Swap the Substrate</h3><p>Change the backend/operator block; keep DAG, scripts, probes, and results.</p></div>
 <div class="fc r au d4"><span class="ic">&#9881;</span><h3>Pluggable Plugins</h3><p>Probes, artifacts, replicas &mdash; no platform coupling.</p></div>
 </div>
 <div class="r as d5" style="width:100%;max-width:700px;margin:0 auto">
@@ -179,48 +397,44 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <linearGradient id="wg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#00d4ff"/></linearGradient>
 <filter id="gl"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
 </defs>
-<!-- Left column: K8S, Docker, Slurm -->
-<rect x="20" y="15" width="110" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
-<text x="75" y="40" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="13" font-weight="600">K8S</text>
-<rect x="20" y="85" width="110" height="40" rx="6" fill="#0d1420" stroke="#6b7d95" stroke-width="1" opacity="0.6"/>
-<text x="75" y="110" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="13">Docker</text>
-<rect x="20" y="158" width="110" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
-<text x="75" y="183" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="13" font-weight="600">Slurm</text>
-<!-- Right column: Docker, K8S, Slurm -->
-<rect x="570" y="15" width="110" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
-<text x="625" y="40" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="13" font-weight="600">Docker</text>
-<rect x="570" y="85" width="110" height="40" rx="6" fill="#0d1420" stroke="#6b7d95" stroke-width="1" opacity="0.6"/>
-<text x="625" y="110" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="13">K8S</text>
-<rect x="570" y="158" width="110" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
-<text x="625" y="183" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="13" font-weight="600">Slurm</text>
-<!-- Dashed wires: all left boxes -> sflow center (behind) -->
-<path d="M130,35 C220,35 280,105 310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
-<path d="M130,105 L310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
-<path d="M130,178 C220,178 280,115 310,110" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
-<!-- Dashed wires: sflow center -> all right boxes (behind) -->
-<path d="M390,110 C420,105 480,35 570,35" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
-<path d="M390,110 L570,105" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
-<path d="M390,110 C420,115 480,178 570,178" fill="none" stroke="#6b7d95" stroke-width="1.5" opacity="0.35" stroke-dasharray="6,4"/>
-<!-- Arrow heads on dashed wires (into sflow) -->
-<polygon points="315,105 305,110 315,115" fill="#6b7d95" opacity="0.4"/>
-<!-- Arrow heads on dashed wires (out of sflow) -->
-<polygon points="565,30 575,35 565,40" fill="#6b7d95" opacity="0.4"/>
-<polygon points="565,100 575,105 565,110" fill="#6b7d95" opacity="0.4"/>
-<polygon points="565,173 575,178 565,183" fill="#6b7d95" opacity="0.4"/>
-<!-- Solid green wire 1: K8S(left) -> sflow -> Slurm(right) -->
-<path id="w1" d="M130,35 C230,35 280,108 350,110 C420,112 470,178 570,178" fill="none" stroke="#76ff03" stroke-width="3" opacity="0.8"/>
-<circle r="5" fill="#76ff03" filter="url(#gl)"><animateMotion dur="2.5s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
-<circle r="4" fill="#00d4ff" filter="url(#gl)"><animateMotion dur="2.5s" begin="1.25s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
-<!-- Solid green wire 2: Slurm(left) -> sflow -> Docker(right) — reverse direction drawn right-to-left -->
-<path id="w2" d="M570,35 C470,35 420,108 350,110 C280,112 230,178 130,178" fill="none" stroke="#76ff03" stroke-width="3" opacity="0.7"/>
-<circle r="5" fill="#76ff03" filter="url(#gl)"><animateMotion dur="2.5s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
-<circle r="4" fill="#00d4ff" filter="url(#gl)"><animateMotion dur="2.5s" begin="1.25s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
-<!-- Arrow heads on green wires -->
-<polygon points="565,173 575,178 565,183" fill="#76ff03" opacity="0.9"/>
-<polygon points="135,173 125,178 135,183" fill="#76ff03" opacity="0.8"/>
-<!-- Center: sflow circle (on top) -->
-<circle cx="350" cy="110" r="42" fill="#060a10" stroke="url(#wg)" stroke-width="2.5" filter="url(#gl)"/>
-<text x="350" y="116" text-anchor="middle" fill="#76ff03" font-family="'Archivo Black',sans-serif" font-size="16" font-weight="800">sflow</text>
+<!-- One stable recipe source -->
+<rect x="20" y="62" width="180" height="96" rx="8" fill="#0d1420" stroke="#00d4ff" stroke-width="1.8"/>
+<text x="110" y="91" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="15" font-weight="700">sflow.yaml</text>
+<text x="110" y="116" text-anchor="middle" fill="#dce3ed" font-family="Consolas,monospace" font-size="9">DAG · scripts · probes</text>
+<text x="110" y="134" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="9">resources · results · artifacts</text>
+
+<!-- Recipe enters the sflow adapter -->
+<path id="recipeIn" d="M200,110 C245,110 268,110 288,110" fill="none" stroke="url(#wg)" stroke-width="3"/>
+<polygon points="283,105 293,110 283,115" fill="#76ff03"/>
+<circle class="xflow-dot xflow-recipe" r="5" fill="#00d4ff" filter="url(#gl)"/>
+
+<!-- sflow adapter -->
+<circle cx="335" cy="110" r="42" fill="#060a10" stroke="url(#wg)" stroke-width="2.5" filter="url(#gl)"/>
+<text x="335" y="116" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, sans-serif" font-size="16" font-weight="800">sflow</text>
+
+<!-- Backend-native fan-out -->
+<path id="toLocal" d="M377,100 C420,85 454,25 500,25" fill="none" stroke="#00d4ff" stroke-width="2.2" opacity=".8"/>
+<path id="toDocker" d="M377,105 C425,98 455,75 500,75" fill="none" stroke="#76ff03" stroke-width="2.2" opacity=".8"/>
+<path id="toSlurm" d="M377,115 C425,122 455,125 500,125" fill="none" stroke="#e3b341" stroke-width="2.2" opacity=".8"/>
+<path id="toK8S" d="M377,120 C420,135 454,175 500,175" fill="none" stroke="#00d4ff" stroke-width="2.2" opacity=".8"/>
+<circle class="xflow-dot xflow-local" r="4" fill="#00d4ff" filter="url(#gl)"/>
+<circle class="xflow-dot xflow-docker" r="4" fill="#76ff03" filter="url(#gl)"/>
+<circle class="xflow-dot xflow-slurm" r="4" fill="#e3b341" filter="url(#gl)"/>
+<circle class="xflow-dot xflow-k8s" r="4" fill="#00d4ff" filter="url(#gl)"/>
+
+<!-- Supported execution backends -->
+<rect x="500" y="5" width="180" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="590" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="12" font-weight="600">Local · bash</text>
+<rect x="500" y="55" width="180" height="40" rx="6" fill="#0d1420" stroke="#76ff03" stroke-width="1.5"/>
+<text x="590" y="80" text-anchor="middle" fill="#76ff03" font-family="Consolas,monospace" font-size="12" font-weight="600">Docker · docker_run</text>
+<rect x="500" y="105" width="180" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="590" y="130" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="12" font-weight="600">Slurm · srun</text>
+<rect x="500" y="155" width="180" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="590" y="180" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="12" font-weight="600">Kubernetes · k8s</text>
+<polygon points="495,20 505,25 495,30" fill="#00d4ff"/>
+<polygon points="495,70 505,75 495,80" fill="#76ff03"/>
+<polygon points="495,120 505,125 495,130" fill="#e3b341"/>
+<polygon points="495,170 505,175 495,180" fill="#00d4ff"/>
 </svg>
 </div>
 </div>
@@ -230,22 +444,22 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s4">
 <div class="gbg"></div>
 <div class="orb oc" style="width:240px;height:240px;top:8%;left:-70px"></div>
-<span class="sn">04 / 12</span>
+<span class="sn">04 / 13</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">DAG Orchestration</span>
-<h2 class="r al d1 ms">Workflow DAG</h2>
+<h2 class="r al d1 ms">Dependencies activate the next stage</h2>
 <div class="dag r as d2">
-<div class="dag-row"><div class="dag-node" style="border-color:var(--cy)">load_image</div></div>
-<div class="dag-arrow">&#9660;</div>
-<div class="dag-row"><div class="dag-node">install_dependency</div><div class="dag-node">gpu_monitor</div></div>
-<div class="dag-arrow">&#9660;</div>
-<div class="dag-row"><div class="dag-node">nats_server</div><div class="dag-node">etcd_server</div></div>
-<div class="dag-arrow">&#9660;</div>
-<div class="dag-row"><div class="dag-node">frontend_server_0</div><div class="dag-node">frontend_server_1</div><div class="dag-node">frontend_server_2</div></div>
-<div class="dag-arrow">&#9660;</div>
-<div class="dag-row"><div class="dag-node">nginx_server</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_0</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_1</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_2</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_3</div><div class="dag-node" style="border-color:var(--cy)">decode_server_0</div></div>
-<div class="dag-arrow">&#9660;</div>
-<div class="dag-row"><div class="dag-node" style="border-color:var(--cy)">benchmark_infmax_16</div></div>
+<div class="dag-row dag-stage" style="--dag-delay:.2s"><div class="dag-node" style="border-color:var(--cy)">load_image</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:.5s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:.65s"><div class="dag-node">install_dependency</div><div class="dag-node">gpu_monitor</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:.95s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:1.1s"><div class="dag-node">nats_server</div><div class="dag-node">etcd_server</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:1.4s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:1.55s"><div class="dag-node">frontend_server_0</div><div class="dag-node">frontend_server_1</div><div class="dag-node">frontend_server_2</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:1.85s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:2s"><div class="dag-node">nginx_server</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_0</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_1</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_2</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_3</div><div class="dag-node" style="border-color:var(--cy)">decode_server_0</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:2.3s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:2.45s"><div class="dag-node" style="border-color:var(--cy)">benchmark_infmax_16</div></div>
 </div>
 </div>
 </section>
@@ -254,24 +468,35 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s5">
 <div class="gbg"></div>
 <div class="orb og" style="width:300px;height:300px;bottom:-90px;right:8%"></div>
-<span class="sn">05 / 12</span>
+<span class="sn">05 / 13</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">Resource Planning</span>
 <h2 class="r al d1 ms">Topology-aware GPU Allocation</h2>
-<div class="term r as d2"><span class="hi">Allocation map (finalized node/GPU assignment):</span>
-  - backend '<span class="cy">slurm_cluster</span>':
-    &#9500;&#9472; node <span class="gr">slurm_cluster-node0</span>
-    &#9474;   GPU 0: <span class="cy">prefill_server_0</span>
-    &#9474;   GPU 1: <span class="cy">prefill_server_1</span>
-    &#9474;   GPU 2: <span class="cy">prefill_server_2</span>
-    &#9474;   GPU 3: <span class="cy">prefill_server_3</span>
-    &#9474;   Tasks: load_image, gpu_monitor, nats_server, etcd_server, frontend_server_0, ...
-    &#9500;&#9472; node <span class="gr">slurm_cluster-node1</span>
-    &#9474;   GPU 0: <span class="yl">decode_server_0</span>
-    &#9474;   GPU 1: <span class="yl">decode_server_0</span>
-    &#9474;   GPU 2: <span class="yl">decode_server_0</span>
-    &#9474;   GPU 3: <span class="yl">decode_server_0</span>
-    &#9474;   Tasks: load_image, gpu_monitor, frontend_server_1, decode_server_0</div>
+<div class="planner-node r ap d2">sflow topology planner<small>GPU capacity · node affinity · task dependencies</small></div>
+<div class="alloc-arrow r au d2">&#9660; backend-native assignment</div>
+<div class="alloc-board r as d3">
+  <div class="compute-node">
+    <div class="node-head"><strong>node-0</strong><span>NVLink domain A · 4 GPUs</span></div>
+    <div class="gpu-grid">
+      <div class="gpu-slot" style="--assign-delay:.65s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 0</b><span>prefill_0</span></span></div>
+      <div class="gpu-slot" style="--assign-delay:.85s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 1</b><span>prefill_1</span></span></div>
+      <div class="gpu-slot" style="--assign-delay:1.05s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 2</b><span>prefill_2</span></span></div>
+      <div class="gpu-slot" style="--assign-delay:1.25s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 3</b><span>prefill_3</span></span></div>
+    </div>
+  </div>
+  <div class="compute-node">
+    <div class="node-head"><strong>node-1</strong><span>NVLink domain B · 4 GPUs</span></div>
+    <div class="task-allocation decode-allocation">
+      <span class="task-allocation-label">decode_0 · 4-GPU task</span>
+      <div class="gpu-grid">
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 0</b><span>decode_0</span></span></div>
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 1</b><span>decode_0</span></span></div>
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 2</b><span>decode_0</span></span></div>
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 3</b><span>decode_0</span></span></div>
+      </div>
+    </div>
+  </div>
+</div>
 </div>
 </section>
 
@@ -279,70 +504,175 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <section class="sec" id="s6">
 <div class="gbg"></div>
 <div class="orb oc" style="width:200px;height:200px;top:-40px;right:28%"></div>
-<span class="sn">06 / 12</span>
+<span class="sn">06 / 13</span>
 <div class="inner">
-<h2 class="r au d0 mb">Core Features</h2>
-<div class="fg">
-<div class="fc r ap d1"><span class="ic" style="color:var(--cy)">&#9829;</span><h3>Probes</h3><p>Readiness &amp; failure gates &mdash; TCP, HTTP, log watch</p></div>
-<div class="fc r ap d2"><span class="ic" style="color:var(--gr)">&#8694;</span><h3>Replicas</h3><p>Parallel / sequential, Cartesian sweeps</p></div>
-<div class="fc r ap d3"><span class="ic" style="color:var(--cy)">&#123;&#123;&#125;&#125;</span><h3>Expressions</h3><p>Jinja2 $&#123;&#123;&#125;&#125; &mdash; variables, backends</p></div>
-<div class="fc r ap d4"><span class="ic" style="color:var(--gr)">&#128230;</span><h3>Artifacts</h3><p>Named URIs: fs://, file://, http://</p></div>
-<div class="fc r ap d5"><span class="ic" style="color:var(--cy)">&#9000;</span><h3>Live TUI</h3><p>Rich terminal &mdash; task status, logs</p></div>
-<div class="fc r ap d6"><span class="ic" style="color:var(--gr)">&#128203;</span><h3>Batch Mode</h3><p>sbatch, CSV-driven bulk sweeps</p></div>
+<span class="pill pc r ap d0 ms">Workflow Lifecycle</span>
+<h2 class="r al d1 ms">Define. Execute. Understand.</h2>
+<div class="lifecycle-flow r as d2">
+  <div class="phase define" data-step="01" style="--phase-delay:.25s">
+    <h3>Define</h3>
+    <div class="phase-item"><span class="phase-icon">DAG</span><span><b>Tasks + dependencies</b><br>One declarative workflow</span></div>
+    <div class="phase-item"><span class="phase-icon">{ }</span><span><b>Variables + artifacts</b><br>Portable inputs and expressions</span></div>
+    <div class="phase-item"><span class="phase-icon">✓</span><span><b>Probes</b><br>Readiness and failure gates</span></div>
+  </div>
+  <div class="flow-arrow" style="--phase-delay:.75s">&#10132;</div>
+  <div class="phase execute" data-step="02" style="--phase-delay:.95s">
+    <h3>Execute</h3>
+    <div class="phase-item"><span class="phase-icon">GPU</span><span><b>Resource planning</b><br>Nodes, GPUs, topology</span></div>
+    <div class="phase-item"><span class="phase-icon">N×</span><span><b>Replicas + sweeps</b><br>Parallel or sequential</span></div>
+    <div class="phase-item"><span class="phase-icon">→</span><span><b>Backend adapters</b><br>Local, Docker, Slurm, K8S</span></div>
+  </div>
+  <div class="flow-arrow" style="--phase-delay:1.45s">&#10132;</div>
+  <div class="phase understand" data-step="03" style="--phase-delay:1.65s">
+    <h3>Understand</h3>
+    <div class="phase-item"><span class="phase-icon">TUI</span><span><b>Live status</b><br>Tasks, logs, readiness</span></div>
+    <div class="phase-item"><span class="phase-icon">∿</span><span><b>Summary + monitor</b><br>Timelines and hardware charts</span></div>
+    <div class="phase-item"><span class="phase-icon">⇧</span><span><b>Results + uploads</b><br>JSON metrics and S3</span></div>
+  </div>
 </div>
 </div>
 </section>
 
-<!-- 7: Modular Composition (native terminal + table) -->
+<!-- 7: Backend Adapters -->
 <section class="sec" id="s7">
 <div class="gbg"></div>
-<div class="orb og" style="width:260px;height:260px;top:-60px;left:20%"></div>
-<span class="sn">07 / 12</span>
+<div class="orb oc" style="width:260px;height:260px;top:-70px;right:16%"></div>
+<span class="sn">07 / 13</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Modular Composition</span>
-<h2 class="r al d1 ms">Split. Reuse. Swap.</h2>
-<div class="two">
-<div class="term r al d2" style="font-size:clamp(.45rem,.75vw,.65rem)"><span class="hi">Input file composition (5 files &rarr; merged workflow):</span>
-
-&#9500;&#9472; <span class="cy">inference_x_v2/slurm_config.yaml</span>
-&#9474;   variables: [<span class="gr">SLURM_ACCOUNT</span>, <span class="gr">SLURM_PARTITION</span>, <span class="gr">SLURM_TIMELIMIT</span>, ...]
-&#9474;   backends: [slurm_cluster]
-&#9500;&#9472; <span class="cy">inference_x_v2/common_workflow.yaml</span>
-&#9474;   variables: [<span class="gr">SERVED_MODEL_NAME</span>, <span class="gr">MODEL_NAME</span>, ... <span class="wh">(+7)</span>]
-&#9474;   artifacts: [LOCAL_MODEL_PATH]
-&#9474;   operators: [dynamo, nginx]
-&#9474;   workflow.tasks: [load_image, install_dependency, gpu_monitor, ...]
-&#9500;&#9472; <span class="cy">vllm/prefill.yaml</span>
-&#9474;   variables: [<span class="gr">NUM_CTX_SERVERS</span>, <span class="gr">CTX_TP_SIZE</span>, ... <span class="wh">(+4)</span>]
-&#9474;   workflow.tasks: [prefill_server]
-&#9500;&#9472; <span class="cy">vllm/decode.yaml</span>
-&#9474;   variables: [<span class="gr">NUM_GEN_SERVERS</span>, <span class="gr">GEN_TP_SIZE</span>, ... <span class="wh">(+4)</span>]
-&#9474;   workflow.tasks: [decode_server]
-&#9492;&#9472; <span class="cy">benchmark_infmax.yaml</span> &rarr; <span class="yl">dynamo_benchmark</span>
-    variables: [<span class="gr">ISL</span>, <span class="gr">OSL</span>, <span class="gr">CONCURRENCY</span>, ... <span class="wh">(+1)</span>]
-    workflow.tasks: [benchmark_infmax]</div>
-<div>
-<table class="mtbl r ar d3">
-<thead><tr><th>Benefit</th><th>Description</th></tr></thead>
-<tbody>
-<tr><td><strong style="color:var(--txt)">Reuse</strong></td><td>Shared components written once, used by all variants</td></tr>
-<tr><td><strong style="color:var(--txt)">Swap</strong></td><td>Change benchmark by swapping <code>benchmark_aiperf</code> for <code>benchmark_infmax</code></td></tr>
-<tr><td><strong style="color:var(--txt)">Mix frameworks</strong></td><td>sglang + aiperf, vllm + infmax, trtllm + aiperf, etc.</td></tr>
-<tr><td><strong style="color:var(--txt)">Smaller diffs</strong></td><td>Changes to one component only touch one file</td></tr>
-<tr><td><strong style="color:var(--txt)">Bulk testing</strong></td><td>CSV combinations, generate/submit all at once</td></tr>
-<tr><td><strong style="color:var(--txt)">Computed vars</strong></td><td><code>GPUS_PER_WORKER</code> chains across modules</td></tr>
-</tbody>
-</table>
+<span class="pill pc r ap d0 ms">Backend Adapters</span>
+<h2 class="r al d1 ms">One intent becomes four native execution plans</h2>
+<div class="contract-strip r al d2"><b>Portable workflow contract</b> &nbsp; DAG · resources · probes · artifacts · results</div>
+<div class="alloc-arrow r au d2">&#9660; sflow adapts the execution substrate</div>
+<div class="backend-lanes r as d3">
+  <div class="backend-lane" style="--adapter-delay:.45s"><span class="backend-symbol">&gt;_</span><h3>Local</h3><p>bash process<br>synthetic node/GPU map</p></div>
+  <div class="backend-lane" style="--adapter-delay:.65s"><span class="backend-symbol">&#9635;</span><h3>Docker</h3><p>docker run<br>container GPU devices</p></div>
+  <div class="backend-lane" style="--adapter-delay:.85s"><span class="backend-symbol">#</span><h3>Slurm</h3><p>salloc + srun<br>scheduler allocations</p></div>
+  <div class="backend-lane" style="--adapter-delay:1.05s"><span class="backend-symbol">&#9096;</span><h3>Kubernetes</h3><p>pods + claims<br>pinning and lifecycle</p></div>
 </div>
+<div class="alloc-arrow r au d4">&#9660;</div>
+<div class="output-strip r ar d4">Consistent outputs &nbsp; task.log · result.json · summary · artifacts</div>
+</div>
+</section>
+
+<!-- 8: Merge Pod -->
+<section class="sec" id="s8">
+<div class="gbg"></div>
+<div class="orb og" style="width:300px;height:300px;bottom:-90px;left:12%"></div>
+<span class="sn">08 / 13</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">Merge Pod</span>
+<h2 class="r al d1 ms">Co-located GPU tasks, one fast intra-node fabric</h2>
+<div class="merge-topology r as d2">
+  <div class="topology-panel">
+    <h3 style="color:#ff7b72">Separate pods · isolated views</h3>
+    <div class="pod-pair">
+      <div class="pod-box">worker A<span>GPU 0 visible</span></div>
+      <div class="slow-link">IB / TCP<br>&#8596;</div>
+      <div class="pod-box">worker B<span>GPU 1 visible</span></div>
+    </div>
+  </div>
+  <div class="merge-action">sflow merge<br>&#10132;</div>
+  <div class="topology-panel merged-topology">
+    <h3 style="color:var(--gr)">One pod · combined GPU view</h3>
+    <div class="worker-row"><span class="worker-tag">worker A</span><span class="worker-tag">worker B</span></div>
+    <div class="shared-gpus"><span class="shared-gpu">GPU 0</span><span class="shared-gpu">GPU 1</span><span class="shared-gpu">GPU 2</span><span class="shared-gpu">GPU 3</span></div>
+    <div class="nvlink-bus">CUDA IPC · NVLink · NVSwitch</div>
+  </div>
+</div>
+<div class="merge-assumption r au d4"><b style="color:#e3b341">Safe boundary:</b> same workflow + backend + node + image. Example: PD KV transfer. Also fits current per-node IMEX constraints.</div>
+</div>
+</section>
+
+<!-- 9: Monitor and Summary -->
+<section class="sec" id="s9">
+<div class="gbg"></div>
+<div class="orb oc" style="width:220px;height:220px;top:-50px;left:20%"></div>
+<span class="sn">09 / 13</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">Observability</span>
+<h2 class="r al d1 ms">Runs explain themselves</h2>
+<div class="two">
+<div class="term r al d2" style="font-size:clamp(.45rem,.72vw,.62rem)"><span class="cy">sflow_summary.log</span>
+Task Duration Chart
+<span class="runline summary-row">prefill    |<span class="livebar cy prefill" data-bar="####..........................">####..........................</span>| 58.412s READY</span>
+<span class="runline summary-row">decode     |<span class="livebar decode" data-bar="##########################....">##########################....</span>| 6m14.882s READY</span>
+<span class="runline summary-row">benchmark  |<span class="livebar cy benchmark" data-bar="..........................####">..........................####</span>| 47.906s COMPLETED</span>
+
+Timeline
+<span class="runline">12:31:33  +00.000s  prefill    SUBMITTED</span>
+<span class="runline">12:31:33  +00.000s  decode     SUBMITTED</span>
+<span class="runline">12:32:31  +58.412s  prefill    READY</span>
+<span class="runline">12:37:48  +06m15s   decode     READY</span>
+<span class="runline">12:37:49  +06m16s   benchmark  SUBMITTED</span>
+<span class="runline">12:38:36  +07m03s   benchmark  COMPLETED</span></div>
+<div class="term r ar d3" style="font-size:clamp(.45rem,.72vw,.62rem)"><span class="gr">sflow_monitor.log</span>
+Metric Summary
+<span class="runline">GPU util %        min=42  avg=87  max=99</span>
+<span class="runline">GPU mem used GiB  min=18  avg=61  max=76</span>
+<span class="runline">GPU power W       min=310 avg=642 max=718</span>
+
+Timelines (cluster avg)
+<span class="runline">GPU util %        <span class="spark cy" data-spark="▁▂▅▇████▆▅">▁▂▅▇████▆▅</span></span>
+<span class="runline">GPU mem used GiB  <span class="spark" data-spark="▁▃▄▆▇█████">▁▃▄▆▇█████</span></span>
+<span class="runline">Net RX MiB/s      <span class="spark cy" data-spark="▁▁▂▅▇▆▃▂▁">▁▁▂▅▇▆▃▂▁</span></span></div>
+</div>
+<div class="obs-chart-grid r au d4" aria-label="Hardware utilization chart samples">
+  <div class="obs-chart-card">
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU Util</span><span class="obs-chart-value">87%</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU utilization line chart"><path d="M5 64 C35 58 42 34 70 36 S108 10 137 16 S180 48 235 20" stroke="#00d4ff"/></svg>
+  </div>
+  <div class="obs-chart-card">
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU Memory</span><span class="obs-chart-value">61 GiB</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU memory line chart"><path d="M5 68 C35 66 58 54 80 48 S120 28 155 24 S200 22 235 18" stroke="#76ff03"/></svg>
+  </div>
+  <div class="obs-chart-card">
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU Power</span><span class="obs-chart-value">642 W</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU power line chart"><path d="M5 58 C28 20 55 74 82 35 S135 14 160 42 S205 60 235 28" stroke="#e3b341"/></svg>
+  </div>
 </div>
 </div>
 </section>
 
-<!-- 8: Error Analysis (real example — Job 1865443) -->
-<section class="sec" id="s8">
+<!-- 10: Modular Composition -->
+<section class="sec" id="s10">
+<div class="gbg"></div>
+<div class="orb og" style="width:260px;height:260px;top:-60px;left:20%"></div>
+<span class="sn">10 / 13</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">Modular Composition</span>
+<h2 class="r al d1 ms">Swap a leaf. Reuse the tree.</h2>
+<div class="recipe-tree r as d2">
+  <div class="tree-root">recipe/<small>composition root</small></div>
+  <div class="tree-branches">
+    <div class="tree-branch" style="--branch-delay:.3s">
+      <div class="branch-label"><code>backend/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf">local.yaml</span><span class="tree-leaf">docker.yaml</span><span class="tree-leaf">slurm.yaml</span><span class="tree-leaf selected" style="--leaf-delay:.75s">k8s.yaml ✓</span></div>
+    </div>
+    <div class="tree-branch" style="--branch-delay:.45s">
+      <div class="branch-label"><code>common/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf fixed">common_workflow.yaml · shared DAG</span></div>
+    </div>
+    <div class="tree-branch" style="--branch-delay:.6s">
+      <div class="branch-label"><code>workload/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf selected" style="--leaf-delay:.95s">vllm/ ✓</span><span class="tree-leaf">sglang/</span><span class="tree-leaf">trtllm/</span></div>
+    </div>
+    <div class="tree-branch" style="--branch-delay:.75s">
+      <div class="branch-label"><code>benchmark/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf selected" style="--leaf-delay:1.15s">aiperf.yaml ✓</span><span class="tree-leaf">infmax.yaml</span></div>
+    </div>
+  </div>
+</div>
+<div class="tree-selection r au d3">&#9660; selected leaves compose</div>
+<div class="compose-result r ap d4"><b>composed.yaml</b> &nbsp; k8s + shared workflow + vLLM + AIPerf</div>
+<div class="output-strip r au d5">Swap one highlighted leaf; shared branches remain unchanged.</div>
+</div>
+</section>
+
+<!-- 11: Error Analysis (real example — Job 1865443) -->
+<section class="sec legacy-hidden" id="s11">
 <div class="gbg"></div>
 <div class="orb oc" style="width:220px;height:220px;bottom:-50px;left:15%"></div>
-<span class="sn">08 / 12</span>
+<span class="sn">11 / 15</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">Real-world Debugging</span>
 <h2 class="r al d1 ms">Structured Error Analysis</h2>
@@ -400,10 +730,10 @@ networking config match SGLang disagg routing.</div>
 </div>
 </section>
 
-<!-- 9: CLI -->
-<section class="sec" id="s9">
+<!-- 12: CLI -->
+<section class="sec legacy-hidden" id="s12">
 <div class="gbg"></div>
-<span class="sn">09 / 12</span>
+<span class="sn">12 / 15</span>
 <div class="inner">
 <h2 class="r au d0 mb">CLI at a Glance</h2>
 <table class="mtbl r au d1" style="max-width:800px">
@@ -420,66 +750,47 @@ networking config match SGLang disagg routing.</div>
 </div>
 </section>
 
-<!-- 10: AI Agent Skills -->
-<section class="sec" id="s10">
+<!-- 13: AI Agent Skills -->
+<section class="sec" id="s13">
 <div class="gbg"></div>
 <div class="orb og" style="width:280px;height:280px;top:-50px;left:-60px"></div>
 <div class="pt" style="width:4px;height:4px;background:var(--cy);top:30%;left:85%;opacity:.3;animation-duration:16s;animation-delay:3s"></div>
-<span class="sn">10 / 12</span>
+<span class="sn">11 / 13</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">AI-Native</span>
-<h2 class="r al d1 ms">Built-in Agent Skills</h2>
-<div class="two">
-<div>
-<p class="r au d2 ms">sflow ships with AI agent skills that teach coding assistants (Cursor, Copilot) how to write sflow YAML and debug errors &mdash; no training required.</p>
-<div class="term r al d3" style="font-size:clamp(.45rem,.75vw,.65rem)"><span class="cy">$ sflow skill --list</span>
-
-<span class="hi">Available AI agent skills:</span>
-
-  - <span class="gr">writing-sflow-yaml</span>          Schema, examples, validation
-  - <span class="gr">sflow-error-analysis</span>        Error catalog, diagnostics
-
-  + <span class="yl">AGENTS.md</span> (agent workflow guidelines)
-
-<span class="cy">$ sflow skill -o .cursor/skills</span>
-<span class="hi">Skills will be copied to: .cursor/skills/</span>
-  Note: directory exists &mdash; files will be merged.
-<span class="gr">&#10003; Skills copied to: .cursor/skills/</span></div>
-</div>
-<div>
-<p class="r ar d3 ms" style="font-size:var(--s);color:var(--txt)">What the agent learns from AGENTS.md</p>
-<table class="mtbl r ar d3">
-<thead><tr><th>Capability</th><th>Detail</th></tr></thead>
-<tbody>
-<tr><td><span class="accent">Write YAML</span></td><td>Schema-aware config authoring with validation</td></tr>
-<tr><td><span class="accent">Debug errors</span></td><td>Categorize errors, read logs, suggest fixes</td></tr>
-<tr><td><span class="accent">GPU planning</span></td><td>TP/DP/PP sizing, node allocation math</td></tr>
-<tr><td><span class="accent">Modular compose</span></td><td>Split configs, missable tasks, CSV sweeps</td></tr>
-<tr><td><span class="accent">Step-by-step</span></td><td>Hardcode first &rarr; validate &rarr; parameterize</td></tr>
-</tbody>
-</table>
-<div class="term r ar d5" style="font-size:clamp(.42rem,.65vw,.55rem);margin-top:var(--gap)"><span class="hi">AGENTS.md workflow</span>
-1. Gather cluster info (account, partition, GPUs)
-2. Write minimal plain-text config
-3. <span class="cy">sflow run --dry-run</span> to validate
-4. Run and debug with <span class="cy">--tui</span>
-5. Extract variables, parameterize
-6. Modularize for multi-framework support</div>
-</div>
+<span class="pill pg r ap d0 ms">Developer Experience</span>
+<h2 class="r al d1 ms">Agent-native workflows improve with every run</h2>
+<div class="agent-loop-shell r as d2">
+  <div class="dev-flow">
+    <div class="dev-step" style="--dev-delay:.3s"><span class="step-num">01</span><h3>Author · agent-native</h3><div class="dev-context"><span>AGENTS.md workflow rules</span><span>writing-sflow-yaml skill</span><span>schema + examples</span></div></div>
+    <div class="dev-arrow">&#10132;</div>
+    <div class="dev-step" style="--dev-delay:.55s"><span class="step-num">02</span><h3>Validate</h3><div class="dev-context"><span>sflow run --dry-run</span><span>resolved variables</span><span>resource / GPU plan</span></div></div>
+    <div class="dev-arrow">&#10132;</div>
+    <div class="dev-step" style="--dev-delay:.8s"><span class="step-num">03</span><h3>Run &amp; observe</h3><div class="dev-context"><span>timestamped task events</span><span>TUI + readiness probes</span><span>sflow_monitor.log</span></div></div>
+    <div class="dev-arrow">&#10132;</div>
+    <div class="dev-step" style="--dev-delay:1.05s"><span class="step-num">04</span><h3>Diagnose &amp; evolve</h3><div class="dev-context"><span>sflow_summary.log</span><span>task.log + failure hints</span><span>result.json metrics</span></div></div>
+  </div>
+  <div class="agent-feedback">
+    <svg class="agent-feedback-orbit" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
+      <path class="agent-loop-arrow" d="M-7,-5 L7,0 L-7,5 Z"/>
+    </svg>
+    <span class="agent-chip">AGENT LOOP</span>
+    <div class="feedback-evidence"><span>timestamps</span><span>summary</span><span>monitor</span><span>failure hints</span></div>
+    <span class="feedback-action">rerun ← adjust YAML ← read context</span>
+  </div>
 </div>
 </div>
 </section>
 
-<!-- 11: Heterogeneous Computing Vision -->
-<section class="sec" id="s11">
+<!-- 14: Heterogeneous Computing Vision -->
+<section class="sec" id="s14">
 <div class="gbg"></div>
 <div class="orb oc" style="width:300px;height:300px;top:-60px;left:-80px"></div>
 <div class="orb og" style="width:250px;height:250px;bottom:-70px;right:-50px"></div>
-<span class="sn">11 / 12</span>
+<span class="sn">12 / 13</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">Vision</span>
 <h2 class="r al d1 ms">Heterogeneous Computing</h2>
-<p class="r au d2" style="max-width:720px">As a top-level orchestration abstraction, sflow is uniquely positioned to unify heterogeneous compute &mdash; allocating the right accelerator from the right resource pool for each stage of a disaggregated pipeline.</p>
+<p class="r au d2" style="max-width:720px">One recipe can route each stage of a disaggregated pipeline to the best resource pool while preserving one workflow contract.</p>
 <div class="r as d3" style="width:100%;max-width:650px;margin:0 auto">
 <svg viewBox="0 0 650 140" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
 <defs><linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#e3b341"/></linearGradient></defs>
@@ -492,7 +803,7 @@ networking config match SGLang disagg routing.</div>
 <text x="70" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">Accelerator &bull; Decode</text>
 <!-- sflow center -->
 <circle cx="325" cy="70" r="35" fill="#060a10" stroke="url(#hg)" stroke-width="2.5"/>
-<text x="325" y="76" text-anchor="middle" fill="#76ff03" font-family="'Archivo Black',sans-serif" font-size="13" font-weight="800">sflow</text>
+<text x="325" y="76" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, sans-serif" font-size="13" font-weight="800">sflow</text>
 <!-- Disaggregated output (right) -->
 <rect x="500" y="10" width="140" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
 <text x="570" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="10" font-weight="600">prefill_server</text>
@@ -506,54 +817,71 @@ networking config match SGLang disagg routing.</div>
 <!-- Wires: sflow -> tasks (animated) -->
 <path id="hw1" d="M360,62 C400,50 440,35 500,35" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
 <path id="hw2" d="M360,78 C400,90 440,105 500,105" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
-<circle r="3.5" fill="#00d4ff"><animateMotion dur="2s" repeatCount="indefinite"><mpath href="#hw1"/></animateMotion></circle>
-<circle r="3.5" fill="#e3b341"><animateMotion dur="2s" repeatCount="indefinite"><mpath href="#hw2"/></animateMotion></circle>
+<circle class="vision-route-dot vision-prefill-dot" r="3.5" fill="#00d4ff"/>
+<circle class="vision-route-dot vision-decode-dot" r="3.5" fill="#e3b341"/>
 <!-- Arrows -->
 <polygon points="495,30 505,35 495,40" fill="#00d4ff" opacity="0.6"/>
 <polygon points="495,100 505,105 495,110" fill="#e3b341" opacity="0.6"/>
 </svg>
 </div>
-<p class="r au d4" style="max-width:720px;font-size:var(--s)">Example: PD disaggregation &mdash; one <code>sflow.yaml</code> routes prefill to <span class="accent">Vera Rubin GPU pools</span> for maximum throughput, and decode to <span style="color:#e3b341">LPU accelerators</span> for low-latency token generation. Each task lands on the optimal hardware automatically.</p>
+<div class="output-strip r au d4">One DAG · specialized accelerators · one workflow contract</div>
 </div>
 </section>
 
-<!-- 12: Closing -->
-<section class="sec" id="s12">
+<!-- 13: Try It -->
+<section class="sec" id="s15">
 <div class="gbg"></div>
 <div class="orb oc" style="width:420px;height:420px;bottom:-160px;left:28%"></div>
 <div class="orb og" style="width:280px;height:280px;top:-90px;right:18%"></div>
-<span class="sn">12 / 12</span>
-<div class="inner" style="align-items:center;text-align:center">
-<span class="pill pc r ap d0 ms">What&rsquo;s Next</span>
-<h2 class="r au d1 mb">Slurm today. Docker &amp; Kubernetes tomorrow.</h2>
-<p class="r au d2" style="max-width:620px">Slurm lacks a workflow orchestration layer &mdash; that&rsquo;s where sflow starts. Docker and K8S backends are planned, leveraging native ecosystems (Helm charts, Argo Workflows).</p>
-<div class="r au d3" style="margin-top:var(--gap);display:flex;gap:calc(var(--gap)*.6);flex-wrap:wrap;justify-content:center">
-<span class="pill pg">Slurm &#10003;</span>
-<span class="pill pc" style="opacity:.45">Docker (planned)</span>
-<span class="pill pc" style="opacity:.45">Kubernetes (planned)</span>
+<span class="sn">13 / 13</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">Try It</span>
+<h2 class="r al d1 ms">Install. Explore. Run.</h2>
+<p class="r au d2" style="max-width:760px">Start locally, validate before allocating hardware, then use the docs and repository as your source of truth.</p>
+<div class="try-layout">
+  <div class="term install-panel r al d2"><span class="section"># install from the repository</span>
+<span class="command">$ uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"</span>
+
+<span class="section"># verify and try a local workflow</span>
+<span class="command">$ sflow --version</span>
+<span class="command">$ sflow sample self_contained/local/hello_world</span>
+<span class="command">$ sflow run -f hello_world.yaml --dry-run</span>
+<span class="success">✓ validate first; run when the plan looks right</span></div>
+  <div class="try-links r ar d3">
+    <a class="try-link" href="https://github.com/NVIDIA/nv-sflow" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">GIT</span><span><b>GitHub Repository</b><small>github.com/NVIDIA/nv-sflow</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="docs/user/intro" target="_top" onclick="event.stopPropagation()"><span class="try-link-icon">DOC</span><span><b>Documentation</b><small>nvidia.github.io/nv-sflow/docs</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="docs/user/quickstart" target="_top" onclick="event.stopPropagation()"><span class="try-link-icon">01</span><span><b>Quickstart</b><small>docs/user/quickstart</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="feature-map" target="_top" onclick="event.stopPropagation()"><span class="try-link-icon">MAP</span><span><b>Feature Map</b><small>Find the right guide by intent</small></span><span class="try-link-arrow">→</span></a>
+  </div>
 </div>
-<div class="r au d4" style="margin-top:var(--gap)">
-<p style="font-size:var(--b)"><span class="accent">$</span> uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main" </p>
-<p style="font-size:var(--s);margin-top:.4em"><a href="https://github.com/NVIDIA/nv-sflow" style="color:var(--cy);text-decoration:none">github.com/NVIDIA/nv-sflow</a></p>
-</div>
+<div class="try-footer r au d4"><span>Local</span><span>Docker</span><span>Slurm</span><span>Kubernetes</span><span>one workflow contract</span></div>
 </div>
 </section>
 
 <script>
 (function(){
-var D=6500,secs=document.querySelectorAll('.sec'),
+var D=6500,secs=document.querySelectorAll('.sec:not(.legacy-hidden)'),
 dotsEl=document.getElementById('dots'),prog=document.getElementById('prog'),
 tmr=document.getElementById('tmr'),badge=document.getElementById('badge'),
 N=secs.length,cur=0,paused=true,timer=null;
 for(var i=0;i<N;i++){var d=document.createElement('button');d.className='dot';d.setAttribute('data-i',i);d.onclick=function(){go(+this.getAttribute('data-i'))};dotsEl.appendChild(d)}
 var dots=dotsEl.querySelectorAll('.dot');
-function activate(i){for(var j=0;j<N;j++)secs[j].classList.remove('on');secs[i].classList.add('on');for(var j=0;j<N;j++)dots[j].classList.toggle('on',j===i);prog.style.width=((i+1)/N*100)+'%';startTimer()}
+function activate(i){
+  // Keep SMIL clocks live: pausing offscreen SVGs can strand delayed animateMotion intervals during load/scroll restoration.
+  for(var j=0;j<N;j++){
+    secs[j].classList.remove('on');
+  }
+  secs[i].classList.add('on');
+  for(var j=0;j<N;j++)dots[j].classList.toggle('on',j===i);
+  prog.style.width=((i+1)/N*100)+'%';
+  startTimer()
+}
 function startTimer(){tmr.style.transition='none';tmr.style.width='0%';requestAnimationFrame(function(){requestAnimationFrame(function(){tmr.style.transition='width '+D+'ms linear';tmr.style.width='100%'})})}
 function go(i){cur=((i%N)+N)%N;secs[cur].scrollIntoView({behavior:'smooth'});activate(cur);resetAuto()}
 function next(){if(!paused)go(cur+1)}
 function resetAuto(){clearInterval(timer);if(!paused)timer=setInterval(next,D)}
-document.addEventListener('click',function(e){if(e.target.closest('.dot'))return;paused=!paused;badge.textContent=paused?'click or press P to enable auto-scroll':'AUTO-SCROLL ON \u2014 click or press P to pause';badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()});
-document.addEventListener('keydown',function(e){if(e.key==='p'||e.key==='P'){document.body.click();return}if(['ArrowDown',' ','ArrowRight','PageDown'].indexOf(e.key)>=0){e.preventDefault();go(cur+1)}else if(['ArrowUp','ArrowLeft','PageUp'].indexOf(e.key)>=0){e.preventDefault();go(cur-1)}});
+function toggleAuto(){paused=!paused;badge.textContent=paused?'press P to enable auto-scroll':'AUTO-SCROLL ON \u2014 press P to pause';badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()}
+document.addEventListener('keydown',function(e){if(e.key==='p'||e.key==='P'){toggleAuto();return}if(['ArrowDown',' ','ArrowRight','PageDown'].indexOf(e.key)>=0){e.preventDefault();go(cur+1)}else if(['ArrowUp','ArrowLeft','PageUp'].indexOf(e.key)>=0){e.preventDefault();go(cur-1)}});
 var obs=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){for(var i=0;i<N;i++)if(secs[i]===e.target){cur=i;activate(i);break}}})},{threshold:.4});
 for(var i=0;i<N;i++)obs.observe(secs[i]);
 activate(0);badge.style.opacity='1';

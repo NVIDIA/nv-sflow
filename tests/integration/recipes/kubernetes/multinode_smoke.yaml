@@ -1,0 +1,96 @@
+version: "0.1"
+
+# Smoke test for the multi-node reservation + pinned task-pod mechanism.
+#
+# What this validates:
+#   1. N placeholder pods are scheduled on N distinct physical nodes (reservation)
+#   2. The task is split into N pods (one per reserved node, leader = index 0) with
+#      SFLOW_TASK_NODE_INDEX / SFLOW_LEADER_ADDRESS injected per pod and the shared
+#      SFLOW_TASK_ASSIGNED_NODE_IPS from the task env
+#   3. Pods can reach each other over the physical node IPs (host_network: true)
+#
+# Mechanism: the leader pod opens a TCP rendezvous socket; every worker connects
+# and sends its node index; the leader verifies all workers checked in and exits 0.
+#
+# No GPUs, no Dynamo, no CRDs required. If this passes, the network path that
+# Dynamo uses for etcd/NATS registration is confirmed working.
+
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    namespace: default
+    nodes: 3        # 1 leader + 2 workers; change to 2 for minimal smoke
+    gpus_per_node: 0
+    host_network: true
+
+operators:
+  - name: py
+    type: k8s
+    image: python:3.11-slim
+
+workflow:
+  name: k8s_multinode_smoke
+  tasks:
+    - name: rendezvous
+      operator: py
+      resources:
+        nodes:
+          count: 3
+      script:
+        - |
+          cat > /tmp/smoke.py << 'PYEOF'
+          import os, socket, json, time, sys
+
+          node_idx  = int(os.environ["SFLOW_TASK_NODE_INDEX"])
+          leader_ip = os.environ["SFLOW_LEADER_ADDRESS"]
+          all_ips   = os.environ["SFLOW_TASK_ASSIGNED_NODE_IPS"].split(",")
+          n_nodes   = len(all_ips)
+          port      = int(os.environ.get("SMOKE_PORT", "17171"))
+
+          print(f"[node-{node_idx}/{n_nodes}] leader={leader_ip}  all_ips={all_ips}", flush=True)
+
+          if n_nodes == 1:
+              print("[node-0] single-node run, no rendezvous needed — PASSED", flush=True)
+              sys.exit(0)
+
+          if node_idx == 0:
+              srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              srv.bind(("0.0.0.0", port))
+              srv.listen(n_nodes)
+              srv.settimeout(60)
+              print(f"[leader] listening on :{port}, expecting {n_nodes - 1} worker(s)", flush=True)
+
+              seen = []
+              for _ in range(n_nodes - 1):
+                  conn, addr = srv.accept()
+                  msg  = json.loads(conn.recv(256).decode())
+                  conn.send(b"ACK")
+                  conn.close()
+                  seen.append(msg["idx"])
+                  print(f"[leader] check-in from node-{msg['idx']} @ {addr[0]}", flush=True)
+
+              srv.close()
+              expected = list(range(1, n_nodes))
+              assert sorted(seen) == expected, f"expected workers {expected}, got {sorted(seen)}"
+              print(f"[leader] all {n_nodes - 1} worker(s) checked in — SMOKE TEST PASSED", flush=True)
+
+          else:
+              for attempt in range(60):
+                  try:
+                      s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                      s.settimeout(5)
+                      s.connect((leader_ip, port))
+                      s.send(json.dumps({"idx": node_idx}).encode())
+                      ack = s.recv(16)
+                      s.close()
+                      print(f"[worker-{node_idx}] checked in with {leader_ip}:{port} — ack={ack}", flush=True)
+                      break
+                  except (ConnectionRefusedError, OSError):
+                      if attempt == 59:
+                          raise RuntimeError(f"[worker-{node_idx}] leader unreachable after 60 attempts")
+                      time.sleep(1)
+
+          PYEOF
+          python3 /tmp/smoke.py
