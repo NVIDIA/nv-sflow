@@ -50,13 +50,14 @@ A bash script hard-wires node names, GPU indices, and execution order. With sflo
 
 ---
 
-This guide teaches sflow in two parts:
+This guide teaches sflow in three parts:
 
 - **Part I: Learn the Basics Locally** – Write workflows, build DAGs, add variables — no cluster needed
 - **Part II: Run on Slurm** – Take the same config to a real HPC cluster
+- **Part III: Run on Kubernetes** – Take the same config to a Kubernetes cluster
 
 :::tip More backends
-This quickstart uses `local` and `slurm`, but the same YAML also runs on the **Docker** and **Kubernetes** backends — just swap the backend block. See [Backends](./backends.md) for all four, and try the Kubernetes samples: `sflow sample self_contained/kubernetes/hello_world` and `sflow sample self_contained/kubernetes/dynamo_trtllm_disagg`.
+This quickstart covers `local`, `slurm`, and `kubernetes`. The same YAML also runs on the **Docker** backend — just swap the backend block. See [Backends](./backends.md) for all four.
 :::
 
 ---
@@ -587,5 +588,173 @@ After submission, monitor your job with standard Slurm commands:
 squeue -u $USER           # Check job status
 scancel <job_id>          # Cancel a job
 tail -f sflow_output/sflow-<job_id>.out  # Follow output logs
+```
+
+---
+
+## Part III: Kubernetes Cluster
+
+Run the same workflow concepts on a Kubernetes cluster. Make sure you have already installed sflow (see [Install sflow](#install-sflow) above), and that the machine running `sflow` has working cluster access — sflow shells out to your **local `kubectl`**.
+
+**How it works (Kubernetes example):**
+
+```mermaid
+flowchart TD
+  Y["recipe.yaml<br/>backends: kubernetes · operators: k8s (image) · workflow.tasks"] -->|sflow run -f recipe.yaml --kube-namespace ml-team| P["1 · Pre-flight RBAC check<br/>2 · Reserve nodes/GPUs<br/>3 · Launch task pods<br/>4 · Execute DAG"]
+```
+
+:::note Requires sflow v0.3.0+
+A few things differ from Slurm on the Kubernetes backend today:
+
+- `sflow run` is **interactive (attached) only** — there is no `sflow batch` / fire-and-forget mode on K8S yet, so the driver process must stay connected for the whole run.
+- `monitor:` blocks are **skipped** (no in-cluster hardware collector yet).
+- Tested on vanilla bare-metal Kubernetes and Google GKE; other environments are untested.
+:::
+
+### 1. Prepare a Kubernetes Workflow
+
+Two things differ from the Slurm setup:
+
+- **The workload image lives on the *operator*, not the backend.** The `kubernetes` backend declares *where* (namespace, nodes, GPUs); the operator declares the container `image` to run.
+- **There is no default operator on Kubernetes.** Unlike `local` → `bash` or `slurm` → `srun`, every K8S task must name an explicit `k8s` (or `k8s_mpi`) operator that carries an `image`.
+
+Start with the smallest working recipe — CPU-only (`gpus_per_node: 0`). Grab it with `sflow sample self_contained/kubernetes/hello_world`:
+
+```yaml
+version: "0.1"
+
+backends:
+  - name: k8s
+    type: kubernetes
+    default: true
+    namespace: default
+    nodes: 1
+    gpus_per_node: 0
+
+operators:
+  - name: k8s_op
+    type: k8s
+    image: ubuntu:22.04       # the workload image lives on the operator
+
+workflow:
+  name: kubernetes_hello_world
+  tasks:
+    - name: hello
+      operator: k8s_op
+      script:
+        - echo "Hello from Kubernetes"
+```
+
+```mermaid
+flowchart TD
+  start((start)) --> hello[hello]
+  hello --> stop((stop))
+```
+
+Common backend fields:
+
+| Backend field | Default | Purpose |
+|---------------|---------|---------|
+| `namespace` | — | Namespace to run in; **must already exist**. One namespace per backend (use separate backends for separate namespaces). |
+| `nodes` | — | Number of nodes to reserve for the workflow. |
+| `gpus_per_node` | derived from node capacity | GPUs per node; checked against real GPU capacity at pre-flight. Set `0` for CPU-only. |
+| `scheduling` | `device_plugin` | How GPUs are requested: `device_plugin` (NVIDIA gpu-operator, `nvidia.com/gpu`) or `dra` (K8s 1.34+, WIP). |
+| `gpu_resource_name` | `nvidia.com/gpu` | Override the device-plugin resource name (e.g. MIG `nvidia.com/mig-1g.5gb`). |
+| `host_network` | `true` | Pod shares the node network namespace (pod IP == node IP). Privileged; turn off on CNI-routable clusters. |
+| `host_ipc` | `false` | Share the node IPC namespace + `/dev/shm` for cross-pod CUDA IPC over NVLink. Privileged; opt-in. |
+| `volumes` | — | Mount existing PVCs / `emptyDir` scratch into every task pod. PVCs must already exist — sflow references them, it does not create them. |
+
+See [Backends](./backends.md) for the full field list, including DRA/MIG, RDMA, and Multi-Node NVLink options.
+
+### 2. Operators on Kubernetes
+
+Each task's `script:` lines run inside a pod built from the operator's container `image`. There are two K8S operator types:
+
+| Operator | Use for |
+|----------|---------|
+| `k8s` | Standard single/multi-node container tasks. Required field: `image`. |
+| `k8s_mpi` | `mpirun`-launched workloads — inherits every `k8s` field and adds an `mpi:` block; sflow injects the SSH/hostfile/sshd glue for you. |
+
+Frequently-used `k8s` operator fields:
+
+| Operator field | Default | Purpose |
+|----------------|---------|---------|
+| `image` | *(required)* | Container image for the task's pod. |
+| `image_pull_secrets` | — | Secret name(s) for pulling from a private registry (e.g. `nvcr.io`). |
+| `service_account` | — | Pod service account (RBAC / cloud workload identity). |
+| `run_as_root` | `false` | Run the container as root. |
+| `shm_size` | node RAM | Shared-memory (`/dev/shm`) size. The K8s 64Mi default segfaults multi-GPU NCCL/MPI jobs — set e.g. `64Gi`. |
+| `cpu` / `memory` | — | Resource requests (`cpu_limit` / `memory_limit` set limits). |
+| `env` | — | Extra environment variables for the pod. |
+
+You can define named operators once and reference them by name in tasks, or override fields per task — the same pattern shown for Slurm operators in Part II.
+
+### 3. Connect to the Cluster and Run
+
+Cluster credentials are passed as **CLI flags on `sflow run`, never in the YAML** — so the same recipe stays cluster-agnostic:
+
+| Flag | Default |
+|------|---------|
+| `--kubeconfig PATH` | `$KUBECONFIG`, else `~/.kube/config` |
+| `--kube-context NAME` | current context |
+| `--kube-namespace NAME` | the backend's `namespace` |
+
+**Validate first with a dry-run** to catch config errors without touching the cluster:
+
+```bash
+sflow run --file hello_world.yaml --dry-run
+```
+
+Then run against your cluster (add `--tui` for the live status/log view):
+
+```bash
+sflow run -f hello_world.yaml \
+  --kubeconfig ~/.kube/prod.config \
+  --kube-context prod-east \
+  --kube-namespace ml-team \
+  --tui
+```
+
+Before allocating, sflow runs a **non-mutating RBAC pre-flight** (`kubectl auth can-i …`) for the pod/configmap/secret/log operations it needs and fails fast with an actionable message if a permission is missing. Bypass it with `SFLOW_SKIP_K8S_PREFLIGHT=1` if your cluster restricts `auth can-i`.
+
+**Prerequisites:**
+
+- Working `kubectl` access from the machine running sflow.
+- The target namespace already exists, with RBAC to create/delete pods, configmaps, and secrets and to read pod logs and nodes.
+- For GPUs: the NVIDIA gpu-operator installed (`device_plugin`, the default), or K8s 1.34+ with `nvidia-dra-driver-gpu` (`dra`, WIP).
+- Any PVCs referenced under `volumes:` already exist in the namespace. For quick debugging on a cluster that lacks them, `sflow run --kube-skip-pvc` drops PVC-backed volumes.
+
+:::tip Private registry images
+For images from a private registry (e.g. `nvcr.io`), create a Kubernetes pull secret in your namespace and reference it from the operator:
+
+```bash
+kubectl create secret docker-registry ngc-secret \
+  --docker-server=nvcr.io \
+  --docker-username='$oauthtoken' \
+  --docker-password=<your-ngc-api-key> \
+  -n ml-team
+```
+
+```yaml
+operators:
+  - name: gpu_worker
+    type: k8s
+    image: nvcr.io/nvidia/pytorch:24.05-py3
+    image_pull_secrets: [ngc-secret]
+```
+:::
+
+### 4. A Real GPU Workload
+
+For a full disaggregated LLM-serving deployment, grab the packaged sample:
+
+```bash
+sflow sample self_contained/kubernetes/dynamo_trtllm_disagg
+```
+
+It shows a 3-node, 8-GPU-per-node backend with `host_network`, `host_ipc` (cross-pod CUDA IPC over NVLink), RDMA, and a read-only model PVC — wired to a `k8s_mpi` operator for the prefill/decode servers and plain `k8s` operators for the NATS/etcd/frontend infra and the benchmark client. Browse all Kubernetes starters with:
+
+```bash
+sflow sample --list
 ```
 
