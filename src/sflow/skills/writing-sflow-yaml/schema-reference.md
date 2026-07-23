@@ -702,8 +702,10 @@ readiness probe hold until workflow completion; probe-less tasks release after c
 Dry-run rehearses these lifetimes across the DAG.
 
 **Kubernetes:** `gpus.count` is a per-task total split evenly across the assigned nodes (must
-be a multiple of the node count); the cluster/DRA assigns physical devices, so
-`CUDA_VISIBLE_DEVICES` is not set. `gpus.release_after: task_ready` is coerced to
+be a multiple of the node count); for an ordinary pod the device-plugin/DRA assigns physical
+devices, so `CUDA_VISIBLE_DEVICES` is left unset — but when co-located GPU tasks are merged
+into one pod (`merge_colocated_gpu_pods`, default `auto`) sflow sets a per-member
+`CUDA_VISIBLE_DEVICES` to pin each task's slice. `gpus.release_after: task_ready` is coerced to
 `task_completion` (a running pod's GPUs cannot be shared).
 
 ### Replicas

@@ -61,7 +61,7 @@ Each replica receives these environment variables:
 | Single-var sweep | `variables: [BATCH_SIZE]` with `domain: [16, 32]` | `t_16`, `t_32` | `SFLOW_REPLICA_INDEX` + `BATCH_SIZE` | same per-replica slicing |
 | Multi-var Cartesian | `variables: [LR, BATCH_SIZE]` | `t_0_001_32`, `t_0_001_64`, … (values joined with `_`) | `SFLOW_REPLICA_INDEX` + every swept variable | same per-replica slicing |
 
-Per-replica `CUDA_VISIBLE_DEVICES` slicing applies on the **local**, **slurm**, and **docker** backends — replica *N* gets the *N*-th contiguous GPU slice (e.g. `count: 2` → replica 0 sees `0,1`, replica 1 sees `2,3`). On **Kubernetes**, GPUs are assigned per pod and `CUDA_VISIBLE_DEVICES` is not set.
+Per-replica `CUDA_VISIBLE_DEVICES` slicing applies on the **local**, **slurm**, and **docker** backends — replica *N* gets the *N*-th contiguous GPU slice (e.g. `count: 2` → replica 0 sees `0,1`, replica 1 sees `2,3`). On **Kubernetes**, each replica is normally its own pod and the device plugin / DRA assigns its GPUs, so `CUDA_VISIBLE_DEVICES` is left unset — unless sflow merges co-located GPU tasks into one shared pod, where it sets a per-member `CUDA_VISIBLE_DEVICES` to pin each one's slice.
 
 ## Replica Policies
 
@@ -212,8 +212,10 @@ Each replica gets 2 GPUs:
 
 :::note Kubernetes
 Per-replica `CUDA_VISIBLE_DEVICES` slicing applies to the **local**, **slurm**, and
-**docker** backends. On **Kubernetes**, DRA or the device plugin assigns GPUs to each
-replica's pod and `CUDA_VISIBLE_DEVICES` is not set — see
+**docker** backends. On **Kubernetes**, each replica normally gets its own pod and DRA / the
+device plugin assigns its GPUs, so `CUDA_VISIBLE_DEVICES` is left unset — the exception is
+co-located GPU tasks that sflow merges into one shared pod, where it sets a per-member
+`CUDA_VISIBLE_DEVICES` to pin each task's slice. See
 [Resources: GPUs on Kubernetes](./resources.md#gpus-on-kubernetes).
 :::
 

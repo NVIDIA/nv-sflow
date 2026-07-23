@@ -16,6 +16,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `artifacts` | | dict / list | — | Named resources referenced by URI. |
 | `backends` | | dict / list | — | Compute backends (`local`, `slurm`, `docker`, `kubernetes`). |
 | `operators` | | dict / list | — | Task execution operators (`bash`, `srun`, `docker_run`, `ssh`, `python`, `k8s`, `k8s_mpi`). |
+| `storage` | | dict / list | — | Post-execution upload targets (S3, …) referenced by task `uploads` / `upload_all` (see [Storage](#storage)). |
 | `workflow` | Yes | object | — | Workflow definition containing name and tasks. |
 
 ## Variables
@@ -39,6 +40,21 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `description` | | string | `null` | Human-readable description. |
 | `content` | | string | `null` | Inline file content. Only valid with `file://` URI. |
 
+## Storage
+
+> YAML path: `storage.<name>` — post-execution upload targets referenced by task `uploads` /
+> `upload_all`. Credentials come from the provider's default chain (e.g. boto3 for S3) —
+> **never inline secrets in YAML**. See [Uploads](./uploads.md).
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `name` | Yes | string | — | Target name (referenced by `uploads.target` / `upload_all.target`). |
+| `type` | Yes | string | — | Target type. Currently `s3`. |
+
+**S3 target** (`type: s3`) adds `bucket` (Yes, string / expr) plus optional `region`,
+`prefix`, `endpoint_url` (S3-compatible stores such as MinIO / Ceph RGW), `storage_class`,
+and `addressing_style` (`auto` / `virtual` / `path`).
+
 ## Backends — Common Fields
 
 > YAML path: `backends.<name>`
@@ -48,6 +64,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `type` | Yes | string | — | `local`, `slurm`, `docker`, or `kubernetes`. |
 | `default` | | bool | `false` | Mark as the default backend (only one allowed). |
 | `gpus_per_node` | | int / expr | `null` | GPUs per node for sflow planning / packing. Does not add Slurm GPU allocation flags. |
+| `include_nodes` | | list[string] | `null` | Restrict allocation to these node hostnames (unioned with `--include-nodes`). Translated per backend: Slurm `--nodelist`, k8s `nodeAffinity` In, Docker host filter. |
+| `exclude_nodes` | | list[string] | `null` | Exclude these node hostnames (unioned with `--exclude-nodes`). |
 
 ## Backends — Local
 
@@ -65,11 +83,94 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 |-------|----------|------|---------|-------------|
 | `account` | Yes | string / expr | — | Slurm account. |
 | `partition` | Yes | string / expr | — | Slurm partition. |
-| `time` | Yes | string / expr | — | Time limit (e.g. `00:30:00`). |
+| `time` | Yes | string / int / expr | — | Time limit — `HH:MM:SS` string or integer minutes. |
 | `nodes` | Yes | int / expr | — | Number of nodes. |
 | `gpus_per_node` | Yes | int / expr | — | GPUs per node for planning. Set to `0` for CPU-only partitions; tasks that request `resources.gpus` against a zero-capacity backend will be rejected. |
 | `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`, `--gpus-per-node=8`). |
 | `job_name` | | string | `null` | Job name; defaults to workflow name. |
+
+## Backends — Kubernetes
+
+> Additional fields when `type: kubernetes`. The workload **image lives on the
+> operator** (`k8s` / `k8s_mpi`), not the backend. Cluster/context/namespace are
+> selected with `sflow run` flags (`--kubeconfig`, `--kube-context`,
+> `--kube-namespace`), never in YAML. See [Backends](./backends.md#kubernetes-backend).
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `namespace` | | string / expr | `null` | Namespace for all pods; **must already exist**. One namespace per backend. Overridable with `--kube-namespace`. |
+| `nodes` | | int / expr | `1` | Number of nodes to reserve. |
+| `scheduling` | | `device_plugin`\|`dra` | `device_plugin` | GPU request mode: NVIDIA device plugin (`nvidia.com/gpu`) or DRA (K8s 1.34+, WIP). |
+| `gpu_resource_name` | | string / expr | `nvidia.com/gpu` | Device-plugin resource name (e.g. MIG `nvidia.com/mig-1g.5gb`, or another vendor). Ignored under `dra`. |
+| `gpu_product_label_key` | | string / expr | `nvidia.com/gpu.product` | Node label carrying the GPU product string (NVLink-scope auto-detection). |
+| `host_network` | | bool | `true` | All pods use host networking (pod IP == node IP). Privileged; disable on CNI-routable clusters. |
+| `host_ipc` | | bool | `false` | Share node IPC namespace + hostPath `/dev/shm` for cross-pod CUDA IPC over NVLink. Privileged; opt-in. |
+| `merge_colocated_gpu_pods` | | bool \| `auto`\|`on`\|`disable` | `auto` | Merge co-located single-node GPU tasks into one pod for intra-node NVLink/cuda_ipc. |
+| `nvlink_domain` | | `auto`\|`node`\|`rack`\|`disable` | `auto` | Advisory NVLink-domain scope; set only to correct a wrong auto-detection. Not the MNNVL switch (see `compute_domain`). |
+| `rdma` | | `auto`\|`disable`\|`gke`\|`shared_device_plugin`\|`host_device` | `auto` | RDMA/IB provisioning for GPU pods; `auto` detects the provider, `disable` forces sockets. |
+| `node_selector` | | map | `null` | Node-selector labels for all pods. Merge/override with `--kube-node-selector`. |
+| `tolerations` | | list[map] | tolerate `nvidia.com/gpu` | Pod tolerations for placeholder + task pods. |
+| `image_pull_policy` | | string / expr | `null` | Default pod pull policy (`Always`/`IfNotPresent`/`Never`); else cluster default. |
+| `probe_pod_image` | | string / expr | `curlimages/curl:latest` | Image for the in-cluster TCP/HTTP probe pod (mirror for air-gapped). |
+| `cpu_per_gpu` | | int / expr | `null` | CPU request per GPU for GPU task pods (requests-only; opt-in). |
+| `cpu_request` | | int / expr | `null` | CPU request for pods without GPUs (requests-only; opt-in). |
+| `collect_max_file_size` | | int / string | `null` (10 MiB) | Per-file cap for collecting a task's node-local output back to the driver; `0` disables. |
+| `collect_grace_seconds` | | int / expr | `120` | Grace period (s) to copy node-local output before pod teardown. |
+| `gib_installer_namespace` | | string / expr | `kube-system` | Namespace of the GKE gIB (`nccl-rdma-installer`) DaemonSet. |
+| `extra_args` | | list[string] | `null` | Extra backend arguments (reserved). |
+| `dra` | | object | `null` | DRA GPU-allocation options (see below); used when `scheduling: dra`. |
+| `compute_domain` | | object | `null` | Multi-Node NVLink (IMEX ComputeDomain) options (see below). |
+| `volumes` | | list[object] | `null` | PVC / `emptyDir` volumes mounted into **every** task pod (see below). |
+| `reservation` | | object | `null` | Node-reservation tuning (see below). |
+
+`gpus_per_node` (see [Common Fields](#backends--common-fields)) is derived from node capacity when unset and validated against real GPU capacity at pre-flight; set `0` for CPU-only. PVCs referenced under `volumes:` must already exist in the namespace — `sflow run --kube-skip-pvc` drops PVC-backed volumes for debugging.
+
+### Kubernetes — `volumes[]`
+
+> YAML path: `backends.<name>.volumes[]`. Set **exactly one** of `claim` or `empty_dir`.
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `name` | Yes | string | — | Pod volume name (DNS-1123). |
+| `mount_path` | Yes | string / expr | — | Absolute mount path inside each task pod. |
+| `claim` | one of | string / expr | `null` | Existing PVC name. Mutually exclusive with `empty_dir`. |
+| `empty_dir` | one of | object | `null` | Ephemeral per-pod scratch volume. Mutually exclusive with `claim`. |
+| `sub_path` | | string / expr | `null` | Path within the volume to mount (`volumeMount.subPath`). |
+| `read_only` | | bool | PVC `true` / emptyDir `false` | Mount read-only. |
+| `ensure_writable` | | bool | `false` | Inject a root initContainer to `chmod` the subPath. Requires a `claim` and `read_only: false`. |
+
+`volumes[].empty_dir` fields: `medium` (`""`\|`Memory`, default `""` = node disk; `Memory` = tmpfs), `size_limit` (string / expr, e.g. `50Gi`).
+
+### Kubernetes — `dra`
+
+> YAML path: `backends.<name>.dra` (used when `scheduling: dra`; DRA is WIP).
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `gpu_device_class` | | string / expr | `gpu.nvidia.com` | DeviceClass GPUs are requested from. |
+| `device_selectors` | | list[string] | `null` | CEL expressions narrowing eligible devices (by product/memory). |
+| `rdma_device_class` | | string / expr | `null` | Opt-in GPU↔NIC co-allocation NIC DeviceClass. |
+| `rdma_match_attribute` | | string / expr | `resource.kubernetes.io/pcieRoot` | Attribute the GPU and NIC requests must share (PCIe root). |
+| `nvlink_domain_label_key` | | string | `null` | Node label key identifying the physical NVLink domain (multi-domain placement). |
+
+### Kubernetes — `compute_domain`
+
+> YAML path: `backends.<name>.compute_domain` — Multi-Node NVLink (IMEX). Independent of `scheduling`.
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `channel` | | string / expr | `null` | Join an existing IMEX channel template; `auto` = the sole existing domain; `off`/empty = no claim. |
+| `create` | | bool | `false` | Create a fresh ComputeDomain CR instead of joining. Privileged; needs `computedomains` RBAC. |
+
+### Kubernetes — `reservation`
+
+> YAML path: `backends.<name>.reservation` — tuning for the node reservation.
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `timeout` | | int / expr | `600` | Seconds to wait for every placeholder pod to be scheduled. |
+| `handoff` | | `auto`\|`create_before_destroy`\|`destroy_before_create` | `auto` | Placeholder→task handoff order (`auto` = destroy-before-create when a GPU ResourceQuota is present). |
+| `placeholder_image` | | string / expr | `bash:5` | Image for reservation placeholder pods (mirror for air-gapped). |
 
 ## Operators — Common Fields
 
@@ -171,9 +272,17 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `pass_envs` | | bool | `true` | Create + mount the env Secret. |
 | `shm_size` | | string | `null` | Cap for RAM-backed `/dev/shm` (e.g. `64Gi`); unset = node-RAM-bounded tmpfs. |
 | `tty` | | bool | `false` | Allocate a pseudo-TTY so `\r` progress bars stream live. |
-| `cpu` / `memory` | | int/string | `null` | Container resource **requests**. |
-| `cpu_limit` / `memory_limit` | | int/string | `null` | Optional hard caps (unset = requests-only). |
+| `cpu` | | int / string | `null` | Container CPU **request**. |
+| `memory` | | string | `null` | Container memory **request** (e.g. `16Gi`). |
+| `cpu_limit` | | int / string | `null` | Optional CPU hard cap (unset = requests-only). |
+| `memory_limit` | | string | `null` | Optional memory hard cap (unset = requests-only). |
 | `env` | | list[dict] | `null` | Raw k8s `EnvVar` entries (only way to use `valueFrom`). |
+| `image_pull_secrets` | | list[string] | `null` | Secret name(s) for pulling from a private registry (e.g. `nvcr.io`). |
+| `service_account` | | string | `null` | Pod service account (RBAC / cloud workload identity). |
+| `working_dir` | | string | `null` | Container working directory. |
+| `ports` | | list[dict] | `null` | Container `ports` entries. |
+| `tolerations` | | list[dict] | inherit backend | Pod tolerations (added to the backend's). |
+| `collect_max_file_size` | | int/string | inherit backend | Per-file cap for collecting node-local output back to the driver; `0` disables. |
 | `security_context` | | map | `null` | Container `securityContext` (deep-merged; caps union-merged). |
 | `device_class` / `device_selectors` | | string/list | inherit backend | DRA overrides (ignored under `device_plugin`). |
 | `container_overrides` / `pod_overrides` | | map | `null` | Raw escape hatches, deep-merged **last** (they win). |
@@ -191,11 +300,13 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `slots_per_worker` | int/string | per-node GPU count | Slots advertised per worker. |
 | `run_launcher_as_worker` | bool | `true` | Launcher pod also runs a rank. |
 | `launcher_creation_policy` | `AtStartup`\|`WaitForWorkersReady` | `WaitForWorkersReady` | When the launcher starts. |
-| `ssh_port` | int | `2222` | Port for the injected sshd. |
+| `ssh_port` | int / expr | `2222` | Port for the injected sshd. |
 | `mpi_implementation` | `OpenMPI`\|`Intel`\|`MPICH` | `OpenMPI` | Selects hostfile/env conventions. |
 | `ensure_sshd` | bool | `true` | Install `openssh-server` if the image lacks sshd. |
 | `forward_env_prefixes` | list[string] | `[]` | Extra env-namespace prefixes forwarded to remote ranks. |
 | `omp_num_threads` | int | `8` | Injected `OMP_NUM_THREADS` per rank; `null`/`0` keeps the image default. |
+| `worker_setup_timeout_seconds` | int / string | `900` | Per-node worker setup / readiness budget before the launcher starts. |
+| `launcher_discovery_timeout` | int / string | `600` | Max wait for the MPI operator to create the launcher pod (`route: operator`). |
 
 ## Workflow
 
@@ -207,6 +318,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `tasks` | Yes | list | — | List of task definitions (must be non-empty). |
 | `timeout` | | string / int | `null` | Workflow-level timeout (e.g. `1h`, `115m`). |
 | `variables` | | dict / list | `null` | Workflow-scoped variables (same format as root `variables`). |
+| `upload_all` | | object | `null` | Zip the whole workflow output dir and upload it to a `storage` target (see [Workflow Upload-All](#workflow-upload-all)). |
+| `monitor` | | object | `null` | Workflow-level hardware monitor (see [Monitor](#monitor)). |
 
 ## Tasks
 
@@ -219,6 +332,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `operator` | | string / object | `null` | Operator name, or inline operator override object. |
 | `backend` | | string / dict | `null` | Backend name, or inline backend override. |
 | `depends_on` | | list[string] | `null` | Names of tasks this task depends on. |
+| `required_by` | | list[string] | `null` | Reverse dependency: `A required_by: [B]` is folded into `B depends_on: [A]` at load (lets an optional fragment attach to a hub without editing it). |
 | `timeout` | | int / string | `null` | Task-level timeout. |
 | `variables` | | dict / list | `null` | Task-scoped variables. |
 | `resources` | | object | `null` | Node / GPU resource requirements. |
@@ -227,6 +341,10 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `probes` | | object | `null` | Readiness and failure probes. |
 | `outputs` | | list | `null` | Output parsing configuration (legacy MVP). |
 | `result` | | map / object | `null` | Consolidated result parsing (regex map, `patterns`, or `file`). Writes `result.json` + workflow `results.json`. |
+| `fail_fast` | | bool | `false` | Prepend `set -e` to the script (shell operators) so the task fails on the first failing command. |
+| `uploads` | | list | `null` | Per-task file uploads to a `storage` target, fired on `COMPLETED` (see [Task Uploads](#task-uploads)). |
+| `ports` | | list | `null` | Service ports the task exposes, feeding `${{ task.<name>.service }}` expressions (see [Task Ports](#task-ports)). |
+| `monitor` | | object | `null` | Per-task hardware monitor (see [Monitor](#monitor)). |
 
 ## Task Resources
 
@@ -237,7 +355,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `nodes.indices` | | list[int / expr] | `null` | Specific node indices (e.g. `[0]`). |
 | `nodes.count` | | int / expr | `null` | Number of nodes. |
 | `nodes.exclude` | | int / list[int] / expr | `null` | Node indices to remove from the placement pool before `indices`, `count`, or GPU packing. |
-| `nodes.release_after` | | string | inferred | When node reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. |
+| `nodes.release_after` | | string | `workflow_completion` | When node reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. sflow reserves nodes **only when this is set explicitly**; omitted, `nodes.indices`/`count` are non-exclusive placement constraints (see note below). |
 | `gpus.count` | If `gpus` is set | int / expr | — | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). |
 | `gpus.release_after` | | string | inferred | When GPU reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. |
 
@@ -325,6 +443,50 @@ Exactly one probe type must be set per probe:
 A simple `name: regex` map is shorthand for `patterns` with `type: auto`, `aggregate: last`, `required: false`, `source: log`.
 
 To publish a metric literally named `file`, use `patterns:`; a top-level `file:` key is reserved for JSON file-source results.
+
+## Task Uploads
+
+> YAML path: `workflow.tasks[].uploads[]` — copy files to a `storage` target when the task
+> reaches `COMPLETED`. See [Uploads](./uploads.md).
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `target` | Yes | string | — | Name of a `storage` target. |
+| `from` | Yes | string | — | Local file or glob to upload. |
+| `to` | | string | `null` | Remote key/prefix; **must end with `/`** when `from` is a glob. |
+| `on_error` | | `warn` \| `fail` | `warn` | What to do if the upload fails. |
+
+## Workflow Upload-All
+
+> YAML path: `workflow.upload_all` — zip the entire workflow output dir and upload it.
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `target` | Yes | string | — | Name of a `storage` target. |
+| `to` | | string | `${{ workflow.run_id }}.zip` | Remote key for the uploaded zip. |
+| `on_error` | | `warn` \| `fail` | `warn` | What to do if the upload fails. |
+
+## Task Ports
+
+> YAML path: `workflow.tasks[].ports[]` — service ports the task exposes, feeding
+> `${{ task.<name>.service }}` expressions.
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `port` | Yes | int / expr | — | Port the task serves on. |
+| `name` | | string | `null` | Optional port name. |
+
+## Monitor
+
+> YAML path: `workflow.monitor` or `workflow.tasks[].monitor` — hardware sampling during the
+> run. Monitor fields are **concrete ints only** (not `${{ }}`-resolved). See [Monitor](./monitor.md).
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `interval` | | int | `5000` | Sampling interval (ms) for built-in scopes without their own. |
+| `scopes` | | object | `null` (all) | Which scopes to collect — `cpu`, `gpu`, `memory`, `disk`, `network`, `custom`; omit ⇒ all built-ins active. |
+| `resources` | | object | `null` | Which hardware to target — `nodes` / `gpus` (like task resources) or `used_by_tasks: [names]`. |
+| `report` | | object | `null` (csv + svg) | Opt-in post-run report `format`: any of `csv`, `svg`, `png` (`png` needs the `sflow[monitor]` extra). |
 
 ## Expression Syntax
 

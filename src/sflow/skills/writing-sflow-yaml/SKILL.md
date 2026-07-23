@@ -53,7 +53,7 @@ any script body.
 1. **List the tasks** — one node per logical step or service (`etcd`, `frontend`,
    `prefill`, `decode`, `benchmark`, …).
 2. **Wire them** with `depends_on` (a task lists the upstreams it waits for). A dependent
-   starts once every upstream is **READY** (if that upstream has a readiness probe, Step 3)
+   starts once every upstream is **READY** (if that upstream has a readiness probe, Step 4)
    or **COMPLETED** (if it has none).
 3. **Identify the terminal task** — the one whose completion ends the run (usually the
    client/`benchmark`). Long-running servers never "complete"; sflow stops them when the
@@ -87,32 +87,73 @@ here and expensive later.
 
 - `script:` is a **list of lines joined into one bash script** (the `python` operator instead
   runs the lines as Python *source* via `python -c`).
-- **Multi-line helpers / configs → a `file://` artifact with `content:`.** Never embed Python
-  via heredocs or `python3 -c` — quoting breaks when YAML → shell → Python nests.
-- **Declare every path you touch as an artifact** (helper script, config, model dir, dataset).
-  An artifact *resolves* the path **and auto-mounts it at the same absolute path** inside
-  containers on every backend — so `${{ artifacts.X.path }}` (YAML) and `${X}` (script) agree,
-  and you never hand-write `container_mounts` / `-v` / k8s `volumes` for it.
+- **Don't inline files or hard-code paths.** Any file a script needs — launch/helper script,
+  config, model dir, dataset — belongs in an **artifact** (Step 3), referenced as
+  `${{ artifacts.X.path }}`. Never embed Python via heredocs or `python3 -c` — quoting breaks
+  when YAML → shell → Python nests.
 - **Reference values:** `${{ variables.X }}` in YAML (plan-time), `${X}` in scripts (runtime).
   For arithmetic/comparison, set the variable's `type` (`integer`, …) or it stays a string.
 
 ```yaml
-artifacts:
-  - name: LAUNCH
-    uri: file://launch.py            # relative → resolves against SFLOW_WORKSPACE_DIR
-    content: |
-      import sys; print("serving", sys.argv[1])
 workflow:
   tasks:
     - name: worker
       depends_on: [frontend]
       script:
-        - python3 ${{ artifacts.LAUNCH.path }} ${{ variables.MODEL }}
+        - python3 ${{ artifacts.LAUNCH.path }} ${{ variables.MODEL }}   # LAUNCH: see Step 3
 ```
 
-See examples.md Examples 1–2; artifact schemes in schema-reference.md.
+See examples.md Examples 1–2.
 
-## Step 3 — Gate the wiring with probes
+## Step 3 — Handle paths with artifacts (don't hand-manage paths)
+
+**An artifact is a named path/URI that sflow resolves, validates, and — inside containers —
+auto-mounts at the *same absolute path* on every backend.** This is the biggest lever for
+portability: declare a path once and you stop caring *where* it lives or *how* to mount it.
+`${{ artifacts.X.path }}` (YAML, plan-time) and `${X}` (script, runtime) always agree, sflow
+**auto-checks** the reference at preflight, and **auto-mounts** it — so you never hand-write
+`container_mounts`, `docker -v`, or k8s `volumes` for it (doing so is redundant — pitfall 13).
+
+Pick the scheme by what the artifact holds:
+
+- **Small code snippets & config files → a `file://` artifact with inline `content:`.** sflow
+  writes the content and mounts it into the container at the same path on *any* backend —
+  local, docker, slurm, kubernetes — so **you don't manage where it lives or how it gets into
+  the container**. Use it for launch/helper scripts, config JSON/YAML, engine specs, etc.
+  **Never** inline them via heredocs / `python3 -c` (YAML → shell → Python quoting breaks) or
+  bake them into the image.
+
+  ```yaml
+  artifacts:
+    - name: LAUNCH
+      uri: file://launch.py             # relative → resolves under SFLOW_WORKSPACE_DIR
+      content: |
+        import sys; print("serving", sys.argv[1])
+    - name: GEN_CONFIG
+      uri: file://gen_config.yaml
+      content: |
+        max_batch_size: 256
+        kv_cache_free_gpu_mem_fraction: 0.9
+  workflow:
+    tasks:
+      - name: worker
+        script:
+          - python3 ${{ artifacts.LAUNCH.path }} --config ${{ artifacts.GEN_CONFIG.path }}
+  ```
+
+- **Large / pre-existing data (models, datasets, checkpoints) → an `fs://` artifact** pointing
+  at storage the compute nodes already see. It still resolves + mounts the same path
+  everywhere, but *you* supply the bytes:
+  - **slurm** → keep it on **shared storage** (Lustre/GPFS/NFS) so the path exists on every node.
+  - **kubernetes** → back it with a **PVC**: declare the PVC under backend `volumes:` at a
+    `mount_path`, then point the `fs://` artifact at a path *under* that mount. An `fs://` path
+    no PVC covers and the node lacks makes the pod fail (pitfall 9).
+
+**Rule of thumb: if a task touches a path, declare it as an artifact** — small text → `file://`
+with `content:`, big data → `fs://` on shared storage / a PVC. Artifact schemes & `content:`
+rules → schema-reference.md.
+
+## Step 4 — Gate the wiring with probes
 
 `depends_on` alone only waits for a process to *start*. For services, wait for **ready**.
 
@@ -139,7 +180,7 @@ See examples.md Examples 1–2; artifact schemes in schema-reference.md.
 (On **kubernetes**, tcp/http probes run from an in-cluster probe pod automatically — the
 driver host usually can't route to the pod network.) See the probes doc.
 
-## Step 4 — Scale with replicas & sweeps
+## Step 5 — Scale with replicas & sweeps
 
 - **Replicate a task:** `replicas: { count: N, policy: parallel|sequential }`.
   `parallel` = all at once (downstream waits for all); `sequential` = one-by-one (sweeps).
@@ -150,7 +191,7 @@ driver host usually can't route to the pod network.) See the probes doc.
 
 See examples.md Example 5; the replicas doc.
 
-## Step 5 — Place on nodes & GPUs
+## Step 6 — Place on nodes & GPUs
 
 - **Pin placement** with `resources.nodes` (`indices` / `count` / `exclude`; negative indices
   count from the end). **Request GPUs** with `resources.gpus.count`.
@@ -164,7 +205,7 @@ See examples.md Example 5; the replicas doc.
 
 See the resources doc.
 
-## Step 6 — Backend-specific handling
+## Step 7 — Backend-specific handling
 
 Pick a backend and apply *its* rules. Start `local`, move to a cluster once the DAG is proven.
 
@@ -201,11 +242,14 @@ the naming). The `image` can live on the backend or the operator. Remote/multi-h
 - Cluster access is **CLI-only** (`--kubeconfig` / `--kube-context` / `--kube-namespace`) so
   recipes stay cluster-agnostic; `namespace` is a backend field (one namespace per backend).
 - `resources.gpus.count` is a per-task **total**, split evenly across the task's nodes → must
-  be a multiple of the node count. sflow does **not** set `CUDA_VISIBLE_DEVICES`.
+  be a multiple of the node count. For an ordinary pod sflow leaves `CUDA_VISIBLE_DEVICES`
+  unset (the device-plugin/DRA assigns the GPUs); when co-located GPU tasks are **merged into
+  one pod** (`merge_colocated_gpu_pods`, default `auto`) it sets a per-member
+  `CUDA_VISIBLE_DEVICES` to pin each task's slice.
 - A single-node task → one pod; a `resources.nodes` task → one pod per node (leader = index 0).
 - **Cluster data → a PVC**: declare it under backend `volumes:` at a `mount_path`, then point
   an `fs://` artifact at a path *under* that mount. Output dirs are ephemeral `emptyDir` — for
-  persistence use a PVC or `uploads:` (Step 7).
+  persistence use a PVC or `uploads:` (Step 8).
 - **Any MPI workload** (`mpirun`-launched, e.g. TRT-LLM `trtllm-llmapi-launch`) → `type: k8s_mpi`,
   and write the `mpirun -np N …` **explicitly** in the script: sflow reads it to set up the MPI
   world for **both single- and multi-node** and injects the keypair/hostfile/sshd/`-x` env
@@ -221,7 +265,7 @@ operators:
 
 See the backends doc; examples.md Examples 8 (k8s), 10 (k8s + PVC), 11 (slurm + Lustre).
 
-## Step 7 — Capture outputs
+## Step 8 — Capture outputs
 
 - **Metrics:** add `result:` (a regex map, `patterns:`, or a JSON `file:`) to parse a task's
   log/output into `${SFLOW_TASK_OUTPUT_DIR}/result.json` plus a workflow `results.json`.
@@ -235,7 +279,7 @@ See the backends doc; examples.md Examples 8 (k8s), 10 (k8s + PVC), 11 (slurm + 
 
 See examples.md Examples 12 (result parsing), 7 (monitor), 9 (uploads); the results / uploads / monitor docs.
 
-## Step 8 — Validate before running
+## Step 9 — Validate before running
 
 Run the one-command preflight before every real run (static schema + reference checks + GPU
 plan + `sflow --dry-run`, with a root-cause explanation on failure). **Exit 0 = ready.**
