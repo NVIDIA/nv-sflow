@@ -3,18 +3,63 @@ title: Artifacts
 sidebar_position: 4
 ---
 
-`artifacts` are “named URIs” you can reference from expressions and task scripts.
+`artifacts` are “named URIs” you can reference from expressions and task scripts. Every
+artifact is exposed three ways — `${{ artifacts.NAME.uri }}`, `${{ artifacts.NAME.path }}`,
+and the env var `${NAME}` injected into every task.
 
-Local schemes (`fs://` / `file://`) resolve to a local filesystem path, while
-`http(s)://` artifacts **are downloaded and cached** on the controller (SHA256-keyed).
-They are mainly used to:
+An artifact is more than a stored path: it is a *declaration that a path matters*, so sflow
+acts on it — it resolves and validates the path, downloads and caches `http(s)://` files,
+writes out `file://` inline `content`, and — the key part — **makes the path available to the
+task wherever the task actually runs, including inside a container and on a remote host.**
+That last property is why you should prefer an artifact over a bare path string (next section).
 
-- Normalize local paths (`fs://` / `file://`) so you can reference them consistently
-- Download and cache remote files (`http(s)://`) so every task sees the same local copy
-- Inject a convenient env var `${NAME}` into every task (the artifact's resolved `path`)
-- Make paths available inside containers: bind-mounted when running with containers
-  on **slurm** / **docker**; on **kubernetes**, `file://` inline content is injected
-  via a ConfigMap and `fs://` paths are treated as remote (see below)
+## Prefer an artifact over a raw path in a variable
+
+You can put a path in a variable and use `${MY_PATH}` in a script — but a variable is just a
+string, and sflow does nothing with it: it is not resolved, not validated, not shipped
+anywhere, and **not mounted into a container**. Declare the path as an artifact instead and you
+get, on every backend:
+
+- **Auto-mount into containers.** When a task runs in a container, sflow makes the artifact's
+  path available **inside** the container at the **same absolute path** it has outside — so
+  `${{ artifacts.X.path }}` and `${X}` point at the same real file whether or not a container
+  is involved, and you never hand-write `container_mounts`, `docker -v`, or k8s `volumes`. A
+  raw variable path gets none of this: inside the container it points at a path that usually
+  does not exist.
+- **Resolution & early validation** — relative paths resolve against the workspace, and a
+  missing path fails before you allocate a backend (see [Path validation](#path-validation)).
+- **Fetching & materialization** — `http(s)://` files are downloaded and cached; `file://`
+  inline `content` is written to disk for you.
+
+**Rule of thumb: if a task reads or writes a path, declare it as an artifact** and reference
+`${{ artifacts.X.path }}` / `${X}` — don't pass the path as a plain variable string.
+
+## Artifacts and where the task actually runs
+
+The machine you run `sflow run` on (the controller) and the machine a task runs on are often
+**not the same**: a Slurm compute node, a Docker container, or — most starkly — a **remote
+Kubernetes pod on another host**. A filesystem path that exists on the controller means nothing
+over there, so *how an artifact reaches the task* is the whole point. One general rule holds on
+every backend:
+
+> A **`file://` artifact with inline `content` ships itself** to wherever the task runs; an
+> **`fs://` artifact names storage the execution host must already be able to see.**
+
+- **`file://` + `content` — portable, self-shipping.** sflow materializes the content and
+  places it at the artifact's path wherever the task runs. Because sflow moves the bytes, it
+  works identically on local, Docker, Slurm, and Kubernetes with no mount setup from you — the
+  right choice for small text you author in the recipe (launch scripts, configs, engine specs).
+- **`fs://` — you provide the storage.** sflow resolves and mounts the path, but the bytes must
+  exist where the task runs. On a single host that is automatic; across hosts you make the path
+  reachable — e.g. **shared storage** (Lustre/GPFS/NFS) on multi-node Slurm. On **Kubernetes**
+  the pod is remote and cannot see the controller's disk, so an `fs://` path is treated as
+  **remote**: it must exist **inside the image** or be mounted from a **PVC** (declare the PVC
+  under the backend's `volumes:` at a `mount_path`, then point the `fs://` artifact at a path
+  under it). See [Path validation](#path-validation) for how each case is checked.
+
+So: inline small text as `file://` `content` (it travels with the task), and reserve `fs://`
+for large, pre-existing data (models, datasets, checkpoints) on storage the execution host can
+see.
 
 ## Minimal example
 
