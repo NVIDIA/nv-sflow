@@ -840,14 +840,16 @@ class TaskConfig(StrictBaseModel):
             raise ValueError("Script list cannot be empty")
         return v
 
-    # Opt in to fail-fast for the task's shell script. When true, sflow prepends
-    # ``set -e`` so a failed command (a failed ``pip install``, a benchmark that
-    # errored, a server that never launched) exits the task non-zero instead of being
-    # masked by a later successful command (classically a trailing ``echo "done"`` ->
-    # exit 0). Applies to shell operators only (never ``python``, whose script is
-    # Python source). Default False keeps the shell default (only the LAST command's
-    # exit code counts), so existing recipes are unchanged; opt in with ``fail_fast: true``.
-    fail_fast: bool = False
+    # Fail-fast for the task's shell script. When true, sflow prepends ``set -e`` so a
+    # failed command (a failed ``pip install``, a benchmark that errored, a server that
+    # never launched) exits the task non-zero instead of being masked by a later
+    # successful command (classically a trailing ``echo "done"`` -> exit 0). Applies to
+    # shell operators only (never ``python``, whose script is Python source).
+    # ``None`` (unset, the default) takes the BACKEND's default: **true on Kubernetes**
+    # (a failed command in a pod should fail the task) and **false everywhere else**
+    # (Slurm/local/docker unchanged). Set explicitly (``fail_fast: true``/``false``) to
+    # override the backend default per task.
+    fail_fast: Optional[bool] = None
 
     probes: Optional[ProbesConfig] = None
     outputs: Optional[List[OutputConfig]] = None

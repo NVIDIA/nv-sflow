@@ -1,0 +1,123 @@
+version: "0.1"
+
+# Lightweight multi-node MPI SMOKE test for the `k8s_mpi` operator (pods route).
+#
+# It proves sflow's MPI bootstrap + role barrier -- worker brings up sshd and idles,
+# leader waits for every worker's sshd, all injected INTO the transparent `mpirun` shim
+# -- launches a real cross-node MPI world REGARDLESS of how the recipe writes its launch
+# line. Two tasks exercise the two "strange" shapes a user recipe can have:
+#
+#   1. mpi_compound_line -- the launch is GLUED onto an if-block's closing `fi;`, prefixed
+#      by an (empty) ${NSYS_CMD}:  `fi; ${NSYS_CMD} mpirun ...` on ONE line. A source-line
+#      launch gate cannot touch this (it can't insert into the middle of an if/fi); the
+#      barrier lives in the shim, so it still engages.
+#   2. mpi_multiline    -- the if/fi is fully closed on its own lines, then `${NSYS_CMD}
+#      mpirun ...` starts a fresh line.
+#
+# It uses the SAME rank density as a real GB serving pod -- GPUS_PER_NODE ranks PER NODE
+# (multi-rank-per-pod), NUM_NODES nodes, so `-np (NUM_NODES*GPUS_PER_NODE)` spans them all.
+# That also exercises `cpu_bind` (default `core`, injected only when slots>1): a regressed
+# binding that mpirun rejects would fail the task too. No model / no benchmark -> the work
+# is a trivial `mpirun ... hostname`, so it stays cheap while covering the real topology.
+#
+# Each task ASSERTS it saw exactly GPUS_PER_NODE ranks on each of the NUM_NODES nodes, so a
+# regressed barrier or ssh (a leader launching before the workers' sshd -> "Connection
+# refused") makes the task exit non-zero and the workflow FAIL -- a deterministic guard.
+#
+# Route is forced to `pods` (what this fix targets, and what a cluster without the Kubeflow
+# MPI Operator uses).
+
+variables:
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    value: default
+  SERVER_IMAGE:
+    description: "MPI-capable image (must ship mpirun + ssh; sflow installs sshd if missing)"
+    value: nvcr.io/nvidia/tensorrt-llm/release:latest
+  GPUS_PER_NODE:
+    description: "GPUs per reserved node == ranks per node (multi-rank-per-pod, like a real server)"
+    type: integer
+    value: 4
+  NUM_NODES:
+    description: "Number of nodes to reserve (>= 2 for a cross-node MPI world)"
+    type: integer
+    value: 2
+
+backends:
+  - name: cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # pod IP == node IP, so sflow's cross-node hostfile (built from the assigned node IPs)
+    # and the SSH transport work.
+    host_network: true
+    host_ipc: true
+    scheduling: device_plugin
+    reservation:
+      timeout: 1200
+
+operators:
+  - name: mpi
+    type: k8s_mpi
+    image: ${{ variables.SERVER_IMAGE }}
+    run_as_root: true
+    shm_size: 8Gi
+    mpi:
+      # Force the pods route (the route this barrier fix targets). One rank per GPU, so
+      # GPUS_PER_NODE ranks share each pod -- the real multi-rank-per-pod density.
+      route: pods
+      slots_per_worker: ${{ variables.GPUS_PER_NODE }}
+      ensure_sshd: true
+      ssh_port: 2222
+
+workflow:
+  name: k8s_mpi_smoke
+  tasks:
+    # (1) STRANGE compound single-line launch: `fi; ${NSYS_CMD} mpirun ...`.
+    - name: mpi_compound_line
+      operator: mpi
+      resources:
+        nodes:
+          count: ${{ variables.NUM_NODES }}
+        gpus:
+          count: ${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}   # GPUS_PER_NODE per node
+      script:
+        - set -euo pipefail
+        - 'NSYS_CMD=""; if [ "0" = "1" ]; then'
+        - '  NSYS_CMD="nsys profile"'
+        - >-
+          fi; ${NSYS_CMD} mpirun -np ${{ variables.NUM_NODES * variables.GPUS_PER_NODE }} --allow-run-as-root
+          bash -c 'echo "[SFLOW_RANK] r=${OMPI_COMM_WORLD_RANK} n=${OMPI_COMM_WORLD_SIZE} host=$(hostname)"'
+          2>&1 | tee /tmp/ranks.txt
+        - 'echo "[smoke] ranks=$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt) distinct_hosts=$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)"'
+        - test "$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt)" -eq "${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}"
+        - test "$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)" -eq "${{ variables.NUM_NODES }}"
+        - echo "[smoke] mpi_compound_line OK: cross-node MPI world spanned all nodes"
+
+    # (2) plain MULTILINE launch: if/fi fully closed, then mpirun starts a fresh line.
+    - name: mpi_multiline
+      operator: mpi
+      # sequential so both shapes reuse the same reserved nodes (keeps it lightweight).
+      depends_on: [mpi_compound_line]
+      resources:
+        nodes:
+          count: ${{ variables.NUM_NODES }}
+        gpus:
+          count: ${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}
+      script:
+        - set -euo pipefail
+        - |
+          NSYS_CMD=""
+          if [ "0" = "1" ]; then
+            NSYS_CMD="nsys profile"
+          fi
+        - >-
+          ${NSYS_CMD} mpirun -np ${{ variables.NUM_NODES * variables.GPUS_PER_NODE }} --allow-run-as-root
+          bash -c 'echo "[SFLOW_RANK] r=${OMPI_COMM_WORLD_RANK} n=${OMPI_COMM_WORLD_SIZE} host=$(hostname)"'
+          2>&1 | tee /tmp/ranks.txt
+        - 'echo "[smoke] ranks=$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt) distinct_hosts=$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)"'
+        - test "$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt)" -eq "${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}"
+        - test "$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)" -eq "${{ variables.NUM_NODES }}"
+        - echo "[smoke] mpi_multiline OK: cross-node MPI world spanned all nodes"

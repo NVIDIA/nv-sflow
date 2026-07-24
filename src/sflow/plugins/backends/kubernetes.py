@@ -65,6 +65,20 @@ _RESERVE_POLL_INTERVAL = 2
 # Overridable at runtime via $SFLOW_K8S_WAIT_HEARTBEAT_SECS.
 _RESERVE_HEARTBEAT_INTERVAL = 30
 
+# Shell for the reservation-stage node-topology probe (log-only): the pod's cpuset
+# size + the CPU-bearing NUMA nodes (Grace/GB boxes also expose CPU-less GPU-HBM NUMA
+# nodes, which the grep drops) + each GPU's CPU/NUMA affinity (nvidia-smi topo). The
+# trailing ``; true`` forces exit 0 so a node missing numactl/nvidia-smi still logs
+# what it has (only a failed ``kubectl exec`` -- pod not ready -- yields non-zero).
+_NODE_TOPOLOGY_PROBE_SH = (
+    'echo "nproc=$(nproc)"; '
+    'echo "cpuset=$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null)"; '
+    "command -v numactl >/dev/null 2>&1 && "
+    "numactl -H 2>/dev/null | grep -E 'available:|node [0-9]+ cpus: [0-9]'; "
+    "command -v nvidia-smi >/dev/null 2>&1 && "
+    "{ echo '--- nvidia-smi topo -m ---'; nvidia-smi topo -m 2>/dev/null; } ; true"
+)
+
 # How GPUs are requested for both placeholder and task pods. Default: device_plugin.
 #   device_plugin -> nvidia.com/gpu device-plugin limit (default; widely available)
 #   dra           -> resource.k8s.io ResourceClaimTemplate (nvidia-dra-driver-gpu,
@@ -552,6 +566,10 @@ class KubernetesBackendConfig(BackendConfig):
 class KubernetesBackend(Backend):
     """Kubernetes backend: reserve+discover nodes, then run each task as pinned pod(s)."""
 
+    # A failed command in a pod should fail the task by default; an explicit
+    # ``fail_fast`` in the task YAML still overrides this (see Backend.default_fail_fast).
+    default_fail_fast: bool = True
+
     def __init__(self, config: KubernetesBackendConfig):
         super().__init__(name=config.name)
         self.config = config
@@ -589,6 +607,9 @@ class KubernetesBackend(Backend):
         # Populated in allocate(): maps a real k8s node name -> the placeholder
         # pod holding it (used for the create-before-destroy GPU handoff).
         self._node_to_resv_pod: dict[str, str] = {}
+        # Formatted per-node CPU/NUMA/GPU topology captured at reservation (log-only +
+        # surfaced in sflow_summary.log). None until the reservation-stage probe runs.
+        self._node_topology_report: str | None = None
         # The channel ResourceClaimTemplate name GPU task pods claim (Multi-Node
         # NVLink / IMEX). Set from a named compute_domain.channel (__init__),
         # a created domain (compute_domain.create, allocate()), or `auto`
@@ -2475,6 +2496,10 @@ class KubernetesBackend(Backend):
             # provider chain -- cross-node NCCL/gloo still ride sockets when IB is off.
             if self._rdma_mode in ("auto", "disable"):
                 await self._detect_network_env(pod_names)
+            # Log-only CPU/NUMA/GPU topology of the reserved GPU nodes (diagnostics for
+            # rank binding); best-effort, never affects the allocation.
+            if holds_gpus:
+                await self._probe_node_topology(pod_names)
             return allocation
         except BaseException:
             # BaseException (not just Exception) so a cancel (Ctrl+C) mid-allocation
@@ -2482,6 +2507,50 @@ class KubernetesBackend(Backend):
             await self._release_alloc(alloc_id)
             self._pending_alloc_id = None
             raise
+
+    async def _probe_node_topology(self, pod_names: list[str]) -> None:
+        """Best-effort, log-only: dump each reserved node's CPU / NUMA / GPU topology.
+
+        Purely informational -- surfaces the pod's cpuset size, which NUMA nodes carry
+        CPUs, and each GPU's CPU/NUMA affinity, so it's visible whether CPU<->NUMA<->GPU
+        binding is sane (e.g. an 8-CPU cpuset confined to one NUMA node while the GPUs
+        span two). NEVER affects scheduling, reservation, or rank binding; any failure
+        (no numactl/nvidia-smi, exec denied, pod still starting) is skipped. Probes all
+        reserved nodes concurrently since they can differ.
+        """
+        if not pod_names:
+            return
+        pod_to_node = {p: n for n, p in self._node_to_resv_pod.items()}
+        reports: dict[str, str] = {}
+
+        async def _probe(pod: str) -> None:
+            try:
+                rc, out, _ = await self._kubectl(
+                    ["exec", pod, *self._ns_args(), "--", "sh", "-c",
+                     _NODE_TOPOLOGY_PROBE_SH]
+                )
+            except Exception:
+                return  # best-effort: never let a topology dump break allocation
+            if rc == 0 and out.strip():
+                node = pod_to_node.get(pod, pod)
+                reports[node] = out.strip()
+                _logger.info(
+                    "Kubernetes backend '%s': reserved node '%s' CPU/NUMA/GPU "
+                    "topology:\n%s",
+                    self.name, node, out.strip(),
+                )
+
+        await asyncio.gather(*(_probe(p) for p in pod_names), return_exceptions=True)
+        if reports:
+            # Stored for the summary file's Node Topology section (read at render time).
+            self._node_topology_report = "\n\n".join(
+                f"{node}:\n{reports[node]}" for node in sorted(reports)
+            )
+
+    @property
+    def node_topology_report(self) -> str | None:
+        """Per-node CPU/NUMA/GPU topology from the reservation probe (or None)."""
+        return self._node_topology_report
 
     async def _detect_network_env(self, pod_names: list[str]) -> None:
         """Best-effort: detect RDMA + build the IB/NCCL/UCX/NIXL plan.

@@ -110,6 +110,14 @@ class Probe(ABC):
         self.last_attempt = None
         self._attempt_detail = ""
 
+    def force_due(self) -> None:
+        """Make the next :meth:`probe` run a check immediately, bypassing the
+        interval gate (but NOT the overall timeout deadline). Used for a final
+        readiness scan when a service's process exits, to close the race between
+        process-exit and the interval-gated probe re-scanning the now-complete log.
+        """
+        self._next_check_at = 0.0
+
     @property
     def effective_check_timeout(self) -> int:
         """Per-attempt timeout (seconds) for a single check.

@@ -89,6 +89,10 @@ class SflowSummaryWriter:
         self._timeline: list[_TimelineEvent] = []
         self._failure_hints: list[str] = []
         self._network_warnings: list[str] = []
+        # Backends (name -> backend), read at render time for their optional
+        # ``node_topology_report`` (populated after allocation, so the final render
+        # picks it up). Duck-typed: non-K8s backends simply have no report.
+        self._backends: dict[str, Any] = {}
         self._uploads: list[UploadResult] = []
         self._task_started: dict[str, float] = {}
         self._task_ready: dict[str, float] = {}
@@ -107,8 +111,10 @@ class SflowSummaryWriter:
         runtime_info_text: str,
         command_log_paths: dict[str, Path | str],
         command_text: str = "",
+        backends: dict[str, Any] | None = None,
     ) -> None:
         self._workflow = workflow
+        self._backends = dict(backends or {})
         self._output_dir = Path(output_dir)
         self._runtime_info_text = runtime_info_text
         # The invocation that produced this run (e.g. "sflow run -f cfg.yaml --set X=1"),
@@ -385,6 +391,7 @@ class SflowSummaryWriter:
         lines.extend(self._gpu_usage_chart_lines(tasks))
         lines.extend(["", "Node Usage Chart", "----------------"])
         lines.extend(self._node_usage_chart_lines(tasks))
+        lines.extend(self._node_topology_lines())
 
         lines.extend(["", "Command Logs", "------------"])
         existing_command_logs = {
@@ -795,6 +802,23 @@ class SflowSummaryWriter:
         if not self._network_warnings:
             return []
         return ["", "Network Warnings", "----------------", *self._network_warnings]
+
+    def _node_topology_lines(self) -> list[str]:
+        """Render the 'Node Topology' section from each backend's reservation-stage
+        CPU/NUMA/GPU probe, or [] when no backend captured one. Read at render time so
+        the final summary picks up reports populated during allocation."""
+        blocks = [
+            (name, getattr(b, "node_topology_report", None))
+            for name, b in self._backends.items()
+        ]
+        blocks = [(name, rep) for name, rep in blocks if rep]
+        if not blocks:
+            return []
+        lines = ["", "Node Topology", "-------------"]
+        for name, rep in blocks:
+            lines.append(f"[backend {name}]")
+            lines.extend(rep.splitlines())
+        return lines
 
     def _upload_section_lines(self) -> list[str]:
         """Render the dedicated 'Uploads' section, or [] when no uploads ran."""

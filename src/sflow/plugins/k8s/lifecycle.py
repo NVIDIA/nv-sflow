@@ -267,6 +267,8 @@ async def pod_exit_code(
 
 async def gather_pods_fail_fast(
     watchers: Sequence[Awaitable[tuple[int, str]]],
+    *,
+    mpi_world_group: bool = False,
 ) -> list[tuple[int, str] | None]:
     """Await one ``(exit_code, phase)`` watcher per pod, failing fast on any death.
 
@@ -280,8 +282,16 @@ async def gather_pods_fail_fast(
     healthy long-lived service -- whose watchers never return -- blocks until the
     caller is cancelled at workflow teardown.
 
+    ``mpi_world_group`` (multi-node MPI): the pods are one MPI ``COMM_WORLD`` -- a
+    healthy run keeps every rank pod alive, so the FIRST pod to go terminal (success
+    OR failure, ANY rank -- leader or worker) means the group is finished/broken.
+    Resolve at once and cancel the survivors instead of blocking on them (idle worker
+    pods whose watchers never return, or a hung leader). ``task_exit_code`` is
+    leader-index-0 authoritative, so a masked-0 exit (``Succeeded``) still surfaces --
+    via the orchestrator's exited-before-ready check -- rather than hanging the run.
+
     Returns a per-pod ``(exit_code, phase)`` list aligned to ``watchers``; slots for
-    pods still running when a peer failed (hence cancelled) are ``None``.
+    pods still running when a peer went terminal (hence cancelled) are ``None``.
     """
     tasks = [asyncio.ensure_future(w) for w in watchers]
     results: list[tuple[int, str] | None] = [None] * len(tasks)
@@ -305,7 +315,10 @@ async def gather_pods_fail_fast(
                 results[idx] = (rc, phase)
                 if rc != 0 or phase == "Failed":
                     failed = True
-            if failed:
+            # Break on any pod failure (existing), or -- for an MPI world group -- the
+            # instant ANY pod goes terminal (success or fail), since one rank ending
+            # breaks the group; cancel the survivors rather than block on them.
+            if failed or (mpi_world_group and any(r is not None for r in results)):
                 break
         return results
     finally:
@@ -562,6 +575,7 @@ async def finalize_complete_log(
     phases: Sequence[str],
     global_args: Sequence[str],
     ns_args: Sequence[str],
+    force: bool = False,
 ) -> None:
     """Rebuild ``dest_path`` as ``[preserved prefix] + [each pod's COMPLETE log]``.
 
@@ -577,9 +591,14 @@ async def finalize_complete_log(
     Only runs when EVERY pod reached a real terminal phase (so each is
     re-fetchable); if any pod is gone/unknown, or any re-fetch fails, the
     live-streamed content is kept as-is (never wiped for a partial rebuild).
+    ``force`` re-fetches irrespective of phase (the cancel/teardown path can't know
+    the phases, and a fast-failing pod's log must be saved before the pod is
+    deleted); a re-fetch that fails on a gone pod still keeps the live content.
     Best-effort: never raises.
     """
-    if not pod_refs or not all(p in ("Succeeded", "Failed") for p in phases):
+    if not pod_refs:
+        return
+    if not force and not all(p in ("Succeeded", "Failed") for p in phases):
         return
     tmp_files = [f"{dest_path}.complete.{i}" for i in range(len(pod_refs))]
     final = dest_path + ".final"
@@ -658,6 +677,7 @@ async def finalize_merged_complete_log(
     phase: str,
     global_args: Sequence[str],
     ns_args: Sequence[str],
+    force: bool = False,
 ) -> None:
     """Rebuild every merged member's ``<task>.log`` from the pod's COMPLETE log.
 
@@ -674,9 +694,10 @@ async def finalize_merged_complete_log(
 
     Only runs when the pod reached a real terminal phase (so it is re-fetchable); if
     the re-fetch or the re-demux fails, the live-streamed content is kept as-is (never
-    wiped for a partial rebuild). Best-effort: never raises.
+    wiped for a partial rebuild). ``force`` re-fetches irrespective of phase (the
+    cancel/teardown path can't know it). Best-effort: never raises.
     """
-    if phase not in ("Succeeded", "Failed"):
+    if not force and phase not in ("Succeeded", "Failed"):
         return
     dump = f"{default_path}.merged.dump"
     tmp_tag_paths = {name: f"{p}.merged.final" for name, p in tag_paths.items()}

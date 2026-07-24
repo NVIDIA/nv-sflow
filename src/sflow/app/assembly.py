@@ -326,6 +326,19 @@ def _merge_image_key(task: Any) -> tuple[str, ...]:
     return ()
 
 
+def _resolve_fail_fast(configured: "bool | None", backend: Any) -> bool:
+    """Resolve a task's shell fail-fast (``set -e`` prelude) default.
+
+    An explicit ``fail_fast`` in the task YAML always wins. When omitted (``None``),
+    fall back to the backend's ``default_fail_fast`` -- True on Kubernetes (a failed
+    command in a pod should fail the task), False elsewhere so Slurm/local/docker are
+    unchanged. ``backend`` may be ``None`` (a task with no placement) -> False.
+    """
+    if configured is not None:
+        return bool(configured)
+    return bool(getattr(backend, "default_fail_fast", False))
+
+
 def _plan_merge_groups(
     task_graph: TaskGraph, resource_placements: "Mapping[str, Any]"
 ) -> None:
@@ -346,9 +359,11 @@ def _plan_merge_groups(
     * the leader's operator is handed the ordered member Task objects + union GPU
       count via ``apply_merge_group`` (duck-typed; only the k8s operator uses it).
 
-    Merged members may not depend on one another (they run concurrently in one
-    pod), so an intra-group completion dependency raises ``ValueError``. Multi-node
-    GPU tasks and CPU-only tasks are never merged.
+    A member that DIRECTLY depends on another member is honored by gating (its
+    in-pod subshell blocks on ``merge_gate_after`` until the dependency reaches
+    COMPLETED/READY). A member reached only through a non-member intermediary is
+    unmergeable (deadlock) and raises ``ValueError``. Multi-node GPU tasks and
+    CPU-only tasks are never merged.
     """
     # Key: (backend, node, image). Node keeps co-located members together; image
     # ensures we only merge tasks that share one container (a merged pod is one
@@ -381,14 +396,20 @@ def _plan_merge_groups(
             continue
         members = sorted(members)
         member_set = set(members)
-        # Concurrent-only: a member that depends on another member -- directly
-        # OR transitively through non-member tasks -- can't be honored inside one
-        # concurrent pod, since the dependency implies a start ordering the merged
-        # pod can't provide. Walk the whole dependency chain (not just direct
-        # edges) so an indirect a->x->b dependency is caught at plan time rather
-        # than deadlocking at run time (the DAG has no b->a edge to detect).
+        # Intra-group dependency handling. A member that depends on another member
+        # of the same pod is honored by GATING: its in-pod subshell blocks until the
+        # dependency is met (COMPLETED/READY) -- see merged_launcher_lines. Only
+        # DIRECT member->member edges are gatable and get recorded on merge_gate_after.
+        #
+        # A member reached only THROUGH a non-member (external) task is still
+        # rejected: that external task depends on a member, but the member cannot run
+        # until the merged pod starts, and the pod's leader (transitively) waits on
+        # the external task -- an unbreakable cycle. Reject at plan time rather than
+        # deadlock at run time.
         for m in members:
-            stack = list(task_graph.dag.get_dependencies(m))
+            deps = task_graph.dag.get_dependencies(m)
+            gate = sorted(d for d in deps if d in member_set)
+            stack = [d for d in deps if d not in member_set]
             seen: set[str] = set()
             while stack:
                 dep = stack.pop()
@@ -397,14 +418,15 @@ def _plan_merge_groups(
                 seen.add(dep)
                 if dep in member_set:
                     raise ValueError(
-                        f"Cannot merge co-located tasks {members} on node "
-                        f"'{node}': '{m}' depends on '{dep}' (directly or "
-                        "transitively) in the same merge group, but merged tasks "
-                        "run concurrently in one pod. Remove the intra-group "
-                        "dependency or disable merge_colocated_gpu_pods on the "
-                        "backend."
+                        f"Cannot merge co-located tasks {members} on node '{node}': "
+                        f"'{m}' depends on member '{dep}' transitively through a "
+                        "non-member task. That non-member can't run until '"
+                        f"{dep}' does, but '{dep}' only runs once the merged pod "
+                        "starts, so the pod would deadlock. Remove the intervening "
+                        "dependency or disable merge_colocated_gpu_pods on the backend."
                     )
                 stack.extend(task_graph.dag.get_dependencies(dep))
+            task_graph.get_task(m).merge_gate_after = gate
         leader_name = members[0]
         group_id = f"{backend_name}:{node}"
         # Every member's container sees ALL union GPUs, but with its OWN packed
@@ -1236,9 +1258,10 @@ def build_task_graph(
         # Authoritative base->replica link (config task name) for plan-time consumers
         # (e.g. the monitor planner) so they never re-derive it from the name string.
         task.base_name = t_conf.name
-        # Per-task fail-fast opt-out (default True); `Task.runnable_script` prepends
+        # Per-task fail-fast: an explicit YAML value wins; when unset, use the backend's
+        # default (True on Kubernetes, False elsewhere). `Task.runnable_script` prepends
         # `set -e` for shell operators at execution time (script itself is untouched).
-        task.fail_fast = bool(t_conf.fail_fast)
+        task.fail_fast = _resolve_fail_fast(t_conf.fail_fast, backend)
         task.sweep_variables = replica_sweep_vars.get(node_name, [])
 
         # Build SFLOW_TASK_ASSIGNED_NODE_NAMES and SFLOW_TASK_ASSIGNED_NODE_IPS env vars

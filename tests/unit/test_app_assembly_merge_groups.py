@@ -255,16 +255,64 @@ def test_merge_when_container_images_match():
     assert tg.get_task("prefill").merge_leader == "decode"
 
 
-def test_intra_group_completion_dependency_raises():
+def test_direct_intra_group_dependency_gates_instead_of_raising():
     tg = _graph(["a", "b"])
-    tg.dag.add_edge("a", "b")  # b depends on a; both would be in one merge group
+    tg.dag.add_edge("a", "b")  # b depends on a; both merged on one node
     be = _FakeBackend("k8s")
     placements = {
         "a": _FakePlacement(be, ["node-a"], 2),
         "b": _FakePlacement(be, ["node-a"], 2),
     }
-    with pytest.raises(ValueError, match="merge"):
-        _plan_merge_groups(tg, placements)
+    _plan_merge_groups(tg, placements)  # no raise
+    # a is the leader (sorted first); both are still merged.
+    assert tg.get_task("a").is_merge_leader is True
+    assert tg.get_task("b").merge_leader == "a"
+    # b gates on a; a gates on nobody.
+    assert tg.get_task("b").merge_gate_after == ["a"]
+    assert tg.get_task("a").merge_gate_after == []
+
+
+def test_non_dependent_members_have_empty_gate():
+    tg = _graph(["decode", "prefill"])  # no edge between them
+    be = _FakeBackend("k8s")
+    placements = {
+        "decode": _FakePlacement(be, ["node-a"], 4),
+        "prefill": _FakePlacement(be, ["node-a"], 2),
+    }
+    _plan_merge_groups(tg, placements)
+    assert tg.get_task("decode").merge_gate_after == []
+    assert tg.get_task("prefill").merge_gate_after == []
+
+
+def test_multi_and_chained_intra_group_deps_gate_directly():
+    # c depends on a AND b; b depends on a. All three merged on one node.
+    tg = _graph(["a", "b", "c"])
+    tg.dag.add_edge("a", "b")  # b depends on a
+    tg.dag.add_edge("a", "c")  # c depends on a
+    tg.dag.add_edge("b", "c")  # c depends on b
+    be = _FakeBackend("k8s")
+    placements = {n: _FakePlacement(be, ["node-a"], 2) for n in ("a", "b", "c")}
+    _plan_merge_groups(tg, placements)
+    assert tg.get_task("a").merge_gate_after == []
+    assert tg.get_task("b").merge_gate_after == ["a"]
+    assert tg.get_task("c").merge_gate_after == ["a", "b"]
+
+
+def test_gated_member_still_inherits_external_deps_on_leader():
+    # b depends on a (member) and a depends on e (external CPU-only). The leader (a)
+    # must still wait for e; the intra-group edge a<-b becomes a gate, not a leader dep.
+    tg = _graph(["a", "b", "e"])
+    tg.dag.add_edge("a", "b")  # b depends on a
+    tg.dag.add_edge("e", "a")  # a depends on e
+    be = _FakeBackend("k8s")
+    placements = {
+        "a": _FakePlacement(be, ["node-a"], 2),
+        "b": _FakePlacement(be, ["node-a"], 2),
+        "e": _FakePlacement(be, ["node-a"], 0),  # CPU-only -> external
+    }
+    _plan_merge_groups(tg, placements)
+    assert "e" in tg.dag.get_dependencies("a")   # external dep hoisted onto leader
+    assert tg.get_task("b").merge_gate_after == ["a"]
 
 
 def test_intra_group_transitive_dependency_raises():

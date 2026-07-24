@@ -9,7 +9,11 @@ apiVersion: v1
 items:
 - apiVersion: v1
   data:
-    entrypoint.sh: nats-server -js
+    entrypoint.sh: '# sflow: fail-fast
+
+      set -e
+
+      nats-server -js'
   kind: ConfigMap
   metadata:
     labels:
@@ -65,9 +69,13 @@ apiVersion: v1
 items:
 - apiVersion: v1
   data:
-    entrypoint.sh: 'etcd --listen-client-urls "http://0.0.0.0:2379" --advertise-client-urls "http://0.0.0.0:2379"
-      --listen-peer-urls "http://0.0.0.0:2380" --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
-      --initial-cluster "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd
+    entrypoint.sh: '# sflow: fail-fast
+
+      set -e
+
+      etcd --listen-client-urls "http://0.0.0.0:2379" --advertise-client-urls "http://0.0.0.0:2379" --listen-peer-urls
+      "http://0.0.0.0:2380" --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380" --initial-cluster
+      "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd
 
       '
   kind: ConfigMap
@@ -125,7 +133,11 @@ apiVersion: v1
 items:
 - apiVersion: v1
   data:
-    entrypoint.sh: python3 -m dynamo.frontend --http-port 8000
+    entrypoint.sh: '# sflow: fail-fast
+
+      set -e
+
+      python3 -m dynamo.frontend --http-port 8000'
   kind: ConfigMap
   metadata:
     labels:
@@ -182,9 +194,9 @@ items:
 - apiVersion: v1
   data:
     entrypoint.sh: "if [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
-      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\nset\
-      \ -x\npython3 -m dynamo.sglang --model-path /models/Qwen3-0.6B --served-model-name Qwen3-0.6B --tensor-parallel-size\
-      \ 4 --skip-tokenizer-init --trust-remote-code"
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n#\
+      \ sflow: fail-fast\nset -e\nset -x\npython3 -m dynamo.sglang --model-path /models/Qwen3-0.6B --served-model-name\
+      \ Qwen3-0.6B --tensor-parallel-size 4 --skip-tokenizer-init --trust-remote-code"
   kind: ConfigMap
   metadata:
     labels:
@@ -243,7 +255,11 @@ apiVersion: v1
 items:
 - apiVersion: v1
   data:
-    entrypoint.sh: 'pip install aiperf==0.3.0
+    entrypoint.sh: '# sflow: fail-fast
+
+      set -e
+
+      pip install aiperf==0.3.0
 
       set -x
 

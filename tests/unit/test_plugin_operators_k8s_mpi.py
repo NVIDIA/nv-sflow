@@ -120,6 +120,7 @@ def test_config_defaults():
     assert c.ssh_port == 2222
     assert c.mpi_implementation == "OpenMPI"
     assert c.ensure_sshd is True
+    assert c.cpu_bind == "core"
     assert c.forward_env_prefixes == []
     # Setup budget defaults to ~15 min (900s -> failureThreshold 180 at a fixed 5s poll).
     assert c.worker_setup_timeout_seconds == 900
@@ -225,6 +226,15 @@ def test_mpirun_wrapper_forwards_and_execs_real_binary():
     assert "--hostfile" in script and "plm_rsh_args" in script
 
 
+def test_mpirun_wrapper_echoes_resolved_launch_line():
+    # The shim echoes the fully-resolved launch (real mpirun + sflow-injected opts +
+    # recipe args) so the actual command that ran is visible in the task log, THEN exec's
+    # it -- otherwise the injected hostfile/-x/binding are hidden from the user.
+    script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="core", slots=4)
+    assert 'echo "[sflow-mpi] launch: ${_sflow_real} ${_sflow_opts[*]} $*"' in script
+    assert script.index("[sflow-mpi] launch:") < script.index('exec "${_sflow_real}"')
+
+
 def test_mpirun_wrapper_operator_route_omits_hostfile():
     # The operator route gets the hostfile from the mpi-operator (OMPI_MCA_*), so
     # the launcher wrapper only forwards env -- it must not inject --hostfile.
@@ -284,13 +294,133 @@ def test_mpirun_wrapper_snapshot_diff_forwards_recipe_export_end_to_end(
 
 
 # ---------------------------------------------------------------------------
+# CPU binding (mpi.cpu_bind) -- bind each rank so LLVM/OpenMP thread pools size to
+# the binding, not the whole node (prevents pid/thread exhaustion when ranks share a pod)
+# ---------------------------------------------------------------------------
+def test_mpirun_wrapper_numa_binding_default():
+    # Multi-rank pod + numa: inject `--map-by numa --bind-to numa`, guarded by an
+    # arg-scan so a recipe that already binds wins.
+    script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="numa", slots=4)
+    assert "--map-by numa --bind-to numa" in script
+    # the user-binding arg-scan is present (respect a recipe's own --bind-to/--map-by).
+    assert "--bind-to|--bind-to=*|--map-by|--map-by=*" in script
+
+
+def test_mpirun_wrapper_core_binding_uses_slots_and_clamped_nproc():
+    # core: PE = cores/rank computed at launch into ${_sflow_pe}. The core count is read
+    # with OMP_NUM_THREADS/OMP_THREAD_LIMIT UNSET (GNU nproc honors them, and sflow sets
+    # OMP_NUM_THREADS -- else nproc returns that cap, not the real cores, collapsing PE),
+    # CLAMPED to the installed cores ($(nproc --all)) so a bogus/inflated count can't
+    # over-bind and fail the launch, and floored at 1.
+    script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="core", slots=4)
+    assert "--map-by ppr:4:node:PE=${_sflow_pe} --bind-to core" in script
+    assert "env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc" in script  # ignore OMP cap
+    assert "nproc --all" in script  # clamp source (installed cores)
+    assert "_sflow_pe=$(( _sflow_ncpu / 4 ))" in script
+    assert "-ge 1 ] || _sflow_pe=1" in script  # floor at 1
+
+
+def test_mpirun_wrapper_no_binding_for_single_rank_pod():
+    # slots=1: one rank per pod never contends -> no binding injected (any mode).
+    script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="numa", slots=1)
+    assert "--bind-to" not in script
+    assert "_sflow_bound" not in script
+
+
+def test_mpirun_wrapper_no_binding_when_none():
+    # cpu_bind=none is an exact no-op even for a multi-rank pod (today's behaviour).
+    script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="none", slots=8)
+    assert "--bind-to" not in script
+    assert "_sflow_bound" not in script
+
+
+def test_mpirun_wrapper_binding_defaults_off_for_existing_callers():
+    # Regression: callers that don't ask for binding (default) get today's wrapper --
+    # no map/bind flags -- so the HIGH-blast-radius launch path is unchanged.
+    script = mpi_boot.build_mpirun_wrapper_script(inject_hostfile=True)
+    assert "--bind-to" not in script
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_mpirun_wrapper_binding_respects_user_provided_binding(tmp_path, fake_process):
+    """Executed end to end: numa flags are injected when the recipe doesn't bind, and
+    SUPPRESSED when the recipe passes its own --bind-to (user wins)."""
+    fake_process.allow_unregistered(True)
+    real = tmp_path / "real_mpirun"
+    real.write_text('#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+    real.chmod(0o755)
+    wrapper = tmp_path / "mpirun"
+    wrapper.write_text(
+        mpi_boot.build_mpirun_wrapper_script(inject_hostfile=False, cpu_bind="numa", slots=4)
+    )
+    wrapper.chmod(0o755)
+    env = {"PATH": os.environ["PATH"], "SFLOW_REAL_MPIRUN": str(real)}
+
+    # The real mpirun prints each arg on its own line; drop the `[sflow-mpi] launch:`
+    # echo line (which re-prints the whole command) so we inspect the REAL argv.
+    def _argv(stdout):
+        return [ln for ln in stdout.split("\n") if not ln.startswith("[sflow-mpi]")]
+
+    # No recipe binding -> sflow injects `--map-by numa --bind-to numa`.
+    out = subprocess.run([str(wrapper), "-np", "4", "app"],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr
+    args = _argv(out.stdout)
+    assert "--bind-to" in args and "numa" in args and "--map-by" in args
+
+    # Recipe already binds -> sflow injects NOTHING (its --bind-to must not appear twice).
+    out = subprocess.run([str(wrapper), "-np", "4", "--bind-to", "core", "app"],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr
+    args = _argv(out.stdout)
+    assert args.count("--bind-to") == 1  # only the recipe's, none injected
+    assert "--map-by" not in args
+
+
+def test_bootstrap_preamble_injects_cpu_binding_pods_route():
+    # Pods route: the bootstrap-built wrapper carries the binding for a multi-rank pod.
+    lines = mpi_boot.build_mpi_bootstrap_preamble(gpus_per_node=8, cpu_bind="numa")
+    assert "--map-by numa --bind-to numa" in "\n".join(lines)
+
+
+def test_mpirun_wrapper_role_barrier_worker_idles_leader_waits():
+    # Barrier-in-wrapper (pods route, multi-node): the wrapper runs the role barrier
+    # ONCE (atomic mkdir lock) -- worker brings up sshd + idles, leader waits for every
+    # worker's sshd -- BEFORE injecting/exec'ing, so it engages regardless of how the
+    # recipe writes its mpirun line (`fi; ${NSYS_CMD} mpirun`, compound, etc.).
+    script = mpi_boot.build_mpirun_wrapper_script(role_barrier=True, ssh_port=2222)
+    assert "mkdir" in script and ".barrier.lock" in script
+    assert 'if [ "${SFLOW_MPI_N_NODES:-1}" -gt 1 ]' in script  # multi-node gate
+    assert "sleep infinity" in script  # worker idles
+    assert "waiting for sshd" in script  # leader waits
+    # the barrier runs before the exec of the real mpirun
+    assert script.index("sleep infinity") < script.index('exec "${_sflow_real}"')
+
+
+def test_mpirun_wrapper_no_role_barrier_by_default():
+    # Operator route / default: NO barrier -- the mpi-operator owns sshd + wait.
+    script = mpi_boot.build_mpirun_wrapper_script(inject_hostfile=False)
+    assert "sleep infinity" not in script
+    assert ".barrier.lock" not in script
+
+
+def test_launcher_preamble_injects_cpu_binding_operator_route():
+    # Operator route: the launcher wrapper carries the binding too (the mpi-operator
+    # supplies the hostfile but not CPU binding).
+    lines = mpi_boot.build_launcher_preamble(cpu_bind="core", slots=2)
+    text = "\n".join(lines)
+    assert "--map-by ppr:2:node:PE=${_sflow_pe} --bind-to core" in text
+    assert "_sflow_pe=$(( _sflow_ncpu / 2 ))" in text  # clamped nproc/slots
+
+
+# ---------------------------------------------------------------------------
 # pods-route bootstrap preamble
 # ---------------------------------------------------------------------------
 def test_bootstrap_preamble_installs_wrapper_and_branches():
-    # INTENTIONAL CHANGE (worker parity): the bootstrap installs the shim + keypair
-    # and (leader-only) builds the hostfile, then snapshots the env before the recipe.
-    # The worker idle + leader wait moved to build_pods_launch_gate so the recipe
-    # setup runs on every pod first -- they are NO LONGER in the bootstrap.
+    # The bootstrap installs the shim + keypair and (leader-only) builds the hostfile,
+    # exports the SFLOW_MPI_* role vars (so the shim's barrier sees them), then snapshots
+    # the env before the recipe. The worker idle + leader wait now live INSIDE the shim
+    # (role barrier), which the bootstrap installs -- so they appear in this text.
     lines = mpi_boot.build_mpi_bootstrap_preamble(ssh_port=2222, gpus_per_node=8)
     text = "\n".join(lines)
     # transparent mpirun shim: written to a WRITABLE dir + PATH-prepended, and the
@@ -303,22 +433,26 @@ def test_bootstrap_preamble_installs_wrapper_and_branches():
     assert mpi_boot.SSH_PRIVATE_KEY_ENV in text
     assert 'if [ "${SFLOW_MPI_NODE_INDEX:-0}" = "0" ]; then' in text  # hostfile leader-guarded
     assert "slots=8" in text
+    # role vars are EXPORTED so the shim subprocess (barrier) can read them.
+    assert 'export SFLOW_MPI_NODE_INDEX=' in text
+    assert 'export SFLOW_MPI_N_NODES=' in text and 'export SFLOW_MPI_NODE_IPS=' in text
     # env snapshot (for the shim's -x auto-forward) is emitted before the recipe.
     assert "compgen -e" in text and "env.snapshot" in text
-    # worker idle + leader wait are deferred to the launch gate, NOT the bootstrap.
-    assert "sleep infinity" not in text
-    assert "waiting for sshd" not in text
+    # the role barrier (worker idle + leader wait) is baked into the installed shim.
+    assert "sleep infinity" in text
+    assert "waiting for sshd" in text
+    assert mpi_boot.SFLOW_MPI_BARRIER_LOCK in text
 
 
-def test_pods_launch_gate_worker_idles_leader_waits():
-    gate = "\n".join(mpi_boot.build_pods_launch_gate(ssh_port=2222))
-    # Only engages for a multi-node run.
-    assert 'if [ "${SFLOW_MPI_N_NODES:-1}" -gt 1 ]; then' in gate
-    # sshd is brought up here (post-setup); a worker idles, the leader waits.
-    assert "sshd up on :2222" in gate
-    assert 'if [ "${SFLOW_MPI_NODE_INDEX:-0}" != "0" ]; then' in gate
-    assert "sleep infinity" in gate
-    assert "waiting for sshd" in gate
+def test_mpirun_shim_barrier_runs_once_and_gates_on_multinode():
+    # The role barrier is in the shim, guarded by an atomic mkdir lock (once per pod)
+    # and the multi-node gate, and runs before the exec of the real mpirun.
+    wrapper = mpi_boot.build_mpirun_wrapper_script(role_barrier=True, ssh_port=2222)
+    assert f'mkdir "{mpi_boot.SFLOW_MPI_BARRIER_LOCK}"' in wrapper
+    assert 'if [ "${SFLOW_MPI_N_NODES:-1}" -gt 1 ]' in wrapper
+    assert "sshd up on :2222" in wrapper
+    assert 'if [ "${SFLOW_MPI_NODE_INDEX:-0}" != "0" ]; then' in wrapper
+    assert wrapper.index("sleep infinity") < wrapper.index('exec "${_sflow_real}"')
 
 
 # ---------------------------------------------------------------------------
@@ -412,10 +546,10 @@ def test_pods_route_multinode_render(monkeypatch):
     assert "PRIVB64" not in shell
 
 
-def test_pods_route_multinode_runs_setup_on_workers_and_gates_launch(monkeypatch):
-    # Worker parity: the recipe setup (exports, mkdir) runs on EVERY pod (before the
-    # launch gate), and the per-role split (worker idle / leader wait) is the gate
-    # inserted right before `exec mpirun` -- not an early worker sleep.
+def test_pods_route_multinode_runs_setup_on_workers_and_barrier_in_shim(monkeypatch):
+    # Worker parity: the recipe setup (exports, mkdir) runs on EVERY pod, unchanged and
+    # NOT wrapped in a role gate. The per-role split (worker idle / leader wait) lives in
+    # the installed mpirun shim's barrier, which fires at the real mpirun call.
     backend = _backend(nodes=3, gpus_per_node=8)
     op = _op(backend, ["node-0", "node-1"], gpu_count=16, route="pods",
              monkeypatch=monkeypatch)
@@ -428,19 +562,19 @@ def test_pods_route_multinode_runs_setup_on_workers_and_gates_launch(monkeypatch
         envs=envs,
     )
     entry = _entrypoint(_manifest_from_plan(plan)[0])
-    # setup runs before the gate; the gate runs before the (auto-exec'd) launch.
-    assert entry.index("export FOO=1") < entry.index("launch gate (pods route)")
-    assert entry.index("mkdir -p /tmp/cache") < entry.index("launch gate (pods route)")
-    assert entry.index("launch gate (pods route)") < entry.index(
-        "exec mpirun -np 16 trtllm-serve /m"
-    )
-    # role split lives in the gate: worker idles, leader waits.
+    # No source-line gate is inserted; the recipe setup + launch are untouched.
+    assert "launch gate (pods route)" not in entry
+    assert "export FOO=1" in entry and "mkdir -p /tmp/cache" in entry
+    assert "exec mpirun -np 16 trtllm-serve /m" in entry
+    # The role split lives in the installed shim's barrier (guarded by the once-lock).
     assert "sleep infinity" in entry
     assert "waiting for sshd" in entry
+    assert mpi_boot.SFLOW_MPI_BARRIER_LOCK in entry
 
 
 def test_pods_route_single_node_has_no_launch_gate(monkeypatch):
-    # A single-node task needs no cross-node barrier, so no gate is inserted.
+    # A single-node task needs no cross-node barrier; the shim's barrier self-skips
+    # (N_NODES=1) so the bare local mpirun runs directly.
     op = _op(_backend(nodes=1, gpus_per_node=8), ["node-0"], gpu_count=8, route="pods",
              monkeypatch=monkeypatch)
     plan = op._build_execution_plan(
@@ -449,6 +583,90 @@ def test_pods_route_single_node_has_no_launch_gate(monkeypatch):
     entry = _entrypoint(_manifest_from_plan(plan)[0])
     assert "launch gate (pods route)" not in entry
     assert "exec mpirun -np 8 x" in entry
+
+
+def test_pods_route_multinode_plan_is_mpi_world_group(monkeypatch):
+    # The multi-node MPI pods plan marks itself an MPI world group so execute()
+    # resolves when ANY rank pod terminates instead of blocking on the survivors.
+    op = _op(_backend(nodes=3, gpus_per_node=8), ["node-0", "node-1"], gpu_count=16,
+             route="pods", monkeypatch=monkeypatch)
+    envs = op._inject_pods_keypair_env(
+        {"SFLOW_TASK_ASSIGNED_NODE_IPS": "10.0.0.1,10.0.0.2"}
+    )
+    plan = op._build_execution_plan(
+        task_name="server", script=["mpirun -np 16 trtllm-serve /m"], envs=envs,
+    )
+    assert plan.mpi_world_group is True
+
+
+def test_pods_route_single_node_plan_not_mpi_world_group(monkeypatch):
+    # A single-node MPI task has no peer pods to hang on -- keep the default (await
+    # the one pod), so world-group early resolution is off.
+    op = _op(_backend(nodes=1, gpus_per_node=8), ["node-0"], gpu_count=8, route="pods",
+             monkeypatch=monkeypatch)
+    plan = op._build_execution_plan(
+        task_name="server", script=["mpirun -np 8 x"], envs={},
+    )
+    assert plan.mpi_world_group is False
+
+
+# ---------------------------------------------------------------------------
+# prefixed mpirun launch detection (final_launch_index): real recipes wrap the
+# launch (`${NSYS_CMD} mpirun ...`) -- it must still engage the gate + auto-exec
+# ---------------------------------------------------------------------------
+def test_final_launch_index_matches_var_prefixed_mpirun():
+    # `${NSYS_CMD} mpirun ...` -- a variable prefix (often empty at runtime) in front
+    # of mpirun -- is still THE workload launch that needs sflow's MPI handling.
+    assert mpi_boot.final_launch_index(["setup", "${NSYS_CMD} mpirun -np 16 x"]) == 1
+
+
+def test_final_launch_index_matches_env_and_exec_prefixed_mpirun():
+    assert mpi_boot.final_launch_index(["FOO=1 BAR=2 mpirun -np 8 x"]) == 0
+    assert mpi_boot.final_launch_index(["exec ${NSYS_CMD} mpirun -np 8 x"]) == 0
+
+
+def test_final_launch_index_still_matches_bare_and_exec_mpirun():
+    # Regression: the original bare / exec forms still resolve.
+    assert mpi_boot.final_launch_index(["mpirun -np 8 x"]) == 0
+    assert mpi_boot.final_launch_index(["exec mpirun -np 8 x"]) == 0
+
+
+def test_final_launch_index_ignores_mpirun_only_as_argument():
+    # Conservative: a real command that merely mentions mpirun as an ARGUMENT (not the
+    # program being run) is NOT a launch -- sflow leaves the user's process model alone.
+    assert mpi_boot.final_launch_index(["echo run mpirun by hand"]) is None
+    assert mpi_boot.final_launch_index(["python drive.py --launcher mpirun"]) is None
+
+
+def test_pods_route_barrier_engages_for_compound_mpirun_line(monkeypatch):
+    # The real mlperf recipe glues the launch onto an if-block's `fi;`
+    # (`fi; ${NSYS_CMD} mpirun ...`), which a source-line gate can't touch. The barrier
+    # lives in the mpirun shim, so it engages at the real mpirun call regardless of the
+    # launch-line syntax -- fixing the ssh-refused race where the leader launched before
+    # the workers' sshd came up.
+    op = _op(_backend(nodes=3, gpus_per_node=8), ["node-0", "node-1"], gpu_count=16,
+             route="pods", monkeypatch=monkeypatch)
+    envs = op._inject_pods_keypair_env(
+        {"SFLOW_TASK_ASSIGNED_NODE_IPS": "10.0.0.1,10.0.0.2"}
+    )
+    plan = op._build_execution_plan(
+        task_name="server",
+        script=[
+            'NSYS_CMD=""; if [ "0" = "1" ]; then',
+            '  NSYS_CMD="nsys profile -o x"',
+            "fi; ${NSYS_CMD} mpirun -np 16 trtllm-serve /m",
+        ],
+        envs=envs,
+    )
+    entry = _entrypoint(_manifest_from_plan(plan)[0])
+    # No source-line gate (can't insert into a compound `fi; ... mpirun` line), and the
+    # compound launch line is preserved verbatim ...
+    assert "launch gate (pods route)" not in entry
+    assert "fi; ${NSYS_CMD} mpirun -np 16 trtllm-serve /m" in entry
+    # ... but the shim's barrier (leader-wait / worker-idle) IS present and fires at the
+    # real mpirun call.
+    assert "sleep infinity" in entry and "waiting for sshd" in entry
+    assert mpi_boot.SFLOW_MPI_BARRIER_LOCK in entry
 
 
 # ---------------------------------------------------------------------------

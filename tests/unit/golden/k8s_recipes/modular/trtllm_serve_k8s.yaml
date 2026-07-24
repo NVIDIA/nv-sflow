@@ -10,9 +10,9 @@ items:
 - apiVersion: v1
   data:
     entrypoint.sh: "if [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
-      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\nset\
-      \ -x\nexport TLLM_LOG_LEVEL=INFO\nexport TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\nunset\
-      \ UCX_TLS\nmpirun -np 4 --allow-run-as-root trtllm-llmapi-launch trtllm-serve /models/Qwen3-0.6B\
+      fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n#\
+      \ sflow: fail-fast\nset -e\nset -x\nexport TLLM_LOG_LEVEL=INFO\nexport TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}\n\
+      unset UCX_TLS\nmpirun -np 4 --allow-run-as-root trtllm-llmapi-launch trtllm-serve /models/Qwen3-0.6B\
       \ --host 0.0.0.0 --port 8000 --tp_size 4"
   kind: ConfigMap
   metadata:
@@ -72,7 +72,11 @@ apiVersion: v1
 items:
 - apiVersion: v1
   data:
-    entrypoint.sh: 'pip install aiperf==0.3.0
+    entrypoint.sh: '# sflow: fail-fast
+
+      set -e
+
+      pip install aiperf==0.3.0
 
       set -x
 

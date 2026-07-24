@@ -67,6 +67,9 @@ SFLOW_MPI_DIR = "/tmp/sflow-mpi"
 SFLOW_MPI_BIN_DIR = f"{SFLOW_MPI_DIR}/bin"
 SFLOW_MPI_HOSTFILE = f"{SFLOW_MPI_DIR}/hostfile"
 SFLOW_MPI_WRAPPER_PATH = f"{SFLOW_MPI_BIN_DIR}/mpirun"
+# Atomic once-per-pod lock (an `mkdir`) guarding the wrapper's role barrier so it runs
+# exactly once -- the recipe's real mpirun -- and nested/re-entrant mpirun calls skip it.
+SFLOW_MPI_BARRIER_LOCK = f"{SFLOW_MPI_DIR}/.barrier.lock"
 # Exported env var names snapshotted just before the recipe runs, so the mpirun shim
 # can ``-x``-forward whatever the recipe itself exported (diffed at launch) without
 # the user having to enumerate ``forward_env_prefixes``. Path is overridable via the
@@ -114,6 +117,108 @@ def _forward_grep_pattern(prefixes: Sequence[str]) -> str:
     return f"^({alts})[A-Za-z0-9_]*"
 
 
+def _cpu_bind_flags(cpu_bind: str, slots: int) -> str:
+    """OpenMPI ``--map-by``/``--bind-to`` flags for a rank-binding mode ("" if off).
+
+    ``numa`` (default): one rank per NUMA domain, round-robin -- caps the LLVM/OpenMP
+    ``hardware_concurrency`` each rank sees to a NUMA node's cores (only reduces it
+    when the node is NPS>1; on NPS1 the whole node is one domain). ``core``: bind each
+    rank to ``PE`` cores, where ``PE`` is computed at launch into ``${_sflow_pe}`` by
+    :func:`_cpu_bind_block` -- ``nproc/slots`` clamped so a bogus/inflated ``nproc`` can't
+    over-bind and fail the launch (respects the pod's real cpuset)."""
+    if cpu_bind == "numa":
+        return "--map-by numa --bind-to numa"
+    if cpu_bind == "core":
+        return f"--map-by ppr:{int(slots)}:node:PE=${{_sflow_pe}} --bind-to core"
+    return ""
+
+
+def _cpu_bind_block(cpu_bind: str, slots: int) -> str:
+    """Wrapper bash that appends the binding flags to ``_sflow_opts`` -- unless the
+    recipe already bound (its own ``--bind-to``/``--map-by`` in ``"$@"`` wins). Empty
+    (no-op) when binding is off: mode ``none`` or a single-rank pod (``slots <= 1``,
+    which never contends), so the launch path is byte-for-byte unchanged there."""
+    s = int(slots)
+    flags = _cpu_bind_flags(cpu_bind, s) if s > 1 else ""
+    if not flags:
+        return ""
+    # `core` needs PE = cores/rank computed at launch. Count the pod's cores with
+    # OMP_NUM_THREADS/OMP_THREAD_LIMIT UNSET -- GNU `nproc` otherwise honors them, and
+    # sflow sets OMP_NUM_THREADS itself, so a plain `$(nproc)` returns that cap (e.g. 8),
+    # not the real core count, and PE collapses to a couple of cores/rank. Then CLAMP to
+    # the installed cores ($(nproc --all)) so a bogus/inflated count can't make PE huge and
+    # fail the launch ("not enough processing elements"). Floor PE at 1. Numa needs no PE.
+    pe_lines = (
+        [
+            "  _sflow_ncpu=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc "
+            "2>/dev/null || nproc 2>/dev/null || echo 1)",
+            '  _sflow_nall=$(nproc --all 2>/dev/null || echo "${_sflow_ncpu}")',
+            '  [ "${_sflow_ncpu}" -gt "${_sflow_nall}" ] 2>/dev/null && _sflow_ncpu=${_sflow_nall}',
+            f"  _sflow_pe=$(( _sflow_ncpu / {s} )); "
+            '[ "${_sflow_pe}" -ge 1 ] || _sflow_pe=1',
+        ]
+        if cpu_bind == "core"
+        else []
+    )
+    return (
+        "\n".join(
+            [
+                "# sflow CPU binding (multi-rank-per-pod): bind each rank within the",
+                "# pod's cpuset so LLVM/OpenMP thread pools size to the binding, not the",
+                "# whole node -- prevents pid/thread exhaustion when ranks share a pod.",
+                "# Skipped if the recipe already binds (--bind-to/--map-by -> user wins).",
+                "_sflow_bound=0",
+                'for _a in "$@"; do',
+                '  case "${_a}" in',
+                "    --bind-to|--bind-to=*|--map-by|--map-by=*) _sflow_bound=1; break ;;",
+                "  esac",
+                "done",
+                'if [ "${_sflow_bound}" = "0" ]; then',
+                *pe_lines,
+                f"  _sflow_opts+=({flags})",
+                "fi",
+            ]
+        )
+        + "\n"
+    )
+
+
+def _role_barrier_block(*, ssh_port: int, ssh_dir: str, ensure_sshd: bool) -> str:
+    """Wrapper bash (pods route, multi-node) that runs the MPI role barrier ONCE per
+    pod -- guarded by an atomic ``mkdir`` lock, so it fires on the recipe's real
+    ``mpirun`` and nested/re-entrant ``mpirun`` calls skip it. A worker brings up
+    ``sshd`` and idles (``sleep infinity`` -- the wrapper never execs ``mpirun`` there);
+    the leader brings up ``sshd`` then blocks until every worker's ``sshd`` (its setup
+    done) before falling through to the launch. Reads ``SFLOW_MPI_N_NODES`` /
+    ``SFLOW_MPI_NODE_INDEX`` / ``SFLOW_MPI_NODE_IPS`` exported by the bootstrap. Because
+    this lives in the wrapper (invoked at the real ``mpirun`` call), it engages no
+    matter how the recipe writes its launch line -- no source-line surgery needed."""
+    inner: list[str] = []
+    if ensure_sshd:
+        inner += _ensure_sshd_lines()
+    inner += _sshd_prepare_lines()
+    inner += [
+        f'"${{SFLOW_SSHD_BIN}}" -p {int(ssh_port)} '
+        f'&& echo "[sflow-mpi] sshd up on :{int(ssh_port)}"',
+        'if [ "${SFLOW_MPI_NODE_INDEX:-0}" != "0" ]; then',
+        '  echo "[sflow-mpi] worker ${SFLOW_MPI_NODE_INDEX}: setup done; '
+        'idle (leader drives mpirun)"',
+        "  sleep infinity",
+        "fi",
+    ]
+    inner += build_leader_wait_lines(ssh_port=ssh_port, ssh_dir=ssh_dir)
+    lines = [
+        "# sflow k8s_mpi role barrier (pods route, multi-node): a worker brings up sshd",
+        "# + idles, the leader waits for every worker's sshd -- run ONCE per pod via an",
+        "# atomic mkdir lock (nested/re-entrant mpirun skips it).",
+        f'if [ "${{SFLOW_MPI_N_NODES:-1}}" -gt 1 ] '
+        f'&& mkdir "{SFLOW_MPI_BARRIER_LOCK}" 2>/dev/null; then',
+    ]
+    lines += [f"  {ln}" for ln in inner]
+    lines += ["fi"]
+    return "\n".join(lines) + "\n"
+
+
 def build_mpirun_wrapper_script(
     *,
     ssh_port: int = DEFAULT_SSH_PORT,
@@ -121,15 +226,32 @@ def build_mpirun_wrapper_script(
     hostfile_path: str = SFLOW_MPI_HOSTFILE,
     forward_prefixes: Sequence[str] | None = None,
     inject_hostfile: bool = True,
+    cpu_bind: str = "none",
+    slots: int = 1,
+    role_barrier: bool = False,
+    ssh_dir: str = DEFAULT_SSH_AUTH_MOUNT_PATH,
+    ensure_sshd: bool = True,
 ) -> str:
     """Return the text of the transparent ``mpirun`` shim (a standalone script).
 
     The shim is placed first on ``PATH`` (so the auto-``exec``ed ``mpirun`` launch
     hits it), prepends the OpenMPI transport (``--hostfile`` + ``--mca plm_rsh_*``) when
-    ``inject_hostfile`` and a hostfile exists, appends ``-x VAR`` for the forward set,
-    then ``exec``s the real ``mpirun`` (found via ``SFLOW_REAL_MPIRUN``, captured by
-    the preamble before it shadowed ``PATH``). ``inject_hostfile=False`` on the
-    operator route, where the mpi-operator supplies the hostfile via ``OMPI_MCA_*``.
+    ``inject_hostfile`` and a hostfile exists, optionally prepends CPU-binding flags
+    (``cpu_bind`` for a multi-rank pod, unless the recipe already binds), appends
+    ``-x VAR`` for the forward set, then ``exec``s the real ``mpirun`` (found via
+    ``SFLOW_REAL_MPIRUN``, captured by the preamble before it shadowed ``PATH``).
+    ``inject_hostfile=False`` on the operator route, where the mpi-operator supplies
+    the hostfile via ``OMPI_MCA_*``.
+
+    ``cpu_bind`` (``numa``/``core``/``none``) binds each rank when ``slots > 1`` so a
+    rank's LLVM/OpenMP thread pools size to the binding, not the whole node -- see
+    :func:`_cpu_bind_block`. A single-rank pod (``slots <= 1``) or ``none`` is an exact
+    no-op, keeping the launch path unchanged for those.
+
+    ``role_barrier`` (pods route) embeds the per-role SSH barrier -- worker idles, leader
+    waits for workers -- INTO the shim (see :func:`_role_barrier_block`), so it engages at
+    the real ``mpirun`` call no matter how the recipe writes the launch line, instead of
+    a fragile source-line gate. Off on the operator route (the mpi-operator owns it).
 
     The forward set (deduped) is the union of three sources, scanned at call time so
     late ``export``s in the recipe are captured: the always-on whole-name vars
@@ -156,6 +278,7 @@ if [ -z "${_sflow_real}" ]; then
 fi
 [ -n "${_sflow_real}" ] || _sflow_real="mpirun"
 
+__ROLE_BARRIER__
 _sflow_opts=()
 # OpenMPI transport (pods route only): a bare `mpirun` finds neither the hostfile
 # nor the alt SSH port, so inject both -- as ONE plm_rsh_args argument.
@@ -164,6 +287,7 @@ if [ "__INJECT_HOSTFILE__" = "1" ] && [ -f "__HOSTFILE__" ]; then
     --mca plm_rsh_agent ssh \
     --mca plm_rsh_args "-p __SSH_PORT__ -i __KEY_PATH__ -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10")
 fi
+__BINDING_BLOCK__
 # Forward env to remote ranks (sshd gives them a bare env), deduped, from three
 # sources: the always-on whole-name vars, the merged prefix set (scanned NOW so late
 # `export`s are captured), and every var the recipe itself exported -- the diff of
@@ -180,14 +304,26 @@ _sflow_names="$(
 for _v in $(printf '%s\n' "${_sflow_names}" | sort -u | sed '/^$/d'); do
   _sflow_opts+=(-x "${_v}")
 done
+# Surface the fully-resolved launch -- the real mpirun + every sflow-injected opt
+# (hostfile, SSH transport, CPU binding, env forwarding) + the recipe's own args -- so
+# the actual command that ran is visible in the task log (the shim otherwise exec's
+# silently). Only the leader reaches this line (workers idle in the role barrier above).
+echo "[sflow-mpi] launch: ${_sflow_real} ${_sflow_opts[*]} $*"
 exec "${_sflow_real}" "${_sflow_opts[@]}" "$@"
 """
+    barrier = (
+        _role_barrier_block(ssh_port=ssh_port, ssh_dir=ssh_dir, ensure_sshd=ensure_sshd)
+        if role_barrier
+        else ""
+    )
     return (
         tmpl.replace("__WRAPPER_PATH__", SFLOW_MPI_WRAPPER_PATH)
         .replace("__INJECT_HOSTFILE__", "1" if inject_hostfile else "0")
         .replace("__HOSTFILE__", hostfile_path)
         .replace("__SSH_PORT__", str(int(ssh_port)))
         .replace("__KEY_PATH__", key_path)
+        .replace("__ROLE_BARRIER__\n", barrier)
+        .replace("__BINDING_BLOCK__\n", _cpu_bind_block(cpu_bind, slots))
         .replace("__EXPLICIT_VARS__", explicit_vars)
         .replace("__GREP_PAT__", grep_pat)
         .replace("__ENV_SNAPSHOT__", SFLOW_MPI_ENV_SNAPSHOT)
@@ -328,6 +464,7 @@ def build_mpi_bootstrap_preamble(
     ensure_sshd: bool = True,
     ssh_dir: str = DEFAULT_SSH_AUTH_MOUNT_PATH,
     forward_prefixes: Sequence[str] | None = None,
+    cpu_bind: str = "none",
 ) -> list[str]:
     """Bash preamble for the **pods route**, prepended to the task entrypoint.
 
@@ -335,27 +472,36 @@ def build_mpi_bootstrap_preamble(
     available and decodes the injected keypair; the leader also builds the hostfile
     from ``SFLOW_TASK_ASSIGNED_NODE_IPS``. It then snapshots the exported env (for the
     shim's ``-x`` auto-forward) and hands control to the recipe, which runs on EVERY
-    pod. The per-role split -- worker ``sshd`` + idle vs leader wait-for-workers +
-    ``mpirun`` -- happens later in :func:`build_pods_launch_gate`, inserted right
-    before the recipe's launch line. Deferring sshd/idle/wait until after the recipe
-    setup lets that setup run on every node (filesystem parity) and turns the leader's
-    wait into a real barrier (a worker's ``sshd`` comes up only once its setup
-    finished). Single-node tasks get only the shim + snapshot (a bare local
-    ``mpirun``).
+    pod. The per-role split -- worker ``sshd`` + idle vs leader wait-for-workers -- runs
+    INSIDE the shim (:func:`_role_barrier_block`) at the real ``mpirun`` call, so the
+    recipe setup runs on every node first (filesystem parity), the leader's wait is a
+    real barrier (a worker's ``sshd`` comes up only once its setup finished), and it
+    engages no matter how the recipe writes its launch line. Single-node tasks get only
+    the shim + snapshot (a bare local ``mpirun``); the barrier self-skips (N_NODES=1).
     """
     wrapper = build_mpirun_wrapper_script(
         ssh_port=ssh_port,
         key_path=f"{ssh_dir}/id_rsa",
         forward_prefixes=forward_prefixes,
         inject_hostfile=True,
+        cpu_bind=cpu_bind,
+        # Ranks per node = the hostfile slots this route writes (gpus_per_node), so a
+        # `core` PE = nproc/gpus_per_node matches the actual rank density.
+        slots=gpus_per_node,
+        # The role barrier (worker idle / leader wait) lives in the shim so it engages
+        # at the real mpirun call regardless of the recipe's launch-line syntax.
+        role_barrier=True,
+        ssh_dir=ssh_dir,
+        ensure_sshd=ensure_sshd,
     )
     lines: list[str] = ["# ===== sflow k8s_mpi bootstrap (pods route) ====="]
     lines += _install_wrapper_lines(wrapper)
-    # Node role + peer IPs. SFLOW_TASK_NODE_INDEX is only set for multi-node tasks.
+    # Node role + peer IPs, EXPORTED so the mpirun shim's role barrier (a subprocess of
+    # the entrypoint) sees them. SFLOW_TASK_NODE_INDEX is only set for multi-node tasks.
     lines += [
-        'SFLOW_MPI_NODE_INDEX="${SFLOW_TASK_NODE_INDEX:-0}"',
-        'SFLOW_MPI_NODE_IPS="${SFLOW_TASK_ASSIGNED_NODE_IPS:-}"',
-        "SFLOW_MPI_N_NODES=$(printf '%s' \"${SFLOW_MPI_NODE_IPS}\" | tr ',' '\\n' | grep -c '[^[:space:]]' || true)",
+        'export SFLOW_MPI_NODE_INDEX="${SFLOW_TASK_NODE_INDEX:-0}"',
+        'export SFLOW_MPI_NODE_IPS="${SFLOW_TASK_ASSIGNED_NODE_IPS:-}"',
+        "export SFLOW_MPI_N_NODES=$(printf '%s' \"${SFLOW_MPI_NODE_IPS}\" | tr ',' '\\n' | grep -c '[^[:space:]]' || true)",
         'if [ "${SFLOW_MPI_N_NODES:-0}" -gt 1 ]; then',
         '  echo "[sflow-mpi] node ${SFLOW_MPI_NODE_INDEX}/${SFLOW_MPI_N_NODES}: preparing SSH/MPI"',
     ]
@@ -363,7 +509,7 @@ def build_mpi_bootstrap_preamble(
         lines += [f"  {ln}" for ln in _ensure_sshd_lines()]
     lines += [f"  {ln}" for ln in _install_keypair_lines(ssh_dir)]
     # Leader builds the hostfile now (before the recipe); sshd start + worker idle +
-    # leader wait are deferred to build_pods_launch_gate so the recipe runs on all pods.
+    # leader wait run later inside the mpirun shim (so the recipe runs on all pods first).
     lines += [
         '  if [ "${SFLOW_MPI_NODE_INDEX:-0}" = "0" ]; then',
         f"    mkdir -p {SFLOW_MPI_DIR}",
@@ -378,56 +524,24 @@ def build_mpi_bootstrap_preamble(
     return lines
 
 
-def build_pods_launch_gate(
-    *,
-    ssh_port: int = DEFAULT_SSH_PORT,
-    ensure_sshd: bool = True,
-    ssh_dir: str = DEFAULT_SSH_AUTH_MOUNT_PATH,
-) -> list[str]:
-    """Role-guarded block inserted right before the recipe's final ``mpirun`` launch
-    (pods route, multi-node). The recipe setup has already run on BOTH pods above.
-
-    Only when there is more than one node: bring up ``sshd`` on every pod (now, AFTER
-    the setup), then a worker idles under ``sleep infinity`` while the leader waits
-    for every peer's ``sshd`` -- i.e. for their setup to finish -- before falling
-    through to the ``exec mpirun`` line that follows this block.
-    """
-    inner: list[str] = []
-    if ensure_sshd:
-        inner += _ensure_sshd_lines()
-    inner += _sshd_prepare_lines()
-    inner += [
-        f'"${{SFLOW_SSHD_BIN}}" -p {int(ssh_port)} && echo "[sflow-mpi] sshd up on :{int(ssh_port)}"',
-        'if [ "${SFLOW_MPI_NODE_INDEX:-0}" != "0" ]; then',
-        '  echo "[sflow-mpi] worker ${SFLOW_MPI_NODE_INDEX}: setup done; idle (leader drives mpirun)"',
-        "  sleep infinity",
-        "fi",
-    ]
-    inner += build_leader_wait_lines(ssh_port=ssh_port, ssh_dir=ssh_dir)
-    lines = [
-        "# ===== sflow k8s_mpi launch gate (pods route) =====",
-        'if [ "${SFLOW_MPI_N_NODES:-1}" -gt 1 ]; then',
-    ]
-    lines += [f"  {ln}" for ln in inner]
-    lines += [
-        "fi",
-        "# ===== end sflow k8s_mpi launch gate =====",
-    ]
-    return lines
-
-
 def build_launcher_preamble(
     *,
     forward_prefixes: Sequence[str] | None = None,
+    cpu_bind: str = "none",
+    slots: int = 1,
 ) -> list[str]:
     """Bash preamble for the **operator route** launcher: install the shim only.
 
     The mpi-operator supplies the hostfile (via ``OMPI_MCA_*``) and SSH transport,
-    so the launcher shim adds only ``-x`` env forwarding (``inject_hostfile=0``).
+    so the launcher shim adds only ``-x`` env forwarding (``inject_hostfile=0``) plus,
+    for a multi-rank pod, the ``cpu_bind`` flags (the operator binds nothing itself).
+    ``slots`` is the MPIJob ``slotsPerWorker`` (ranks per node).
     """
     wrapper = build_mpirun_wrapper_script(
         forward_prefixes=forward_prefixes,
         inject_hostfile=False,
+        cpu_bind=cpu_bind,
+        slots=slots,
     )
     lines = ["# ===== sflow k8s_mpi launcher (operator route) ====="]
     lines += _install_wrapper_lines(wrapper)
@@ -462,6 +576,29 @@ def build_worker_command(
     return ["bash", "-lc", "\n".join(script_lines)]
 
 
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _is_mpirun_launch(stripped: str) -> bool:
+    """True when the command's effective program is ``mpirun``.
+
+    Matches a bare ``mpirun ...`` and an ``mpirun`` reached through the transparent
+    prefixes recipes put in front of it: ``exec``, env assignments (``FOO=bar``), and
+    shell variables (``${NSYS_CMD}``/``$NSYS`` -- typically an optional profiler that
+    is empty at runtime). Every token before ``mpirun`` must be such a prefix, so a
+    line that merely names ``mpirun`` as an argument (``echo ... mpirun``,
+    ``python drive.py --launcher mpirun``) is NOT a launch and the user's process
+    model is left untouched.
+    """
+    for tok in stripped.split():
+        if tok == "mpirun":
+            return True
+        if tok == "exec" or tok.startswith("$") or _ENV_ASSIGN_RE.match(tok):
+            continue  # transparent prefix; keep scanning for mpirun
+        return False  # a real, non-mpirun program -> not our launch
+    return False
+
+
 def final_launch_index(script: Sequence[str]) -> int | None:
     """Index of the recipe's final ``mpirun`` launch line, or ``None``.
 
@@ -471,21 +608,18 @@ def final_launch_index(script: Sequence[str]) -> int | None:
     ``K8sMpiOperator._insert_pods_launch_gate`` (insert the role gate before it).
 
     Walks backwards to the last real command (trailing blank/comment lines skipped)
-    and returns its index only when that command is an ``mpirun`` launch -- a bare
-    ``mpirun ...`` or an already-``exec``ed ``exec mpirun ...``. Any other final
-    command (a user wrapper or a post-launch step) yields ``None`` so callers leave
-    the user's own process model untouched.
+    and returns its index only when that command is an ``mpirun`` launch -- see
+    :func:`_is_mpirun_launch`, which accepts a bare ``mpirun``, an ``exec mpirun``, and
+    an ``mpirun`` wrapped by transparent prefixes (``${NSYS_CMD} mpirun``,
+    ``FOO=1 mpirun``). Any other final command (a user wrapper or a post-launch step)
+    yields ``None`` so callers leave the user's own process model untouched.
     """
     lines = list(script)
     for i in range(len(lines) - 1, -1, -1):
         stripped = lines[i].lstrip()
         if not stripped or stripped.startswith("#"):
             continue
-        parts = stripped.split()
-        is_launch = parts[0] == "mpirun" or (
-            parts[0] == "exec" and parts[1:2] == ["mpirun"]
-        )
-        return i if is_launch else None
+        return i if _is_mpirun_launch(stripped) else None
     return None
 
 

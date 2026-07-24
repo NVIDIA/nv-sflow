@@ -255,6 +255,11 @@ class Task:
     # Packed CUDA_VISIBLE_DEVICES slice for this member within the merged
     # container's union GPU range (e.g. "0,1"); None when not merged.
     merge_cuda_visible_devices: str | None = None
+    # Set on a merged member to the sorted names of the DIRECT in-group members it
+    # depends on. Its in-pod subshell (see merged_launcher_lines) blocks until each
+    # is met -- COMPLETED (its exit-code file) or READY (a driver-touched marker) --
+    # before running. Empty for non-dependent members. See _plan_merge_groups.
+    merge_gate_after: list[str] = field(default_factory=list)
 
     @property
     def is_merge_leader(self) -> bool:

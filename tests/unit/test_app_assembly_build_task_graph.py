@@ -3,7 +3,6 @@
 
 import asyncio
 import json
-import logging
 
 import pytest
 from pydantic import Field
@@ -153,6 +152,49 @@ def test_build_task_graph_creates_nodes_edges_and_default_operator():
     assert t1.operator.config.type == "srun"
     assert t1.operator.config.job_id == "111"
     assert t1.operator.config.nodelist == ["n1"]
+
+
+def test_build_task_graph_fail_fast_follows_backend_default_when_unset():
+    # A backend that raises the default (kubernetes-like): an unset fail_fast becomes
+    # True, but an explicit YAML value is always honored.
+    state = _single_node_state()
+    state.backends["b1"].default_fail_fast = True  # simulate kubernetes
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [_slurm_backend_dict()],
+            "workflow": {
+                "name": "wf",
+                "tasks": [
+                    {"name": "t_default", "script": ["echo 1"]},
+                    {"name": "t_optout", "script": ["echo 2"], "fail_fast": False},
+                    {"name": "t_optin", "script": ["echo 3"], "fail_fast": True},
+                ],
+            },
+        }
+    )
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t_default").fail_fast is True   # backend default applies
+    assert tg.get_task("t_optout").fail_fast is False    # explicit opt-out honored
+    assert tg.get_task("t_optin").fail_fast is True
+
+
+def test_build_task_graph_fail_fast_unchanged_for_default_backend():
+    # A backend that doesn't raise the default (base False -> slurm/local/docker):
+    # an unset fail_fast stays False, so existing recipes are unchanged.
+    state = _single_node_state()  # _FakeBackend inherits Backend.default_fail_fast=False
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [_slurm_backend_dict()],
+            "workflow": {
+                "name": "wf",
+                "tasks": [{"name": "t1", "script": ["echo 1"]}],
+            },
+        }
+    )
+    tg = build_task_graph(config, state)
+    assert tg.get_task("t1").fail_fast is False
 
 
 def _single_node_state() -> SflowState:
