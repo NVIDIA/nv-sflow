@@ -12,58 +12,73 @@ items:
       \ PATH; fall back to scanning PATH for a non-self.\n_sflow_real=\"${SFLOW_REAL_MPIRUN:-}\"\nif [\
       \ -z \"${_sflow_real}\" ]; then\n  for _c in $(type -ap mpirun 2>/dev/null); do\n    if [ \"${_c}\"\
       \ != \"/tmp/sflow-mpi/bin/mpirun\" ]; then _sflow_real=\"${_c}\"; break; fi\n  done\nfi\n[ -n \"\
-      ${_sflow_real}\" ] || _sflow_real=\"mpirun\"\n\n_sflow_opts=()\n# OpenMPI transport (pods route\
-      \ only): a bare `mpirun` finds neither the hostfile\n# nor the alt SSH port, so inject both -- as\
-      \ ONE plm_rsh_args argument.\nif [ \"1\" = \"1\" ] && [ -f \"/tmp/sflow-mpi/hostfile\" ]; then\n\
-      \  _sflow_opts+=(--hostfile \"/tmp/sflow-mpi/hostfile\" \\\n    --mca plm_rsh_agent ssh \\\n   \
-      \ --mca plm_rsh_args \"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\
-      \ -o ConnectTimeout=10\")\nfi\n# Forward env to remote ranks (sshd gives them a bare env), deduped,\
-      \ from three\n# sources: the always-on whole-name vars, the merged prefix set (scanned NOW so late\n\
-      # `export`s are captured), and every var the recipe itself exported -- the diff of\n# the current\
-      \ exports against the pre-recipe snapshot -- so a plain `export FOO=bar`\n# reaches workers without\
-      \ listing it in forward_env_prefixes.\n_sflow_snap=\"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
-      \n_sflow_names=\"$(\n  for _v in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\\
-      ${${_v}+x}\\\" ]\" && printf '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
+      ${_sflow_real}\" ] || _sflow_real=\"mpirun\"\n\n# sflow k8s_mpi role barrier (pods route, multi-node):\
+      \ a worker brings up sshd\n# + idles, the leader waits for every worker's sshd -- run ONCE per pod\
+      \ via an\n# atomic mkdir lock (nested/re-entrant mpirun skips it).\nif [ \"${SFLOW_MPI_N_NODES:-1}\"\
+      \ -gt 1 ] && mkdir \"/tmp/sflow-mpi/.barrier.lock\" 2>/dev/null; then\n  if [ ! -x /usr/sbin/sshd\
+      \ ] && ! command -v sshd >/dev/null 2>&1; then\n    echo \"[sflow-mpi] installing openssh-server\"\
+      \n    export DEBIAN_FRONTEND=noninteractive\n    (apt-get update -qq && apt-get install -y -qq --no-install-recommends\
+      \ openssh-server) || echo \"[sflow-mpi] WARNING: could not install openssh-server\"\n  fi\n  mkdir\
+      \ -p /run/sshd && chmod 755 /run/sshd\n  ssh-keygen -A >/dev/null 2>&1 || true\n  SFLOW_SSHD_BIN=\"\
+      $( [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd || command -v sshd || true )\"\n  if [ -z \"${SFLOW_SSHD_BIN}\"\
+      \ ]; then echo \"[sflow-mpi] FATAL: sshd unavailable\"; exit 1; fi\n  \"${SFLOW_SSHD_BIN}\" -p 2222\
+      \ && echo \"[sflow-mpi] sshd up on :2222\"\n  if [ \"${SFLOW_MPI_NODE_INDEX:-0}\" != \"0\" ]; then\n\
+      \    echo \"[sflow-mpi] worker ${SFLOW_MPI_NODE_INDEX}: setup done; idle (leader drives mpirun)\"\
+      \n    sleep infinity\n  fi\n  SFLOW_SSH_OPTS=\"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no\
+      \ -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes\"\n  for ip in $(printf '%s'\
+      \ \"${SFLOW_MPI_NODE_IPS}\" | tr ',' ' '); do\n    echo \"[sflow-mpi] waiting for sshd on ${ip}:2222\"\
+      \n    for _ in $(seq 1 240); do\n      if ssh ${SFLOW_SSH_OPTS} \"${ip}\" true 2>/dev/null; then\
+      \ echo \"[sflow-mpi] ${ip} ssh ok\"; break; fi\n      sleep 2\n    done\n  done\nfi\n_sflow_opts=()\n\
+      # OpenMPI transport (pods route only): a bare `mpirun` finds neither the hostfile\n# nor the alt\
+      \ SSH port, so inject both -- as ONE plm_rsh_args argument.\nif [ \"1\" = \"1\" ] && [ -f \"/tmp/sflow-mpi/hostfile\"\
+      \ ]; then\n  _sflow_opts+=(--hostfile \"/tmp/sflow-mpi/hostfile\" \\\n    --mca plm_rsh_agent ssh\
+      \ \\\n    --mca plm_rsh_args \"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\
+      \ -o ConnectTimeout=10\")\nfi\n# sflow CPU binding (multi-rank-per-pod): bind each rank within the\n\
+      # pod's cpuset so LLVM/OpenMP thread pools size to the binding, not the\n# whole node -- prevents\
+      \ pid/thread exhaustion when ranks share a pod.\n# Skipped if the recipe already binds (--bind-to/--map-by\
+      \ -> user wins).\n_sflow_bound=0\nfor _a in \"$@\"; do\n  case \"${_a}\" in\n    --bind-to|--bind-to=*|--map-by|--map-by=*)\
+      \ _sflow_bound=1; break ;;\n  esac\ndone\nif [ \"${_sflow_bound}\" = \"0\" ]; then\n  _sflow_ncpu=$(env\
+      \ -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || nproc 2>/dev/null || echo 1)\n  _sflow_nall=$(nproc\
+      \ --all 2>/dev/null || echo \"${_sflow_ncpu}\")\n  [ \"${_sflow_ncpu}\" -gt \"${_sflow_nall}\" ]\
+      \ 2>/dev/null && _sflow_ncpu=${_sflow_nall}\n  _sflow_pe=$(( _sflow_ncpu / 8 )); [ \"${_sflow_pe}\"\
+      \ -ge 1 ] || _sflow_pe=1\n  _sflow_opts+=(--map-by ppr:8:node:PE=${_sflow_pe} --bind-to core)\n\
+      fi\n# Forward env to remote ranks (sshd gives them a bare env), deduped, from three\n# sources:\
+      \ the always-on whole-name vars, the merged prefix set (scanned NOW so late\n# `export`s are captured),\
+      \ and every var the recipe itself exported -- the diff of\n# the current exports against the pre-recipe\
+      \ snapshot -- so a plain `export FOO=bar`\n# reaches workers without listing it in forward_env_prefixes.\n\
+      _sflow_snap=\"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\n_sflow_names=\"$(\n  for\
+      \ _v in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\${${_v}+x}\\\" ]\" && printf\
+      \ '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
       \  [ -f \"${_sflow_snap}\" ] && comm -13 \"${_sflow_snap}\" <(compgen -e | sort -u)\n)\"\nfor _v\
       \ in $(printf '%s\\n' \"${_sflow_names}\" | sort -u | sed '/^$/d'); do\n  _sflow_opts+=(-x \"${_v}\"\
-      )\ndone\nexec \"${_sflow_real}\" \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\nchmod\
-      \ +x /tmp/sflow-mpi/bin/mpirun\nexport SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command -v mpirun\
-      \ 2>/dev/null || true)}\"\nexport PATH=/tmp/sflow-mpi/bin:${PATH}\nSFLOW_MPI_NODE_INDEX=\"${SFLOW_TASK_NODE_INDEX:-0}\"\
-      \nSFLOW_MPI_NODE_IPS=\"${SFLOW_TASK_ASSIGNED_NODE_IPS:-}\"\nSFLOW_MPI_N_NODES=$(printf '%s' \"${SFLOW_MPI_NODE_IPS}\"\
-      \ | tr ',' '\\n' | grep -c '[^[:space:]]' || true)\nif [ \"${SFLOW_MPI_N_NODES:-0}\" -gt 1 ]; then\n\
-      \  echo \"[sflow-mpi] node ${SFLOW_MPI_NODE_INDEX}/${SFLOW_MPI_N_NODES}: preparing SSH/MPI\"\n \
-      \ if [ ! -x /usr/sbin/sshd ] && ! command -v sshd >/dev/null 2>&1; then\n    echo \"[sflow-mpi]\
-      \ installing openssh-server\"\n    export DEBIAN_FRONTEND=noninteractive\n    (apt-get update -qq\
-      \ && apt-get install -y -qq --no-install-recommends openssh-server) || echo \"[sflow-mpi] WARNING:\
-      \ could not install openssh-server\"\n  fi\n  mkdir -p /run/sshd /root/.ssh && chmod 755 /run/sshd\
-      \ && chmod 700 /root/.ssh\n  ssh-keygen -A >/dev/null 2>&1 || true\n  if [ -n \"${SFLOW_MPI_SSH_PRIVATE_KEY_B64:-}\"\
-      \ ]; then\n    printf %s \"${SFLOW_MPI_SSH_PRIVATE_KEY_B64}\" | base64 -d > /root/.ssh/id_rsa\n\
-      \    printf %s \"${SFLOW_MPI_SSH_PUBLIC_KEY_B64:-}\" | base64 -d > /root/.ssh/id_rsa.pub\n    cp\
-      \ /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys\n    chmod 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys\
-      \ /root/.ssh/id_rsa.pub\n    printf 'Host *\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile\
-      \ /dev/null\\n' > /root/.ssh/config\n    chmod 600 /root/.ssh/config\n  else\n    echo \"[sflow-mpi]\
-      \ FATAL: no injected SSH keypair; cannot bootstrap MPI over SSH\"\n    exit 1\n  fi\n  if [ \"${SFLOW_MPI_NODE_INDEX:-0}\"\
-      \ = \"0\" ]; then\n    mkdir -p /tmp/sflow-mpi\n    printf '%s' \"${SFLOW_MPI_NODE_IPS}\" | tr ','\
-      \ '\\n' | sed '/^[[:space:]]*$/d' | awk '{print $1\" slots=8\"}' > /tmp/sflow-mpi/hostfile\n   \
-      \ echo \"[sflow-mpi] hostfile:\"; cat /tmp/sflow-mpi/hostfile\n  fi\nfi\n# ===== end sflow k8s_mpi\
-      \ bootstrap =====\n# --- sflow: snapshot exported env (pre-recipe) for mpirun -x auto-forward ---\n\
-      mkdir -p /tmp/sflow-mpi 2>/dev/null || true\ncompgen -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
-      \ 2>/dev/null || true\n# ===== sflow k8s_mpi launch gate (pods route) =====\nif [ \"${SFLOW_MPI_N_NODES:-1}\"\
-      \ -gt 1 ]; then\n  if [ ! -x /usr/sbin/sshd ] && ! command -v sshd >/dev/null 2>&1; then\n    echo\
-      \ \"[sflow-mpi] installing openssh-server\"\n    export DEBIAN_FRONTEND=noninteractive\n    (apt-get\
-      \ update -qq && apt-get install -y -qq --no-install-recommends openssh-server) || echo \"[sflow-mpi]\
-      \ WARNING: could not install openssh-server\"\n  fi\n  mkdir -p /run/sshd && chmod 755 /run/sshd\n\
-      \  ssh-keygen -A >/dev/null 2>&1 || true\n  SFLOW_SSHD_BIN=\"$( [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd\
-      \ || command -v sshd || true )\"\n  if [ -z \"${SFLOW_SSHD_BIN}\" ]; then echo \"[sflow-mpi] FATAL:\
-      \ sshd unavailable\"; exit 1; fi\n  \"${SFLOW_SSHD_BIN}\" -p 2222 && echo \"[sflow-mpi] sshd up\
-      \ on :2222\"\n  if [ \"${SFLOW_MPI_NODE_INDEX:-0}\" != \"0\" ]; then\n    echo \"[sflow-mpi] worker\
-      \ ${SFLOW_MPI_NODE_INDEX}: setup done; idle (leader drives mpirun)\"\n    sleep infinity\n  fi\n\
-      \  SFLOW_SSH_OPTS=\"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\
-      \ -o ConnectTimeout=5 -o BatchMode=yes\"\n  for ip in $(printf '%s' \"${SFLOW_MPI_NODE_IPS}\" |\
-      \ tr ',' ' '); do\n    echo \"[sflow-mpi] waiting for sshd on ${ip}:2222\"\n    for _ in $(seq 1\
-      \ 240); do\n      if ssh ${SFLOW_SSH_OPTS} \"${ip}\" true 2>/dev/null; then echo \"[sflow-mpi] ${ip}\
-      \ ssh ok\"; break; fi\n      sleep 2\n    done\n  done\nfi\n# ===== end sflow k8s_mpi launch gate\
-      \ =====\nexec mpirun -np 16 trtllm-serve /models/m"
+      )\ndone\n# Surface the fully-resolved launch -- the real mpirun + every sflow-injected opt\n# (hostfile,\
+      \ SSH transport, CPU binding, env forwarding) + the recipe's own args -- so\n# the actual command\
+      \ that ran is visible in the task log (the shim otherwise exec's\n# silently). Only the leader reaches\
+      \ this line (workers idle in the role barrier above).\necho \"[sflow-mpi] launch: ${_sflow_real}\
+      \ ${_sflow_opts[*]} $*\"\nexec \"${_sflow_real}\" \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\n\
+      chmod +x /tmp/sflow-mpi/bin/mpirun\nexport SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command -v\
+      \ mpirun 2>/dev/null || true)}\"\nexport PATH=/tmp/sflow-mpi/bin:${PATH}\nexport SFLOW_MPI_NODE_INDEX=\"\
+      ${SFLOW_TASK_NODE_INDEX:-0}\"\nexport SFLOW_MPI_NODE_IPS=\"${SFLOW_TASK_ASSIGNED_NODE_IPS:-}\"\n\
+      export SFLOW_MPI_N_NODES=$(printf '%s' \"${SFLOW_MPI_NODE_IPS}\" | tr ',' '\\n' | grep -c '[^[:space:]]'\
+      \ || true)\nif [ \"${SFLOW_MPI_N_NODES:-0}\" -gt 1 ]; then\n  echo \"[sflow-mpi] node ${SFLOW_MPI_NODE_INDEX}/${SFLOW_MPI_N_NODES}:\
+      \ preparing SSH/MPI\"\n  if [ ! -x /usr/sbin/sshd ] && ! command -v sshd >/dev/null 2>&1; then\n\
+      \    echo \"[sflow-mpi] installing openssh-server\"\n    export DEBIAN_FRONTEND=noninteractive\n\
+      \    (apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-server) || echo\
+      \ \"[sflow-mpi] WARNING: could not install openssh-server\"\n  fi\n  mkdir -p /run/sshd /root/.ssh\
+      \ && chmod 755 /run/sshd && chmod 700 /root/.ssh\n  ssh-keygen -A >/dev/null 2>&1 || true\n  if\
+      \ [ -n \"${SFLOW_MPI_SSH_PRIVATE_KEY_B64:-}\" ]; then\n    printf %s \"${SFLOW_MPI_SSH_PRIVATE_KEY_B64}\"\
+      \ | base64 -d > /root/.ssh/id_rsa\n    printf %s \"${SFLOW_MPI_SSH_PUBLIC_KEY_B64:-}\" | base64\
+      \ -d > /root/.ssh/id_rsa.pub\n    cp /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys\n    chmod\
+      \ 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys /root/.ssh/id_rsa.pub\n    printf 'Host *\\n\
+      \  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n' > /root/.ssh/config\n    chmod\
+      \ 600 /root/.ssh/config\n  else\n    echo \"[sflow-mpi] FATAL: no injected SSH keypair; cannot bootstrap\
+      \ MPI over SSH\"\n    exit 1\n  fi\n  if [ \"${SFLOW_MPI_NODE_INDEX:-0}\" = \"0\" ]; then\n    mkdir\
+      \ -p /tmp/sflow-mpi\n    printf '%s' \"${SFLOW_MPI_NODE_IPS}\" | tr ',' '\\n' | sed '/^[[:space:]]*$/d'\
+      \ | awk '{print $1\" slots=8\"}' > /tmp/sflow-mpi/hostfile\n    echo \"[sflow-mpi] hostfile:\";\
+      \ cat /tmp/sflow-mpi/hostfile\n  fi\nfi\n# ===== end sflow k8s_mpi bootstrap =====\n# --- sflow:\
+      \ snapshot exported env (pre-recipe) for mpirun -x auto-forward ---\nmkdir -p /tmp/sflow-mpi 2>/dev/null\
+      \ || true\ncompgen -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
+      \ 2>/dev/null || true\nexec mpirun -np 16 trtllm-serve /models/m"
   kind: ConfigMap
   metadata:
     labels:

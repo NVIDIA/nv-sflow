@@ -300,6 +300,99 @@ def test_gather_pods_fail_fast_treats_watcher_exception_as_failure():
     assert results[0] == (1, "Failed")  # a raising watcher counts as a failed pod
 
 
+def test_gather_pods_fail_fast_mpi_world_group_resolves_on_leader_success():
+    # A multi-node MPI leader (index 0) whose `mpirun` exits masked-0 (Succeeded)
+    # while the idle worker watchers never return would otherwise block the task
+    # until SIGINT. With mpi_world_group, the leader terminating (ANY code) resolves
+    # the gather now and cancels the still-idle peers.
+    cancelled = {"w1": False, "w2": False}
+
+    async def leader():
+        return (0, "Succeeded")
+
+    async def idle(key):
+        try:
+            await asyncio.Event().wait()  # never returns (idle worker)
+            return (0, "Succeeded")
+        except asyncio.CancelledError:
+            cancelled[key] = True
+            raise
+
+    async def drive():
+        return await asyncio.wait_for(
+            life.gather_pods_fail_fast(
+                [leader(), idle("w1"), idle("w2")], mpi_world_group=True
+            ),
+            timeout=2,
+        )
+
+    results = asyncio.run(drive())
+    assert results[0] == (0, "Succeeded")
+    assert results[1] is None and results[2] is None  # idle peers cancelled
+    assert cancelled == {"w1": True, "w2": True}
+
+
+def test_gather_pods_fail_fast_mpi_world_group_resolves_on_any_pod_terminal():
+    # Broadened Fix B: the pods are one MPI world group, so ANY pod going terminal
+    # (here a WORKER at index 1, masked-Succeeded) resolves the whole task and cancels
+    # the rest -- a dead/finished rank breaks the group, don't wait on the others (nor
+    # only on the leader). The leader here stays "running" and is cancelled.
+    cancelled = {"leader": False, "w2": False}
+
+    async def leader():
+        try:
+            await asyncio.Event().wait()  # leader still running
+            return (0, "Succeeded")
+        except asyncio.CancelledError:
+            cancelled["leader"] = True
+            raise
+
+    async def worker_done():
+        return (0, "Succeeded")
+
+    async def idle():
+        try:
+            await asyncio.Event().wait()
+            return (0, "Succeeded")
+        except asyncio.CancelledError:
+            cancelled["w2"] = True
+            raise
+
+    async def drive():
+        return await asyncio.wait_for(
+            life.gather_pods_fail_fast(
+                [leader(), worker_done(), idle()], mpi_world_group=True
+            ),
+            timeout=2,
+        )
+
+    res = asyncio.run(drive())
+    assert res[1] == (0, "Succeeded")  # the worker that terminated
+    assert res[0] is None and res[2] is None  # leader + other idle peer cancelled
+    assert cancelled["leader"] and cancelled["w2"]
+
+
+def test_gather_pods_fail_fast_default_awaits_all_even_when_leader_succeeds():
+    # Default (mpi_world_group=False, non-MPI multi-node): a run-to-completion
+    # task must still await ALL pods -- a leader succeeding while a peer is still
+    # running does NOT resolve the task early. Proven by the idle peer forcing a
+    # timeout (unchanged behaviour).
+    async def leader():
+        return (0, "Succeeded")
+
+    async def idle():
+        await asyncio.Event().wait()
+        return (0, "Succeeded")
+
+    async def drive():
+        return await asyncio.wait_for(
+            life.gather_pods_fail_fast([leader(), idle()]), timeout=0.5
+        )
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(drive())
+
+
 def test_task_exit_code_any_failed_pod_fails_task():
     # Leader succeeded but a worker failed -> the task fails (not leader-only).
     assert life.task_exit_code([(0, "Succeeded"), (7, "Failed")]) == 7
@@ -581,7 +674,71 @@ def test_execute_offloads_stream_and_stops_on_terminal(monkeypatch, tmp_path):
         < kinds.index("exit")
         < kinds.index("finalize")
     )
+    # The terminal path finalizes exactly once -- the `finally`'s cancel-path re-fetch
+    # is guarded by `finalized` so it never runs a second time on a clean finish.
+    assert kinds.count("finalize") == 1
     assert kinds[-1] == "delete"
+
+
+def test_execute_finalizes_log_before_delete_on_cancel(monkeypatch, tmp_path):
+    # On SIGINT/teardown execute() is cancelled at the pod-status watch; it must still
+    # re-fetch each pod's COMPLETE log BEFORE deleting the pods, else a fast-failing
+    # launcher's log is lost. Simulate an idle pod, cancel mid-run, and assert finalize
+    # ran before delete_objects.
+    order: list[str] = []
+    at_watch = asyncio.Event()
+
+    async def fake_start_stream(log_command, dest_path):
+        return _FakeProc()
+
+    async def fake_tail(path, *, task_name):
+        await asyncio.sleep(3600)
+
+    async def fake_watch(pod_ref, **kw):
+        at_watch.set()
+        await asyncio.sleep(3600)  # idle pod: never terminal on its own
+        return "Succeeded"
+
+    async def fake_terminate(p, *, kill_group=False):
+        pass
+
+    async def fake_finalize(pod_refs, dest, *, prefix_size, phases, force=False, **kw):
+        order.append("finalize")
+
+    async def fake_exit(pod_ref, *, phase="", **kw):
+        return 0
+
+    async def fake_delete(refs, **kw):
+        order.append("delete")
+
+    monkeypatch.setattr(life, "start_pod_log_file_stream", fake_start_stream)
+    monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
+    monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
+    monkeypatch.setattr(life, "terminate_process", fake_terminate)
+    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "pod_exit_code", fake_exit)
+    monkeypatch.setattr(life, "delete_objects", fake_delete)
+
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(backend=_backend(), assigned_nodes=["node-0"],
+                             artifacts=[], gpu_count=2)
+
+    async def drive():
+        t = asyncio.ensure_future(
+            op.execute(
+                launcher=_FakeLauncher(), output_logger=None,
+                env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+                task_name="decode_server_0", script=["run"],
+            )
+        )
+        await asyncio.wait_for(at_watch.wait(), timeout=2)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        return t
+
+    asyncio.run(drive())
+    assert order == ["finalize", "delete"]  # log saved BEFORE pods deleted
 
 
 def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
@@ -597,6 +754,8 @@ def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
         envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
     )
     assert len(plan.pod_refs) == 2  # one pod per node
+    # Non-MPI multi-node is run-to-completion: NOT an MPI world group (await all pods).
+    assert plan.mpi_world_group is False
     leader_ref = plan.pod_refs[0]
     worker_cancelled = {"v": False}
 
@@ -650,6 +809,71 @@ def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
     rc = asyncio.run(drive())
     assert rc == 1  # the dead leader fails the whole task ...
     assert worker_cancelled["v"] is True  # ... and the idle worker was cancelled
+
+
+def test_execute_force_refetches_cancelled_peer_log_before_delete(monkeypatch, tmp_path):
+    # When fail-fast / world-group resolution cancels a peer, that peer is still
+    # Running (non-terminal ""-phase), so the normal complete-log re-fetch would skip
+    # (all-or-nothing phase guard) and lose every pod's log. execute() must FORCE the
+    # re-fetch -- the pods still exist -- BEFORE the finally deletes them.
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(backend=_backend(nodes=2, gpus_per_node=8),
+                             assigned_nodes=["node-0", "node-1"], artifacts=[],
+                             gpu_count=16)
+    plan = op._build_execution_plan(
+        task_name="decode_server_0", script=["run"],
+        envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+    )
+    leader_ref = plan.pod_refs[0]
+    order: list[str] = []
+    seen: dict = {}
+
+    async def fake_start_stream(log_command, dest_path):
+        return _FakeProc()
+
+    async def fake_tail(path, *, task_name):
+        await asyncio.sleep(3600)
+
+    async def fake_watch(pod_ref, **kw):
+        if pod_ref == leader_ref:
+            return "Failed"
+        await asyncio.sleep(3600)  # peer idles -> cancelled by fail-fast
+        return "Succeeded"
+
+    async def fake_terminate(p, *, kill_group=False):
+        pass
+
+    async def fake_exit(pod_ref, *, phase="", **kw):
+        return 1 if phase == "Failed" else 0
+
+    async def fake_finalize(pod_refs, dest, *, prefix_size, phases, force=False, **kw):
+        order.append("finalize")
+        seen["force"] = force
+        seen["phases"] = tuple(phases)
+
+    async def fake_delete(refs, **kw):
+        order.append("delete")
+
+    monkeypatch.setattr(life, "start_pod_log_file_stream", fake_start_stream)
+    monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
+    monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
+    monkeypatch.setattr(life, "terminate_process", fake_terminate)
+    monkeypatch.setattr(life, "pod_exit_code", fake_exit)
+    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "delete_objects", fake_delete)
+
+    async def drive():
+        return await asyncio.wait_for(
+            op.execute(launcher=_FakeLauncher(), output_logger=None,
+                       env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+                       task_name="decode_server_0", script=["run"]),
+            timeout=2,
+        )
+
+    asyncio.run(drive())
+    assert seen["force"] is True  # cancelled peer ("" phase) -> force the re-fetch
+    assert "" in seen["phases"]  # the cancelled peer contributed a non-terminal phase
+    assert order == ["finalize", "delete"]  # re-fetch BEFORE the pods are deleted
 
 
 def test_run_pod_stream_status_authoritative_interrupts_stream(monkeypatch, tmp_path):
@@ -1299,7 +1523,8 @@ def test_execute_merge_tails_each_member_and_rebuilds_complete_logs(monkeypatch,
         events.append(("terminate", kill_group))
 
     async def fake_merged_finalize(
-        pod_ref, *, tag_paths, default_path, prefix_size, phase, global_args, ns_args
+        pod_ref, *, tag_paths, default_path, prefix_size, phase, global_args, ns_args,
+        force=False,
     ):
         events.append(("merged_finalize", tuple(sorted(tag_paths)), phase))
 

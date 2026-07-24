@@ -181,6 +181,50 @@ def test_summary_renders_network_warnings_section(tmp_path):
     )
 
 
+def test_summary_renders_node_topology_section(tmp_path):
+    # A backend's reservation-stage CPU/NUMA/GPU probe surfaces in a dedicated
+    # 'Node Topology' section so it's visible when reviewing results later. Read from
+    # the backend at render time (report is populated during allocation).
+    tg = TaskGraph()
+    server = _task("decode_server_0", tmp_path)
+    tg.dag.add_node("decode_server_0", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    class _FakeBackend:
+        node_topology_report = "gb300-node-a:\nnproc=144\ncpuset=0-143"
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow, output_dir=tmp_path, runtime_info_text="rt",
+        command_log_paths={}, backends={"cluster": _FakeBackend()},
+    )
+    writer.workflow_finished(status="READY")
+
+    text = (tmp_path / "sflow_summary.log").read_text()
+    assert "Node Topology" in text
+    assert "[backend cluster]" in text
+    assert "nproc=144" in text and "cpuset=0-143" in text
+
+
+def test_summary_omits_node_topology_when_no_backend_report(tmp_path):
+    # A backend with no topology report (non-K8s, or probe skipped) -> no section.
+    tg = TaskGraph()
+    server = _task("s", tmp_path)
+    tg.dag.add_node("s", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    class _NoTopoBackend:
+        node_topology_report = None
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow, output_dir=tmp_path, runtime_info_text="rt",
+        command_log_paths={}, backends={"local": _NoTopoBackend()},
+    )
+    writer.workflow_finished(status="READY")
+    assert "Node Topology" not in (tmp_path / "sflow_summary.log").read_text()
+
+
 def test_summary_omits_network_warnings_section_when_none(tmp_path):
     tg = TaskGraph()
     server = _task("s", tmp_path)

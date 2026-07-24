@@ -1047,8 +1047,14 @@ Config (all optional — the common case needs none of these):
   what lets cross-task `cuda_ipc`/NVLink P2P work; each task still gets its own env,
   and the driver demuxes the single container log stream back into per-task logs. Only
   **single-node GPU tasks** co-located on a node merge (CPU-only infra and
-  multi-node tasks keep their own pods); merged tasks must be concurrent (a
-  completion-before-start dependency between two members is rejected). This is the
+  multi-node tasks keep their own pods). **Intra-group dependencies are honored by
+  gating:** when merged task B depends on merged task A, B's process blocks (inside
+  the pod) until A is *met* — A COMPLETED (batch) or A READY (service, its readiness
+  probe passed) — then runs. That is the same "dependency satisfied" rule the DAG
+  uses everywhere: COMPLETED is detected from A's in-pod exit-code file, and READY
+  reuses the same `kubectl exec` channel sflow already uses for probes (no extra
+  RBAC). A dependency reached only *through* a non-merged task in between is still
+  rejected (it would deadlock the pod). This is the
   node-local counterpart to IB/RDMA: on a real multi-node IB cluster UCX already
   auto-selects RDMA, but for same-node disaggregation NVLink needs the tasks in one
   pod. Privileged-adjacent (pairs naturally with `host_ipc`), so opt-in.

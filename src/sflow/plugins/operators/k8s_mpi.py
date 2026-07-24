@@ -43,7 +43,6 @@ from sflow.plugins.k8s.mpi_bootstrap import (
     build_launcher_preamble,
     build_mpi_bootstrap_preamble,
     build_mpijob_manifest,
-    build_pods_launch_gate,
     build_worker_command,
     final_launch_index,
     inject_mpi_scheduling,
@@ -115,6 +114,20 @@ class MpiConfig(BaseModel):
     # for GPU-bound serving; raise it for CPU-bound phases (roughly CPUs-per-node divided by
     # ranks-per-node). Set to null/0 to inject nothing and leave the image default.
     omp_num_threads: int | None = 8
+    # CPU binding for each MPI rank, injected into the mpirun wrapper (both routes) ONLY
+    # when several ranks share a pod (slots_per_worker > 1); a single-rank pod is untouched.
+    # OMP_NUM_THREADS caps libgomp but NOT the LLVM/MLIR ThreadPool that CuteDSL/TRT-LLM
+    # autotuning JIT spins up, which sizes to the rank's CPU affinity mask -- so an unbound
+    # rank reads the whole node's cores and, with several ranks per pod, blows past the
+    # cgroup pid limit ("pthread_create failed: Resource temporarily unavailable"). Binding
+    # shrinks that mask. "core" (default): PE = nproc/ranks cores per rank (nproc read from
+    # the pod's live cpuset at launch), giving each rank an isolated core slice and the
+    # tightest thread cap -- the reliable choice when a GPU pod's cpuset lands within a
+    # single NUMA node (typical on K8s GB200/GB300). "numa": one rank per NUMA domain
+    # (adds NUMA-local memory) -- only partitions ranks when the cpuset spans >1 NUMA node.
+    # "none": inject nothing (pre-feature behaviour). A recipe that already passes
+    # --bind-to/--map-by keeps its own binding (sflow injects nothing).
+    cpu_bind: Literal["core", "numa", "none"] = "core"
     # How long a worker's per-node setup (image apt-install + weight staging) may take
     # before its readiness probe reaps it (operator route). The worker's readiness probe
     # (tcpSocket on the ssh port) is what launcherCreationPolicy=WaitForWorkersReady gates
@@ -326,6 +339,7 @@ class K8sMpiOperator(K8sContainerOperator):
             gpus_per_node=max(self._per_pod_gpus, 1),
             ensure_sshd=self.config.mpi.ensure_sshd,
             forward_prefixes=self._forward_prefixes(),
+            cpu_bind=self.config.mpi.cpu_bind,
         )
 
     @staticmethod
@@ -364,36 +378,26 @@ class K8sMpiOperator(K8sContainerOperator):
             return self._build_mpijob_execution_plan(
                 task_name=task_name, script=script, envs=envs
             )
-        # Pods route, multi-node: split the launch by role right before the mpirun
-        # line -- a worker brings up sshd + idles; the leader waits for workers then
-        # launches -- so the recipe setup (above the gate) runs on EVERY pod
-        # (filesystem parity) and the leader never launches a rank before a worker's
-        # setup finished. The bootstrap preamble no longer idles the worker itself.
-        if self._node_count > 1:
-            script = self._insert_pods_launch_gate(script)
+        # Pods route: the per-role split (worker brings up sshd + idles; leader waits
+        # for workers then launches) lives INSIDE the mpirun shim (see
+        # build_mpi_bootstrap_preamble -> _role_barrier_block), so it engages at the real
+        # mpirun call regardless of how the recipe writes its launch line -- no source
+        # gate to insert here. The recipe setup still runs on every pod (parity).
         # Pods route: reuse the base N-pod build. The ephemeral SSH keypair is added
         # to the task env by execute() (via _inject_pods_keypair_env), NOT here: the
         # env-Secret's values are read from the apply command's OWN process env at
         # runtime, which build_command()/dry-run has no way to supply. When execute()
         # provides it, the keypair is already in ``envs`` here and flows into the
         # Secret automatically.
-        return super()._build_execution_plan(
+        plan = super()._build_execution_plan(
             task_name=task_name, script=script, envs=envs
         )
-
-    def _insert_pods_launch_gate(self, script: Sequence[str]) -> list[str]:
-        """Insert the pods-route role gate right before the recipe's final ``mpirun``
-        launch. No-op when the final command is not an ``mpirun`` launch (the user
-        owns their own process model) -- the launch is located by
-        :func:`final_launch_index`, the same finder ``_auto_exec_launch`` uses."""
-        lines = list(script)
-        idx = final_launch_index(lines)
-        if idx is None:
-            return lines
-        gate = build_pods_launch_gate(
-            ssh_port=self._ssh_port(), ensure_sshd=self.config.mpi.ensure_sshd
-        )
-        return lines[:idx] + gate + lines[idx:]
+        # Multi-node: the pods are one MPI world group, so resolve the moment ANY rank
+        # pod goes terminal (a finished/dead rank breaks the group) instead of hanging
+        # on the survivors -- an idle worker, or a leader still up after a worker died.
+        if self._node_count > 1:
+            plan.mpi_world_group = True
+        return plan
 
     # ------------------------------------------------------------------
     # Operator route: render an MPIJob CR
@@ -441,7 +445,9 @@ class K8sMpiOperator(K8sContainerOperator):
         # wrapper for -x forwarding) + the user's mpirun script. The mpi-operator
         # injects the hostfile + SSH transport, so the wrapper adds only -x here.
         launcher_script: list[str] = build_launcher_preamble(
-            forward_prefixes=self._forward_prefixes()
+            forward_prefixes=self._forward_prefixes(),
+            cpu_bind=c.mpi.cpu_bind,
+            slots=slots,
         ) + list(script)
         rdma_lib_mounts: list[tuple[str, str]] = []
         if rdma_hcas and self._rdma_lib_mounts:

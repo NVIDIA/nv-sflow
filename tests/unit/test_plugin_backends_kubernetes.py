@@ -372,6 +372,54 @@ def test_build_time_no_hcas_does_not_warn(monkeypatch, caplog):
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
+# ---------------------------------------------------------------------------
+# reservation-stage node topology probe (log-only, best-effort)
+# ---------------------------------------------------------------------------
+def test_probe_node_topology_logs_cpu_numa_gpu(monkeypatch, caplog):
+    # Log-only visibility: sflow execs a topology dump in each reservation pod and
+    # logs it per reserved node (for diagnosing CPU<->NUMA<->GPU binding). It must
+    # never affect allocation.
+    be = KubernetesBackend(_cfg())
+    be._node_to_resv_pod = {"gb300-node-a": "res-0"}
+    topo = (
+        "nproc=8\n"
+        "cpuset=0-7\n"
+        "available: 34 nodes (0-33)\n"
+        "node 0 cpus: 0 1 2 3 4 5 6 7\n"
+        "--- nvidia-smi topo -m ---\n"
+        "GPU0 X NODE NUMA Affinity 0\n"
+    )
+
+    async def fake_kubectl(args):
+        return (0, topo, "") if list(args)[:1] == ["exec"] else (0, "", "")
+
+    monkeypatch.setattr(be, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(logging.getLogger("sflow"), "propagate", True)
+    with caplog.at_level(logging.INFO, logger="sflow.plugins.backends.kubernetes"):
+        asyncio.run(be._probe_node_topology(["res-0"]))
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "gb300-node-a" in logged  # labelled per reserved node
+    assert "nproc=8" in logged and "available: 34 nodes" in logged
+    assert "NUMA Affinity 0" in logged
+    # Also stored for the summary file's Node Topology section.
+    assert be.node_topology_report is not None
+    assert "gb300-node-a" in be.node_topology_report
+    assert "nproc=8" in be.node_topology_report
+
+
+def test_probe_node_topology_best_effort_on_exec_failure(monkeypatch):
+    # A failed exec (no numactl/nvidia-smi, denied, pod not ready) is skipped -- the
+    # probe never raises and never blocks allocation.
+    be = KubernetesBackend(_cfg())
+    be._node_to_resv_pod = {"node-a": "res-0"}
+
+    async def boom(args):
+        raise RuntimeError("exec denied")
+
+    monkeypatch.setattr(be, "_kubectl", boom)
+    asyncio.run(be._probe_node_topology(["res-0"]))  # must not raise
+
+
 def test_detect_network_env_gke_provider(monkeypatch):
     be = KubernetesBackend(_cfg())
     node_json = json.dumps(

@@ -87,6 +87,13 @@ class Backend(ABC):
     Abstract base class for compute resource providers.
     """
 
+    # Default for a task's shell fail-fast (``set -e`` prelude) when the task does not
+    # set ``fail_fast`` explicitly. False here keeps Slurm/local/docker behavior
+    # unchanged; Kubernetes overrides this to True (a failed command in a pod should
+    # fail the task). An explicit ``fail_fast`` in the task YAML always wins. Resolved
+    # in ``app.assembly._resolve_fail_fast``.
+    default_fail_fast: bool = False
+
     def __init__(self, name: str):
         self.name = name
         self.allocation: Allocation | None = None

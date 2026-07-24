@@ -68,6 +68,12 @@ class Orchestrator:
         # Owners of task monitors currently held (acquired, not yet released).
         self._held_monitors: dict[str, "MonitorConsumer"] = {}
 
+        # Merge-pod gates already opened this run: (member_name, dep_name) pairs.
+        # An in-group dependency that reached READY/COMPLETED had its in-pod gate
+        # marker touched; recorded so we touch each edge once (idempotent, retried
+        # on exec failure). See _signal_merge_gates.
+        self._merge_gates_opened: set[tuple[str, str]] = set()
+
     async def _acquire_task_monitor(self, task: Task) -> None:
         registry = self._monitor_registry
         monitor = task.monitor
@@ -192,11 +198,30 @@ class Orchestrator:
                         # Note: `result()` may raise CancelledError; treat it as cancellation.
                         exit_code = proc_task.result()
                         t.exit_code = exit_code
-                        if exit_code == 0:
+                        # A service (readiness-probed) whose process exits before it
+                        # ever reached READY failed to start -- even on exit 0 (e.g. a
+                        # failure masked by a `mpirun | tee` pipeline). Do NOT mark it
+                        # COMPLETED (which would wrongly satisfy dependents that expect
+                        # the service to be up); route it through the failure/retry
+                        # path with a clear reason instead. But first double-confirm
+                        # with a forced final readiness scan, in case the service
+                        # became ready and exited in the probe scan gap (see
+                        # _recheck_readiness_after_exit) -- only fail if it is STILL
+                        # not READY afterwards.
+                        before_ready = exit_code == 0 and self._exited_before_ready(t)
+                        if before_ready:
+                            await self._recheck_readiness_after_exit(t)
+                            before_ready = self._exited_before_ready(t)
+                        if exit_code == 0 and not before_ready:
                             await self._finalize_successful_task(t)
                         else:
                             # Get the exception
                             task_exception = proc_task.exception()
+                            fail_reason = (
+                                "service exited before readiness"
+                                if before_ready
+                                else "process exit"
+                            )
                             retries = getattr(t, "retries", None)
                             attempts = int(getattr(t, "attempts", 0))
                             if retries is not None and (attempts - 1) < int(
@@ -215,7 +240,8 @@ class Orchestrator:
                                 # transitions back to RUNNING.
                                 t.status = TaskStatus.INITIATED
                                 _logger.warning(
-                                    f"Task '{t.name}' failed (exit={exit_code}, exception={task_exception}); "
+                                    f"Task '{t.name}' failed ({fail_reason}; exit={exit_code}, "
+                                    f"exception={task_exception}); "
                                     f"retrying in {delay:.2f}s (attempt {attempts}/{1 + int(retries.count)})"
                                 )
                                 self._record_summary(
@@ -227,12 +253,13 @@ class Orchestrator:
                             else:
                                 t.status = TaskStatus.FAILED
                                 _logger.error(
-                                    f"Task '{t.name}' failed (exit={exit_code}, exception={task_exception})"
+                                    f"Task '{t.name}' failed ({fail_reason}; exit={exit_code}, "
+                                    f"exception={task_exception})"
                                 )
                                 self._record_summary(
                                     "task_failed",
                                     t,
-                                    reason="process exit",
+                                    reason=fail_reason,
                                     exit_code=exit_code,
                                 )
                     except asyncio.CancelledError:
@@ -298,6 +325,10 @@ class Orchestrator:
                                 ),
                             )
                             raise
+
+                # Open in-pod gates for merged members whose in-group dependency just
+                # reached READY/COMPLETED, so the gated member's subshell proceeds.
+                await self._signal_merge_gates()
 
                 # Fail-fast: if any task reaches FAILED, cancel remaining work so we don't hang
                 # with blocked INITIATED tasks that can never become submittable.
@@ -386,6 +417,57 @@ class Orchestrator:
             self._record_summary(
                 "workflow_finished", status=summary_status, detail=summary_detail
             )
+
+    def _exited_before_ready(self, task: Task) -> bool:
+        """True when a service task's process exited before it ever became READY.
+
+        A task with readiness probe(s) is a service: for dependents it is "satisfied"
+        by reaching READY (up and serving), not merely by its process exiting. If the
+        process exits while the task is still RUNNING (never READY) -- even with exit
+        0, e.g. a startup failure masked into a 0 exit by a ``mpirun | tee`` pipeline,
+        or a crash that returns 0 -- the service failed to start. Marking it COMPLETED
+        would wrongly satisfy dependents (they would launch against a dead server), so
+        the caller treats it as a failure.
+
+        Returns False for batch tasks (no readiness probes) and for services that DID
+        reach READY (``status == READY``): a later clean exit is fine there, since
+        dependents were already unblocked when the service became ready.
+        """
+        if task.status == TaskStatus.READY:
+            return False
+        return any(
+            getattr(p, "type", None) == ProbeType.READINESS
+            for p in (getattr(task, "probes", None) or [])
+        )
+
+    async def _recheck_readiness_after_exit(self, task: Task) -> None:
+        """Give a just-exited service one final readiness scan before failing it.
+
+        There is a gap between a task's process exiting and the (interval-gated)
+        readiness probe re-scanning its log: a service can log its readiness line and
+        exit 0 in that gap, so ``status`` is still RUNNING at process-exit even though
+        it DID become ready. To avoid a false failure, flush the (now complete) task
+        log and force each readiness probe to check once more immediately; a match
+        flips the task to READY (via :meth:`_run_probe`), and the caller then treats
+        the exit as a clean finish rather than a startup failure. If no probe
+        triggers, the service genuinely exited before ready.
+        """
+        self._flush_task_log_handlers()
+        for probe in list(getattr(task, "probes", None) or []):
+            if task.status == TaskStatus.READY:
+                break
+            if getattr(probe, "type", None) != ProbeType.READINESS:
+                continue
+            force_due = getattr(probe, "force_due", None)
+            if callable(force_due):
+                force_due()
+            try:
+                await self._run_probe(probe, task)
+            except Exception:  # noqa: BLE001 - a final-scan error just means "not ready"
+                _logger.debug(
+                    "final readiness recheck for '%s' errored", task.name,
+                    exc_info=True,
+                )
 
     async def _finalize_successful_task(self, t: Task) -> None:
         """
@@ -826,6 +908,19 @@ class Orchestrator:
             TaskStatus.CANCELLED,
             TaskStatus.INITIATED,
         )
+        # Leader is retrying -> its pod (and the in-pod /tmp/sflow-merge-gate markers)
+        # are recreated fresh on the next attempt, so forget which gates we opened for
+        # THIS group. Its dependency members re-run and re-reach READY/COMPLETED, and
+        # _signal_merge_gates re-touches the new pod's markers. Idempotency WITHIN a
+        # pod instance is unchanged: the set repopulates as each gate reopens, and
+        # other merge groups' opened edges are preserved.
+        if status == TaskStatus.INITIATED and self._merge_gates_opened:
+            group_members = set(getattr(leader, "merge_members", []) or [])
+            self._merge_gates_opened = {
+                edge
+                for edge in self._merge_gates_opened
+                if edge[0] not in group_members
+            }
         for name in getattr(leader, "merge_members", []) or []:
             if name == leader.name:
                 continue
@@ -858,6 +953,46 @@ class Orchestrator:
                     follower,
                     reason=f"merge leader '{leader.name}' failed",
                 )
+
+    async def _signal_merge_gates(self) -> None:
+        """Open in-pod gates for merged members whose in-group dependency is met.
+
+        A merged member may depend on another member of the same pod (see
+        ``_plan_merge_groups``); its in-pod subshell blocks in ``_sflow_gate`` until
+        the dependency is met. COMPLETED is observed in-pod via the dependency's
+        exit-code file, but READY (a long-lived service) is known only to the driver,
+        so when a dependency reaches READY (or COMPLETED) tell the leader's operator
+        to touch the gate marker in the pod. Idempotent: each edge is opened once on
+        the first successful exec; a failed exec is retried next tick (self-healing).
+        The ``member RUNNING`` guard bounds the work to the window before the
+        dependent starts.
+        """
+        for leader in self.workflow.get_tasks():
+            if not getattr(leader, "is_merge_leader", False):
+                continue
+            if leader.status not in (TaskStatus.RUNNING, TaskStatus.READY):
+                continue
+            opener = getattr(leader.operator, "open_merge_gate", None)
+            if not callable(opener):
+                continue
+            for member_name in getattr(leader, "merge_members", []) or []:
+                try:
+                    member = self.workflow.get_task(member_name)
+                except KeyError:
+                    continue
+                if member.status != TaskStatus.RUNNING:
+                    continue
+                for dep_name in getattr(member, "merge_gate_after", []) or []:
+                    key = (member_name, dep_name)
+                    if key in self._merge_gates_opened:
+                        continue
+                    try:
+                        dep = self.workflow.get_task(dep_name)
+                    except KeyError:
+                        continue
+                    if dep.status in (TaskStatus.READY, TaskStatus.COMPLETED):
+                        if await opener(dep_name):
+                            self._merge_gates_opened.add(key)
 
     def _surface_network_fallback(self, task: Task) -> None:
         """Warn + record when a task's pod(s) degraded RDMA -> TCP at runtime.

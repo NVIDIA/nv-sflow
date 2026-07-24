@@ -50,6 +50,21 @@ _UNRECOVERABLE_WAITING_REASONS = (
 
 _MANIFEST_HEREDOC = "SFLOW_K8S_MANIFEST"
 
+# In-pod dependency gate for merge pods. A dependent member's subshell blocks in
+# _sflow_gate until each named in-group dependency is met: either the driver touches
+# <MERGE_GATE_DIR>/<dep>.open (the dependency reached READY -- only the driver knows
+# a service is ready) OR the dependency member's own exit-code file shows success
+# (COMPLETED, written in-pod). Fixed path so the driver's `kubectl exec ... touch`
+# and the in-pod loop agree; /tmp is per-container so two merged pods on one node
+# never collide.
+MERGE_GATE_DIR = "/tmp/sflow-merge-gate"
+MERGE_GATE_POLL_SECONDS = 2
+
+
+def merge_gate_marker(dep_name: str) -> str:
+    """Absolute path of the gate-open marker the driver touches for ``dep_name``."""
+    return f"{MERGE_GATE_DIR}/{dep_name}.open"
+
 
 def sanitize_name(name: str, *, max_length: int = 253) -> str:
     """Coerce a task name into a DNS-1123-ish Kubernetes resource name."""
@@ -294,7 +309,7 @@ def apply_then_handoff_lines(
 
 
 def merged_launcher_lines(
-    members: Sequence[tuple[str, str, str, str]],
+    members: Sequence[tuple[str, ...]],  # (name, cvd, script, env[, gate])
     *,
     preamble_lines: Sequence[str] = (),
 ) -> list[str]:
@@ -303,7 +318,10 @@ def merged_launcher_lines(
     ``members`` is ``[(task_name, cuda_visible_devices, script_path, env_path)]``.
     All members share the one container (so they see every GPU -> NVLink/cuda_ipc),
     but each runs in its own subshell with its packed ``CUDA_VISIBLE_DEVICES`` and
-    its own sourced env file. Each member's combined stdout/stderr is tagged
+    its own sourced env file. A member with an in-group dependency (a non-empty 5th
+    ``gate`` tuple element) blocks in ``_sflow_gate`` until each dependency is met
+    (its ``.open`` marker or a success rc file) before running; an empty ``gate``
+    waits for nothing. Each member's combined stdout/stderr is tagged
     ``[[sflow-mux:<task>]] `` so the driver can demux the single container log into
     per-task ``<task>.log`` files. The launcher exits non-zero if any member does
     (its container exit code is the merge leader task's), and blocks in ``wait``
@@ -315,17 +333,50 @@ def merged_launcher_lines(
     lines.extend(list(preamble_lines))
     lines.extend(
         [
+            f"_SFLOW_GATE_DIR={shlex.quote(MERGE_GATE_DIR)}",
+            'mkdir -p "$_SFLOW_GATE_DIR"',
             '_sflow_rc_dir="$(mktemp -d)"',
+            # Block until each named in-pod dependency is met: the driver touches
+            # $_SFLOW_GATE_DIR/<dep>.open when it reaches READY, or the dependency's
+            # own rc file shows 0 (COMPLETED). If a dependency FAILED (rc!=0), return
+            # that rc so the gated member propagates the failure instead of running.
+            "_sflow_gate() {",
+            '  for _dep in "$@"; do',
+            '    if [ ! -f "$_SFLOW_GATE_DIR/$_dep.open" ] '
+            '&& [ ! -f "$_sflow_rc_dir/$_dep" ]; then',
+            '      echo "sflow: $_name waiting for merged dependency $_dep..."',
+            "    fi",
+            "    while :; do",
+            '      [ -f "$_SFLOW_GATE_DIR/$_dep.open" ] && break',
+            '      if [ -f "$_sflow_rc_dir/$_dep" ]; then',
+            '        _drc="$(cat "$_sflow_rc_dir/$_dep" 2>/dev/null || echo 1)"',
+            '        [ "$_drc" = 0 ] && break',
+            '        echo "sflow: merged dependency $_dep failed (rc=$_drc); '
+            '$_name will not start" >&2',
+            '        return "$_drc"',
+            "      fi",
+            f"      sleep {int(MERGE_GATE_POLL_SECONDS)}",
+            "    done",
+            "  done",
+            "  return 0",
+            "}",
             "_sflow_run() {",
-            '  _name="$1"; _cvd="$2"; _script="$3"; _envf="$4"',
+            '  _name="$1"; _cvd="$2"; _script="$3"; _envf="$4"; _gate="$5"',
             "  (",
             '    export CUDA_VISIBLE_DEVICES="$_cvd"',
             # Mirror onto NVIDIA_VISIBLE_DEVICES too -- some runtimes/newer GPU stacks
             # honor only that one; keep the member's slice identical across both.
             '    export NVIDIA_VISIBLE_DEVICES="$_cvd"',
             '    if [ -f "$_envf" ]; then . "$_envf"; fi',
-            '    bash -l "$_script"',
-            '    echo "$?" > "$_sflow_rc_dir/$_name"',
+            # _gate unquoted: empty string -> zero args -> _sflow_gate returns 0
+            # immediately, so a non-dependent member behaves exactly as before.
+            "    if _sflow_gate $_gate; then",
+            '      bash -l "$_script"',
+            '      echo "$?" > "$_sflow_rc_dir/$_name"',
+            "    else",
+            # _sflow_gate returned the failed dependency's rc; record it as ours.
+            '      echo "$?" > "$_sflow_rc_dir/$_name"',
+            "    fi",
             # `|| [ -n "$_sflow_line" ]`: emit a final line the script wrote without a
             # trailing newline (plain `read` returns non-zero and would drop it), so a
             # member's last line (e.g. a no-newline readiness marker) is never lost.
@@ -335,11 +386,14 @@ def merged_launcher_lines(
             "}",
         ]
     )
-    for name, cvd, script_path, env_path in members:
+    for member in members:
+        name, cvd, script_path, env_path = member[0], member[1], member[2], member[3]
+        gate = member[4] if len(member) > 4 else ""
         lines.append(
             "_sflow_run "
             f"{shlex.quote(name)} {shlex.quote(cvd)} "
-            f"{shlex.quote(script_path)} {shlex.quote(env_path)}"
+            f"{shlex.quote(script_path)} {shlex.quote(env_path)} "
+            f"{shlex.quote(gate)}"
         )
     lines.extend(
         [

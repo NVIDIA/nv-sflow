@@ -341,7 +341,7 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 | `probes` | | object | `null` | Readiness and failure probes. |
 | `outputs` | | list | `null` | Output parsing configuration (legacy MVP). |
 | `result` | | map / object | `null` | Consolidated result parsing (regex map, `patterns`, or `file`). Writes `result.json` + workflow `results.json`. |
-| `fail_fast` | | bool | `false` | Prepend `set -e` to the script (shell operators) so the task fails on the first failing command. |
+| `fail_fast` | | bool | backend | Prepend `set -e` to the script (shell operators) so the task fails on the first failing command. Unset takes the backend default: `true` on Kubernetes, `false` on Slurm/local/docker. Set explicitly to override. |
 | `uploads` | | list | `null` | Per-task file uploads to a `storage` target, fired on `COMPLETED` (see [Task Uploads](#task-uploads)). |
 | `ports` | | list | `null` | Service ports the task exposes, feeding `${{ task.<name>.service }}` expressions (see [Task Ports](#task-ports)). |
 | `monitor` | | object | `null` | Per-task hardware monitor (see [Monitor](#monitor)). |

@@ -327,7 +327,7 @@ Beyond `depends_on`, `resources`, `replicas`, and `probes`, a task supports:
 - `operator` / `backend`: name (or inline override object) of the operator or backend for this task.
 - `ports`: service ports the task exposes (each with `port` and an optional `name`).
 - `timeout`: per-task timeout (seconds or a string like `30m`); the workflow also has its own `timeout`.
-- `fail_fast`: bool, default `false` (shell default: only the last command's exit code counts). Set `true` to prepend `set -e` to shell-operator scripts so any failed command fails the task. Applies to shell operators only (never `python`, whose script is Python source).
+- `fail_fast`: bool, **default depends on the backend** — `true` on Kubernetes (a failed command in a pod should fail the task), `false` on Slurm/local/docker (shell default: only the last command's exit code counts). Leave unset to take the backend default, or set explicitly (`true`/`false`) to override per task. When effective-true, sflow prepends `set -e` to shell-operator scripts so any failed command fails the task. Applies to shell operators only (never `python`, whose script is Python source).
 - `variables`: task-scoped variables (same format as top-level `variables`).
 - `retries`: retry policy (`count`, `interval`, `backoff`) for a failed task.
 - `result`: consolidated result parsing that writes `result.json` — see [Results](./results.md).

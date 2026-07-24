@@ -973,6 +973,7 @@ class SflowApp:
                             runtime_info_text=format_runtime_info(),
                             command_log_paths=command_log_paths,
                             command_text=command_text,
+                            backends=state.backends,
                         )
 
                     orch = Orchestrator(

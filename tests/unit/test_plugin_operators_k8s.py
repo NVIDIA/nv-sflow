@@ -5,6 +5,7 @@
 multi-node pod-set + env wiring, ConfigMap script mount, hostname pinning, and
 the create-before-destroy handoff gating (GPU tasks only)."""
 
+import asyncio
 import json
 import logging
 import os
@@ -1960,7 +1961,7 @@ def test_network_fallback_status_none_when_log_missing(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _member_task(name, script, envs, cvd):
+def _member_task(name, script, envs, cvd, gate_after=None):
     from sflow.core.task import Task, TaskStatus
 
     t = Task(
@@ -1972,6 +1973,7 @@ def _member_task(name, script, envs, cvd):
         envs=dict(envs),
     )
     t.merge_cuda_visible_devices = cvd
+    t.merge_gate_after = list(gate_after or [])
     return t
 
 
@@ -2062,6 +2064,197 @@ def test_merge_pod_configmap_has_launcher_and_member_scripts():
     assert 'export CUDA_VISIBLE_DEVICES="$_cvd"' in launcher
     # NVIDIA_VISIBLE_DEVICES mirrors the same per-member slice.
     assert 'export NVIDIA_VISIBLE_DEVICES="$_cvd"' in launcher
+
+
+def test_merged_launcher_renders_gate_only_for_dependent_member():
+    from sflow.plugins.k8s.shell import (
+        MERGE_GATE_DIR,
+        merge_gate_marker,
+        merged_launcher_lines,
+    )
+
+    lines = merged_launcher_lines(
+        [
+            ("prefill", "4,5", "/sflow/merge_prefill.sh", "/sflow/p/envsh", ""),
+            ("decode", "0,1,2,3", "/sflow/merge_decode.sh", "/sflow/d/envsh", "prefill"),
+        ]
+    )
+    text = "\n".join(lines)
+    # Gate scaffolding present.
+    assert "_sflow_gate() {" in text
+    assert 'mkdir -p "$_SFLOW_GATE_DIR"' in text
+    assert f"_SFLOW_GATE_DIR={MERGE_GATE_DIR}" in text  # /tmp/... needs no shell quoting
+    assert "/tmp/sflow-merge-gate" in text
+    # decode waits for prefill; prefill has an empty gate arg.
+    assert (
+        "_sflow_run decode 0,1,2,3 /sflow/merge_decode.sh /sflow/d/envsh prefill" in text
+    )
+    assert "_sflow_run prefill 4,5 /sflow/merge_prefill.sh /sflow/p/envsh ''" in text
+    # Marker path helper matches what the loop checks.
+    assert merge_gate_marker("prefill") == "/tmp/sflow-merge-gate/prefill.open"
+
+
+def test_merged_launcher_backward_compatible_with_4_tuples():
+    # Existing callers pass 4-tuples (no gate); must still render, empty gate arg.
+    from sflow.plugins.k8s.shell import merged_launcher_lines
+
+    lines = merged_launcher_lines([("m", "0", "/s/m.sh", "/s/envsh")])
+    text = "\n".join(lines)
+    assert "_sflow_run m 0 /s/m.sh /s/envsh ''" in text
+
+
+def test_merged_plan_threads_gate_into_launcher_for_dependent_member():
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend("dra", 8), assigned_nodes=["node-0"], artifacts=[],
+        gpu_count=4, cuda_visible_devices="0,1,2,3",
+    )
+    prefill = _member_task(
+        "prefill", ["run-prefill"],
+        {"SFLOW_OUTPUT_DIR": "/out", "SFLOW_TASK_OUTPUT_DIR": "/out/prefill"}, "4,5",
+    )
+    decode = _member_task(
+        "decode", ["run-decode"],
+        {"SFLOW_OUTPUT_DIR": "/out", "SFLOW_TASK_OUTPUT_DIR": "/out/decode"}, "0,1,2,3",
+        gate_after=["prefill"],
+    )
+    op.apply_merge_group(members=[decode, prefill], union_gpus=6)
+    cmd = op.build_command(task_name="decode", script=["run-decode"], envs=decode.envs)
+    launcher = cmd.as_list()[-1]
+    # decode gates on prefill; prefill gates on nobody (empty last arg).
+    assert (
+        "_sflow_run decode 0,1,2,3 /sflow/merge_decode.sh" in launcher
+        and "/envsh prefill" in launcher
+    )
+    assert "_sflow_run prefill 4,5 /sflow/merge_prefill.sh" in launcher
+    assert "/envsh ''" in launcher  # prefill's empty gate arg
+
+
+def test_open_merge_gate_execs_touch_marker(monkeypatch):
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend("dra", 8), assigned_nodes=["node-0"], artifacts=[],
+        gpu_count=4, cuda_visible_devices="0,1,2,3",
+    )
+    decode = _member_task("decode", ["run-decode"], {}, "0,1,2,3")
+    prefill = _member_task("prefill", ["run-prefill"], {}, "4,5")
+    op.apply_merge_group(members=[decode, prefill], union_gpus=6)
+
+    calls = []
+
+    async def _fake_run_kubectl(args, *, global_args=None):
+        calls.append(list(args))
+        return 0, "", ""
+
+    from sflow.plugins.operators import k8s_operator as mod
+    monkeypatch.setattr(mod.k8s_lifecycle, "run_kubectl", _fake_run_kubectl)
+
+    ok = asyncio.run(op.open_merge_gate("prefill"))
+    assert ok is True
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[0] == "exec"
+    assert "--" in args and "sh" in args and "-c" in args
+    joined = " ".join(args)
+    assert "/tmp/sflow-merge-gate/prefill.open" in joined
+    assert "mkdir -p /tmp/sflow-merge-gate" in joined
+
+
+def test_open_merge_gate_noop_when_not_merge_leader():
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    assert asyncio.run(op.open_merge_gate("prefill")) is False
+
+
+def test_end_to_end_assembly_gate_renders_in_launcher():
+    # Real planner sets merge_gate_after; real operator renders the gate. decode
+    # depends on prefill; both co-located GPU tasks on one node with merge on.
+    from sflow.app.assembly import _plan_merge_groups
+    from sflow.core.task import Task, TaskStatus
+    from sflow.core.task_graph import TaskGraph
+
+    class _BE:
+        name = "k8s"
+        merge_colocated_gpu_pods = True
+        compute_domain_channel = None
+        nvlink_domain_scope = None
+        rdma_enabled = False
+
+    class _PL:
+        def __init__(self, be, nodes, gpu):
+            self.backend, self.assigned_nodes, self.gpu_count = be, nodes, gpu
+
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend("dra", 8), assigned_nodes=["node-0"], artifacts=[],
+        gpu_count=4, cuda_visible_devices="0,1,2,3",
+    )
+    # Both members share the real operator so grouping sees one image and the leader
+    # renders the merged pod. The planner packs CVD + records the gate itself.
+    decode = Task(
+        name="decode", logger=logging.getLogger("test.decode"), operator=op,
+        status=TaskStatus.INITIATED, script=["run-decode"],
+        envs={"SFLOW_OUTPUT_DIR": "/out", "SFLOW_TASK_OUTPUT_DIR": "/out/decode"},
+    )
+    prefill = Task(
+        name="prefill", logger=logging.getLogger("test.prefill"), operator=op,
+        status=TaskStatus.INITIATED, script=["run-prefill"],
+        envs={"SFLOW_OUTPUT_DIR": "/out", "SFLOW_TASK_OUTPUT_DIR": "/out/prefill"},
+    )
+    tg = TaskGraph()
+    tg.dag.add_node("decode", decode)
+    tg.dag.add_node("prefill", prefill)
+    tg.dag.add_edge("prefill", "decode")  # decode depends on prefill
+    be = _BE()
+    _plan_merge_groups(
+        tg, {"decode": _PL(be, ["node-0"], 4), "prefill": _PL(be, ["node-0"], 2)}
+    )
+    # Planner recorded the gate; leader is 'decode' (sorted first).
+    assert decode.merge_gate_after == ["prefill"]
+    assert decode.is_merge_leader is True
+
+    cmd = op.build_command(task_name="decode", script=["run-decode"], envs=decode.envs)
+    shell = cmd.as_list()[-1]
+    after = shell.split(_MARK, 1)[1]
+    body = after.split("\n" + _MARK, 1)[0]
+    manifest = json.loads(body.split("\n", 1)[1])
+    launcher = _entrypoint(manifest)  # real entrypoint.sh (unescaped newlines)
+    assert "_sflow_gate() {" in launcher
+    decode_line = next(
+        ln for ln in launcher.splitlines() if ln.startswith("_sflow_run decode")
+    )
+    prefill_line = next(
+        ln for ln in launcher.splitlines() if ln.startswith("_sflow_run prefill")
+    )
+    assert decode_line.endswith(" prefill")  # decode's gate arg = prefill
+    assert prefill_line.endswith(" ''")       # prefill has no gate
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="bash not available")
+def test_merged_gate_blocks_until_dependency_completes(tmp_path, fake_process):
+    # A gated member must not run its script until the dependency's rc file shows 0.
+    # We simulate a dependency that "completes" (exit 0) and assert the gated member
+    # then runs.
+    fake_process.allow_unregistered(True)  # real bash
+    from sflow.plugins.k8s.shell import bash_lc_command, merged_launcher_lines
+
+    dep_ok = tmp_path / "dep_ok.sh"
+    dep_ok.write_text("exit 0\n")
+    gated = tmp_path / "gated.sh"
+    gated.write_text("printf 'GATED-RAN\\n'\n")
+    noenv = str(tmp_path / "noenv")
+    # Dependency 'dep' runs and exits 0; 'gated' waits for 'dep' then runs.
+    cmd = bash_lc_command(
+        merged_launcher_lines(
+            [
+                ("dep", "0", str(dep_ok), noenv, ""),
+                ("gated", "0", str(gated), noenv, "dep"),
+            ]
+        )
+    )
+    result = subprocess.run(
+        [str(a) for a in cmd.as_list()], text=True, capture_output=True, timeout=30
+    )
+    assert "[[sflow-mux:gated]] GATED-RAN" in result.stdout, result.stderr
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="bash not available")

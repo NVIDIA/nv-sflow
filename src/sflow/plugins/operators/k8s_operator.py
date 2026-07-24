@@ -49,10 +49,12 @@ from sflow.plugins.k8s.render import (
     render_task_pod,
 )
 from sflow.plugins.k8s.shell import (
+    MERGE_GATE_DIR,
     build_apply_command,
     build_log_stream_command,
     build_merged_apply_command,
     configmap_data_key,
+    merge_gate_marker,
     merged_launcher_lines,
     namespace_segment,
     sanitize_name,
@@ -106,6 +108,11 @@ _SFLOW_COLLECT_POLL_INTERVAL = 1.0
 # driver. Files larger than this are skipped with a warning -- sync those via ``uploads:``
 # / a PVC. Override per task with ``collect_max_file_size`` (0 disables collection).
 _SFLOW_COLLECT_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+# Bound on the cancel-path complete-log re-fetch (``execute``'s ``finally``): a SIGINT'd
+# run re-fetches each pod's log before deleting the pods, but that best-effort fetch must
+# never let teardown hang -- so cap it and fall through to the pod delete on timeout.
+_SFLOW_FINALIZE_ON_CANCEL_TIMEOUT = 30.0
 
 
 def _parse_size_bytes(value: int | str | None, default: int) -> int:
@@ -385,6 +392,12 @@ class _K8sExecPlan:
     # ``execute`` runs the cp-collector (see ``_collect_via_cp``) concurrently with the
     # pod-status watch.
     collect_output: bool = False
+    # Multi-node MPI (pods route): the pods are one MPI COMM_WORLD. When True,
+    # ``execute`` passes it to ``gather_pods_fail_fast`` so the task resolves the moment
+    # ANY rank pod goes terminal (a finished/dead rank breaks the group) instead of
+    # blocking on the survivors until teardown. Off for single-pod and non-MPI
+    # multi-node (run-to-completion) tasks, which must await every pod.
+    mpi_world_group: bool = False
 
 
 class K8sContainerOperatorConfig(OperatorConfig):
@@ -672,6 +685,36 @@ class K8sContainerOperator(Operator):
         """
         self._merge_members = list(members)
         self._merge_union_gpus = int(union_gpus)
+
+    async def open_merge_gate(self, dep_name: str) -> bool:
+        """Open the in-pod gate for ``dep_name`` so a merged member waiting on it
+        (via ``_sflow_gate``) proceeds. The orchestrator calls this when an in-group
+        dependency reaches READY/COMPLETED. Reuses the release idiom used for
+        node-local collect: ``kubectl exec ... touch <marker>``. Returns ``True`` on
+        a successful exec (the orchestrator then stops re-touching); ``False`` if
+        this operator is not a merge leader or the exec failed (retried next tick).
+        """
+        if not self._merge_members:
+            return False
+        pod = self._merged_pod_base()
+        ns_args = (
+            ["--namespace", self._namespace] if self._namespace else []
+        )
+        marker = merge_gate_marker(dep_name)
+        rc, _out, err = await k8s_lifecycle.run_kubectl(
+            [
+                "exec", pod, *ns_args, "--", "sh", "-c",
+                f"mkdir -p {shlex.quote(MERGE_GATE_DIR)} && "
+                f"touch {shlex.quote(marker)}",
+            ],
+            global_args=list(self._kubectl_global_args),
+        )
+        if rc != 0:
+            _logger.debug(
+                "open_merge_gate(%s) exec on pod %s rc=%s: %s",
+                dep_name, pod, rc, err,
+            )
+        return rc == 0
 
     def apply_backend_context(
         self,
@@ -1286,7 +1329,7 @@ class K8sContainerOperator(Operator):
         # live from the member Task objects (script/envs finalized by assembly +
         # configure_task_runtime).
         cm_data: dict[str, str] = {}
-        launcher_members: list[tuple[str, str, str, str]] = []
+        launcher_members: list[tuple[str, str, str, str, str]] = []
         env_file_secrets: list[tuple[str, str]] = []
         member_env_secrets: list[tuple[str, list[tuple[str, str]]]] = []
         combined_env: dict[str, str] = {}
@@ -1314,7 +1357,10 @@ class K8sContainerOperator(Operator):
             cm_data[script_key] = "\n".join(m_script)
             script_path = f"{SFLOW_SCRIPT_DIR}/{script_key}"
             env_path = f"{SFLOW_SCRIPT_DIR}/menv/{sanitize_name(m_name)}/envsh"
-            launcher_members.append((m_name, cvd, script_path, env_path))
+            gate = " ".join(
+                str(g) for g in (getattr(m, "merge_gate_after", None) or [])
+            )
+            launcher_members.append((m_name, cvd, script_path, env_path, gate))
             prefix = f"SFMERGE{i}__"
             key_pairs = [(k, f"{prefix}{k}") for k in m_envs]
             if key_pairs:
@@ -1922,6 +1968,11 @@ class K8sContainerOperator(Operator):
             task_name=task_name, script=list(script), envs=dict(env)
         )
         tailers: list[asyncio.Future] = []
+        # Re-fetch the complete log exactly once: normally on the terminal path below,
+        # else (cancelled first) in the ``finally`` before the pods are deleted.
+        # ``apply_prefix_size`` is bound here so the ``finally`` can use it.
+        finalized = False
+        apply_prefix_size = 0
         # Single-pod node-local output collector (kubectl cp), run concurrently with the
         # pod-status watch below; None unless this task stages output for collection.
         collector: asyncio.Future | None = None
@@ -2042,7 +2093,8 @@ class K8sContainerOperator(Operator):
                 [
                     self._run_pod_stream(plan=plan, index=i)
                     for i in range(len(plan.pod_refs))
-                ]
+                ],
+                mpi_world_group=plan.mpi_world_group,
             )
             # The pod is terminal now. If it produced output, the collector already
             # copied it back and released the pod (that's WHY it went terminal); if it
@@ -2068,25 +2120,15 @@ class K8sContainerOperator(Operator):
             # Single pod -> one log per pod (finalize_complete_log). Merge-pod -> one
             # container log carrying every member, re-split by the mux tag into each
             # member's <task>.log (finalize_merged_complete_log). Same guarantee both.
-            if plan.merge_tag_paths and plan.task_log_path:
-                await k8s_lifecycle.finalize_merged_complete_log(
-                    plan.pod_refs[0],
-                    tag_paths=plan.merge_tag_paths,
-                    default_path=plan.task_log_path,
-                    prefix_size=apply_prefix_size,
-                    phase=phases[0] if phases else "",
-                    global_args=plan.global_args,
-                    ns_args=plan.ns_args,
-                )
-            elif plan.task_log_path:
-                await k8s_lifecycle.finalize_complete_log(
-                    plan.pod_refs,
-                    plan.task_log_path,
-                    prefix_size=apply_prefix_size,
-                    phases=phases,
-                    global_args=plan.global_args,
-                    ns_args=plan.ns_args,
-                )
+            # A peer cancelled by fail-fast / world-group resolution is still Running
+            # (non-terminal ""-phase), which would make the all-or-nothing re-fetch skip
+            # and drop every pod's log. Force it -- the pods still exist here, and the
+            # `finally` deletes them only after -- so the launcher + peer logs survive.
+            force_refetch = not all(p in ("Succeeded", "Failed") for p in phases)
+            await self._finalize_task_log(
+                plan, apply_prefix_size, phases, force=force_refetch
+            )
+            finalized = True
             # Any failed pod fails the whole task; otherwise the leader's code.
             return k8s_lifecycle.task_exit_code(results)
         finally:
@@ -2104,6 +2146,17 @@ class K8sContainerOperator(Operator):
                     t.cancel()
             if tailers:
                 await asyncio.gather(*tailers, return_exceptions=True)
+            # Cancelled before the normal re-fetch: pull each pod's COMPLETE log BEFORE
+            # deleting the pods, else a fast-failing launcher's log is lost. Bounded +
+            # best-effort so teardown always reaches the delete and the cancel survives.
+            if not finalized and plan.task_log_path:
+                try:
+                    await asyncio.wait_for(
+                        self._finalize_task_log(plan, apply_prefix_size, [], force=True),
+                        timeout=_SFLOW_FINALIZE_ON_CANCEL_TIMEOUT,
+                    )
+                except (Exception, asyncio.CancelledError):
+                    pass
             await k8s_lifecycle.delete_objects(
                 plan.cleanup_refs, global_args=plan.global_args, ns_args=plan.ns_args
             )
@@ -2170,6 +2223,49 @@ class K8sContainerOperator(Operator):
                     "--", "sh", "-c", f"touch {shlex.quote(done_remote)}",
                 ],
                 global_args=global_args,
+            )
+
+    async def _finalize_task_log(
+        self,
+        plan: _K8sExecPlan,
+        prefix_size: int,
+        phases: Sequence[str],
+        *,
+        force: bool = False,
+    ) -> None:
+        """Re-fetch each pod's COMPLETE container log and rebuild ``<task>.log``.
+
+        Shared by the normal terminal path and the cancel/teardown path (``execute``'s
+        ``finally``): the live ``kubectl logs -f`` follow is cut the instant a pod is
+        terminal (or on teardown), so the on-disk log may miss the tail. A one-shot
+        re-fetch rebuilds it complete -- single pod -> ``finalize_complete_log``,
+        merge-pod -> ``finalize_merged_complete_log``. ``force`` fetches irrespective of
+        pod phase (the cancel path can't know the phases and must save a fast-failing
+        launcher's log before the pods are deleted). Best-effort: the underlying
+        finalizers never raise and keep the live content if a re-fetch fails.
+        """
+        if not plan.task_log_path:
+            return
+        if plan.merge_tag_paths:
+            await k8s_lifecycle.finalize_merged_complete_log(
+                plan.pod_refs[0],
+                tag_paths=plan.merge_tag_paths,
+                default_path=plan.task_log_path,
+                prefix_size=prefix_size,
+                phase=phases[0] if phases else "",
+                global_args=plan.global_args,
+                ns_args=plan.ns_args,
+                force=force,
+            )
+        else:
+            await k8s_lifecycle.finalize_complete_log(
+                plan.pod_refs,
+                plan.task_log_path,
+                prefix_size=prefix_size,
+                phases=phases,
+                global_args=plan.global_args,
+                ns_args=plan.ns_args,
+                force=force,
             )
 
     async def _run_pod_stream(

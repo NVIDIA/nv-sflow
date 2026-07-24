@@ -17,21 +17,35 @@ items:
       \ ONE plm_rsh_args argument.\nif [ \"0\" = \"1\" ] && [ -f \"/tmp/sflow-mpi/hostfile\" ]; then\n\
       \  _sflow_opts+=(--hostfile \"/tmp/sflow-mpi/hostfile\" \\\n    --mca plm_rsh_agent ssh \\\n   \
       \ --mca plm_rsh_args \"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\
-      \ -o ConnectTimeout=10\")\nfi\n# Forward env to remote ranks (sshd gives them a bare env), deduped,\
-      \ from three\n# sources: the always-on whole-name vars, the merged prefix set (scanned NOW so late\n\
-      # `export`s are captured), and every var the recipe itself exported -- the diff of\n# the current\
-      \ exports against the pre-recipe snapshot -- so a plain `export FOO=bar`\n# reaches workers without\
-      \ listing it in forward_env_prefixes.\n_sflow_snap=\"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
-      \n_sflow_names=\"$(\n  for _v in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\\
-      ${${_v}+x}\\\" ]\" && printf '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
+      \ -o ConnectTimeout=10\")\nfi\n# sflow CPU binding (multi-rank-per-pod): bind each rank within the\n\
+      # pod's cpuset so LLVM/OpenMP thread pools size to the binding, not the\n# whole node -- prevents\
+      \ pid/thread exhaustion when ranks share a pod.\n# Skipped if the recipe already binds (--bind-to/--map-by\
+      \ -> user wins).\n_sflow_bound=0\nfor _a in \"$@\"; do\n  case \"${_a}\" in\n    --bind-to|--bind-to=*|--map-by|--map-by=*)\
+      \ _sflow_bound=1; break ;;\n  esac\ndone\nif [ \"${_sflow_bound}\" = \"0\" ]; then\n  _sflow_ncpu=$(env\
+      \ -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || nproc 2>/dev/null || echo 1)\n  _sflow_nall=$(nproc\
+      \ --all 2>/dev/null || echo \"${_sflow_ncpu}\")\n  [ \"${_sflow_ncpu}\" -gt \"${_sflow_nall}\" ]\
+      \ 2>/dev/null && _sflow_ncpu=${_sflow_nall}\n  _sflow_pe=$(( _sflow_ncpu / 8 )); [ \"${_sflow_pe}\"\
+      \ -ge 1 ] || _sflow_pe=1\n  _sflow_opts+=(--map-by ppr:8:node:PE=${_sflow_pe} --bind-to core)\n\
+      fi\n# Forward env to remote ranks (sshd gives them a bare env), deduped, from three\n# sources:\
+      \ the always-on whole-name vars, the merged prefix set (scanned NOW so late\n# `export`s are captured),\
+      \ and every var the recipe itself exported -- the diff of\n# the current exports against the pre-recipe\
+      \ snapshot -- so a plain `export FOO=bar`\n# reaches workers without listing it in forward_env_prefixes.\n\
+      _sflow_snap=\"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\n_sflow_names=\"$(\n  for\
+      \ _v in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\${${_v}+x}\\\" ]\" && printf\
+      \ '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
       \  [ -f \"${_sflow_snap}\" ] && comm -13 \"${_sflow_snap}\" <(compgen -e | sort -u)\n)\"\nfor _v\
       \ in $(printf '%s\\n' \"${_sflow_names}\" | sort -u | sed '/^$/d'); do\n  _sflow_opts+=(-x \"${_v}\"\
-      )\ndone\nexec \"${_sflow_real}\" \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\nchmod\
-      \ +x /tmp/sflow-mpi/bin/mpirun\nexport SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command -v mpirun\
-      \ 2>/dev/null || true)}\"\nexport PATH=/tmp/sflow-mpi/bin:${PATH}\n# --- sflow: snapshot exported\
-      \ env (pre-recipe) for mpirun -x auto-forward ---\nmkdir -p /tmp/sflow-mpi 2>/dev/null || true\n\
-      compgen -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\" 2>/dev/null\
-      \ || true\n# ===== end sflow k8s_mpi launcher =====\nexec mpirun -np 16 trtllm-serve /models/m"
+      )\ndone\n# Surface the fully-resolved launch -- the real mpirun + every sflow-injected opt\n# (hostfile,\
+      \ SSH transport, CPU binding, env forwarding) + the recipe's own args -- so\n# the actual command\
+      \ that ran is visible in the task log (the shim otherwise exec's\n# silently). Only the leader reaches\
+      \ this line (workers idle in the role barrier above).\necho \"[sflow-mpi] launch: ${_sflow_real}\
+      \ ${_sflow_opts[*]} $*\"\nexec \"${_sflow_real}\" \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\n\
+      chmod +x /tmp/sflow-mpi/bin/mpirun\nexport SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command -v\
+      \ mpirun 2>/dev/null || true)}\"\nexport PATH=/tmp/sflow-mpi/bin:${PATH}\n# --- sflow: snapshot\
+      \ exported env (pre-recipe) for mpirun -x auto-forward ---\nmkdir -p /tmp/sflow-mpi 2>/dev/null\
+      \ || true\ncompgen -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
+      \ 2>/dev/null || true\n# ===== end sflow k8s_mpi launcher =====\nexec mpirun -np 16 trtllm-serve\
+      \ /models/m"
   kind: ConfigMap
   metadata:
     labels:
@@ -148,21 +162,36 @@ items:
                 if [ \"0\" = \"1\" ] && [ -f \"/tmp/sflow-mpi/hostfile\" ]; then\n  _sflow_opts+=(--hostfile\
                 \ \"/tmp/sflow-mpi/hostfile\" \\\n    --mca plm_rsh_agent ssh \\\n    --mca plm_rsh_args\
                 \ \"-p 2222 -i /root/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\
-                \ -o ConnectTimeout=10\")\nfi\n# Forward env to remote ranks (sshd gives them a bare env),\
-                \ deduped, from three\n# sources: the always-on whole-name vars, the merged prefix set\
-                \ (scanned NOW so late\n# `export`s are captured), and every var the recipe itself exported\
-                \ -- the diff of\n# the current exports against the pre-recipe snapshot -- so a plain\
-                \ `export FOO=bar`\n# reaches workers without listing it in forward_env_prefixes.\n_sflow_snap=\"\
-                ${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\n_sflow_names=\"$(\n  for _v\
-                \ in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\${${_v}+x}\\\" ]\"\
-                \ && printf '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
+                \ -o ConnectTimeout=10\")\nfi\n# sflow CPU binding (multi-rank-per-pod): bind each rank\
+                \ within the\n# pod's cpuset so LLVM/OpenMP thread pools size to the binding, not the\n\
+                # whole node -- prevents pid/thread exhaustion when ranks share a pod.\n# Skipped if the\
+                \ recipe already binds (--bind-to/--map-by -> user wins).\n_sflow_bound=0\nfor _a in \"\
+                $@\"; do\n  case \"${_a}\" in\n    --bind-to|--bind-to=*|--map-by|--map-by=*) _sflow_bound=1;\
+                \ break ;;\n  esac\ndone\nif [ \"${_sflow_bound}\" = \"0\" ]; then\n  _sflow_ncpu=$(env\
+                \ -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || nproc 2>/dev/null || echo\
+                \ 1)\n  _sflow_nall=$(nproc --all 2>/dev/null || echo \"${_sflow_ncpu}\")\n  [ \"${_sflow_ncpu}\"\
+                \ -gt \"${_sflow_nall}\" ] 2>/dev/null && _sflow_ncpu=${_sflow_nall}\n  _sflow_pe=$((\
+                \ _sflow_ncpu / 8 )); [ \"${_sflow_pe}\" -ge 1 ] || _sflow_pe=1\n  _sflow_opts+=(--map-by\
+                \ ppr:8:node:PE=${_sflow_pe} --bind-to core)\nfi\n# Forward env to remote ranks (sshd\
+                \ gives them a bare env), deduped, from three\n# sources: the always-on whole-name vars,\
+                \ the merged prefix set (scanned NOW so late\n# `export`s are captured), and every var\
+                \ the recipe itself exported -- the diff of\n# the current exports against the pre-recipe\
+                \ snapshot -- so a plain `export FOO=bar`\n# reaches workers without listing it in forward_env_prefixes.\n\
+                _sflow_snap=\"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\n_sflow_names=\"\
+                $(\n  for _v in PATH LD_LIBRARY_PATH OMP_NUM_THREADS; do\n    eval \"[ -n \\\"\\${${_v}+x}\\\
+                \" ]\" && printf '%s\\n' \"${_v}\"\n  done\n  env | grep -oE '^(NCCL_|UCX_|GLOO_|NVSHMEM_|OMPI_MCA_|SFLOW_)[A-Za-z0-9_]*'\n\
                 \  [ -f \"${_sflow_snap}\" ] && comm -13 \"${_sflow_snap}\" <(compgen -e | sort -u)\n\
                 )\"\nfor _v in $(printf '%s\\n' \"${_sflow_names}\" | sort -u | sed '/^$/d'); do\n  _sflow_opts+=(-x\
-                \ \"${_v}\")\ndone\nexec \"${_sflow_real}\" \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\n\
-                chmod +x /tmp/sflow-mpi/bin/mpirun\nexport SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command\
-                \ -v mpirun 2>/dev/null || true)}\"\nexport PATH=/tmp/sflow-mpi/bin:${PATH}\n# --- sflow:\
-                \ snapshot exported env (pre-recipe) for mpirun -x auto-forward ---\nmkdir -p /tmp/sflow-mpi\
-                \ 2>/dev/null || true\ncompgen -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
+                \ \"${_v}\")\ndone\n# Surface the fully-resolved launch -- the real mpirun + every sflow-injected\
+                \ opt\n# (hostfile, SSH transport, CPU binding, env forwarding) + the recipe's own args\
+                \ -- so\n# the actual command that ran is visible in the task log (the shim otherwise\
+                \ exec's\n# silently). Only the leader reaches this line (workers idle in the role barrier\
+                \ above).\necho \"[sflow-mpi] launch: ${_sflow_real} ${_sflow_opts[*]} $*\"\nexec \"${_sflow_real}\"\
+                \ \"${_sflow_opts[@]}\" \"$@\"\n\nSFLOW_MPIRUN_WRAPPER_EOF\nchmod +x /tmp/sflow-mpi/bin/mpirun\n\
+                export SFLOW_REAL_MPIRUN=\"${SFLOW_REAL_MPIRUN:-$(command -v mpirun 2>/dev/null || true)}\"\
+                \nexport PATH=/tmp/sflow-mpi/bin:${PATH}\n# --- sflow: snapshot exported env (pre-recipe)\
+                \ for mpirun -x auto-forward ---\nmkdir -p /tmp/sflow-mpi 2>/dev/null || true\ncompgen\
+                \ -e 2>/dev/null | sort -u > \"${SFLOW_MPI_ENV_SNAPSHOT:-/tmp/sflow-mpi/env.snapshot}\"\
                 \ 2>/dev/null || true\n# ===== end sflow k8s_mpi launcher =====\nif [ ! -x /usr/sbin/sshd\
                 \ ] && ! command -v sshd >/dev/null 2>&1; then\n  echo \"[sflow-mpi] installing openssh-server\"\
                 \n  export DEBIAN_FRONTEND=noninteractive\n  (apt-get update -qq && apt-get install -y\
