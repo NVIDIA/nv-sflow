@@ -420,6 +420,58 @@ def test_probe_node_topology_best_effort_on_exec_failure(monkeypatch):
     asyncio.run(be._probe_node_topology(["res-0"]))  # must not raise
 
 
+def test_probe_node_topology_clears_stale_report_before_early_return(monkeypatch):
+    # A later allocation whose probe yields no report must NOT reuse the previous run's
+    # cached report -- it is cleared at the start of the probe, before any early return.
+    be = KubernetesBackend(_cfg())
+    be._node_to_resv_pod = {"node-a": "res-0"}
+
+    async def ok(args):
+        return (0, "nproc=8\n", "") if list(args)[:1] == ["exec"] else (0, "", "")
+
+    monkeypatch.setattr(be, "_kubectl", ok)
+    asyncio.run(be._probe_node_topology(["res-0"]))
+    assert be.node_topology_report is not None  # first run stores it
+    asyncio.run(be._probe_node_topology([]))  # empty -> early return, no new report
+    assert be.node_topology_report is None  # stale report cleared, not reused
+
+
+def test_probe_node_topology_times_out_best_effort(monkeypatch):
+    # A hung exec must not block allocation: the probe times out (best-effort) rather
+    # than waiting indefinitely.
+    import sflow.plugins.backends.kubernetes as _k8s
+
+    monkeypatch.setattr(_k8s, "_NODE_TOPOLOGY_PROBE_TIMEOUT_S", 0.05)
+    be = KubernetesBackend(_cfg())
+    be._node_to_resv_pod = {"node-a": "res-0"}
+
+    async def hang(args):
+        await asyncio.sleep(30)  # never returns within the timeout
+        return (0, "x", "")
+
+    monkeypatch.setattr(be, "_kubectl", hang)
+    # The outer wait_for guards the TEST: absent the fix the probe hangs 30s and this
+    # raises (clear RED); with the per-exec timeout it returns near-instantly.
+    asyncio.run(asyncio.wait_for(be._probe_node_topology(["res-0"]), timeout=5))
+    assert be.node_topology_report is None  # timed out -> no report, allocation not blocked
+
+
+def test_probe_node_topology_passes_request_timeout(monkeypatch):
+    # The exec carries an explicit --request-timeout so kubectl self-terminates on a
+    # wedged pod (no orphaned client), on top of the client-side wait_for backstop.
+    be = KubernetesBackend(_cfg())
+    be._node_to_resv_pod = {"node-a": "res-0"}
+    seen: list[list[str]] = []
+
+    async def capture(args):
+        seen.append(list(args))
+        return (0, "nproc=8\n", "")
+
+    monkeypatch.setattr(be, "_kubectl", capture)
+    asyncio.run(be._probe_node_topology(["res-0"]))
+    assert seen and any(a.startswith("--request-timeout=") for a in seen[0])
+
+
 def test_detect_network_env_gke_provider(monkeypatch):
     be = KubernetesBackend(_cfg())
     node_json = json.dumps(

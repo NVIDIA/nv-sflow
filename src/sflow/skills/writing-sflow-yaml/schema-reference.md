@@ -645,7 +645,7 @@ workflow:
   probes: {}                    # optional
   retries: {}                   # optional
   timeout: 30m                  # optional: per-task timeout
-  fail_fast: false              # optional: default false; set true to run the shell script with `set -e`
+  fail_fast: false              # optional: unset=backend default (true on K8s, false on Slurm/local/docker); prepends `set -e` when effective-true
   ports: []                     # optional: named service ports the task exposes
   variables: {}                 # optional: task-scoped variables
   outputs: []                   # optional (legacy MVP)
@@ -669,7 +669,7 @@ workflow:
 | `probes`     | dict        | No       | Readiness and failure probes               |
 | `retries`    | dict        | No       | Retry policy                               |
 | `timeout`    | int/str     | No       | Per-task timeout (e.g. `1800`, `"30m"`)    |
-| `fail_fast`  | bool        | No       | Default `false` (shell default: only the LAST command's exit code counts). Set `true` to run the task's shell script with `set -e` so a failed command fails the task instead of a later successful command (e.g. a trailing `echo`) masking it. Ignored by the `python` operator (its script is Python source). |
+| `fail_fast`  | bool        | No       | **Default depends on the backend** — `true` on Kubernetes, `false` on Slurm/local/docker (shell default: only the LAST command's exit code counts). Leave unset for the backend default, or set explicitly (`true`/`false`) to override per task. When effective-true, runs the task's shell script with `set -e` so a failed command fails the task instead of a later successful command (e.g. a trailing `echo`) masking it. Ignored by the `python` operator (its script is Python source). |
 | `ports`      | list        | No       | Named service ports (`{ port, name }`) the task exposes |
 | `variables`  | dict/list   | No       | Task-scoped variables (same format as global) |
 | `outputs`    | list        | No       | Output parsing patterns (legacy MVP)       |

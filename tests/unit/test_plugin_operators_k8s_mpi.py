@@ -121,6 +121,7 @@ def test_config_defaults():
     assert c.mpi_implementation == "OpenMPI"
     assert c.ensure_sshd is True
     assert c.cpu_bind == "core"
+    assert c.cpu_bind_cores_per_rank == 8
     assert c.forward_env_prefixes == []
     # Setup budget defaults to ~15 min (900s -> failureThreshold 180 at a fixed 5s poll).
     assert c.worker_setup_timeout_seconds == 900
@@ -235,6 +236,29 @@ def test_mpirun_wrapper_echoes_resolved_launch_line():
     assert script.index("[sflow-mpi] launch:") < script.index('exec "${_sflow_real}"')
 
 
+def test_mpirun_wrapper_launch_echo_goes_to_stderr(tmp_path, fake_process):
+    """The `[sflow-mpi] launch:` diagnostic must go to STDERR, not stdout, so it never
+    pollutes a result-parsed launcher's stdout (or a tee'd rank capture). Task logs
+    capture stderr too, so it stays visible."""
+    fake_process.allow_unregistered(True)
+    real = tmp_path / "real_mpirun"
+    real.write_text('#!/usr/bin/env bash\nprintf "WORKLOAD-STDOUT\\n"\n')
+    real.chmod(0o755)
+    wrapper = tmp_path / "mpirun"
+    wrapper.write_text(mpi_boot.build_mpirun_wrapper_script(inject_hostfile=False))
+    wrapper.chmod(0o755)
+    out = subprocess.run(
+        [str(wrapper), "-np", "1", "app"],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], "SFLOW_REAL_MPIRUN": str(real)},
+    )
+    assert out.returncode == 0, out.stderr
+    assert "[sflow-mpi] launch:" in out.stderr  # diagnostic on stderr
+    assert "[sflow-mpi] launch:" not in out.stdout  # stdout stays clean for result parsing
+    assert "WORKLOAD-STDOUT" in out.stdout
+
+
 def test_mpirun_wrapper_operator_route_omits_hostfile():
     # The operator route gets the hostfile from the mpi-operator (OMPI_MCA_*), so
     # the launcher wrapper only forwards env -- it must not inject --hostfile.
@@ -307,17 +331,53 @@ def test_mpirun_wrapper_numa_binding_default():
 
 
 def test_mpirun_wrapper_core_binding_uses_slots_and_clamped_nproc():
-    # core: PE = cores/rank computed at launch into ${_sflow_pe}. The core count is read
+    # core: PE = cores/rank computed at launch into ${_sflow_pe}. The CPU count is read
     # with OMP_NUM_THREADS/OMP_THREAD_LIMIT UNSET (GNU nproc honors them, and sflow sets
-    # OMP_NUM_THREADS -- else nproc returns that cap, not the real cores, collapsing PE),
-    # CLAMPED to the installed cores ($(nproc --all)) so a bogus/inflated count can't
+    # OMP_NUM_THREADS -- else nproc returns that cap, not the real CPUs, collapsing PE),
+    # CLAMPED to the installed CPUs ($(nproc --all)) so a bogus/inflated count can't
     # over-bind and fail the launch, and floored at 1.
     script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="core", slots=4)
     assert "--map-by ppr:4:node:PE=${_sflow_pe} --bind-to core" in script
     assert "env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc" in script  # ignore OMP cap
-    assert "nproc --all" in script  # clamp source (installed cores)
-    assert "_sflow_pe=$(( _sflow_ncpu / 4 ))" in script
+    assert "nproc --all" in script  # clamp source (installed CPUs)
+    assert "_sflow_pe=$(( _sflow_cores / 4 ))" in script
     assert "-ge 1 ] || _sflow_pe=1" in script  # floor at 1
+
+
+def test_mpirun_wrapper_core_binding_converts_cpus_to_cores():
+    # `PE=N` asks for N *cores* per rank but nproc counts logical CPUs (SMT threads), so
+    # PE = nproc/slots over-asks by the SMT factor and OpenMPI aborts "binding more
+    # processes than cpus on a resource". The wrapper divides by threads-per-core.
+    script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="core", slots=4)
+    assert "lscpu" in script and "Thread\\(s\\) per core" in script
+    assert "_sflow_cores=$(( _sflow_ncpu / _sflow_smt ))" in script
+    assert "_sflow_smt=1" in script  # unknown/garbage threads-per-core -> assume 1
+
+
+def test_mpirun_wrapper_core_binding_caps_cores_per_rank():
+    # PE is capped so a rank takes a modest slice instead of every core it can see --
+    # a big affinity mask is the thread explosion the binding exists to prevent, and an
+    # uncapped PE is what over-asks on a fat node. 0 = uncapped (cores/slots).
+    script = mpi_boot.build_mpirun_wrapper_script(
+        cpu_bind="core", slots=4, cpu_bind_cores_per_rank=8
+    )
+    assert '[ "${_sflow_pe}" -gt 8 ] && _sflow_pe=8' in script
+    uncapped = mpi_boot.build_mpirun_wrapper_script(
+        cpu_bind="core", slots=4, cpu_bind_cores_per_rank=0
+    )
+    assert "-gt 8 ] && _sflow_pe=" not in uncapped
+    assert "_sflow_pe=$(( _sflow_cores / 4 ))" in uncapped
+
+
+def test_mpirun_wrapper_core_binding_skips_when_cpuset_smaller_than_ranks():
+    # Guard: a pod cpuset with FEWER cores than ranks-per-pod can't satisfy `--bind-to
+    # core` (PE floors to 1 but slots*1 > cores -> OpenMPI aborts "not enough processing
+    # elements"). Since core became the default bind, the wrapper must DEGRADE to no
+    # binding at launch instead of hard-failing a launch that worked before. The check
+    # is a runtime `_sflow_cores -lt slots` guard around the bind-flag append.
+    script = mpi_boot.build_mpirun_wrapper_script(cpu_bind="core", slots=4)
+    assert '"${_sflow_cores}" -lt 4 ]' in script  # runtime guard: cores vs rank count
+    assert "skipping --bind-to core" in script  # degrade-to-no-bind path present
 
 
 def test_mpirun_wrapper_no_binding_for_single_rank_pod():
@@ -377,6 +437,158 @@ def test_mpirun_wrapper_binding_respects_user_provided_binding(tmp_path, fake_pr
     assert "--map-by" not in args
 
 
+def test_mpirun_wrapper_binding_respects_rankfile(tmp_path, fake_process):
+    """A recipe that binds via --rankfile (not --bind-to/--map-by) must ALSO suppress
+    sflow's default core-binding injection -- else OpenMPI rejects the conflicting
+    directives now that `core` is the default. A fat cpuset ensures binding WOULD be
+    injected absent the fix (so this is a real regression guard, not a no-op)."""
+    fake_process.allow_unregistered(True)
+    fake = _fake_cpu_topology(tmp_path, nproc=64, threads_per_core=2)  # 32 cores >> 4 ranks
+    real = tmp_path / "real_mpirun"
+    real.write_text('#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+    real.chmod(0o755)
+    wrapper = tmp_path / "mpirun"
+    wrapper.write_text(
+        mpi_boot.build_mpirun_wrapper_script(
+            inject_hostfile=False, cpu_bind="core", slots=4
+        )
+    )
+    wrapper.chmod(0o755)
+    out = subprocess.run(
+        [str(wrapper), "-np", "4", "--rankfile", "rf", "app"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fake}:{os.environ['PATH']}", "SFLOW_REAL_MPIRUN": str(real)},
+    )
+    assert out.returncode == 0, out.stderr
+    argv = [ln for ln in out.stdout.split("\n") if not ln.startswith("[sflow-mpi]")]
+    assert "--map-by" not in argv  # sflow injected nothing (recipe's rankfile wins)
+    assert "--bind-to" not in argv
+    assert "--rankfile" in argv  # the recipe's own binding survives
+
+
+def test_mpi_config_rejects_negative_cores_per_rank():
+    """cpu_bind_cores_per_rank must be >= 0 (0 == uncapped); a negative typo must not
+    silently disable the cap."""
+    from pydantic import ValidationError
+
+    from sflow.plugins.operators.k8s_mpi import MpiConfig
+
+    MpiConfig(cpu_bind_cores_per_rank=0)  # uncapped -- allowed
+    MpiConfig(cpu_bind_cores_per_rank=16)  # allowed
+    with pytest.raises(ValidationError):
+        MpiConfig(cpu_bind_cores_per_rank=-1)
+
+
+def _fake_cpu_topology(tmp_path, *, nproc, threads_per_core, lscpu=True):
+    """A bin dir (to prepend to PATH) whose `nproc`/`lscpu` report a chosen topology,
+    so the wrapper's launch-time core math can be exercised for real. ``lscpu=False``
+    shadows lscpu with a failing stub to simulate a slim image (no util-linux), which
+    sends the wrapper down its cpu0-sysfs SMT-sibling fallback."""
+    bindir = tmp_path / f"fakebin_{nproc}_{threads_per_core}_{int(lscpu)}"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "nproc").write_text(f"#!/usr/bin/env bash\necho {nproc}\n")
+    (bindir / "lscpu").write_text(
+        f'#!/usr/bin/env bash\necho "Thread(s) per core:  {threads_per_core}"\n'
+        if lscpu
+        else "#!/usr/bin/env bash\nexit 127\n"
+    )
+    for f in ("nproc", "lscpu"):
+        (bindir / f).chmod(0o755)
+    return bindir
+
+
+def _run_wrapper(tmp_path, fake_bin, fake_process, *, slots, cores_per_rank, label=""):
+    """Run the built shim with a stub `mpirun` that echoes its argv; return (argv, stderr)."""
+    fake_process.allow_unregistered(True)  # this one really shells out
+    real = tmp_path / "real_mpirun"
+    real.write_text('#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+    real.chmod(0o755)
+    wrapper = tmp_path / f"mpirun_{label}_{slots}_{cores_per_rank}"
+    wrapper.write_text(
+        mpi_boot.build_mpirun_wrapper_script(
+            inject_hostfile=False, cpu_bind="core", slots=slots,
+            cpu_bind_cores_per_rank=cores_per_rank,
+        )
+    )
+    wrapper.chmod(0o755)
+    out = subprocess.run(
+        [str(wrapper), "-np", str(slots), "app"], capture_output=True, text=True,
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}", "SFLOW_REAL_MPIRUN": str(real)},
+    )
+    assert out.returncode == 0, out.stderr
+    return [ln for ln in out.stdout.split("\n") if not ln.startswith("[sflow-mpi]")], out.stderr
+
+
+# Real host shapes sflow lands on. `PE` counts CORES while `nproc` counts logical CPUs,
+# so threads-per-core differs by CPU FAMILY, not by arch: x86 Intel/AMD run SMT-2 with
+# hyperthreading/SMT enabled, Grace (Neoverse V2) is SMT-1, and Vera (Olympus) is SMT-2
+# again via spatial multithreading. The invariant every case must hold is
+# `PE * ranks <= physical cores` -- violating it is exactly the OpenMPI abort
+# "binding more processes than cpus on a resource".
+_CPU_FAMILIES = [
+    # (label, nproc/cpuset threads, threads-per-core, ranks-per-pod, expected PE @cap 8)
+    ("intel-xeon-8xb200", 224, 2, 8, 8),    # GKE a4-highgpu-8g: 112 cores -> 14, capped
+    ("amd-epyc-turin-2s", 512, 2, 8, 8),    # 256 cores -> 32, capped
+    ("grace-gb200", 72, 1, 4, 8),           # 72 cores -> 18, capped
+    ("grace-gb300-starved", 8, 1, 4, 2),    # tiny cpuset: 8 cores -> 2, cap not reached
+    ("vera-1s", 176, 2, 8, 8),              # 88 Olympus cores -> 11, capped
+    ("vera-2s", 352, 2, 16, 8),             # 176 cores -> 11, capped
+    ("intel-no-smt", 96, 1, 8, 8),          # hyperthreading disabled: 96 cores -> 12
+]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+@pytest.mark.parametrize("label,ncpu,smt,slots,want_pe", _CPU_FAMILIES)
+def test_mpirun_wrapper_core_binding_pe_math_per_cpu_family(
+    tmp_path, fake_process, label, ncpu, smt, slots, want_pe
+):
+    """Executed end to end per CPU family. The bug this guards: on SMT-2 hosts the old
+    `PE = nproc/slots` asked for the THREAD count per rank (224/8 = 28 cores a rank =
+    224 of the node's 112 cores) and OpenMPI aborted the launch."""
+    fake = _fake_cpu_topology(tmp_path, nproc=ncpu, threads_per_core=smt)
+    argv, stderr = _run_wrapper(tmp_path, fake, fake_process, slots=slots, cores_per_rank=8, label=label)
+    assert f"ppr:{slots}:node:PE={want_pe}" in argv
+    assert f"{slots} rank(s) to {want_pe} core(s) each" in stderr  # decision is logged
+    # The invariant OpenMPI enforces: the request must fit in the physical cores.
+    assert want_pe * slots <= ncpu // smt
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_mpirun_wrapper_core_binding_cap_is_what_bounds_pe(tmp_path, fake_process):
+    """Uncapped (cores_per_rank=0) keeps the old cores/ranks math -- it fits, but hands
+    each rank every core it can see, which is the affinity mask the binding exists to
+    shrink. The cap is what bounds it: 112 cores / 8 ranks = 14 -> 8."""
+    fake = _fake_cpu_topology(tmp_path, nproc=224, threads_per_core=2)
+    argv, _ = _run_wrapper(tmp_path, fake, fake_process, slots=8, cores_per_rank=0, label="uncapped")
+    assert "ppr:8:node:PE=14" in argv
+    argv, _ = _run_wrapper(tmp_path, fake, fake_process, slots=8, cores_per_rank=8, label="capped")
+    assert "ppr:8:node:PE=8" in argv
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_mpirun_wrapper_core_binding_smt_fallback_without_lscpu(tmp_path, fake_process):
+    """Slim images ship no `lscpu`: threads-per-core then comes from cpu0's sysfs SMT
+    siblings, and if that is unreadable too the wrapper assumes 1 (the cap keeps the
+    request survivable). Either way the launch must proceed, never abort."""
+    fake = _fake_cpu_topology(tmp_path, nproc=224, threads_per_core=2, lscpu=False)
+    argv, stderr = _run_wrapper(tmp_path, fake, fake_process, slots=8, cores_per_rank=8, label="nolscpu")
+    # This host's own /sys answers (SMT-2 -> PE 8; SMT-1 -> 224/8 = 28 capped to 8),
+    # so either way the cap holds the request to 8 cores per rank.
+    assert "ppr:8:node:PE=8" in argv
+    assert "--bind-to" in argv and "core" in argv
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_mpirun_wrapper_core_binding_degrades_on_tiny_cpuset(tmp_path, fake_process):
+    """8 logical CPUs, SMT-2 (= 4 cores) for 8 ranks: `--bind-to core` is unsatisfiable,
+    so the wrapper degrades to NO binding rather than aborting the launch."""
+    fake = _fake_cpu_topology(tmp_path, nproc=8, threads_per_core=2)
+    argv, stderr = _run_wrapper(tmp_path, fake, fake_process, slots=8, cores_per_rank=8, label="tiny")
+    assert "--bind-to" not in argv and "--map-by" not in argv
+    assert "4 core(s) < 8 rank(s)" in stderr
+
+
 def test_bootstrap_preamble_injects_cpu_binding_pods_route():
     # Pods route: the bootstrap-built wrapper carries the binding for a multi-rank pod.
     lines = mpi_boot.build_mpi_bootstrap_preamble(gpus_per_node=8, cpu_bind="numa")
@@ -397,6 +609,24 @@ def test_mpirun_wrapper_role_barrier_worker_idles_leader_waits():
     assert script.index("sleep infinity") < script.index('exec "${_sflow_real}"')
 
 
+def test_mpirun_wrapper_role_barrier_fails_fast_on_sshd_failure():
+    # sshd start failure must ABORT the wrapper (exit non-zero), not let a worker idle
+    # forever / the leader fall through to a doomed launch.
+    script = mpi_boot.build_mpirun_wrapper_script(role_barrier=True, ssh_port=2222)
+    assert "sshd failed to start" in script  # sshd start failure is surfaced
+    assert "exit 1" in script  # ...and aborts the wrapper
+
+
+def test_build_leader_wait_lines_fails_fast_on_unreachable_worker():
+    # The leader's wait loop must fail fast when a peer's sshd never becomes reachable,
+    # not fall through to launch (which would fail late with "Connection refused").
+    from sflow.plugins.k8s.mpi_bootstrap import build_leader_wait_lines
+
+    text = "\n".join(build_leader_wait_lines(ssh_port=2222))
+    assert "never became reachable" in text  # exhaustion is surfaced
+    assert "exit 1" in text  # ...and aborts
+
+
 def test_mpirun_wrapper_no_role_barrier_by_default():
     # Operator route / default: NO barrier -- the mpi-operator owns sshd + wait.
     script = mpi_boot.build_mpirun_wrapper_script(inject_hostfile=False)
@@ -407,10 +637,13 @@ def test_mpirun_wrapper_no_role_barrier_by_default():
 def test_launcher_preamble_injects_cpu_binding_operator_route():
     # Operator route: the launcher wrapper carries the binding too (the mpi-operator
     # supplies the hostfile but not CPU binding).
-    lines = mpi_boot.build_launcher_preamble(cpu_bind="core", slots=2)
+    lines = mpi_boot.build_launcher_preamble(
+        cpu_bind="core", slots=2, cpu_bind_cores_per_rank=8
+    )
     text = "\n".join(lines)
     assert "--map-by ppr:2:node:PE=${_sflow_pe} --bind-to core" in text
-    assert "_sflow_pe=$(( _sflow_ncpu / 2 ))" in text  # clamped nproc/slots
+    assert "_sflow_pe=$(( _sflow_cores / 2 ))" in text  # clamped cores/slots
+    assert '[ "${_sflow_pe}" -gt 8 ] && _sflow_pe=8' in text  # cap threaded through
 
 
 # ---------------------------------------------------------------------------

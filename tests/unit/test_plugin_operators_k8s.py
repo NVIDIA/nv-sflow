@@ -15,6 +15,7 @@ import stat
 import subprocess
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -800,6 +801,53 @@ def test_execution_plan_task_log_path_and_cleanup_refs(tmp_path):
     assert "configmap/decode-server-0-abc-cfg" in plan.cleanup_refs
     assert "secret/decode-server-0-abc-env" in plan.cleanup_refs
     assert any(r.startswith("resourceclaimtemplate") for r in plan.cleanup_refs)
+
+
+def test_execute_reraises_cancellation_after_delete_when_finalize_cancelled(
+    monkeypatch, tmp_path
+):
+    # If teardown's log finalize is cancelled, execute() must STILL delete the pods and
+    # then RE-RAISE CancelledError -- a cancel must never masquerade as a completed task.
+    from sflow.plugins.k8s import lifecycle as k8s_lifecycle
+
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(
+        backend=_backend("dra", 8, nodes=1, namespace="ns"),
+        assigned_nodes=["node-0"],
+        artifacts=[],
+        gpu_count=2,
+    )
+
+    # apply "fails" (rc=1) so execute returns straight into the finally with
+    # finalized=False; there the (simulated) finalize is cancelled.
+    class _Launcher:
+        async def run_async(self, command, **kwargs):
+            return 1
+
+    async def _finalize_cancelled(*a, **k):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(op, "_finalize_task_log", _finalize_cancelled)
+
+    deleted: list[list[str]] = []
+
+    async def _fake_delete(refs, **k):
+        deleted.append(list(refs))
+
+    monkeypatch.setattr(k8s_lifecycle, "delete_objects", _fake_delete)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            op.execute(
+                launcher=_Launcher(),
+                output_logger=None,
+                env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+                task_name="t",
+                script=["run"],
+                status_note=None,
+            )
+        )
+    assert deleted, "delete_objects must still run despite the finalize cancellation"
 
 
 def test_object_names_scoped_by_allocation_id_so_parallel_runs_dont_collide():
@@ -2094,6 +2142,25 @@ def test_merged_launcher_renders_gate_only_for_dependent_member():
     assert merge_gate_marker("prefill") == "/tmp/sflow-merge-gate/prefill.open"
 
 
+def test_merged_gate_does_not_fail_dependency_on_empty_rc_read():
+    # Race guard: a dependency's rc file is written non-atomically (`echo "$?" > f`
+    # truncates then writes), so a poll can `cat` it EMPTY mid-write. An empty read must
+    # be treated as "still writing" (keep waiting), NOT reach `return "$_drc"` (an empty
+    # `_drc` is a bash "numeric argument required" error -> the gated member would be
+    # wrongly skipped as if its dependency had failed).
+    from sflow.plugins.k8s.shell import merged_launcher_lines
+
+    text = "\n".join(
+        merged_launcher_lines(
+            [
+                ("dep", "0", "/s/dep.sh", "/s/env", ""),
+                ("gated", "0", "/s/gated.sh", "/s/env", "dep"),
+            ]
+        )
+    )
+    assert '[ -z "$_drc" ]' in text  # empty read -> keep waiting, don't fail the dep
+
+
 def test_merged_launcher_backward_compatible_with_4_tuples():
     # Existing callers pass 4-tuples (no gate); must still render, empty gate arg.
     from sflow.plugins.k8s.shell import merged_launcher_lines
@@ -2208,11 +2275,15 @@ def test_end_to_end_assembly_gate_renders_in_launcher():
     _plan_merge_groups(
         tg, {"decode": _PL(be, ["node-0"], 4), "prefill": _PL(be, ["node-0"], 2)}
     )
-    # Planner recorded the gate; leader is 'decode' (sorted first).
+    # Planner recorded the gate; the leader is the UPSTREAM member 'prefill' (DAG
+    # order, not the alphabet), so the pod is owned by what the other waits on.
     assert decode.merge_gate_after == ["prefill"]
-    assert decode.is_merge_leader is True
+    assert prefill.is_merge_leader is True
+    assert decode.merge_leader == "prefill"
 
-    cmd = op.build_command(task_name="decode", script=["run-decode"], envs=decode.envs)
+    cmd = op.build_command(
+        task_name="prefill", script=["run-prefill"], envs=prefill.envs
+    )
     shell = cmd.as_list()[-1]
     after = shell.split(_MARK, 1)[1]
     body = after.split("\n" + _MARK, 1)[0]
@@ -2444,3 +2515,146 @@ def test_merge_pod_launcher_and_apply_are_valid_bash(fake_process):
             [shutil.which("bash"), "-n"], input=text, capture_output=True, text=True
         )
         assert proc.returncode == 0, proc.stderr
+
+
+# --- merged member done-marker ----------------------------------------------
+# The merged container blocks in `wait` while any member is a long-lived service,
+# so a finished one-shot member is invisible in the pod phase (the workflow would
+# hang forever). Each member echoes [[sflow-member-done:<rc>]] on its own tagged
+# stream; the operator parses it out of that member's <task>.log.
+
+
+def test_merged_launcher_emits_member_done_marker_per_member():
+    from sflow.plugins.k8s.shell import merged_launcher_lines
+
+    text = "\n".join(merged_launcher_lines([("m", "0", "/s/m.sh", "/s/envsh")]))
+    # Captured into a var first: extra lines after the script would clobber `$?`.
+    assert "_sflow_mrc=$?" in text
+    assert 'echo "[[sflow-member-done:${_sflow_mrc}]]"' in text
+    # Emitted INSIDE the subshell so it carries the member's mux tag (and thus
+    # lands in that member's <task>.log, not the leader's).
+    body = text[text.index("_sflow_run() {") : text.index("  ) 2>&1 |")]
+    assert "sflow-member-done" in body
+
+
+def test_merged_launcher_marker_runs_for_real_and_preserves_rc(tmp_path, fake_process):
+    # Exec the generated launcher: a one-shot member must announce its rc while a
+    # sibling "service" keeps the container alive (the exact hang scenario).
+    fake_process.allow_unregistered(True)  # this test runs REAL bash
+
+    from sflow.plugins.k8s.shell import merged_launcher_lines
+
+    (tmp_path / "svc.sh").write_text("echo serving; sleep 30\n")
+    (tmp_path / "bench.sh").write_text("echo benchmarking; exit 3\n")
+    entry = tmp_path / "entry.sh"
+    entry.write_text(
+        "\n".join(
+            merged_launcher_lines(
+                [
+                    ("svc", "0", str(tmp_path / "svc.sh"), "/nope"),
+                    ("bench", "1", str(tmp_path / "bench.sh"), "/nope"),
+                ]
+            )
+        )
+    )
+    # The launcher never returns (svc holds the container open) -- that IS the
+    # scenario; grab the output the timeout buffered and assert bench announced.
+    with pytest.raises(subprocess.TimeoutExpired) as exc:
+        subprocess.run(["bash", str(entry)], capture_output=True, timeout=5)
+    out = (exc.value.output or b"").decode()
+    assert "[[sflow-mux:bench]] [[sflow-member-done:3]]" in out
+
+
+def _done_op():
+    return K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+
+
+def _done_task(tmp_path, name, log_text):
+    d = tmp_path / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.log").write_text(log_text)
+    return SimpleNamespace(
+        name=name, envs={"SFLOW_WORKFLOW_OUTPUT_DIR": str(tmp_path)}
+    )
+
+
+def test_merged_member_exit_code_reads_marker(tmp_path):
+    t = _done_task(tmp_path, "bench", "working\n[[sflow-member-done:0]]\n")
+    assert _done_op().merged_member_exit_code(t) == 0
+
+
+def test_merged_member_exit_code_reads_nonzero(tmp_path):
+    t = _done_task(tmp_path, "bench", "boom\n[[sflow-member-done:7]]\n")
+    assert _done_op().merged_member_exit_code(t) == 7
+
+
+def test_merged_member_exit_code_none_before_marker(tmp_path):
+    t = _done_task(tmp_path, "bench", "still working\n")
+    assert _done_op().merged_member_exit_code(t) is None
+
+
+def test_merged_member_exit_code_none_when_log_missing(tmp_path):
+    t = SimpleNamespace(
+        name="bench", envs={"SFLOW_WORKFLOW_OUTPUT_DIR": str(tmp_path)}
+    )
+    assert _done_op().merged_member_exit_code(t) is None
+
+
+def test_merged_member_exit_code_uses_last_marker_after_retry(tmp_path):
+    # A retry appends to the same <task>.log; the CURRENT attempt's rc must win.
+    t = _done_task(
+        tmp_path, "bench", "[[sflow-member-done:1]]\nretry\n[[sflow-member-done:0]]\n"
+    )
+    assert _done_op().merged_member_exit_code(t) == 0
+
+
+def test_merged_member_exit_code_ignores_partial_marker(tmp_path):
+    # Marker still mid-write (no closing token) must not resolve the member.
+    t = _done_task(tmp_path, "bench", "[[sflow-member-done:0")
+    assert _done_op().merged_member_exit_code(t) is None
+
+
+def test_merged_member_exit_code_scans_only_the_log_tail(tmp_path):
+    # Cost guard: the orchestrator re-checks this once per second for every
+    # unresolved merged member, and a serving member's log reaches megabytes -- so
+    # the check must stay O(1) in log size, not re-scan the whole file each tick.
+    d = tmp_path / "bench"
+    d.mkdir()
+    log = d / "bench.log"
+    with open(log, "wb") as fh:
+        fh.write(b"noise line to skip\n" * 400_000)  # ~7.6 MB of chatter
+        fh.write(b"[[sflow-member-done:0]]\n")
+    task = SimpleNamespace(
+        name="bench", envs={"SFLOW_WORKFLOW_OUTPUT_DIR": str(tmp_path)}
+    )
+    assert log.stat().st_size > 5_000_000
+    op = _done_op()
+
+    reads: list[int] = []
+    real_open = open
+
+    def _counting_open(path, *a, **kw):
+        fh = real_open(path, *a, **kw)
+        if str(path) == str(log):
+            real_read = fh.read
+
+            def _read(*ra, **rkw):
+                data = real_read(*ra, **rkw)
+                reads.append(len(data))
+                return data
+
+            fh.read = _read
+        return fh
+
+    import builtins
+
+    builtins.open = _counting_open
+    try:
+        assert op.merged_member_exit_code(task) == 0
+    finally:
+        builtins.open = real_open
+    # `reads` empty would mean the log was pulled in some other way (e.g. a revert to
+    # Path.read_text, which bypasses builtins.open) -- that must not pass vacuously.
+    assert reads, "expected a bounded tail read via open(); log was read another way"
+    # Whole-file read would be >5 MB; only the bounded tail may be pulled in.
+    assert sum(reads) <= 16384, f"read {sum(reads)} bytes; expected a bounded tail"

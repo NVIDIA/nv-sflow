@@ -78,6 +78,9 @@ _NODE_TOPOLOGY_PROBE_SH = (
     "command -v nvidia-smi >/dev/null 2>&1 && "
     "{ echo '--- nvidia-smi topo -m ---'; nvidia-smi topo -m 2>/dev/null; } ; true"
 )
+# Per-exec bound for the best-effort topology probe so a hung ``kubectl exec`` (pod
+# wedged, API stall) can never block the allocate() path -- it is informational only.
+_NODE_TOPOLOGY_PROBE_TIMEOUT_S = 15
 
 # How GPUs are requested for both placeholder and task pods. Default: device_plugin.
 #   device_plugin -> nvidia.com/gpu device-plugin limit (default; widely available)
@@ -2518,6 +2521,9 @@ class KubernetesBackend(Backend):
         (no numactl/nvidia-smi, exec denied, pod still starting) is skipped. Probes all
         reserved nodes concurrently since they can differ.
         """
+        # Drop any report from a prior probe run BEFORE the early returns: a later
+        # allocation that produces no successful report must not reuse a stale one.
+        self._node_topology_report = None
         if not pod_names:
             return
         pod_to_node = {p: n for n, p in self._node_to_resv_pod.items()}
@@ -2525,12 +2531,19 @@ class KubernetesBackend(Backend):
 
         async def _probe(pod: str) -> None:
             try:
-                rc, out, _ = await self._kubectl(
-                    ["exec", pod, *self._ns_args(), "--", "sh", "-c",
-                     _NODE_TOPOLOGY_PROBE_SH]
+                rc, out, _ = await asyncio.wait_for(
+                    self._kubectl(
+                        ["exec", pod, *self._ns_args(),
+                         # kubectl self-terminates the exec at this bound, so a wedged
+                         # pod leaves no orphaned client; wait_for is the hard backstop.
+                         f"--request-timeout={_NODE_TOPOLOGY_PROBE_TIMEOUT_S}s",
+                         "--", "sh", "-c", _NODE_TOPOLOGY_PROBE_SH]
+                    ),
+                    timeout=_NODE_TOPOLOGY_PROBE_TIMEOUT_S,
                 )
             except Exception:
-                return  # best-effort: never let a topology dump break allocation
+                # best-effort: a failed OR timed-out exec never breaks allocation.
+                return
             if rc == 0 and out.strip():
                 node = pod_to_node.get(pod, pod)
                 reports[node] = out.strip()

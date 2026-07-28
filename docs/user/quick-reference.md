@@ -305,6 +305,8 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 | `ensure_sshd` | bool | `true` | Install `openssh-server` if the image lacks sshd. |
 | `forward_env_prefixes` | list[string] | `[]` | Extra env-namespace prefixes forwarded to remote ranks. |
 | `omp_num_threads` | int | `8` | Injected `OMP_NUM_THREADS` per rank; `null`/`0` keeps the image default. |
+| `cpu_bind` | `core`\|`numa`\|`none` | `core` | Per-rank CPU binding, injected only when several ranks share a pod. |
+| `cpu_bind_cores_per_rank` | int | `8` | Max cores bound per rank under `cpu_bind: core`; `0` = uncapped. |
 | `worker_setup_timeout_seconds` | int / string | `900` | Per-node worker setup / readiness budget before the launcher starts. |
 | `launcher_discovery_timeout` | int / string | `600` | Max wait for the MPI operator to create the launcher pod (`route: operator`). |
 

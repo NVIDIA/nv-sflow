@@ -194,6 +194,16 @@ class Orchestrator:
                     finished.append(name)
 
                     t = self.workflow.get_task(name)
+                    # A merged member already resolved from its OWN done-marker is
+                    # done: its leader's execute() only lingers to hold the shared
+                    # pod, so whatever that coroutine reports now (the pod's exit,
+                    # or the teardown cancellation that deletes it) must not restate
+                    # the task's outcome. Just reap the coroutine.
+                    if t.status.is_terminal() and (
+                        getattr(t, "is_merge_leader", False)
+                        or getattr(t, "is_merge_follower", False)
+                    ):
+                        continue
                     try:
                         # Note: `result()` may raise CancelledError; treat it as cancellation.
                         exit_code = proc_task.result()
@@ -329,6 +339,12 @@ class Orchestrator:
                 # Open in-pod gates for merged members whose in-group dependency just
                 # reached READY/COMPLETED, so the gated member's subshell proceeds.
                 await self._signal_merge_gates()
+
+                # Resolve merged members from their OWN exit status, so the shared pod's
+                # lifetime is decoupled from any member's status: a finished member --
+                # e.g. the terminal task -- completes instead of hanging the workflow,
+                # and the driver reclaims the pod at teardown once the DAG is done.
+                await self._resolve_finished_merge_members()
 
                 # Fail-fast: if any task reaches FAILED, cancel remaining work so we don't hang
                 # with blocked INITIATED tasks that can never become submittable.
@@ -882,6 +898,70 @@ class Orchestrator:
             self._record_summary("task_submitted", follower)
             follower.status = TaskStatus.RUNNING
             await self._acquire_task_monitor(follower)
+
+    @staticmethod
+    def _member_done_rc(task: Task) -> int | None:
+        """Return a merged member's exit code once it announced completion, else None.
+
+        Merging is k8s-only, so the marker parsing lives with its emitter in the k8s
+        operator (``merged_member_exit_code``) and is reached duck-typed here -- the
+        same convention ``_signal_merge_gates`` uses for ``open_merge_gate``, keeping
+        core free of any plugin import. Operators without the method (local/slurm/
+        docker, which never merge) simply report None.
+        """
+        operator = getattr(task, "operator", None)
+        reader = getattr(operator, "merged_member_exit_code", None)
+        if reader is None:
+            return None
+        try:
+            return reader(task)
+        except Exception:  # never let a log-read error break the poll loop
+            return None
+
+    async def _resolve_finished_merge_members(self) -> None:
+        """Give each merged member's OWN exit status to the DAG when its script ends.
+
+        Merged members run as background processes in a shared pod, so a member has
+        no pod of its own to end, and the shared container stays up as long as ANY
+        member still runs. Tying a member's status to that pod is what hung the run:
+        a follower was only ever mirrored from the leader, and the leader itself
+        waited on a pod its own siblings kept alive -- so a one-shot member (notably
+        the workflow's TERMINAL task) could never reach COMPLETED.
+
+        Every member -- leader included -- instead reports its own rc (the done-marker
+        it wrote when its own script returned), and this forwards that to the DAG
+        exactly as a normal task's process exit would: rc 0 finalizes it (result
+        parsing + uploads), non-zero fails it. No sibling or pod state is consulted.
+
+        This is what decouples the shared pod's lifetime from any member's status.
+        The leader's ``execute()`` keeps running (holding the pod) after the leader's
+        own task is resolved; once every task's status is terminal the DAG finishes
+        and the driver's teardown cancels that ``execute()``, which deletes the pod --
+        so the pod outlives every member and is reclaimed by the driver, not by a task.
+
+        Members that have not finished report nothing (no marker yet) and are left
+        alone, as is anything already resolved.
+        """
+        for task in self.workflow.get_tasks():
+            if not (
+                getattr(task, "is_merge_leader", False)
+                or getattr(task, "is_merge_follower", False)
+            ):
+                continue
+            if task.status not in (TaskStatus.RUNNING, TaskStatus.READY):
+                continue
+            rc = self._member_done_rc(task)
+            if rc is None:
+                continue  # still running: its script has not returned yet
+            task.exit_code = rc
+            if rc == 0:
+                _logger.info("Merged member '%s' finished (exit=0)", task.name)
+                await self._finalize_successful_task(task)
+            else:
+                task.status = TaskStatus.FAILED
+                self._record_summary(
+                    "task_failed", task, reason=f"merged member exited with {rc}"
+                )
 
     async def _propagate_merge_leader_status(self, leader: Task) -> None:
         """Mirror a finished merge leader's terminal outcome onto its followers.

@@ -247,21 +247,22 @@ items:
       $@\"; do\n    if [ ! -f \"$_SFLOW_GATE_DIR/$_dep.open\" ] && [ ! -f \"$_sflow_rc_dir/$_dep\" ];\
       \ then\n      echo \"sflow: $_name waiting for merged dependency $_dep...\"\n    fi\n    while :;\
       \ do\n      [ -f \"$_SFLOW_GATE_DIR/$_dep.open\" ] && break\n      if [ -f \"$_sflow_rc_dir/$_dep\"\
-      \ ]; then\n        _drc=\"$(cat \"$_sflow_rc_dir/$_dep\" 2>/dev/null || echo 1)\"\n        [ \"\
-      $_drc\" = 0 ] && break\n        echo \"sflow: merged dependency $_dep failed (rc=$_drc); $_name\
-      \ will not start\" >&2\n        return \"$_drc\"\n      fi\n      sleep 2\n    done\n  done\n  return\
-      \ 0\n}\n_sflow_run() {\n  _name=\"$1\"; _cvd=\"$2\"; _script=\"$3\"; _envf=\"$4\"; _gate=\"$5\"\n\
-      \  (\n    export CUDA_VISIBLE_DEVICES=\"$_cvd\"\n    export NVIDIA_VISIBLE_DEVICES=\"$_cvd\"\n \
-      \   if [ -f \"$_envf\" ]; then . \"$_envf\"; fi\n    if _sflow_gate $_gate; then\n      bash -l\
-      \ \"$_script\"\n      echo \"$?\" > \"$_sflow_rc_dir/$_name\"\n    else\n      echo \"$?\" > \"\
-      $_sflow_rc_dir/$_name\"\n    fi\n  ) 2>&1 | while IFS= read -r _sflow_line || [ -n \"$_sflow_line\"\
-      \ ]; do\n      printf '[[sflow-mux:%s]] %s\\n' \"$_name\" \"$_sflow_line\"\n    done &\n}\n_sflow_run\
-      \ agg_server_0 0,1,2,3 /sflow/merge_agg_server_0.sh /sflow/menv/agg-server-0/envsh ''\n_sflow_run\
-      \ agg_server_1 1,0,2,3 /sflow/merge_agg_server_1.sh /sflow/menv/agg-server-1/envsh ''\n_sflow_run\
-      \ agg_server_2 2,0,1,3 /sflow/merge_agg_server_2.sh /sflow/menv/agg-server-2/envsh ''\n_sflow_run\
-      \ agg_server_3 3,0,1,2 /sflow/merge_agg_server_3.sh /sflow/menv/agg-server-3/envsh ''\nwait\n_sflow_rc=0\n\
-      for _f in \"$_sflow_rc_dir\"/*; do\n  _c=\"$(cat \"$_f\" 2>/dev/null || echo 1)\"\n  [ \"$_c\" =\
-      \ \"0\" ] || _sflow_rc=\"$_c\"\ndone\nexit \"$_sflow_rc\""
+      \ ]; then\n        _drc=\"$(cat \"$_sflow_rc_dir/$_dep\" 2>/dev/null || echo 1)\"\n        [ -z\
+      \ \"$_drc\" ] && { sleep 2; continue; }\n        [ \"$_drc\" = 0 ] && break\n        echo \"sflow:\
+      \ merged dependency $_dep failed (rc=$_drc); $_name will not start\" >&2\n        return \"$_drc\"\
+      \n      fi\n      sleep 2\n    done\n  done\n  return 0\n}\n_sflow_run() {\n  _name=\"$1\"; _cvd=\"\
+      $2\"; _script=\"$3\"; _envf=\"$4\"; _gate=\"$5\"\n  (\n    export CUDA_VISIBLE_DEVICES=\"$_cvd\"\
+      \n    export NVIDIA_VISIBLE_DEVICES=\"$_cvd\"\n    if [ -f \"$_envf\" ]; then . \"$_envf\"; fi\n\
+      \    if _sflow_gate $_gate; then\n      bash -l \"$_script\"\n      _sflow_mrc=$?\n    else\n  \
+      \    _sflow_mrc=$?\n    fi\n    echo \"$_sflow_mrc\" > \"$_sflow_rc_dir/$_name\"\n    echo \"[[sflow-member-done:${_sflow_mrc}]]\"\
+      \n  ) 2>&1 | while IFS= read -r _sflow_line || [ -n \"$_sflow_line\" ]; do\n      printf '[[sflow-mux:%s]]\
+      \ %s\\n' \"$_name\" \"$_sflow_line\"\n    done &\n}\n_sflow_run agg_server_0 0,1,2,3 /sflow/merge_agg_server_0.sh\
+      \ /sflow/menv/agg-server-0/envsh ''\n_sflow_run agg_server_1 1,0,2,3 /sflow/merge_agg_server_1.sh\
+      \ /sflow/menv/agg-server-1/envsh ''\n_sflow_run agg_server_2 2,0,1,3 /sflow/merge_agg_server_2.sh\
+      \ /sflow/menv/agg-server-2/envsh ''\n_sflow_run agg_server_3 3,0,1,2 /sflow/merge_agg_server_3.sh\
+      \ /sflow/menv/agg-server-3/envsh ''\nwait\n_sflow_rc=0\nfor _f in \"$_sflow_rc_dir\"/*; do\n  _c=\"\
+      $(cat \"$_f\" 2>/dev/null || echo 1)\"\n  [ \"$_c\" = \"0\" ] || _sflow_rc=\"$_c\"\ndone\nexit \"\
+      $_sflow_rc\""
     merge_agg_server_0.sh: "# sflow: fail-fast\nset -e\nset -x\necho ${CUDA_VISIBLE_DEVICES}\nif [ \"\
       ${NET_DEBUG}\" == \"1\" ]; then\n  export NCCL_DEBUG=INFO\n  export NCCL_DEBUG_SUBSYS=NET\n  export\
       \ UCX_LOG_LEVEL=info\nfi\n\nexport VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0}\

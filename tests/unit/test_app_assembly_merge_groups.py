@@ -568,3 +568,73 @@ def test_no_hint_when_scope_unknown(caplog):
     with caplog.at_level(logging.WARNING, logger="sflow.app.assembly"):
         _warn_interconnect_hints(placements)
     assert not _warn_messages(caplog)
+
+
+# --- member order follows the DAG (upstream first), not the alphabet ---------
+# The leader OWNS the shared pod: its execute() holds the container and deletes it
+# on return. A downstream one-shot leader could therefore never resolve -- its own
+# siblings keep alive the pod it is waiting on. Ordering members upstream-first
+# makes the pod's owner the member the others wait on.
+
+
+def test_member_order_follows_dag_not_alphabet_so_upstream_leads():
+    # 'benchmark' sorts first but depends on 'server'; 'server' must lead.
+    tg = _graph(["benchmark", "server"])
+    tg.dag.add_edge("server", "benchmark")  # server -> benchmark
+    be = _FakeBackend("k8s")
+    placements = {
+        "benchmark": _FakePlacement(be, ["node-a"], 1),
+        "server": _FakePlacement(be, ["node-a"], 4),
+    }
+    _plan_merge_groups(tg, placements)
+
+    leader = tg.get_task("server")
+    assert leader.is_merge_leader is True
+    assert leader.merge_members == ["server", "benchmark"]  # upstream first
+    assert tg.get_task("benchmark").merge_leader == "server"
+    # The downstream member is still gated behind its upstream in-pod.
+    assert tg.get_task("benchmark").merge_gate_after == ["server"]
+
+
+def test_dag_order_puts_terminal_task_last_in_a_realistic_group():
+    # frontends serve; harness consumes them and exits -> harness must not lead.
+    names = ["frontend_a", "frontend_b", "mlperf_harness"]
+    tg = _graph(names)
+    tg.dag.add_edge("frontend_a", "mlperf_harness")
+    tg.dag.add_edge("frontend_b", "mlperf_harness")
+    be = _FakeBackend("k8s")
+    placements = {n: _FakePlacement(be, ["node-a"], 1) for n in names}
+    _plan_merge_groups(tg, placements)
+
+    leader = tg.get_task("frontend_a")
+    assert leader.is_merge_leader is True
+    assert leader.merge_members == ["frontend_a", "frontend_b", "mlperf_harness"]
+
+
+def test_independent_members_keep_deterministic_name_order():
+    # No intra-group edge -> the DAG says nothing; stay on stable name order.
+    tg = _graph(["beta", "alpha"])
+    be = _FakeBackend("k8s")
+    placements = {
+        "alpha": _FakePlacement(be, ["node-a"], 2),
+        "beta": _FakePlacement(be, ["node-a"], 2),
+    }
+    _plan_merge_groups(tg, placements)
+
+    assert tg.get_task("alpha").is_merge_leader is True
+    assert tg.get_task("alpha").merge_members == ["alpha", "beta"]
+
+
+def test_dag_order_drives_gpu_slice_packing():
+    # Slices are packed in member order, so upstream-first also owns the first GPUs.
+    tg = _graph(["benchmark", "server"])
+    tg.dag.add_edge("server", "benchmark")
+    be = _FakeBackend("k8s")
+    placements = {
+        "benchmark": _FakePlacement(be, ["node-a"], 2),
+        "server": _FakePlacement(be, ["node-a"], 4),
+    }
+    _plan_merge_groups(tg, placements)
+
+    assert tg.get_task("server").merge_cuda_visible_devices == "0,1,2,3,4,5"
+    assert tg.get_task("benchmark").merge_cuda_visible_devices == "4,5,0,1,2,3"

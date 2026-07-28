@@ -95,6 +95,16 @@ SFLOW_ENTRYPOINT_PATH = f"{SFLOW_SCRIPT_DIR}/{SFLOW_ENTRYPOINT_FILE}"
 # so both sides agree on the exact literal.
 MERGE_MUX_OPEN = "[[sflow-mux:"
 MERGE_MUX_CLOSE = "]] "
+# Merge-pod per-member completion marker. A merged pod's container cannot exit
+# while ANY member is a long-running service (the launcher blocks in ``wait``), so
+# a one-shot member's completion is NOT observable from the pod's phase. Each
+# member therefore echoes ``[[sflow-member-done:<rc>]]`` on its own tagged stream
+# when its script returns; the demux lands it in that member's ``<task>.log`` and
+# the orchestrator resolves the member from it (see
+# ``core.orchestrator._resolve_finished_merge_members``). Without this a merged
+# terminal task can never reach COMPLETED and the workflow hangs forever.
+MERGE_DONE_OPEN = "[[sflow-member-done:"
+MERGE_DONE_CLOSE = "]]"
 _SCRIPT_VOLUME_NAME = "sflow-scripts"
 # Where the ensure_writable initContainer mounts each target volume's ROOT (no
 # subPath) so it can mkdir + chmod the workload's subPath dir writable.
