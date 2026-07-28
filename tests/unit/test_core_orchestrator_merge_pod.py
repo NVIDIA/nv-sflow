@@ -276,3 +276,111 @@ def test_propagate_failed_leaves_already_failed_follower_unchanged():
     asyncio.run(orch._propagate_merge_leader_status(leader))
     assert follower.status == TaskStatus.FAILED
     assert "prefill" not in summary.failed
+
+
+# --- one-shot member finishing inside a still-running merged pod -------------
+# A merge pod's container blocks in `wait` while any member is a long-lived
+# service, so a finished one-shot member (e.g. the workflow's TERMINAL task) is
+# invisible in the pod phase and used to hang the run forever. Each member now
+# echoes [[sflow-member-done:<rc>]] into its own <task>.log; the orchestrator
+# resolves the member from it while the leader keeps owning the pod.
+
+
+class _DoneOp(_Op):
+    """Operator exposing the k8s duck-typed member-done reader."""
+
+    def __init__(self, rc_by_task=None):
+        super().__init__()
+        self._rc = rc_by_task or {}
+
+    def merged_member_exit_code(self, task):
+        return self._rc.get(task.name)
+
+
+def _mk_done(rc, follower_status=TaskStatus.RUNNING):
+    orch, leader, follower, summary = _mk(follower_status=follower_status)
+    leader.status = TaskStatus.READY  # service leader: pod stays alive
+    follower.operator = _DoneOp({follower.name: rc})
+    return orch, leader, follower, summary
+
+
+def test_finished_merge_follower_completes_while_leader_still_runs():
+    orch, leader, follower, _ = _mk_done(0)
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert follower.status == TaskStatus.COMPLETED
+    assert follower.exit_code == 0
+    assert leader.status == TaskStatus.READY  # leader untouched
+
+
+def test_finished_merge_follower_fails_on_nonzero_rc():
+    orch, leader, follower, summary = _mk_done(7)
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert follower.status == TaskStatus.FAILED
+    assert follower.exit_code == 7
+    assert "prefill" in summary.failed
+
+
+def test_merge_follower_untouched_until_marker_appears():
+    orch, _leader, follower, _ = _mk_done(None)  # no marker yet
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert follower.status == TaskStatus.RUNNING
+
+
+def test_ready_service_follower_is_not_resolved_without_marker():
+    orch, _leader, follower, _ = _mk_done(None, follower_status=TaskStatus.READY)
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert follower.status == TaskStatus.READY
+
+
+def test_resolve_noop_when_operator_lacks_reader():
+    orch, _leader, follower, _ = _mk(follower_status=TaskStatus.RUNNING)
+    asyncio.run(orch._resolve_finished_merge_members())  # plain _Op
+    assert follower.status == TaskStatus.RUNNING
+
+
+def test_resolve_survives_reader_error():
+    orch, _leader, follower, _ = _mk_done(0)
+
+    def _boom(_task):
+        raise OSError("log vanished")
+
+    follower.operator.merged_member_exit_code = _boom
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert follower.status == TaskStatus.RUNNING
+
+
+# --- pod lifetime is decoupled from every member's status -------------------
+# The leader's execute() owns the shared pod (it deletes it on return), so tying
+# the LEADER's status to pod-terminal deadlocked it too: it waited on a pod its
+# own siblings kept alive. Every member -- leader included -- now resolves from
+# its own done-marker, and the pod is reclaimed later by the driver's teardown.
+
+
+def test_merge_leader_resolves_from_its_own_marker_while_pod_lives():
+    orch, leader, follower, _ = _mk(follower_status=TaskStatus.READY)
+    leader.operator = _DoneOp({leader.name: 0})
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert leader.status == TaskStatus.COMPLETED
+    assert leader.exit_code == 0
+    # The sibling service is untouched: the pod must stay up for it.
+    assert follower.status == TaskStatus.READY
+
+
+def test_one_shot_leader_and_service_follower_lets_dag_finish():
+    # The 'benchmark leads, server follows' shape: the leader is one-shot, its
+    # sibling serves. Leader completing is what lets the DAG reach terminal.
+    orch, leader, follower, _ = _mk(follower_status=TaskStatus.READY)
+    leader.operator = _DoneOp({leader.name: 0})
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert leader.status.is_terminal()
+
+
+def test_resolving_a_member_is_idempotent_across_ticks():
+    # The poll loop re-runs every tick and the marker stays in the log, so a
+    # resolved member must not be re-finalized (double uploads/result parsing).
+    orch, _leader, follower, summary = _mk(follower_status=TaskStatus.RUNNING)
+    follower.operator = _DoneOp({follower.name: 3})
+    asyncio.run(orch._resolve_finished_merge_members())
+    assert follower.status == TaskStatus.FAILED
+    asyncio.run(orch._resolve_finished_merge_members())  # second tick
+    assert summary.failed == ["prefill"]  # recorded exactly once

@@ -42,6 +42,8 @@ from sflow.plugins.k8s.rdma_preamble import (
 )
 from sflow.plugins.k8s.render import (
     DEFAULT_GPU_TOLERATION,
+    MERGE_DONE_CLOSE,
+    MERGE_DONE_OPEN,
     SFLOW_ENTRYPOINT_FILE,
     SFLOW_SCRIPT_DIR,
     render_configmap,
@@ -113,6 +115,13 @@ _SFLOW_COLLECT_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB
 # run re-fetches each pod's log before deleting the pods, but that best-effort fetch must
 # never let teardown hang -- so cap it and fall through to the pod delete on timeout.
 _SFLOW_FINALIZE_ON_CANCEL_TIMEOUT = 30.0
+
+# How much of a merged member's log tail ``merged_member_exit_code`` scans for the
+# member-done marker. The orchestrator polls it once per tick (1s) for every
+# unresolved member, so this MUST stay O(1) in log size -- a serving member's log
+# reaches megabytes. The marker is the member's final line, so a few KiB always
+# covers it while keeping each check a single short read.
+_MERGE_DONE_TAIL_BYTES = 8192
 
 
 def _parse_size_bytes(value: int | str | None, default: int) -> int:
@@ -685,6 +694,52 @@ class K8sContainerOperator(Operator):
         """
         self._merge_members = list(members)
         self._merge_union_gpus = int(union_gpus)
+
+    def merged_member_exit_code(self, task: Any) -> int | None:
+        """This merged member's exit code once it announced completion, else None.
+
+        A merge pod's container blocks in ``wait`` while ANY member is a long-lived
+        service, so a finished one-shot member (notably the workflow's terminal task)
+        is invisible in the pod's phase -- without this the run would hang forever.
+        Each member echoes ``[[sflow-member-done:<rc>]]`` on its own tagged stream
+        when its script returns (``k8s.shell.merged_launcher_lines``) and the demux
+        lands it in that member's ``<task>.log``; parse the LAST marker (a retry
+        appends to the same file). Returns None if the log or marker is not there
+        yet -- the orchestrator just re-checks on its next tick.
+        """
+        envs = getattr(task, "envs", None) or {}
+        name = getattr(task, "name", "")
+        wf_out = envs.get("SFLOW_WORKFLOW_OUTPUT_DIR")
+        if wf_out:
+            path = Path(wf_out) / name / f"{name}.log"
+        else:
+            task_out = envs.get("SFLOW_TASK_OUTPUT_DIR")
+            if not task_out:
+                return None
+            path = Path(task_out) / f"{name}.log"
+        # Read only the TAIL, never the whole log: the orchestrator re-checks every
+        # poll tick (1s) for every unresolved member, and a serving member's log runs
+        # to megabytes -- a full read here would re-scan all of it, per member, per
+        # second. The marker is the LAST thing a member writes (its subshell echoes it
+        # after the script returns), so a small tail always contains it.
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - _MERGE_DONE_TAIL_BYTES))
+                text = fh.read().decode(errors="replace")
+        except OSError:
+            return None
+        rc: int | None = None
+        for chunk in text.split(MERGE_DONE_OPEN)[1:]:
+            end = chunk.find(MERGE_DONE_CLOSE)
+            if end < 0:
+                continue  # marker still mid-write; ignore this fragment
+            try:
+                rc = int(chunk[:end].strip())
+            except ValueError:
+                continue
+        return rc
 
     async def open_merge_gate(self, dep_name: str) -> bool:
         """Open the in-pod gate for ``dep_name`` so a merged member waiting on it
@@ -2149,17 +2204,24 @@ class K8sContainerOperator(Operator):
             # Cancelled before the normal re-fetch: pull each pod's COMPLETE log BEFORE
             # deleting the pods, else a fast-failing launcher's log is lost. Bounded +
             # best-effort so teardown always reaches the delete and the cancel survives.
+            _cancelled: asyncio.CancelledError | None = None
             if not finalized and plan.task_log_path:
                 try:
                     await asyncio.wait_for(
                         self._finalize_task_log(plan, apply_prefix_size, [], force=True),
                         timeout=_SFLOW_FINALIZE_ON_CANCEL_TIMEOUT,
                     )
-                except (Exception, asyncio.CancelledError):
-                    pass
+                except asyncio.CancelledError as exc:
+                    # Preserve cancellation: still delete below, then re-raise -- don't
+                    # let a cancel during finalize masquerade as a completed task.
+                    _cancelled = exc
+                except Exception:
+                    pass  # best-effort finalize -- teardown must still reach the delete
             await k8s_lifecycle.delete_objects(
                 plan.cleanup_refs, global_args=plan.global_args, ns_args=plan.ns_args
             )
+            if _cancelled is not None:
+                raise _cancelled
 
     async def _collect_via_cp(
         self,

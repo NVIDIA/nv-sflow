@@ -224,11 +224,14 @@ def _cpu_bind_block(cpu_bind: str, slots: int, cpu_bind_cores_per_rank: int = 0)
                 "# sflow CPU binding (multi-rank-per-pod): bind each rank within the",
                 "# pod's cpuset so LLVM/OpenMP thread pools size to the binding, not the",
                 "# whole node -- prevents pid/thread exhaustion when ranks share a pod.",
-                "# Skipped if the recipe already binds (--bind-to/--map-by -> user wins).",
+                "# Skipped if the recipe already binds -- via --bind-to/--map-by OR a",
+                "# rankfile/cpu-list/hwthread flag (any of which OpenMPI rejects alongside",
+                "# sflow's --map-by ppr/--bind-to core) -> the recipe's own binding wins.",
                 "_sflow_bound=0",
                 'for _a in "$@"; do',
                 '  case "${_a}" in',
-                "    --bind-to|--bind-to=*|--map-by|--map-by=*) _sflow_bound=1; break ;;",
+                "    --bind-to|--bind-to=*|--map-by|--map-by=*|--rankfile|--rankfile=*|-rf"
+                "|--cpu-list|--cpu-list=*|--use-hwthread-cpus) _sflow_bound=1; break ;;",
                 "  esac",
                 "done",
                 'if [ "${_sflow_bound}" = "0" ]; then',
@@ -255,8 +258,13 @@ def _role_barrier_block(*, ssh_port: int, ssh_dir: str, ensure_sshd: bool) -> st
         inner += _ensure_sshd_lines()
     inner += _sshd_prepare_lines()
     inner += [
+        # Fail fast if sshd won't start: otherwise a worker would idle forever with no
+        # sshd (leader can never connect) and the leader would fall through to a doomed
+        # launch. `set -e` is not on in the shim, so guard the exit explicitly.
         f'"${{SFLOW_SSHD_BIN}}" -p {int(ssh_port)} '
-        f'&& echo "[sflow-mpi] sshd up on :{int(ssh_port)}"',
+        f'|| {{ echo "[sflow-mpi] ERROR: sshd failed to start on :{int(ssh_port)}" >&2; '
+        "exit 1; }",
+        f'echo "[sflow-mpi] sshd up on :{int(ssh_port)}"',
         'if [ "${SFLOW_MPI_NODE_INDEX:-0}" != "0" ]; then',
         '  echo "[sflow-mpi] worker ${SFLOW_MPI_NODE_INDEX}: setup done; '
         'idle (leader drives mpirun)"',
@@ -367,7 +375,9 @@ done
 # (hostfile, SSH transport, CPU binding, env forwarding) + the recipe's own args -- so
 # the actual command that ran is visible in the task log (the shim otherwise exec's
 # silently). Only the leader reaches this line (workers idle in the role barrier above).
-echo "[sflow-mpi] launch: ${_sflow_real} ${_sflow_opts[*]} $*"
+# To STDERR: the task log captures both streams, so it stays visible, but the workload's
+# stdout stays clean for result parsing / a tee'd rank capture.
+echo "[sflow-mpi] launch: ${_sflow_real} ${_sflow_opts[*]} $*" >&2
 exec "${_sflow_real}" "${_sflow_opts[@]}" "$@"
 """
     barrier = (
@@ -511,10 +521,15 @@ def build_leader_wait_lines(
         '-o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"',
         'for ip in $(printf \'%s\' "${SFLOW_MPI_NODE_IPS}" | tr \',\' \' \'); do',
         '  echo "[sflow-mpi] waiting for sshd on ${ip}:%d"' % int(ssh_port),
+        "  _sflow_ssh_ok=0",
         "  for _ in $(seq 1 240); do",
-        '    if ssh ${SFLOW_SSH_OPTS} "${ip}" true 2>/dev/null; then echo "[sflow-mpi] ${ip} ssh ok"; break; fi',
+        '    if ssh ${SFLOW_SSH_OPTS} "${ip}" true 2>/dev/null; then echo "[sflow-mpi] ${ip} ssh ok"; _sflow_ssh_ok=1; break; fi',
         "    sleep 2",
         "  done",
+        # Fail fast instead of falling through to launch (which would fail late with a
+        # confusing "Connection refused") when a peer's sshd never becomes reachable.
+        '  [ "${_sflow_ssh_ok}" = 1 ] || { echo "[sflow-mpi] ERROR: worker ${ip} sshd '
+        'never became reachable; aborting" >&2; exit 1; }',
         "done",
     ]
 

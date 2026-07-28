@@ -348,7 +348,9 @@ def _plan_merge_groups(
     via ``merge_colocated_gpu_pods``, tasks with >0 GPUs assigned to exactly one
     physical node are grouped by ``(backend, node, container-image)`` -- same node
     AND same image, since a merged pod is one container. Groups with >=2 members
-    become one merged pod owned by a deterministic leader (first member by name):
+    become one merged pod owned by a deterministic leader -- members are ordered by
+    their DAG dependency (upstream first, name breaking ties) and the leader is the
+    first, so the member that owns the shared pod is the one others wait on:
 
     * every member sees ALL union GPUs (``CUDA_VISIBLE_DEVICES``), with its own
       packed slice listed FIRST so the workload uses it as ``cuda:0`` -- exposing
@@ -406,9 +408,11 @@ def _plan_merge_groups(
         # until the merged pod starts, and the pod's leader (transitively) waits on
         # the external task -- an unbreakable cycle. Reject at plan time rather than
         # deadlock at run time.
+        intra_deps: dict[str, list[str]] = {}
         for m in members:
             deps = task_graph.dag.get_dependencies(m)
             gate = sorted(d for d in deps if d in member_set)
+            intra_deps[m] = gate
             stack = [d for d in deps if d not in member_set]
             seen: set[str] = set()
             while stack:
@@ -427,6 +431,35 @@ def _plan_merge_groups(
                     )
                 stack.extend(task_graph.dag.get_dependencies(dep))
             task_graph.get_task(m).merge_gate_after = gate
+        # Order members by their DAG dependency, upstream first (name breaks ties, so
+        # the result stays deterministic). A downstream member follows its upstream:
+        # it is gated behind it in-pod anyway, and it is the one that finishes and
+        # leaves, while the upstream it waits on is what keeps serving.
+        #
+        # That ordering also picks the leader (members[0] = a most-upstream member),
+        # which matters because the leader OWNS THE POD: its execute() holds the
+        # shared container and deletes it on return. With plain alphabetical order a
+        # downstream one-shot could lead (e.g. 'benchmark' before 'server'), and it
+        # can never resolve -- its own siblings keep the pod it waits on alive.
+        # Upstream-first makes the pod's owner the member that lives longest.
+        # (Members with no intra-group edge are unordered by the DAG, so they keep
+        # name order; a finished non-leader member is resolved from its own
+        # done-marker -- see orchestrator._resolve_finished_merge_members.)
+        ordered: list[str] = []
+        placed: set[str] = set()
+        while len(ordered) < len(members):
+            ready = [
+                m
+                for m in members
+                if m not in placed
+                and all(d in placed for d in intra_deps.get(m, ()))
+            ]
+            if not ready:  # cycle guard: keep remaining name order, never loop forever
+                ready = [m for m in members if m not in placed]
+            for m in ready:
+                ordered.append(m)
+                placed.add(m)
+        members = ordered
         leader_name = members[0]
         group_id = f"{backend_name}:{node}"
         # Every member's container sees ALL union GPUs, but with its OWN packed

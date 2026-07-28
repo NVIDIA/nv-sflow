@@ -1,0 +1,134 @@
+version: "0.1"
+
+# Lightweight single-node SMOKE test for MERGE-POD DAG execution (no model, no benchmark).
+#
+# Several co-located single-GPU tasks are folded into ONE pod (`merge_colocated_gpu_pods`,
+# on by default), where every member runs as a background process in the shared container.
+# That container only exits once EVERY member's script returns -- so with a long-running
+# member in the group the pod NEVER reaches a terminal phase. Any design that reads a
+# member's outcome from the POD therefore deadlocks: the observed bug was a merged terminal
+# task that stayed non-terminal forever and hung the run until it was killed by hand.
+#
+# This recipe puts a deliberately MIXED group in one pod -- some members readiness-probed
+# services that never exit, some one-shot tasks that finish -- and makes the workflow's
+# terminal task a one-shot MEMBER of that pod. The DAG must still complete:
+#
+#   service_a  (service, readiness-probed) -- serves forever, holds the pod open
+#   service_b  (service, readiness-probed) -- second service, so the group is not 1:1
+#   warmup     (one-shot)                  -- finishes early, while both services run
+#   client     (one-shot, TERMINAL)        -- gated in-pod behind service_a/service_b
+#
+# All four are 1-GPU tasks on the same node, so sflow merges them into a single 4-GPU pod.
+# `client` depends on the services, which also exercises the in-pod dependency GATE, and
+# the DAG-order leader rule (upstream first) makes a service own the pod.
+#
+# PASS/FAIL is the whole point and is deterministic:
+#   * regressed  -> `warmup`/`client` never reach COMPLETED, the workflow HANGS and the e2e
+#                   run times out (the exact production symptom);
+#   * healthy    -> `client` completes, the DAG finishes, and the driver deletes the shared
+#                   pod at teardown (pod lifetime is the driver's, not any member's).
+# Each one-shot also ASSERTS it really ran inside the shared pod alongside the services,
+# so a merge that silently stopped happening fails the task instead of passing vacuously.
+#
+# Cheap by construction: `bash:5`-style trivial work, no model download, one node.
+
+variables:
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    value: default
+  SERVER_IMAGE:
+    description: "Any image with bash + coreutils; no GPU work is actually run"
+    value: nvcr.io/nvidia/tensorrt-llm/release:latest
+  GPUS_PER_NODE:
+    description: "GPUs on the node; must be >= the 4 single-GPU members so they co-locate"
+    type: integer
+    value: 4
+
+backends:
+  - name: cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: 1
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    scheduling: device_plugin
+    # Explicit rather than relying on the default, since this recipe exists to test it.
+    merge_colocated_gpu_pods: "on"
+    reservation:
+      timeout: 1200
+
+operators:
+  - name: gpu
+    type: k8s
+    image: ${{ variables.SERVER_IMAGE }}
+    run_as_root: true
+
+workflow:
+  name: k8s_merge_pod_smoke
+  tasks:
+    # --- services: readiness-probed, never exit on their own -> they hold the pod open.
+    - name: service_a
+      operator: gpu
+      resources:
+        gpus:
+          count: 1
+      script:
+        - set -euo pipefail
+        - echo "[smoke] service_a starting in $(hostname)"
+        - echo "SERVICE_A READY"
+        # Serve "forever": sflow stops it when the DAG finishes.
+        - while true; do sleep 3600 & wait $!; done
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "SERVICE_A READY"
+          timeout: 600
+          interval: 5
+
+    - name: service_b
+      operator: gpu
+      resources:
+        gpus:
+          count: 1
+      script:
+        - set -euo pipefail
+        - echo "[smoke] service_b starting in $(hostname)"
+        - echo "SERVICE_B READY"
+        - while true; do sleep 3600 & wait $!; done
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "SERVICE_B READY"
+          timeout: 600
+          interval: 5
+
+    # --- one-shot that finishes EARLY, while both services are still running. Its
+    # completion is only observable from its own exit, never from the shared pod.
+    - name: warmup
+      operator: gpu
+      resources:
+        gpus:
+          count: 1
+      script:
+        - set -euo pipefail
+        - echo "[smoke] warmup running in $(hostname)"
+        # Prove the merge actually happened: a merged member sees the union of the
+        # group's GPUs (4), not just its own 1. If merging regressed, this fails.
+        - 'echo "[smoke] warmup CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"'
+        - test "$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)" -eq ${{ variables.GPUS_PER_NODE }}
+        - echo "[smoke] warmup OK: finished while the services keep serving"
+
+    # --- TERMINAL task, and a MEMBER of the same pod. This is the shape that hung:
+    # it can only complete if its own exit resolves it while its siblings serve on.
+    - name: client
+      operator: gpu
+      depends_on: [service_a, service_b]
+      resources:
+        gpus:
+          count: 1
+      script:
+        - set -euo pipefail
+        - echo "[smoke] client running in $(hostname)"
+        # Same-pod check: the in-pod gate only released us after both services were up.
+        - test "$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)" -eq ${{ variables.GPUS_PER_NODE }}
+        - echo "[smoke] client OK: terminal member completed inside a pod its siblings keep alive"

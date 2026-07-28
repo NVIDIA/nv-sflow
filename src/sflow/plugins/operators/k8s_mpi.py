@@ -137,7 +137,7 @@ class MpiConfig(BaseModel):
     # OpenMPI then aborts the launch with "A request was made to bind to that would
     # result in binding more processes than cpus on a resource". Raise it for CPU-heavy
     # workloads that need a wider slice; set to 0 for no cap (cores/ranks, as before).
-    cpu_bind_cores_per_rank: int = 8
+    cpu_bind_cores_per_rank: int = Field(default=8, ge=0)
     # How long a worker's per-node setup (image apt-install + weight staging) may take
     # before its readiness probe reaps it (operator route). The worker's readiness probe
     # (tcpSocket on the ssh port) is what launcherCreationPolicy=WaitForWorkersReady gates

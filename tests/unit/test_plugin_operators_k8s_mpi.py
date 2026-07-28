@@ -236,6 +236,29 @@ def test_mpirun_wrapper_echoes_resolved_launch_line():
     assert script.index("[sflow-mpi] launch:") < script.index('exec "${_sflow_real}"')
 
 
+def test_mpirun_wrapper_launch_echo_goes_to_stderr(tmp_path, fake_process):
+    """The `[sflow-mpi] launch:` diagnostic must go to STDERR, not stdout, so it never
+    pollutes a result-parsed launcher's stdout (or a tee'd rank capture). Task logs
+    capture stderr too, so it stays visible."""
+    fake_process.allow_unregistered(True)
+    real = tmp_path / "real_mpirun"
+    real.write_text('#!/usr/bin/env bash\nprintf "WORKLOAD-STDOUT\\n"\n')
+    real.chmod(0o755)
+    wrapper = tmp_path / "mpirun"
+    wrapper.write_text(mpi_boot.build_mpirun_wrapper_script(inject_hostfile=False))
+    wrapper.chmod(0o755)
+    out = subprocess.run(
+        [str(wrapper), "-np", "1", "app"],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], "SFLOW_REAL_MPIRUN": str(real)},
+    )
+    assert out.returncode == 0, out.stderr
+    assert "[sflow-mpi] launch:" in out.stderr  # diagnostic on stderr
+    assert "[sflow-mpi] launch:" not in out.stdout  # stdout stays clean for result parsing
+    assert "WORKLOAD-STDOUT" in out.stdout
+
+
 def test_mpirun_wrapper_operator_route_omits_hostfile():
     # The operator route gets the hostfile from the mpi-operator (OMPI_MCA_*), so
     # the launcher wrapper only forwards env -- it must not inject --hostfile.
@@ -414,6 +437,49 @@ def test_mpirun_wrapper_binding_respects_user_provided_binding(tmp_path, fake_pr
     assert "--map-by" not in args
 
 
+def test_mpirun_wrapper_binding_respects_rankfile(tmp_path, fake_process):
+    """A recipe that binds via --rankfile (not --bind-to/--map-by) must ALSO suppress
+    sflow's default core-binding injection -- else OpenMPI rejects the conflicting
+    directives now that `core` is the default. A fat cpuset ensures binding WOULD be
+    injected absent the fix (so this is a real regression guard, not a no-op)."""
+    fake_process.allow_unregistered(True)
+    fake = _fake_cpu_topology(tmp_path, nproc=64, threads_per_core=2)  # 32 cores >> 4 ranks
+    real = tmp_path / "real_mpirun"
+    real.write_text('#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+    real.chmod(0o755)
+    wrapper = tmp_path / "mpirun"
+    wrapper.write_text(
+        mpi_boot.build_mpirun_wrapper_script(
+            inject_hostfile=False, cpu_bind="core", slots=4
+        )
+    )
+    wrapper.chmod(0o755)
+    out = subprocess.run(
+        [str(wrapper), "-np", "4", "--rankfile", "rf", "app"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fake}:{os.environ['PATH']}", "SFLOW_REAL_MPIRUN": str(real)},
+    )
+    assert out.returncode == 0, out.stderr
+    argv = [ln for ln in out.stdout.split("\n") if not ln.startswith("[sflow-mpi]")]
+    assert "--map-by" not in argv  # sflow injected nothing (recipe's rankfile wins)
+    assert "--bind-to" not in argv
+    assert "--rankfile" in argv  # the recipe's own binding survives
+
+
+def test_mpi_config_rejects_negative_cores_per_rank():
+    """cpu_bind_cores_per_rank must be >= 0 (0 == uncapped); a negative typo must not
+    silently disable the cap."""
+    from pydantic import ValidationError
+
+    from sflow.plugins.operators.k8s_mpi import MpiConfig
+
+    MpiConfig(cpu_bind_cores_per_rank=0)  # uncapped -- allowed
+    MpiConfig(cpu_bind_cores_per_rank=16)  # allowed
+    with pytest.raises(ValidationError):
+        MpiConfig(cpu_bind_cores_per_rank=-1)
+
+
 def _fake_cpu_topology(tmp_path, *, nproc, threads_per_core, lscpu=True):
     """A bin dir (to prepend to PATH) whose `nproc`/`lscpu` report a chosen topology,
     so the wrapper's launch-time core math can be exercised for real. ``lscpu=False``
@@ -541,6 +607,24 @@ def test_mpirun_wrapper_role_barrier_worker_idles_leader_waits():
     assert "waiting for sshd" in script  # leader waits
     # the barrier runs before the exec of the real mpirun
     assert script.index("sleep infinity") < script.index('exec "${_sflow_real}"')
+
+
+def test_mpirun_wrapper_role_barrier_fails_fast_on_sshd_failure():
+    # sshd start failure must ABORT the wrapper (exit non-zero), not let a worker idle
+    # forever / the leader fall through to a doomed launch.
+    script = mpi_boot.build_mpirun_wrapper_script(role_barrier=True, ssh_port=2222)
+    assert "sshd failed to start" in script  # sshd start failure is surfaced
+    assert "exit 1" in script  # ...and aborts the wrapper
+
+
+def test_build_leader_wait_lines_fails_fast_on_unreachable_worker():
+    # The leader's wait loop must fail fast when a peer's sshd never becomes reachable,
+    # not fall through to launch (which would fail late with "Connection refused").
+    from sflow.plugins.k8s.mpi_bootstrap import build_leader_wait_lines
+
+    text = "\n".join(build_leader_wait_lines(ssh_port=2222))
+    assert "never became reachable" in text  # exhaustion is surfaced
+    assert "exit 1" in text  # ...and aborts
 
 
 def test_mpirun_wrapper_no_role_barrier_by_default():

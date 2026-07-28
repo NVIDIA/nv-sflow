@@ -18,6 +18,8 @@ from collections.abc import Mapping, Sequence
 
 from sflow.core.command import Command
 from sflow.plugins.k8s.render import (
+    MERGE_DONE_CLOSE,
+    MERGE_DONE_OPEN,
     MERGE_MUX_CLOSE,
     MERGE_MUX_OPEN,
     SFLOW_ALLOC_LABEL,
@@ -327,6 +329,12 @@ def merged_launcher_lines(
     (its container exit code is the merge leader task's), and blocks in ``wait``
     for long-lived services until the pod is torn down. ``preamble_lines`` (e.g. the
     RDMA affinity preamble) run once in the parent shell before any member starts.
+
+    Because that ``wait`` never returns while ANY member is a long-lived service,
+    the pod's phase says nothing about an individual member. Each member therefore
+    echoes ``[[sflow-member-done:<rc>]]`` on its own tagged stream as soon as its
+    script returns, so the driver can resolve a finished one-shot member (e.g. the
+    workflow's terminal task) while its sibling services keep the container alive.
     """
     tag_fmt = f"{MERGE_MUX_OPEN}%s{MERGE_MUX_CLOSE}%s\\n"
     lines: list[str] = ["set -uo pipefail"]
@@ -379,11 +387,17 @@ def merged_launcher_lines(
             # immediately, so a non-dependent member behaves exactly as before.
             "    if _sflow_gate $_gate; then",
             '      bash -l "$_script"',
-            '      echo "$?" > "$_sflow_rc_dir/$_name"',
+            "      _sflow_mrc=$?",
             "    else",
             # _sflow_gate returned the failed dependency's rc; record it as ours.
-            '      echo "$?" > "$_sflow_rc_dir/$_name"',
+            "      _sflow_mrc=$?",
             "    fi",
+            '    echo "$_sflow_mrc" > "$_sflow_rc_dir/$_name"',
+            # Announce THIS member's completion on its own tagged stream. The pod's
+            # container cannot exit while a sibling service still runs (the `wait`
+            # below), so this marker is the only signal the driver has that a
+            # one-shot member finished -- see MERGE_DONE_OPEN in k8s.render.
+            f'    echo "{MERGE_DONE_OPEN}${{_sflow_mrc}}{MERGE_DONE_CLOSE}"',
             # `|| [ -n "$_sflow_line" ]`: emit a final line the script wrote without a
             # trailing newline (plain `read` returns non-zero and would drop it), so a
             # member's last line (e.g. a no-newline readiness marker) is never lost.
