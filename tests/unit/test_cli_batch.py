@@ -627,6 +627,180 @@ def test_bulk_input_without_nodes_succeeds_with_node_column(mock_sflow_app, tmp_
     assert "--set SLURM_NODES=2" in script_text
 
 
+def test_bulk_input_set_overrides_backend_nodes_in_generated_script(
+    mock_sflow_app, tmp_path
+):
+    """Repro: `--set` overriding the backend node count reaches the GENERATED sbatch
+    script, not just the dry-run. The backend sizes off ``nodes: ${{ variables.NUM_NODES }}``;
+    the CSV sets NUM_NODES=2 and ``--set NUM_NODES=8`` must win in ``#SBATCH --nodes``."""
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: NUM_NODES\n"
+        "    value: 1\n"
+        "backends:\n"
+        "  - name: slurm\n"
+        "    type: slurm\n"
+        "    default: true\n"
+        "    nodes: ${{ variables.NUM_NODES }}\n"
+        "    gpus_per_node: 8\n"
+        "    account: acct\n"
+        "    partition: batch\n"
+        '    time: "01:00:00"\n'
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: serve\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    out_dir = tmp_path / "sflow_output"
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file,NUM_NODES\n{wf_path},2\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-input",
+            str(csv_file),
+            "--partition",
+            "batch",
+            "--account",
+            "acct",
+            "--set",
+            "NUM_NODES=8",
+            "--output-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    scripts = list(out_dir.rglob("*.sh"))
+    assert len(scripts) == 1
+    script_text = scripts[0].read_text()
+    # --set (8) must win over the stale CSV value (2), matching the dry-run.
+    assert "#SBATCH --nodes=8" in script_text, script_text
+    assert "#SBATCH --nodes=2" not in script_text
+    assert "--set NUM_NODES=8" in script_text
+
+
+def test_bulk_input_set_overrides_node_column_in_generated_script(
+    mock_sflow_app, tmp_path
+):
+    """Same bug via a bare node-count column (no backend ``nodes`` field): ``--set``
+    must still win over the CSV SLURM_NODES value in the ``#SBATCH --nodes`` directive."""
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: SLURM_NODES\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: serve\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    out_dir = tmp_path / "sflow_output"
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file,SLURM_NODES\n{wf_path},2\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-input",
+            str(csv_file),
+            "--partition",
+            "batch",
+            "--account",
+            "acct",
+            "--set",
+            "SLURM_NODES=8",
+            "--output-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    scripts = list(out_dir.rglob("*.sh"))
+    assert len(scripts) == 1
+    script_text = scripts[0].read_text()
+    assert "#SBATCH --nodes=8" in script_text, script_text
+    assert "#SBATCH --nodes=2" not in script_text
+
+
+def test_bulk_input_set_node_override_reflected_in_job_name(mock_sflow_app, tmp_path):
+    """The derived job NAME encodes the node count; a ``--set`` node override must be
+    reflected there too (not the stale CSV value) so the name matches the allocation."""
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: SLURM_NODES\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: serve\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    out_dir = tmp_path / "sflow_output"
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file,SLURM_NODES\n{wf_path},2\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-input",
+            str(csv_file),
+            "--partition",
+            "batch",
+            "--account",
+            "acct",
+            "--set",
+            "SLURM_NODES=8",
+            "--output-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_text = list(out_dir.rglob("*.sh"))[0].read_text()
+    assert "8n" in script_text  # job name encodes the effective (overridden) node count
+    assert "2n_" not in script_text  # not the stale CSV value
+
+
+def test_resolve_node_count_cli_set_overrides_csv_node_column():
+    """`_resolve_node_count` precedence: explicit --nodes > global --set node var >
+    the row's CSV node cell (so the job name tracks the effective allocation)."""
+    from sflow.cli.batch import _resolve_node_count
+
+    assert _resolve_node_count({"SLURM_NODES": "2"}, None, {"SLURM_NODES": "8"}) == "8n"
+    assert _resolve_node_count({"SLURM_NODES": "2"}, None) == "2n"  # no override -> CSV
+    assert _resolve_node_count({"SLURM_NODES": "2"}, 4, {"SLURM_NODES": "8"}) == "4n"
+
+
+def test_first_node_column_int_scans_and_skips_malformed():
+    """The consolidated node-column peek returns the first PARSEABLE node-count column,
+    skips empty/malformed values (they can't mask a valid column), and returns None when
+    nothing parses. Shared by the naming and both bulk paths."""
+    from sflow.cli.batch import _first_node_column_int
+
+    assert _first_node_column_int({"NUM_NODES": "4"}) == 4
+    assert _first_node_column_int({"SLURM_NODES": "3"}) == 3
+    # a malformed value does not mask a good column elsewhere in the scan
+    assert _first_node_column_int({"SLURM_NODES": "oops", "NUM_NODES": "2"}) == 2
+    # empty / whitespace / non-numeric only -> None
+    assert _first_node_column_int({"NUM_NODES": "  "}) is None
+    assert _first_node_column_int({"SLURM_NODES": "x"}) is None
+    assert _first_node_column_int({}) is None
+    # non-node columns are ignored
+    assert _first_node_column_int({"MODEL": "5"}) is None
+
+
 def test_batch_sbatch_extra_args_order_preserved(
     mock_sflow_app, temp_workflow_file, tmp_path
 ):
@@ -2405,6 +2579,67 @@ class TestDeriveNodes:
             "    - name: t1\n      script:\n        - echo hi\n"
         )
         assert _derive_nodes([f], cli_overrides=["SLURM_NODES=10"]) == 10
+
+    def test_compound_expression_resolves_via_full_pipeline(self, tmp_path):
+        """A COMPOUND ${{ }} expression (arithmetic) resolves through the SAME full
+        config pipeline as the dry-run, so `sflow batch` sizing matches `sflow run`.
+        The bespoke regex only matched a bare ``${{ variables.X }}`` and returned None
+        here. Requires a complete backend so the pipeline validates (incomplete configs
+        fall back to the regex, unchanged)."""
+        f = tmp_path / "wf.yaml"
+        f.write_text(
+            'version: "0.1"\n'
+            "variables:\n"
+            "  - name: NUM_NODES\n    type: integer\n    value: 3\n"
+            "backends:\n"
+            "  - name: slurm_cluster\n    type: slurm\n"
+            "    nodes: ${{ variables.NUM_NODES * 2 }}\n"
+            "    partition: gpu\n    account: test\n    gpus_per_node: 8\n"
+            '    time: "01:00:00"\n'
+            "workflow:\n  name: wf\n  tasks:\n"
+            "    - name: t1\n      script:\n        - echo hi\n"
+        )
+        assert _derive_nodes([f]) == 6  # 3 * 2, via full resolver
+        assert _derive_nodes([f], cli_overrides=["NUM_NODES=5"]) == 10  # 5 * 2
+
+
+def test_bulk_input_compound_node_expression_matches_dry_run(mock_sflow_app, tmp_path):
+    """Backend sizes nodes off a COMPOUND expression of a CSV var; the generated sbatch
+    must resolve it like the dry-run (8), not fall back to the raw CSV cell (4)."""
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: NUM_NODES\n    type: integer\n    value: 1\n"
+        "backends:\n"
+        "  - name: slurm\n    type: slurm\n    default: true\n"
+        "    nodes: ${{ variables.NUM_NODES * 2 }}\n"
+        "    gpus_per_node: 8\n    account: acct\n    partition: batch\n"
+        '    time: "01:00:00"\n'
+        "workflow:\n  name: wf\n  tasks:\n    - name: serve\n      script: [echo hi]\n"
+    )
+    out_dir = tmp_path / "out"
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(f"sflow_config_file,NUM_NODES\n{wf_path},4\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--bulk-input",
+            str(csv_file),
+            "--partition",
+            "batch",
+            "--account",
+            "acct",
+            "--output-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    script_text = list(out_dir.rglob("*.sh"))[0].read_text()
+    assert "#SBATCH --nodes=8" in script_text, script_text  # 4 * 2, matching dry-run
+    assert "#SBATCH --nodes=4" not in script_text  # not the raw CSV cell
 
 
 def test_single_job_derives_nodes_from_config(mock_sflow_app, tmp_path):

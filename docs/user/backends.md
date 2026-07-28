@@ -736,6 +736,8 @@ workflow:
 | `ensure_sshd` | `true` | Install `openssh-server` at startup if the image lacks `sshd`. |
 | `forward_env_prefixes` | `[]` | Extra env-namespace prefixes forwarded to remote ranks (additive to sflow's defaults). |
 | `omp_num_threads` | `8` | Injected `OMP_NUM_THREADS` per rank; `null`/`0` keeps the image default. |
+| `cpu_bind` | `core` | Per-rank CPU binding, injected **only when several ranks share a pod** (and never over a binding the recipe already passes). `core` gives each rank an isolated core slice — the tightest cap on the LLVM/OpenMP thread pools that `OMP_NUM_THREADS` alone doesn't reach; `numa` binds one rank per NUMA domain (only partitions when the cpuset spans >1 domain); `none` injects nothing. |
+| `cpu_bind_cores_per_rank` | `8` | Upper bound on the cores bound to each rank under `cpu_bind: core`. The launch-time value is `min(cores-in-cpuset / ranks-per-pod, this)`, so a small cpuset still gets a smaller slice, and if the cpuset has fewer cores than ranks the binding is skipped rather than failing the launch. Raise it for CPU-heavy workloads; `0` = no cap. |
 
 > The `pods` route consumes the curated/override operator fields (base render); the
 > `MPIJob` CR route (`operator`) does not.

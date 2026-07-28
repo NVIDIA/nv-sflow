@@ -91,9 +91,12 @@ workflow:
           fi; ${NSYS_CMD} mpirun -np ${{ variables.NUM_NODES * variables.GPUS_PER_NODE }} --allow-run-as-root
           bash -c 'echo "[SFLOW_RANK] r=${OMPI_COMM_WORLD_RANK} n=${OMPI_COMM_WORLD_SIZE} host=$(hostname)"'
           2>&1 | tee /tmp/ranks.txt
-        - 'echo "[smoke] ranks=$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt) distinct_hosts=$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)"'
-        - test "$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt)" -eq "${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}"
-        - test "$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)" -eq "${{ variables.NUM_NODES }}"
+        # Match only REAL rank lines "[SFLOW_RANK] r=<digit>" -- the shim's own
+        # "[sflow-mpi] launch: ... echo [SFLOW_RANK] r=${OMPI_COMM_WORLD_RANK} ..." echo is
+        # also tee'd here, so an unanchored grep would over-count (its `r=${...}` is not a digit).
+        - 'echo "[smoke] ranks=$(grep -cE "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt) distinct_hosts=$(grep -E "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt | grep -oE "host=[^ ]+" | sort -u | wc -l)"'
+        - test "$(grep -cE "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt)" -eq "${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}"
+        - test "$(grep -E "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt | grep -oE "host=[^ ]+" | sort -u | wc -l)" -eq "${{ variables.NUM_NODES }}"
         - echo "[smoke] mpi_compound_line OK: cross-node MPI world spanned all nodes"
 
     # (2) plain MULTILINE launch: if/fi fully closed, then mpirun starts a fresh line.
@@ -117,7 +120,10 @@ workflow:
           ${NSYS_CMD} mpirun -np ${{ variables.NUM_NODES * variables.GPUS_PER_NODE }} --allow-run-as-root
           bash -c 'echo "[SFLOW_RANK] r=${OMPI_COMM_WORLD_RANK} n=${OMPI_COMM_WORLD_SIZE} host=$(hostname)"'
           2>&1 | tee /tmp/ranks.txt
-        - 'echo "[smoke] ranks=$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt) distinct_hosts=$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)"'
-        - test "$(grep -c "\[SFLOW_RANK\]" /tmp/ranks.txt)" -eq "${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}"
-        - test "$(grep -oE "host=[^ ]+" /tmp/ranks.txt | sort -u | wc -l)" -eq "${{ variables.NUM_NODES }}"
+        # Match only REAL rank lines "[SFLOW_RANK] r=<digit>" -- the shim's own
+        # "[sflow-mpi] launch: ... echo [SFLOW_RANK] r=${OMPI_COMM_WORLD_RANK} ..." echo is
+        # also tee'd here, so an unanchored grep would over-count (its `r=${...}` is not a digit).
+        - 'echo "[smoke] ranks=$(grep -cE "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt) distinct_hosts=$(grep -E "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt | grep -oE "host=[^ ]+" | sort -u | wc -l)"'
+        - test "$(grep -cE "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt)" -eq "${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}"
+        - test "$(grep -E "\[SFLOW_RANK\] r=[0-9]" /tmp/ranks.txt | grep -oE "host=[^ ]+" | sort -u | wc -l)" -eq "${{ variables.NUM_NODES }}"
         - echo "[smoke] mpi_multiline OK: cross-node MPI world spanned all nodes"

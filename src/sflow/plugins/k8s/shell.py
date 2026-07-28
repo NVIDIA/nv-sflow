@@ -350,6 +350,13 @@ def merged_launcher_lines(
             '      [ -f "$_SFLOW_GATE_DIR/$_dep.open" ] && break',
             '      if [ -f "$_sflow_rc_dir/$_dep" ]; then',
             '        _drc="$(cat "$_sflow_rc_dir/$_dep" 2>/dev/null || echo 1)"',
+            # The rc file is written non-atomically (`echo "$?" > f` truncates then
+            # writes), so a poll can read it EMPTY mid-write. Treat empty as "still
+            # writing" and keep waiting -- an empty _drc must never reach
+            # `return "$_drc"` (bash errors on a non-numeric arg, wrongly failing the
+            # gated member as if its dependency had failed).
+            f'        [ -z "$_drc" ] && {{ sleep {int(MERGE_GATE_POLL_SECONDS)}; '
+            "continue; }",
             '        [ "$_drc" = 0 ] && break',
             '        echo "sflow: merged dependency $_dep failed (rc=$_drc); '
             '$_name will not start" >&2',

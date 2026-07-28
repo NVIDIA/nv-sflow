@@ -2094,6 +2094,25 @@ def test_merged_launcher_renders_gate_only_for_dependent_member():
     assert merge_gate_marker("prefill") == "/tmp/sflow-merge-gate/prefill.open"
 
 
+def test_merged_gate_does_not_fail_dependency_on_empty_rc_read():
+    # Race guard: a dependency's rc file is written non-atomically (`echo "$?" > f`
+    # truncates then writes), so a poll can `cat` it EMPTY mid-write. An empty read must
+    # be treated as "still writing" (keep waiting), NOT reach `return "$_drc"` (an empty
+    # `_drc` is a bash "numeric argument required" error -> the gated member would be
+    # wrongly skipped as if its dependency had failed).
+    from sflow.plugins.k8s.shell import merged_launcher_lines
+
+    text = "\n".join(
+        merged_launcher_lines(
+            [
+                ("dep", "0", "/s/dep.sh", "/s/env", ""),
+                ("gated", "0", "/s/gated.sh", "/s/env", "dep"),
+            ]
+        )
+    )
+    assert '[ -z "$_drc" ]' in text  # empty read -> keep waiting, don't fail the dep
+
+
 def test_merged_launcher_backward_compatible_with_4_tuples():
     # Existing callers pass 4-tuples (no gate); must still render, empty gate arg.
     from sflow.plugins.k8s.shell import merged_launcher_lines

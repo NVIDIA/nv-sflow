@@ -120,14 +120,24 @@ class MpiConfig(BaseModel):
     # autotuning JIT spins up, which sizes to the rank's CPU affinity mask -- so an unbound
     # rank reads the whole node's cores and, with several ranks per pod, blows past the
     # cgroup pid limit ("pthread_create failed: Resource temporarily unavailable"). Binding
-    # shrinks that mask. "core" (default): PE = nproc/ranks cores per rank (nproc read from
-    # the pod's live cpuset at launch), giving each rank an isolated core slice and the
-    # tightest thread cap -- the reliable choice when a GPU pod's cpuset lands within a
-    # single NUMA node (typical on K8s GB200/GB300). "numa": one rank per NUMA domain
-    # (adds NUMA-local memory) -- only partitions ranks when the cpuset spans >1 NUMA node.
-    # "none": inject nothing (pre-feature behaviour). A recipe that already passes
-    # --bind-to/--map-by keeps its own binding (sflow injects nothing).
+    # shrinks that mask. "core" (default): each rank gets an isolated slice of
+    # cpu_bind_cores_per_rank cores (measured from the pod's live cpuset at launch),
+    # giving the tightest thread cap -- the reliable choice when a GPU pod's cpuset lands
+    # within a single NUMA node (typical on K8s GB200/GB300). "numa": one rank per NUMA
+    # domain (adds NUMA-local memory) -- only partitions ranks when the cpuset spans >1
+    # NUMA node. "none": inject nothing (pre-feature behaviour). A recipe that already
+    # passes --bind-to/--map-by keeps its own binding (sflow injects nothing).
     cpu_bind: Literal["core", "numa", "none"] = "core"
+    # Upper bound on the cores bound to each rank under cpu_bind="core" (the OpenMPI
+    # PE value). The launch-time value is min(cores-in-cpuset / ranks-per-pod, this), so
+    # a small cpuset still gets a smaller slice. Default 8 cores per rank (= per GPU) --
+    # ample for the host-side work of a GPU rank, and deliberately NOT the whole node:
+    # handing a rank every core it can see is what the binding exists to prevent (large
+    # affinity mask -> large LLVM/OpenMP pools) and it over-asks on fat nodes, where
+    # OpenMPI then aborts the launch with "A request was made to bind to that would
+    # result in binding more processes than cpus on a resource". Raise it for CPU-heavy
+    # workloads that need a wider slice; set to 0 for no cap (cores/ranks, as before).
+    cpu_bind_cores_per_rank: int = 8
     # How long a worker's per-node setup (image apt-install + weight staging) may take
     # before its readiness probe reaps it (operator route). The worker's readiness probe
     # (tcpSocket on the ssh port) is what launcherCreationPolicy=WaitForWorkersReady gates
@@ -340,6 +350,7 @@ class K8sMpiOperator(K8sContainerOperator):
             ensure_sshd=self.config.mpi.ensure_sshd,
             forward_prefixes=self._forward_prefixes(),
             cpu_bind=self.config.mpi.cpu_bind,
+            cpu_bind_cores_per_rank=self.config.mpi.cpu_bind_cores_per_rank,
         )
 
     @staticmethod
@@ -447,6 +458,7 @@ class K8sMpiOperator(K8sContainerOperator):
         launcher_script: list[str] = build_launcher_preamble(
             forward_prefixes=self._forward_prefixes(),
             cpu_bind=c.mpi.cpu_bind,
+            cpu_bind_cores_per_rank=c.mpi.cpu_bind_cores_per_rank,
             slots=slots,
         ) + list(script)
         rdma_lib_mounts: list[tuple[str, str]] = []

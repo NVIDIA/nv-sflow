@@ -1481,16 +1481,26 @@ class _RowNamingCtx:
     instead of O(R) per row (eliminating the O(R²) total cost).
     """
 
-    __slots__ = ("common_stems", "differing_cols", "cli_nodes", "fallback_base")
+    __slots__ = (
+        "common_stems",
+        "differing_cols",
+        "cli_nodes",
+        "fallback_base",
+        "cli_var_overrides",
+    )
 
     def __init__(
         self,
         all_rows: list[dict[str, str]],
         fallback_base: str = "sflow",
         cli_nodes: int | None = None,
+        cli_var_overrides: dict[str, str] | None = None,
     ) -> None:
         self.fallback_base = fallback_base
         self.cli_nodes = cli_nodes
+        # Global ``--set`` overrides (shared by every row); a node-count override here
+        # wins over a row's CSV node cell so the derived name matches the allocation.
+        self.cli_var_overrides = cli_var_overrides or {}
 
         all_stem_sets = [
             {_path_to_stem(p) for p in r["sflow_config_file"].split()} for r in all_rows
@@ -1513,26 +1523,55 @@ def build_row_naming_ctx(
     all_rows: list[dict[str, str]],
     fallback_base: str = "sflow",
     cli_nodes: int | None = None,
+    cli_var_overrides: dict[str, str] | None = None,
 ) -> _RowNamingCtx:
     """Build the shared naming context once before iterating rows."""
-    return _RowNamingCtx(all_rows, fallback_base=fallback_base, cli_nodes=cli_nodes)
+    return _RowNamingCtx(
+        all_rows,
+        fallback_base=fallback_base,
+        cli_nodes=cli_nodes,
+        cli_var_overrides=cli_var_overrides,
+    )
+
+
+def _first_node_column_int(source: "dict[str, Any]") -> int | None:
+    """First parseable node-count column value (as int) from a name->value map, or None.
+
+    Scans ``_NODE_COLUMN_NAMES`` in order. ``source`` is a merged override map (e.g.
+    ``all_overrides`` / a var map) so a CLI ``--set`` value already wins over the CSV
+    cell. A present-but-non-numeric value is SKIPPED (the scan continues) rather than
+    aborting, so one malformed column can't mask a good one. Single source of truth for
+    the node-column peek used by the naming and both bulk paths.
+    """
+    for col in _NODE_COLUMN_NAMES:
+        raw = source.get(col)
+        val = raw.strip() if isinstance(raw, str) else raw
+        if val in (None, ""):
+            continue
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _resolve_node_count(
     row: dict[str, str],
     cli_nodes: int | None,
+    cli_var_overrides: dict[str, str] | None = None,
 ) -> str | None:
-    """Return the node count for a row as ``<N>n``, or None if unknown."""
+    """Return the node count for a row as ``<N>n``, or None if unknown.
+
+    Precedence mirrors the sbatch node sizing so the name tracks the allocation:
+    an explicit ``--nodes`` wins, then a global ``--set`` override of a node-count
+    variable (not the stale CSV cell), then the row's CSV node column.
+    """
     if cli_nodes is not None:
         return f"{cli_nodes}n"
-    for col in _NODE_COLUMN_NAMES:
-        val = (row.get(col) or "").strip()
-        if val:
-            try:
-                return f"{int(val)}n"
-            except ValueError:
-                pass
-    return None
+    # CLI --set wins over the CSV cell per node-count column, then a malformed value is
+    # skipped instead of masking a good column (see _first_node_column_int).
+    n = _first_node_column_int({**row, **(cli_var_overrides or {})})
+    return f"{n}n" if n is not None else None
 
 
 def _derive_row_name(
@@ -1569,7 +1608,7 @@ def _derive_row_name(
     row_stems = [_path_to_stem(p) for p in row["sflow_config_file"].split()]
     parts.extend(s for s in row_stems if s not in ctx.common_stems)
 
-    node_label = _resolve_node_count(row, ctx.cli_nodes)
+    node_label = _resolve_node_count(row, ctx.cli_nodes, ctx.cli_var_overrides)
     if node_label:
         parts.append(node_label)
 
@@ -1684,14 +1723,20 @@ def _resolve_backend_int_field(
     return None
 
 
-def _derive_gpus_per_node(
+def _derive_backend_int(
     config_files: list[Path],
+    field: str,
     cli_overrides: list[str] | None = None,
 ) -> int | None:
-    """Derive gpus_per_node from sflow config files' backend definitions.
+    """Resolve an int Slurm-backend field (``nodes`` / ``gpus_per_node``) from the config.
 
-    Merges variables from all files, then checks each file's backends.
-    CLI ``--set`` overrides are applied to the variable map.
+    Fast path: a lightweight per-file regex peek (handles ``<field>: <int>`` and a bare
+    ``${{ variables.X }}``). If that can't resolve the value (e.g. a compound expression
+    like ``${{ variables.NUM_NODES * 2 }}``), fall back to the SAME full resolution
+    pipeline as the dry-run (:func:`_resolve_slurm_backends`) so the generated sbatch
+    matches ``sflow run`` -- no dry-run/generated-script divergence. The fallback only
+    runs when the regex returns None, so currently-resolving configs are unchanged and
+    partial fragments (which the pipeline can't validate) keep their regex result.
     """
     import yaml as _yaml
 
@@ -1714,46 +1759,33 @@ def _derive_gpus_per_node(
             merged_var_map[k] = v
 
     for d in all_data:
-        result = _resolve_backend_int_field(d, "gpus_per_node", merged_var_map)
+        result = _resolve_backend_int_field(d, field, merged_var_map)
         if result is not None:
             return result
+
+    for backend in _resolve_slurm_backends(config_files, cli_overrides):
+        val = getattr(backend, field, None)
+        if val is not None:
+            return int(val)
     return None
+
+
+def _derive_gpus_per_node(
+    config_files: list[Path],
+    cli_overrides: list[str] | None = None,
+) -> int | None:
+    """Derive ``gpus_per_node`` from the config's Slurm backend (see
+    :func:`_derive_backend_int` for the regex-fast-path + full-pipeline-fallback)."""
+    return _derive_backend_int(config_files, "gpus_per_node", cli_overrides)
 
 
 def _derive_nodes(
     config_files: list[Path],
     cli_overrides: list[str] | None = None,
 ) -> int | None:
-    """Derive nodes from sflow config files' backend definitions.
-
-    Merges variables from all files, then checks each file's backends.
-    CLI ``--set`` overrides are applied to the variable map.
-    """
-    import yaml as _yaml
-
-    merged_var_map: dict[str, Any] = {}
-    all_data: list[dict] = []
-
-    for f in config_files:
-        try:
-            with open(f) as fh:
-                raw = _yaml.safe_load(fh)
-            if isinstance(raw, dict):
-                all_data.append(raw)
-                merged_var_map.update(_build_var_map(raw))
-        except Exception:
-            continue
-
-    for entry in cli_overrides or []:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            merged_var_map[k] = v
-
-    for d in all_data:
-        result = _resolve_backend_int_field(d, "nodes", merged_var_map)
-        if result is not None:
-            return result
-    return None
+    """Derive ``nodes`` from the config's Slurm backend (see :func:`_derive_backend_int`
+    for the regex-fast-path + full-pipeline-fallback)."""
+    return _derive_backend_int(config_files, "nodes", cli_overrides)
 
 
 def _classify_csv_columns(
@@ -2186,24 +2218,18 @@ def _run_bulk_submit(
         row_nodes = nodes
         if row_nodes is None:
             try:
-                import yaml as _yaml
-
-                with open(yaml_file) as fh:
-                    data = _yaml.safe_load(fh)
-
-                var_map = _build_var_map(data, cli_overrides=cli_set_var)
-
-                row_nodes = _resolve_backend_int_field(data, "nodes", var_map)
-
+                # Regex-fast-path + full-pipeline-fallback (matches the dry-run) for a
+                # compound ``${{ }}`` node expression. Only peek the node-count columns
+                # (loading the YAML) when the backend has no resolvable ``nodes`` field.
+                row_nodes = _derive_nodes([yaml_file], cli_overrides=cli_set_var)
                 if row_nodes is None:
-                    for name in _NODE_COLUMN_NAMES:
-                        if name in var_map:
-                            try:
-                                row_nodes = int(var_map[name])
-                            except (ValueError, TypeError):
-                                pass
-                            if row_nodes is not None:
-                                break
+                    import yaml as _yaml
+
+                    with open(yaml_file) as fh:
+                        data = _yaml.safe_load(fh)
+                    row_nodes = _first_node_column_int(
+                        _build_var_map(data, cli_overrides=cli_set_var)
+                    )
             except Exception:
                 pass
 
@@ -2430,7 +2456,9 @@ def _run_bulk_edit(
     row_indices: set[int] | None = None
     if row_selectors:
         row_indices = set(parse_row_selector(row_selectors, n_rows=len(rows)))
-    naming_ctx = build_row_naming_ctx(rows, fallback_base=job_name, cli_nodes=nodes)
+    naming_ctx = build_row_naming_ctx(
+        rows, fallback_base=job_name, cli_nodes=nodes, cli_var_overrides=cli_var_map
+    )
 
     for idx, row in enumerate(rows, start=1):
         if row_indices is not None and idx not in row_indices:
@@ -2543,14 +2571,15 @@ def _run_bulk_edit(
 
         row_nodes = nodes
         if row_nodes is None:
-            for col_name in _NODE_COLUMN_NAMES:
-                val = row.get(col_name)
-                if val:
-                    try:
-                        row_nodes = int(val)
-                    except ValueError:
-                        pass
-                    break
+            # Resolve the backend node count from the config with this row's MERGED
+            # overrides (CLI --set winning over CSV) -- the SAME inputs the dry-run
+            # above and the gpus_per_node derivation use -- so a `--set` node override
+            # reaches the generated ``#SBATCH --nodes`` directive, not just the dry-run.
+            # Fall back to a node-count CSV column (also --set-overridden, via
+            # ``all_overrides``) when the backend has no resolvable ``nodes`` field.
+            row_nodes = _derive_nodes(config_files, cli_overrides=set_var)
+            if row_nodes is None:
+                row_nodes = _first_node_column_int(all_overrides)
 
         row_name = _derive_row_name(row, idx, naming_ctx)
 

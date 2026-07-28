@@ -350,6 +350,7 @@ if true; then
     DOCKER_MULTI_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/docker_multi_node.log"
     KUBERNETES_HELLO_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_hello_world.log"
     KUBERNETES_LWS_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_multinode.log"
+    KUBERNETES_MPI_SMOKE_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_mpi_smoke.log"
     mkdir -p "$BACKEND_AGNOSTIC_DIR"
     run_check "dry-run docker_hello_world uses docker_run default operator" \
         bash -c "sflow run \"$EXAMPLES_DIR/self_contained/docker/hello_world.yaml\" --dry-run --verbose > \"$DOCKER_HELLO_DRYRUN_LOG\" 2>&1 && \
@@ -371,6 +372,13 @@ if true; then
             grep -F -- 'id=kubernetes' \"$KUBERNETES_LWS_DRYRUN_LOG\" && \
             grep -F -- 'operator: k8s' \"$KUBERNETES_LWS_DRYRUN_LOG\" && \
             grep -F -- 'Dry-run complete: k8s_multinode' \"$KUBERNETES_LWS_DRYRUN_LOG\""
+    # Multi-node k8s_mpi SMOKE example (bootstrap + role barrier + cpu_bind render);
+    # plan-only here (the real cross-node run lives in scripts/k8s_e2e_verify.sh).
+    run_check "dry-run kubernetes_mpi_smoke uses k8s_mpi operator" \
+        bash -c "sflow run \"$EXAMPLES_DIR/self_contained/kubernetes/mpi_smoke.yaml\" --dry-run --verbose > \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\" 2>&1 && \
+            grep -F -- 'id=kubernetes' \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\" && \
+            grep -F -- 'operator: k8s_mpi' \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\" && \
+            grep -F -- 'Dry-run complete: k8s_mpi_smoke' \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\""
 
     # NOTE: the mimic-script SMOKE recipes (reservation / cross-task IP / apply +
     # validate / log offload) are test fixtures, not user-facing examples. They live

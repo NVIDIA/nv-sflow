@@ -120,12 +120,12 @@ def _forward_grep_pattern(prefixes: Sequence[str]) -> str:
 def _cpu_bind_flags(cpu_bind: str, slots: int) -> str:
     """OpenMPI ``--map-by``/``--bind-to`` flags for a rank-binding mode ("" if off).
 
-    ``numa`` (default): one rank per NUMA domain, round-robin -- caps the LLVM/OpenMP
+    ``core`` (default): bind each rank to ``PE`` cores, where ``PE`` is computed at
+    launch into ``${_sflow_pe}`` by :func:`_cpu_bind_block` -- physical cores per rank,
+    clamped to the pod's real cpuset and capped at ``cpu_bind_cores_per_rank``.
+    ``numa``: one rank per NUMA domain, round-robin -- caps the LLVM/OpenMP
     ``hardware_concurrency`` each rank sees to a NUMA node's cores (only reduces it
-    when the node is NPS>1; on NPS1 the whole node is one domain). ``core``: bind each
-    rank to ``PE`` cores, where ``PE`` is computed at launch into ``${_sflow_pe}`` by
-    :func:`_cpu_bind_block` -- ``nproc/slots`` clamped so a bogus/inflated ``nproc`` can't
-    over-bind and fail the launch (respects the pod's real cpuset)."""
+    when the node is NPS>1; on NPS1 the whole node is one domain)."""
     if cpu_bind == "numa":
         return "--map-by numa --bind-to numa"
     if cpu_bind == "core":
@@ -133,33 +133,91 @@ def _cpu_bind_flags(cpu_bind: str, slots: int) -> str:
     return ""
 
 
-def _cpu_bind_block(cpu_bind: str, slots: int) -> str:
+def _cpu_bind_block(cpu_bind: str, slots: int, cpu_bind_cores_per_rank: int = 0) -> str:
     """Wrapper bash that appends the binding flags to ``_sflow_opts`` -- unless the
     recipe already bound (its own ``--bind-to``/``--map-by`` in ``"$@"`` wins). Empty
     (no-op) when binding is off: mode ``none`` or a single-rank pod (``slots <= 1``,
-    which never contends), so the launch path is byte-for-byte unchanged there."""
+    which never contends), so the launch path is byte-for-byte unchanged there.
+
+    ``cpu_bind_cores_per_rank`` caps ``PE`` (``<= 0`` = uncapped): binding every core
+    the pod owns is needlessly aggressive on a fat node and is what over-asks when the
+    core count is misread, so take a modest slice per rank and leave the rest free."""
     s = int(slots)
+    cap = int(cpu_bind_cores_per_rank)
     flags = _cpu_bind_flags(cpu_bind, s) if s > 1 else ""
     if not flags:
         return ""
-    # `core` needs PE = cores/rank computed at launch. Count the pod's cores with
-    # OMP_NUM_THREADS/OMP_THREAD_LIMIT UNSET -- GNU `nproc` otherwise honors them, and
-    # sflow sets OMP_NUM_THREADS itself, so a plain `$(nproc)` returns that cap (e.g. 8),
-    # not the real core count, and PE collapses to a couple of cores/rank. Then CLAMP to
-    # the installed cores ($(nproc --all)) so a bogus/inflated count can't make PE huge and
-    # fail the launch ("not enough processing elements"). Floor PE at 1. Numa needs no PE.
-    pe_lines = (
-        [
+    # `core` needs PE = cores/rank computed at launch, so it emits its own (guarded)
+    # append; `numa` just appends the static flags. For `core`: count the pod's CPUs
+    # with OMP_NUM_THREADS/OMP_THREAD_LIMIT UNSET -- GNU `nproc` otherwise honors them,
+    # and sflow sets OMP_NUM_THREADS itself, so a plain `$(nproc)` returns that cap
+    # (e.g. 8), not the real CPU count, and PE collapses. CLAMP to the installed CPUs
+    # ($(nproc --all)) so a bogus/inflated count can't make PE huge and fail the launch.
+    #
+    # Then convert CPUs -> CORES: `PE=N` asks for N *cores* per rank, but `nproc` counts
+    # logical CPUs (SMT threads). On an SMT-2 host, PE = nproc/slots asks for twice the
+    # cores that exist and OpenMPI aborts "A request was made to bind to that would
+    # result in binding more processes than cpus on a resource" (e.g. 224 threads / 8
+    # ranks -> PE=28, but the node has only 112 cores). So divide by threads-per-core,
+    # from `lscpu` and falling back to cpu0's sysfs SMT siblings. This is per-CPU-family,
+    # not per-arch: x86 Intel Xeon and AMD EPYC are SMT-2 when hyperthreading/SMT is on,
+    # Grace (Neoverse V2) is SMT-1, and Vera (Olympus) is SMT-2 again via spatial
+    # multithreading -- so ARM cannot be assumed single-threaded. When neither source
+    # answers we assume 1: PE then over-asks by the SMT factor, which the cap below is
+    # what actually keeps safe. On a hybrid P/E-core CPU lscpu reports the max (2), so
+    # cores are UNDER-counted and PE comes out small -- the safe direction.
+    #
+    # Finally CAP at `cpu_bind_cores_per_rank`: a rank needs only enough cores to keep
+    # its host-side work fed, and a smaller slice is exactly what shrinks the LLVM/OpenMP
+    # pools we are binding for. Uncapped, PE grows with the node and re-creates the
+    # over-ask above whenever the measured core count is optimistic.
+    #
+    # If the cpuset has FEWER cores than ranks (`cores < slots`), `--bind-to core` can't
+    # be satisfied (PE floors to 1 but slots*1 > cores -> OpenMPI aborts), so DEGRADE to
+    # no binding instead of hard-failing a launch that worked before core became the
+    # default. Floor PE at 1 otherwise.
+    if cpu_bind == "core":
+        bind_lines = [
             "  _sflow_ncpu=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc "
             "2>/dev/null || nproc 2>/dev/null || echo 1)",
             '  _sflow_nall=$(nproc --all 2>/dev/null || echo "${_sflow_ncpu}")',
             '  [ "${_sflow_ncpu}" -gt "${_sflow_nall}" ] 2>/dev/null && _sflow_ncpu=${_sflow_nall}',
-            f"  _sflow_pe=$(( _sflow_ncpu / {s} )); "
+            # threads-per-core: PE counts cores, nproc counts SMT threads.
+            "  _sflow_smt=$(LC_ALL=C lscpu 2>/dev/null | "
+            "awk -F: '/^Thread\\(s\\) per core/ {gsub(/[^0-9]/, \"\", $2); print $2; exit}')",
+            '  case "${_sflow_smt}" in ""|*[!0-9]*) _sflow_smt=0 ;; esac',
+            # lscpu missing (slim images): count cpu0's SMT siblings in sysfs, which is
+            # either a list ("0,112" -- x86) or a range ("0-1").
+            '  if [ "${_sflow_smt}" -lt 1 ] 2>/dev/null; then',
+            "    _sflow_smt=$(awk -F, '{n=0; for (i=1; i<=NF; i++) "
+            '{ if ($i ~ /-/) { split($i, r, "-"); n += r[2] - r[1] + 1 } else { n++ } } '
+            "print n; exit}' /sys/devices/system/cpu/cpu0/topology/thread_siblings_list "
+            "2>/dev/null)",
+            '    case "${_sflow_smt}" in ""|*[!0-9]*) _sflow_smt=1 ;; esac',
+            '    [ "${_sflow_smt}" -ge 1 ] 2>/dev/null || _sflow_smt=1',
+            "  fi",
+            '  _sflow_cores=$(( _sflow_ncpu / _sflow_smt )); '
+            '[ "${_sflow_cores}" -ge 1 ] || _sflow_cores=1',
+            f'  if [ "${{_sflow_cores}}" -lt {s} ] 2>/dev/null; then',
+            f'    echo "sflow: pod cpuset has ${{_sflow_cores}} core(s) < {s} rank(s); '
+            'skipping --bind-to core (would abort mpirun)" >&2',
+            "  else",
+            f"    _sflow_pe=$(( _sflow_cores / {s} )); "
             '[ "${_sflow_pe}" -ge 1 ] || _sflow_pe=1',
+            *(
+                [f'    [ "${{_sflow_pe}}" -gt {cap} ] && _sflow_pe={cap}']
+                if cap > 0
+                else []
+            ),
+            f'    echo "sflow: binding {s} rank(s) to ${{_sflow_pe}} core(s) each '
+            '(${_sflow_ncpu} cpu(s) / ${_sflow_smt} thread(s) per core'
+            + (f", cap {cap}" if cap > 0 else "")
+            + ')" >&2',
+            f"    _sflow_opts+=({flags})",
+            "  fi",
         ]
-        if cpu_bind == "core"
-        else []
-    )
+    else:
+        bind_lines = [f"  _sflow_opts+=({flags})"]
     return (
         "\n".join(
             [
@@ -174,8 +232,7 @@ def _cpu_bind_block(cpu_bind: str, slots: int) -> str:
                 "  esac",
                 "done",
                 'if [ "${_sflow_bound}" = "0" ]; then',
-                *pe_lines,
-                f"  _sflow_opts+=({flags})",
+                *bind_lines,
                 "fi",
             ]
         )
@@ -227,6 +284,7 @@ def build_mpirun_wrapper_script(
     forward_prefixes: Sequence[str] | None = None,
     inject_hostfile: bool = True,
     cpu_bind: str = "none",
+    cpu_bind_cores_per_rank: int = 0,
     slots: int = 1,
     role_barrier: bool = False,
     ssh_dir: str = DEFAULT_SSH_AUTH_MOUNT_PATH,
@@ -245,8 +303,9 @@ def build_mpirun_wrapper_script(
 
     ``cpu_bind`` (``numa``/``core``/``none``) binds each rank when ``slots > 1`` so a
     rank's LLVM/OpenMP thread pools size to the binding, not the whole node -- see
-    :func:`_cpu_bind_block`. A single-rank pod (``slots <= 1``) or ``none`` is an exact
-    no-op, keeping the launch path unchanged for those.
+    :func:`_cpu_bind_block`, which also caps ``core``'s cores-per-rank at
+    ``cpu_bind_cores_per_rank`` (``<= 0`` = uncapped). A single-rank pod
+    (``slots <= 1``) or ``none`` is an exact no-op, keeping the launch path unchanged.
 
     ``role_barrier`` (pods route) embeds the per-role SSH barrier -- worker idles, leader
     waits for workers -- INTO the shim (see :func:`_role_barrier_block`), so it engages at
@@ -323,7 +382,10 @@ exec "${_sflow_real}" "${_sflow_opts[@]}" "$@"
         .replace("__SSH_PORT__", str(int(ssh_port)))
         .replace("__KEY_PATH__", key_path)
         .replace("__ROLE_BARRIER__\n", barrier)
-        .replace("__BINDING_BLOCK__\n", _cpu_bind_block(cpu_bind, slots))
+        .replace(
+            "__BINDING_BLOCK__\n",
+            _cpu_bind_block(cpu_bind, slots, cpu_bind_cores_per_rank),
+        )
         .replace("__EXPLICIT_VARS__", explicit_vars)
         .replace("__GREP_PAT__", grep_pat)
         .replace("__ENV_SNAPSHOT__", SFLOW_MPI_ENV_SNAPSHOT)
@@ -465,6 +527,7 @@ def build_mpi_bootstrap_preamble(
     ssh_dir: str = DEFAULT_SSH_AUTH_MOUNT_PATH,
     forward_prefixes: Sequence[str] | None = None,
     cpu_bind: str = "none",
+    cpu_bind_cores_per_rank: int = 0,
 ) -> list[str]:
     """Bash preamble for the **pods route**, prepended to the task entrypoint.
 
@@ -485,8 +548,9 @@ def build_mpi_bootstrap_preamble(
         forward_prefixes=forward_prefixes,
         inject_hostfile=True,
         cpu_bind=cpu_bind,
+        cpu_bind_cores_per_rank=cpu_bind_cores_per_rank,
         # Ranks per node = the hostfile slots this route writes (gpus_per_node), so a
-        # `core` PE = nproc/gpus_per_node matches the actual rank density.
+        # `core` PE = cores/gpus_per_node matches the actual rank density.
         slots=gpus_per_node,
         # The role barrier (worker idle / leader wait) lives in the shim so it engages
         # at the real mpirun call regardless of the recipe's launch-line syntax.
@@ -528,6 +592,7 @@ def build_launcher_preamble(
     *,
     forward_prefixes: Sequence[str] | None = None,
     cpu_bind: str = "none",
+    cpu_bind_cores_per_rank: int = 0,
     slots: int = 1,
 ) -> list[str]:
     """Bash preamble for the **operator route** launcher: install the shim only.
@@ -541,6 +606,7 @@ def build_launcher_preamble(
         forward_prefixes=forward_prefixes,
         inject_hostfile=False,
         cpu_bind=cpu_bind,
+        cpu_bind_cores_per_rank=cpu_bind_cores_per_rank,
         slots=slots,
     )
     lines = ["# ===== sflow k8s_mpi launcher (operator route) ====="]
