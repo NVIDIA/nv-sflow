@@ -60,6 +60,15 @@ class KubectlConfig:
     # --extra-kubectl-args (repeatable): verbatim global kubectl flags, e.g.
     # "--insecure-skip-tls-verify", "--as=admin", "--request-timeout=30s".
     extra_args: list[str] = field(default_factory=list)
+    # --extra-kubectl-apply-args (repeatable): verbatim flags for the `kubectl apply`
+    # SUBCOMMAND only, e.g. "--validate=false", "--server-side", "--force-conflicts".
+    # Separate from extra_args because kubectl takes global flags BEFORE the
+    # subcommand: an apply-only flag placed there (`kubectl --validate=false apply`)
+    # is rejected as an unknown flag, and would break every other kubectl call too.
+    # Applied to every apply sflow issues -- the backend's allocate-time reservation
+    # Pod / ComputeDomain / ResourceClaimTemplate as well as each task's Secret and
+    # Pod -- so a cluster that rejects one rejects them all consistently.
+    apply_args: list[str] = field(default_factory=list)
     # --kube-compute-domain-channel: overrides `compute_domain.channel` for every k8s
     # backend (a channel template name, "auto", or "disable"/legacy "off"). Lets
     # MNNVL/IMEX be tuned per
@@ -100,8 +109,13 @@ class KubectlConfig:
 
         ``namespace`` is intentionally excluded: it overrides the backend
         namespace and is already threaded onto every call via ``--namespace``.
+        ``apply_args`` is excluded too -- those belong after the subcommand.
         """
         return kubectl_global_args(self.kubeconfig, self.context, self.extra_args)
+
+    def kubectl_apply_args(self) -> list[str]:
+        """Flags to append to the ``kubectl apply`` subcommand (shell-split)."""
+        return normalize_extra_args(self.apply_args)
 
     def is_empty(self) -> bool:
         return not (
@@ -109,6 +123,7 @@ class KubectlConfig:
             or self.context
             or self.namespace
             or self.extra_args
+            or self.apply_args
             or self.node_selector
             or self.compute_domain_channel is not None
             or self.compute_domain_create is not None

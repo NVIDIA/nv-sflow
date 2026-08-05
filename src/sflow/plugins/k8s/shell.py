@@ -245,19 +245,43 @@ def build_log_stream_command(
     return cmd
 
 
-def kubectl_global_args_prelude(args: Sequence[str]) -> list[str]:
+def kubectl_global_args_prelude(
+    args: Sequence[str], apply_args: Sequence[str] = ()
+) -> list[str]:
     """A shell ``kubectl`` function that prefixes CLI-level global flags.
 
     Defining a function named ``kubectl`` makes every ``kubectl ...`` line in the
     wrapper (apply / logs / get / delete / secret / handoff) transparently carry
     the ``--kubeconfig`` / ``--context`` / passthrough flags, with no per-call
     plumbing. ``command kubectl`` runs the real binary (avoids recursion). Returns
-    no lines when there are no global args (the real kubectl is used directly).
+    no lines when there is nothing to inject (the real kubectl is used directly).
+
+    ``apply_args`` (``--extra-kubectl-apply-args``) are flags for the ``apply``
+    SUBCOMMAND -- ``--validate=false``, ``--server-side``, ... -- which kubectl only
+    accepts AFTER the verb, so they cannot ride in ``args``. The function branches on
+    the subcommand and splices them in after ``apply``, which covers every apply the
+    wrapper emits (task Pod, merged Pod, MPIJob, env Secrets) and any added later,
+    without threading a parameter through each builder. Non-apply calls are
+    untouched, so a flag that only ``apply`` understands can't break ``get``/``logs``.
     """
-    if not args:
+    if not args and not apply_args:
         return []
     joined = " ".join(shlex.quote(str(a)) for a in args)
-    return [f'kubectl() {{ command kubectl {joined} "$@"; }}']
+    if not apply_args:
+        return [f'kubectl() {{ command kubectl {joined} "$@"; }}']
+    applied = " ".join(shlex.quote(str(a)) for a in apply_args)
+    # `${1:-}` guards `set -u` on a bare `kubectl`; `shift` drops the verb we re-add.
+    prefix = f"{joined} " if joined else ""
+    return [
+        "kubectl() {",
+        '  if [ "${1:-}" = apply ]; then',
+        "    shift",
+        f'    command kubectl {prefix}apply {applied} "$@"',
+        "  else",
+        f'    command kubectl {prefix}"$@"',
+        "  fi",
+        "}",
+    ]
 
 
 def bash_lc_command(lines: Sequence[str]) -> Command:
@@ -474,6 +498,7 @@ def build_merged_apply_command(
     handoff_delete_pods: Sequence[str],
     handoff_before_apply: bool = False,
     kubectl_global_args: Sequence[str] = (),
+    kubectl_apply_args: Sequence[str] = (),
     allocation_id: str | None = None,
 ) -> Command:
     """Apply step for a merge-pod: per-member env Secrets, then the single pod.
@@ -485,7 +510,7 @@ def build_merged_apply_command(
     the create-before-destroy handoff, and waits for the single pod to start.
     """
     lines = ["set -euo pipefail"]
-    lines.extend(kubectl_global_args_prelude(kubectl_global_args))
+    lines.extend(kubectl_global_args_prelude(kubectl_global_args, kubectl_apply_args))
     for secret_name, key_pairs in member_env_secrets:
         lines.extend(
             merged_env_secret_lines(
@@ -515,6 +540,7 @@ def build_manifest_apply_command(
     handoff_delete_pods: Sequence[str] = (),
     handoff_before_apply: bool = False,
     kubectl_global_args: Sequence[str] = (),
+    kubectl_apply_args: Sequence[str] = (),
     allocation_id: str | None = None,
 ) -> Command:
     """Apply a manifest via heredoc + run the GPU handoff, WITHOUT waiting on a pod.
@@ -528,7 +554,7 @@ def build_manifest_apply_command(
     controller's Pending pods can bind onto the reserved GPUs.
     """
     lines = ["set -euo pipefail"]
-    lines.extend(kubectl_global_args_prelude(kubectl_global_args))
+    lines.extend(kubectl_global_args_prelude(kubectl_global_args, kubectl_apply_args))
     if secret_name is not None and envs:
         lines.append("env_file=$(mktemp)")
         lines.extend(secret_printf_lines(envs))
@@ -557,6 +583,7 @@ def build_apply_command(
     handoff_delete_pods: Sequence[str],
     handoff_before_apply: bool = False,
     kubectl_global_args: Sequence[str] = (),
+    kubectl_apply_args: Sequence[str] = (),
     allocation_id: str | None = None,
 ) -> Command:
     """Build the ``kubectl apply`` step for a (possibly multi-pod) task.
@@ -578,7 +605,7 @@ def build_apply_command(
     lines = ["set -euo pipefail"]
     # Define a kubectl() wrapper carrying the CLI-level global flags (if any) so
     # every kubectl call below (secret / apply / handoff / wait) uses them.
-    lines.extend(kubectl_global_args_prelude(kubectl_global_args))
+    lines.extend(kubectl_global_args_prelude(kubectl_global_args, kubectl_apply_args))
     if use_secret:
         lines.append("env_file=$(mktemp)")
         lines.extend(secret_printf_lines(envs))

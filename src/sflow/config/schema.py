@@ -601,10 +601,64 @@ class NodeResourceConfig(StrictBaseModel):
 
 
 class GpuResourceConfig(StrictBaseModel):
-    """GPU resource configuration for a task."""
+    """GPU resource configuration for a task.
 
-    count: Resolvable[int]  # Can be int or expression like "${{ variables.GPU_COUNT }}"
+    ``count`` alone is index-agnostic: the planner packs the task into any
+    contiguous idle GPU run on a single node. ``indices`` pins the task to
+    specific device indices instead, and the two combine -- ``count`` is then the
+    total across nodes and ``indices`` the per-node slice, so a task fans out
+    over ``count / len(indices)`` nodes.
+
+    Unlike ``resources.nodes.indices``, GPU indices must be non-negative:
+    ``CUDA_VISIBLE_DEVICES`` is a literal device list, and ``-1`` would mean a
+    different physical device on nodes with different ``gpus_per_node``.
+    """
+
+    count: Optional[Resolvable[int]] = None  # int or "${{ variables.GPU_COUNT }}"
+    indices: Optional[Union[List[Resolvable[int]], str]] = None  # [0, 1] or "${{ ... }}"
     release_after: ResourceReleaseAfter = ResourceReleaseAfter.WORKFLOW_COMPLETION
+
+    # mode="before" so bools are still bools here: Pydantic would otherwise
+    # coerce them to 0/1 and the check below could never fire.
+    @field_validator("indices", mode="before")
+    @classmethod
+    def indices_must_be_list_or_expression(cls, v: Any) -> Any:
+        if isinstance(v, str) and not is_expression(v):
+            raise ValueError(
+                "resources.gpus.indices must be a list or an expression that resolves to a list"
+            )
+        if isinstance(v, list):
+            if not v:
+                raise ValueError("resources.gpus.indices must not be empty")
+            # Reject bools before Pydantic coerces them to 0/1: YAML reads
+            # `yes`/`no`/`on`/`off` as booleans, so a typo would silently become
+            # a valid-looking GPU index.
+            bools = [i for i in v if isinstance(i, bool)]
+            if bools:
+                raise ValueError(
+                    f"resources.gpus.indices must be integers, got bool(s) {bools}; "
+                    "quote YAML values like 'on'/'no' if you meant a GPU index"
+                )
+            concrete = [i for i in v if isinstance(i, int)]
+            negative = [i for i in concrete if i < 0]
+            if negative:
+                raise ValueError(
+                    f"resources.gpus.indices must be non-negative, got {negative}; "
+                    "GPU indices are absolute device ids, not Python-style offsets"
+                )
+            if len(set(concrete)) != len(concrete):
+                raise ValueError(
+                    f"resources.gpus.indices contains duplicate index/indices: {v}"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def require_count_or_indices(self) -> "GpuResourceConfig":
+        if self.count is None and self.indices is None:
+            raise ValueError(
+                "resources.gpus requires 'count', 'indices', or both"
+            )
+        return self
 
 
 class ResourcesConfig(StrictBaseModel):

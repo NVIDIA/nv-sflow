@@ -704,3 +704,120 @@ def test_preflight_fs_artifact_with_unresolvable_expression_skipped(tmp_path: Pa
     )
     with pytest.raises(ValueError, match="Undefined variable"):
         SflowApp().run(file=wf, dry_run=True)
+
+
+# ---------------------------------------------------------------------------
+# inline-content artifacts must not escape the run's output directory
+# ---------------------------------------------------------------------------
+
+
+def _inline_cfg(uri: str) -> SflowConfig:
+    return SflowConfig(
+        version="0.1",
+        artifacts=[{"name": "gen", "uri": uri, "content": "payload\n"}],
+        workflow=WorkflowConfig(
+            name="wf", tasks=[TaskConfig(name="t1", script=["echo hi"])]
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "file://../escape.txt",
+        "file://../../escape.txt",
+        "file://sub/../../escape.txt",
+        "file://./../escape.txt",
+    ],
+)
+def test_inline_content_cannot_escape_the_output_dir(tmp_path: Path, uri: str):
+    """A relative file:// URI with `..` must be rejected, not written outside.
+
+    ``output_dir / raw`` does not collapse `..`, so these previously resolved outside the
+    run directory and ``path.write_text(content)`` wrote there -- an arbitrary-file-write
+    primitive for a workflow from an untrusted source, and a correctness bug regardless:
+    files that escape the run dir are never cleaned up and can clobber the user's own.
+    """
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    with pytest.raises(ValueError, match="escapes the workflow output directory"):
+        resolve_artifacts(
+            _inline_cfg(uri),
+            _empty_state(),
+            workspace_dir=tmp_path,
+            output_dir=out_dir,
+            materialize=True,
+        )
+    assert not (tmp_path / "escape.txt").exists()
+    assert not list(tmp_path.glob("**/escape.txt"))
+
+
+@pytest.mark.parametrize(
+    "uri,expected",
+    [
+        ("file://gen.txt", "gen.txt"),
+        ("file://scripts/helper.sh", "scripts/helper.sh"),
+        # `..` that stays INSIDE must still normalize and be allowed -- the guard is a
+        # containment check, not a blanket ban on the characters.
+        ("file://a/../b/keep.txt", "b/keep.txt"),
+    ],
+)
+def test_inline_content_inside_the_output_dir_still_works(
+    tmp_path: Path, uri: str, expected: str
+):
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    state = resolve_artifacts(
+        _inline_cfg(uri),
+        _empty_state(),
+        workspace_dir=tmp_path,
+        output_dir=out_dir,
+        materialize=True,
+    )
+    written = out_dir / expected
+    assert written.read_text() == "payload\n"
+    assert state.artifacts["gen"].path == written.resolve()
+
+
+def test_fs_uri_outside_the_workspace_is_still_allowed(tmp_path: Path):
+    """The containment check must NOT be generalised to artifact resolution at large.
+
+    Every production recipe mounts its model from an absolute path far outside any
+    workspace (e.g. ``fs:///mnt/lustre01/models/deepseek-r1-...``). Confining artifact
+    resolution to workspace_dir -- the remediation an external report suggested -- would
+    break all of them, which is why the guard is scoped to generated inline content only.
+    """
+    model = tmp_path / "elsewhere" / "model"
+    model.mkdir(parents=True)
+    cfg = SflowConfig(
+        version="0.1",
+        artifacts=[{"name": "m", "uri": f"fs://{model}"}],
+        workflow=WorkflowConfig(
+            name="wf", tasks=[TaskConfig(name="t1", script=["echo hi"])]
+        ),
+    )
+    state = resolve_artifacts(
+        cfg,
+        _empty_state(),
+        workspace_dir=tmp_path / "ws",
+        output_dir=tmp_path / "out",
+        materialize=True,
+    )
+    assert state.artifacts["m"].path == model
+
+
+def test_traversal_is_rejected_before_anything_is_written(tmp_path: Path):
+    """Rejection must happen instead of the write, not after it."""
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("original\n")
+    with pytest.raises(ValueError):
+        resolve_artifacts(
+            _inline_cfg("file://../victim.txt"),
+            _empty_state(),
+            workspace_dir=tmp_path,
+            output_dir=out_dir,
+            materialize=True,
+        )
+    assert victim.read_text() == "original\n", "the existing file was overwritten"

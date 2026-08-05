@@ -17,6 +17,7 @@ from sflow.plugins.backends.kubernetes import (
     KubernetesDraConfig,
     KubernetesReservationConfig,
 )
+from sflow.core.kubectl_config import KubectlConfig
 from sflow.plugins.k8s.capabilities import MPI_OPERATOR, CapabilityState
 from sflow.plugins.operators.bash import BashOperator
 
@@ -61,13 +62,13 @@ def test_resolve_handoff_mode_auto_follows_gpu_quota(monkeypatch):
 def test_gpu_quota_present_parses_kubectl(monkeypatch):
     be = KubernetesBackend(_cfg(namespace="ns"))
 
-    async def _has_gpu(args):
+    async def _has_gpu(args, **_kw):
         return (0, "map[pods:10 requests.nvidia.com/gpu:72]", "")
 
     monkeypatch.setattr(be, "_kubectl", _has_gpu)
     assert asyncio.run(be._gpu_quota_present()) is True
 
-    async def _no_gpu(args):
+    async def _no_gpu(args, **_kw):
         return (0, "map[pods:10]", "")
 
     monkeypatch.setattr(be, "_kubectl", _no_gpu)
@@ -288,7 +289,7 @@ def _fake_kubectl(probe_out, *, node_json=None, node_name="node-a", installer_po
     --field-selector status.phase=Running,spec.nodeName=<node>``).
     """
 
-    async def _run(args):
+    async def _run(args, **_kw):
         a = list(args)
         if a and a[0] == "exec":
             return 0, probe_out, ""
@@ -362,7 +363,7 @@ def test_build_time_no_hcas_does_not_warn(monkeypatch, caplog):
     # No RDMA hardware at all -> TCP is expected, not a degradation: no WARNING.
     be = KubernetesBackend(_cfg())
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         return 0, "IFACE eth0\n", ""
 
     monkeypatch.setattr(be, "_kubectl", fake_kubectl)
@@ -390,7 +391,7 @@ def test_probe_node_topology_logs_cpu_numa_gpu(monkeypatch, caplog):
         "GPU0 X NODE NUMA Affinity 0\n"
     )
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         return (0, topo, "") if list(args)[:1] == ["exec"] else (0, "", "")
 
     monkeypatch.setattr(be, "_kubectl", fake_kubectl)
@@ -413,7 +414,7 @@ def test_probe_node_topology_best_effort_on_exec_failure(monkeypatch):
     be = KubernetesBackend(_cfg())
     be._node_to_resv_pod = {"node-a": "res-0"}
 
-    async def boom(args):
+    async def boom(args, **_kw):
         raise RuntimeError("exec denied")
 
     monkeypatch.setattr(be, "_kubectl", boom)
@@ -426,7 +427,7 @@ def test_probe_node_topology_clears_stale_report_before_early_return(monkeypatch
     be = KubernetesBackend(_cfg())
     be._node_to_resv_pod = {"node-a": "res-0"}
 
-    async def ok(args):
+    async def ok(args, **_kw):
         return (0, "nproc=8\n", "") if list(args)[:1] == ["exec"] else (0, "", "")
 
     monkeypatch.setattr(be, "_kubectl", ok)
@@ -445,7 +446,7 @@ def test_probe_node_topology_times_out_best_effort(monkeypatch):
     be = KubernetesBackend(_cfg())
     be._node_to_resv_pod = {"node-a": "res-0"}
 
-    async def hang(args):
+    async def hang(args, **_kw):
         await asyncio.sleep(30)  # never returns within the timeout
         return (0, "x", "")
 
@@ -463,7 +464,7 @@ def test_probe_node_topology_passes_request_timeout(monkeypatch):
     be._node_to_resv_pod = {"node-a": "res-0"}
     seen: list[list[str]] = []
 
-    async def capture(args):
+    async def capture(args, **_kw):
         seen.append(list(args))
         return (0, "nproc=8\n", "")
 
@@ -580,7 +581,7 @@ def test_gib_installer_probe_scopes_to_scheduling_node(monkeypatch):
     # instead of a cluster-wide false positive.
     seen: dict[str, list[str]] = {}
 
-    async def _capture(args):
+    async def _capture(args, **_kw):
         a = list(args)
         if a[:2] == ["get", "pods"]:
             seen["args"] = a
@@ -613,7 +614,7 @@ def test_detect_network_env_shared_device_plugin_provider(monkeypatch):
 def test_detect_network_env_pins_iface_even_without_rdma(monkeypatch):
     be = KubernetesBackend(_cfg())
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         return 0, "IFACE eth0\n", ""  # routable NIC, no RDMA HCAs
 
     monkeypatch.setattr(be, "_kubectl", fake_kubectl)
@@ -627,7 +628,7 @@ def test_detect_network_env_pins_iface_even_without_rdma(monkeypatch):
 def test_detect_network_env_nothing_when_no_iface(monkeypatch):
     be = KubernetesBackend(_cfg())
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         return 0, "", ""  # no default route, no HCAs
 
     monkeypatch.setattr(be, "_kubectl", fake_kubectl)
@@ -667,7 +668,7 @@ def test_detect_network_env_disable_no_iface_keeps_disable_flags(monkeypatch):
     # fallback).
     be = KubernetesBackend(_cfg(rdma="disable"))
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         return 0, "", ""  # no default route, no HCAs
 
     monkeypatch.setattr(be, "_kubectl", fake_kubectl)
@@ -776,7 +777,7 @@ def _fake_kubectl_sync(*, product="", crd_present=False):
     crd`` branch remains for the discovery-error fallback.
     """
 
-    def _run(args, *, timeout="10s"):
+    def _run(args, *, timeout="10s", **_kw):
         a = list(args)
         if a[:1] == ["api-resources"]:
             # Discovery reports the ComputeDomain resource served iff the CRD exists.
@@ -843,7 +844,7 @@ def test_detect_nvlink_scope_disable_when_undetectable(monkeypatch):
 def test_detect_nvlink_scope_warn_only_on_kubectl_error(monkeypatch):
     be = KubernetesBackend(_cfg())
 
-    def _err(args, *, timeout="10s"):
+    def _err(args, *, timeout="10s", **_kw):
         raise RuntimeError("kubectl blew up")
 
     monkeypatch.setattr(be, "_kubectl_sync", _err)
@@ -879,7 +880,7 @@ def test_nvlink_domain_scope_none_before_detection():
 def _fake_mpi_sync(*, discovery_rc=0, discovery_out="", crd_rc=1, calls=None):
     """Fake ``_kubectl_sync`` answering ``api-resources`` (discovery) + ``get crd``."""
 
-    def _run(args, *, timeout="10s"):
+    def _run(args, *, timeout="10s", **_kw):
         a = list(args)
         if calls is not None:
             calls.append(a)
@@ -963,7 +964,7 @@ def test_compute_domain_crd_detected_via_api_discovery_no_crd_access(monkeypatch
     be = KubernetesBackend(_cfg())
     calls: list[list[str]] = []
 
-    def _sync(args, *, timeout="10s"):
+    def _sync(args, *, timeout="10s", **_kw):
         calls.append(list(args))
         if args[:1] == ["api-resources"]:
             return 0, "computedomains.resource.nvidia.com", ""
@@ -981,7 +982,7 @@ def test_api_resource_served_falls_back_to_crd_get_on_discovery_error(monkeypatc
     be = KubernetesBackend(_cfg())
     calls: list[list[str]] = []
 
-    def _sync(args, *, timeout="10s"):
+    def _sync(args, *, timeout="10s", **_kw):
         calls.append(list(args))
         if args[:1] == ["api-resources"]:
             return 1, "", "unable to retrieve the complete list of server APIs"
@@ -1000,7 +1001,7 @@ def _fake_mpi_usable_sync(*, installed=True, allow=None):
     can-i`` answers per-verb from ``allow`` (default: all yes)."""
     allow = allow or {}
 
-    def _run(args, *, timeout="10s"):
+    def _run(args, *, timeout="10s", **_kw):
         a = list(args)
         if a[:1] == ["api-resources"]:
             return (0, "mpijobs.kubeflow.org", "") if installed else (0, "", "")
@@ -1069,7 +1070,7 @@ def _cds_json(*pairs):
 def test_detect_compute_domains_parses_json(monkeypatch):
     be = KubernetesBackend(_cfg(namespace="ml"))
 
-    def fake_sync(args, *, timeout="10s"):
+    def fake_sync(args, *, timeout="10s", **_kw):
         if args[:2] == ["get", "computedomains"]:
             return 0, _cds_json(("cd-a", "cd-a-channel"), ("cd-b", "cd-b-channel")), ""
         return 1, "", ""
@@ -1324,7 +1325,7 @@ def test_node_label_reads_escaped_jsonpath(monkeypatch):
     be = KubernetesBackend(_cfg())
     seen: dict = {}
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         seen["args"] = list(args)
         return 0, "clique-7", ""
 
@@ -1638,6 +1639,271 @@ def test_preflight_connectivity_checks_dra_resource_permissions():
             backend.preflight_validate()
 
 
+# A namespaced ServiceAccount (a Role bound inside its own namespace) is the norm on
+# a shared multi-tenant cluster. It can create/read pods, but holds NO cluster-scoped
+# rights -- so both `get namespaces` and `get nodes` come back 403. sflow needs
+# neither, and must not reject an otherwise perfectly runnable workflow.
+_FORBIDDEN_NS = (
+    'Error from server (Forbidden): namespaces "ml" is forbidden: User '
+    '"system:serviceaccount:ml:perflab-test" cannot get resource "namespaces" in '
+    'API group "" in the namespace "ml"'
+)
+
+
+def test_preflight_tolerates_forbidden_namespace_read(caplog):
+    backend = KubernetesBackend(_cfg(namespace="ml", scheduling="device_plugin"))
+    seen: list[tuple[str, str]] = []
+
+    def answer(argv):
+        if "namespace" in argv and "get" in argv:
+            return 1, "", _FORBIDDEN_NS
+        if "can-i" in argv:
+            seen.append(_can_i_verb_resource(argv))
+            return 0, "yes", ""
+        return 0, "", ""
+
+    with (
+        mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+        mock.patch("subprocess.run", side_effect=_kubectl_run(answer)),
+        caplog.at_level(logging.WARNING),
+    ):
+        backend.preflight_validate()  # 403 != unreachable -> must not raise
+
+    # ...and it went on to check the permissions that DO matter.
+    assert ("create", "pods") in seen
+    assert "Cannot reach or authenticate" not in caplog.text
+
+
+def test_preflight_forbidden_namespace_does_not_mask_unreachable_cluster():
+    # A 403 is tolerated; a genuinely dead/unauthenticated API still hard-fails.
+    for err in (
+        "Unable to connect to the server: dial tcp 10.0.0.1:443 i/o timeout",
+        "error: You must be logged in to the server (Unauthorized)",
+    ):
+        backend = KubernetesBackend(_cfg(namespace="ml", scheduling="device_plugin"))
+
+        def answer(argv, _err=err):
+            if "namespace" in argv and "get" in argv:
+                return 1, "", _err
+            return 0, "yes", ""
+
+        with (
+            mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+            mock.patch("subprocess.run", side_effect=_kubectl_run(answer)),
+        ):
+            with pytest.raises(ValueError, match="Cannot reach or authenticate"):
+                backend.preflight_validate()
+
+
+def test_preflight_warns_instead_of_failing_when_get_nodes_denied(caplog):
+    # `get nodes` is cluster-scoped and only powers best-effort detection
+    # (gpus_per_node derivation, GPU product label, kubelet version) -- a denial
+    # degrades those, it does not block the run.
+    backend = KubernetesBackend(_cfg(namespace="ml", scheduling="device_plugin"))
+
+    def answer(argv):
+        if "namespace" in argv and "get" in argv:
+            return 0, "namespace/ml", ""
+        if "can-i" in argv:
+            _verb, resource = _can_i_verb_resource(argv)
+            return (1, "no", "") if resource == "nodes" else (0, "yes", "")
+        return 0, "", ""
+
+    with (
+        mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+        mock.patch("subprocess.run", side_effect=_kubectl_run(answer)),
+        caplog.at_level(logging.WARNING),
+    ):
+        backend.preflight_validate()  # must not raise
+
+    assert "lack optional" in caplog.text
+    assert "get nodes (cluster-scoped)" in caplog.text
+    assert "gpus_per_node" in caplog.text  # the actionable part
+
+
+def test_preflight_dra_deviceclass_denial_is_warn_only(caplog):
+    # Same rule under DRA: the deviceclass read backs a warn-only check, while the
+    # namespaced resourceclaimtemplates verbs stay hard requirements.
+    backend = KubernetesBackend(_cfg(namespace="ml", scheduling="dra"))
+
+    def answer(argv):
+        if "namespace" in argv and "get" in argv:
+            return 0, "namespace/ml", ""
+        if "can-i" in argv:
+            _verb, resource = _can_i_verb_resource(argv)
+            if resource.startswith("deviceclasses"):
+                return 1, "no", ""
+            return 0, "yes", ""
+        return 0, "", ""
+
+    with (
+        mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+        mock.patch("subprocess.run", side_effect=_kubectl_run(answer)),
+        caplog.at_level(logging.WARNING),
+    ):
+        backend.preflight_validate()  # must not raise
+
+    assert "deviceclasses" in caplog.text
+
+
+def test_preflight_skips_rbac_check_when_can_i_itself_forbidden(caplog):
+    # Some locked-down clusters withhold `create selfsubjectaccessreviews`, so
+    # `auth can-i` answers nothing at all. Warn and proceed -- a real gap surfaces
+    # at the first pod -- rather than blaming connectivity for an RBAC denial.
+    backend = KubernetesBackend(_cfg(namespace="ml", scheduling="device_plugin"))
+
+    def answer(argv):
+        if "namespace" in argv and "get" in argv:
+            return 0, "namespace/ml", ""
+        if "can-i" in argv:
+            return 1, "", (
+                "Error from server (Forbidden): selfsubjectaccessreviews.authorization"
+                '.k8s.io is forbidden: User "system:serviceaccount:ml:perflab-test" '
+                'cannot create resource "selfsubjectaccessreviews"'
+            )
+        return 0, "", ""
+
+    with (
+        mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+        mock.patch("subprocess.run", side_effect=_kubectl_run(answer)),
+        caplog.at_level(logging.WARNING),
+    ):
+        backend.preflight_validate()  # must not raise
+
+    assert "skipping the RBAC preflight" in caplog.text
+    assert "Cannot reach or authenticate" not in caplog.text
+
+
+def test_preflight_namespaced_service_account_runs_clean(caplog):
+    # End-to-end shape of the multi-tenant setup: no cluster-scoped rights at all,
+    # every namespaced verb granted -> the workflow launches with warnings only.
+    backend = KubernetesBackend(_cfg(namespace="ml", scheduling="device_plugin"))
+
+    def answer(argv):
+        if "namespace" in argv and "get" in argv:
+            return 1, "", _FORBIDDEN_NS
+        if "can-i" in argv:
+            _verb, resource = _can_i_verb_resource(argv)
+            return (1, "no", "") if resource == "nodes" else (0, "yes", "")
+        # Every direct cluster-scoped read is 403 too (not just the can-i answer),
+        # so the best-effort detectors exercise their real degrade paths.
+        if "nodes" in argv:
+            return 1, "", 'Error from server (Forbidden): nodes is forbidden: User ...'
+        return 0, "", ""
+
+    with (
+        mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+        mock.patch("subprocess.run", side_effect=_kubectl_run(answer)),
+        caplog.at_level(logging.WARNING),
+    ):
+        backend.preflight_validate()  # must not raise
+
+    assert "lack optional" in caplog.text  # warned, did not block
+    # gpus_per_node stays unset rather than being silently derived from a failed read.
+    assert backend._gpu_per_node is None
+
+
+def test_optional_permissions_are_not_required():
+    # Guard the split itself: a best-effort permission must never sit in the
+    # hard-gate list, or preflight would reject a namespaced ServiceAccount again.
+    for sched in ("device_plugin", "dra"):
+        backend = KubernetesBackend(_cfg(namespace="ml", scheduling=sched))
+        required = backend._required_permissions()
+        optional = backend._optional_permissions()
+        assert ("get", "nodes", False) in optional
+        assert not set(required) & set(optional)
+        # Hard gates must all be namespaced -- a cluster-scoped one would reintroduce
+        # the same false failure for any namespaced-Role identity.
+        assert all(namespaced for _v, _r, namespaced in required)
+
+
+# ---------------------------------------------------------------------------
+# namespace confinement: a configured namespace binds EVERY namespaced call
+# ---------------------------------------------------------------------------
+
+
+def test_confine_appends_namespace_to_namespaced_calls():
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    assert be._confine_to_namespace(["get", "pods"], namespaced=True) == [
+        "get",
+        "pods",
+        "--namespace",
+        "ml",
+    ]
+
+
+def test_confine_is_noop_without_a_configured_namespace():
+    # No namespace set -> nothing to confine to; kubectl keeps its own default.
+    be = KubernetesBackend(_cfg())
+    assert be._confine_to_namespace(["get", "pods"], namespaced=True) == ["get", "pods"]
+
+
+def test_confine_never_double_selects_a_namespace():
+    # Call sites that still pass _ns_args() (or a deliberate cross-namespace -n,
+    # e.g. the gIB installer probe in kube-system) must be left exactly as built --
+    # two --namespace flags would either conflict or silently override intent.
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    for existing in (
+        ["get", "pods", "--namespace", "ml"],
+        ["get", "pods", "-n", "kube-system"],
+        ["get", "pods", "--namespace=kube-system"],
+    ):
+        assert be._confine_to_namespace(list(existing), namespaced=True) == existing
+
+
+def test_confine_skipped_for_cluster_scoped_calls():
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    assert be._confine_to_namespace(["get", "nodes"], namespaced=False) == [
+        "get",
+        "nodes",
+    ]
+
+
+def test_kubectl_sync_confines_to_namespace_by_default(monkeypatch):
+    # The guardrail is in the runner, so a call site that forgets _ns_args() still
+    # stays inside the namespace instead of falling back to the kubeconfig default.
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        k8s_mod.k8s_lifecycle,
+        "run_kubectl_sync",
+        lambda args, **kw: seen.append(list(args)) or (0, "", ""),
+    )
+    be._kubectl_sync(["get", "configmaps"])
+    assert seen[0] == ["get", "configmaps", "--namespace", "ml"]
+
+
+def test_can_i_does_not_get_namespace_injected(monkeypatch):
+    # `auth can-i` encodes scope in the QUESTION: injecting -n turns a cluster-scoped
+    # query into a namespaced one, which answers "no" and would fake a missing grant.
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    seen: list[list[str]] = []
+
+    def _sync(args, *, timeout="10s", **_kw):
+        seen.append(list(args))
+        return 0, "yes", ""
+
+    monkeypatch.setattr(be, "_kubectl_sync", _sync)
+    assert be._can_i("get", "nodes", namespaced=False) is True
+    assert seen[0] == ["auth", "can-i", "get", "nodes"]  # no -n anywhere
+    assert be._can_i("create", "pods", namespaced=True) is True
+    assert seen[1] == ["auth", "can-i", "create", "pods", "-n", "ml"]
+
+
+def test_kube_namespace_cli_override_confines_calls(monkeypatch):
+    # --kube-namespace wins over the recipe value, and confinement follows it.
+    be = KubernetesBackend(_cfg(namespace="recipe-ns"))
+    be.apply_kubectl_config(KubectlConfig(namespace="cli-ns"))
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        k8s_mod.k8s_lifecycle,
+        "run_kubectl_sync",
+        lambda args, **kw: seen.append(list(args)) or (0, "", ""),
+    )
+    be._kubectl_sync(["get", "secrets"])
+    assert seen[0][-2:] == ["--namespace", "cli-ns"]
+
+
 def test_preflight_connectivity_skipped_via_env(monkeypatch):
     monkeypatch.setenv("SFLOW_SKIP_K8S_PREFLIGHT", "1")
     backend = KubernetesBackend(_cfg(namespace="ml", scheduling="device_plugin"))
@@ -1681,7 +1947,7 @@ def test_release_alloc_deletes_configmaps_and_secrets():
     backend = KubernetesBackend(_cfg(namespace="ml"))
     kinds: list[str] = []
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         if "delete" in args:
             kinds.append(args[args.index("delete") + 1])
         return 0, "", ""
@@ -2618,7 +2884,7 @@ def test_wait_for_pod_scheduled_logs_reason_then_returns(monkeypatch):
 
     phase_calls = {"n": 0}
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         if "events" in args:
             return 0, "", ""
         if any("nodeName" in a for a in args):
@@ -2652,7 +2918,7 @@ def test_wait_for_pod_scheduled_timeout_includes_events(monkeypatch):
         _cfg(namespace="ml", reservation=KubernetesReservationConfig(timeout=2))
     )
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         if "events" in args:
             return 0, "5m Warning FailedScheduling pod/x device class gpu.nvidia.com does not exist", ""
         if any("nodeName" in a for a in args):
@@ -2789,7 +3055,7 @@ def test_exec_in_probe_pod_builds_kubectl_exec_args(monkeypatch):
     be._probe_pod_name = "pp"
     seen = {}
 
-    async def fake_kubectl(args):
+    async def fake_kubectl(args, **_kw):
         seen["args"] = list(args)
         return 0, "ok", ""
 
@@ -2833,7 +3099,7 @@ def test_parse_k8s_minor_handles_common_forms():
 def _fake_version_kubectl(nodes_out, *, nodes_rc=0, server_out="", server_rc=0):
     """Scripted _kubectl_sync: node list vs `version` fallback."""
 
-    def _fn(args, *, timeout="10s"):
+    def _fn(args, *, timeout="10s", **_kw):
         if args[:2] == ["get", "nodes"]:
             return (nodes_rc, nodes_out, "" if nodes_rc == 0 else "forbidden")
         if args[:1] == ["version"]:
@@ -2884,3 +3150,142 @@ def test_preflight_kubelet_check_skipped_when_bypassed(monkeypatch):
     )
     be._preflight_check_kubelet_version()
     assert called == []  # skipped -> no cluster call
+
+
+def test_namespace_is_inserted_before_a_double_dash_separator(monkeypatch):
+    """``kubectl exec <pod> -- cmd`` stops parsing flags at ``--``.
+
+    Appending the confinement flag blindly puts it AFTER the separator, where kubectl
+    hands it to the container as two extra argv entries instead of selecting a
+    namespace -- so the call silently runs in the kubeconfig's default namespace AND
+    the command in the pod gets mangled. Every exec call site passes ``_ns_args()``
+    today, but confining by default only means something if the next one need not.
+    """
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    confined = be._confine_to_namespace(
+        ["exec", "pod-a", "--", "sh", "-c", "nvidia-smi"], namespaced=True
+    )
+    assert confined == [
+        "exec", "pod-a", "--namespace", "ml", "--", "sh", "-c", "nvidia-smi"
+    ], confined
+    # The container's own argv must be byte-identical to what the caller asked for.
+    assert confined[confined.index("--") + 1:] == ["sh", "-c", "nvidia-smi"]
+
+
+def test_namespace_confinement_leaves_an_explicit_namespace_alone(monkeypatch):
+    """A call that already selects a namespace -- including a deliberate cross-namespace
+    probe like the gIB installer lookup -- must not be rewritten."""
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    args = ["get", "pods", "-n", "gpu-operator", "-o", "name"]
+    assert be._confine_to_namespace(list(args), namespaced=True) == args
+
+
+def test_async_kubectl_confines_to_namespace_by_default(monkeypatch):
+    """The async runner needs the same guardrail as the sync one.
+
+    Most of the backend's cluster traffic goes through ``_kubectl``, not
+    ``_kubectl_sync``: pod status, events, deletes, execs. On a shared cluster the
+    credentials are usually a ServiceAccount bound to one namespace, so a call that
+    falls back to the kubeconfig default is a 403 -- or lands in another tenant.
+    """
+    be = KubernetesBackend(_cfg(namespace="ml"))
+    seen: list[list[str]] = []
+
+    async def _run(args, **kw):
+        seen.append(list(args))
+        return 0, "", ""
+
+    monkeypatch.setattr(k8s_mod.k8s_lifecycle, "run_kubectl", _run)
+    asyncio.run(be._kubectl(["get", "pods"]))
+    assert seen[0] == ["get", "pods", "--namespace", "ml"]
+
+    seen.clear()
+    asyncio.run(be._kubectl(["get", "nodes"], namespaced=False))
+    assert seen[0] == ["get", "nodes"], "cluster-scoped calls must opt out cleanly"
+
+
+# ---------------------------------------------------------------------------
+# every bypassable preflight failure must name SFLOW_SKIP_K8S_PREFLIGHT
+# ---------------------------------------------------------------------------
+
+
+def _preflight_error(answer) -> str:
+    """Run preflight against a fake kubectl and return the raised message."""
+    backend = KubernetesBackend(_cfg(namespace="ml"))
+    with (
+        mock.patch("shutil.which", return_value="/usr/bin/kubectl"),
+        mock.patch("subprocess.run", side_effect=_kubectl_run(answer)),
+    ):
+        with pytest.raises(ValueError) as exc:
+            backend.preflight_validate()
+    return str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "case,answer",
+    [
+        (
+            "unreachable",
+            lambda argv: (1, "", "Unable to connect to the server: dial tcp ... i/o timeout"),
+        ),
+        (
+            "namespace missing",
+            lambda argv: (1, "", 'Error from server (NotFound): namespaces "ml" not found')
+            if "namespace" in argv
+            else (0, "yes", ""),
+        ),
+        (
+            "can-i answers neither yes nor no",
+            lambda argv: (1, "", "error: You must be logged in to the server")
+            if "can-i" in argv
+            else (0, "", ""),
+        ),
+        (
+            "rbac denied",
+            lambda argv: (0, "no", "") if "can-i" in argv else (0, "", ""),
+        ),
+    ],
+)
+def test_bypassable_preflight_failures_point_at_the_env_var(case, answer):
+    """A user blocked by a preflight check must be told how to override it.
+
+    Preflight is a convenience gate in front of the real cluster and it CAN be wrong --
+    an unusual proxy, a credential that is restricted but working, a `kubectl auth can-i`
+    the cluster withholds. The override existed but was documented only in a docstring,
+    so the error that blocked the run gave no way to get past it.
+    """
+    msg = _preflight_error(answer)
+    assert "SFLOW_SKIP_K8S_PREFLIGHT=1" in msg, f"{case}: no bypass hint in {msg!r}"
+    # And it must not over-promise: skipping the CHECK is not the same as the run working.
+    assert "surfaces the real error at the first pod" in msg, case
+
+
+def test_missing_kubectl_does_not_offer_the_bypass():
+    """The one preflight failure the env var CANNOT rescue must not suggest it.
+
+    `shutil.which("kubectl")` is checked before the bypass is ever consulted, and
+    nothing in the k8s backend works without kubectl -- so pointing the user at
+    SFLOW_SKIP_K8S_PREFLIGHT here would send them down a dead end.
+    """
+    backend = KubernetesBackend(_cfg(namespace="ml"))
+    with mock.patch("shutil.which", return_value=None):
+        with pytest.raises(ValueError) as exc:
+            backend.preflight_validate()
+    msg = str(exc.value)
+    assert "kubectl" in msg
+    assert "SFLOW_SKIP_K8S_PREFLIGHT" not in msg, (
+        "the bypass cannot help when kubectl is missing; suggesting it is a dead end"
+    )
+
+
+def test_the_bypass_hint_has_exactly_one_source():
+    """The RBAC message used to hand-roll its own copy of the hint -- that is how
+    wording drifts. Every occurrence must come from the shared constant."""
+    import inspect
+
+    src = inspect.getsource(k8s_mod)
+    literal_uses = src.count('"SFLOW_SKIP_K8S_PREFLIGHT=1')
+    assert literal_uses <= 1, (
+        f"{literal_uses} hand-written copies of the hint string; use "
+        "_PREFLIGHT_BYPASS_HINT so the wording cannot drift"
+    )

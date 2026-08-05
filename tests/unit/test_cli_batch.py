@@ -5198,3 +5198,90 @@ def test_batch_sflow_version_and_source_path_are_mutually_exclusive(
 
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output
+
+
+# ---------------------------------------------------------------------------
+# a short CSV row must be a clean CLI error, not a traceback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case,content",
+    [
+        # csv.DictReader PADS a row that has fewer fields than the header with None, so
+        # this row reaches the code as {"sflow_config_file": None} -- past the header
+        # check, straight into `.split()`.
+        ("short row (trailing column padded to None)", "extra,sflow_config_file\nonly_one_field\n"),
+        ("explicitly empty value", "sflow_config_file,extra\n,x\n"),
+        ("whitespace-only value", "sflow_config_file,extra\n   ,x\n"),
+    ],
+)
+def test_bulk_input_row_missing_config_file_is_a_clean_error(
+    mock_sflow_app, tmp_path, case, content
+):
+    """A CSV whose header has the column but whose ROW leaves it blank must be rejected.
+
+    The header check alone is not enough, and the gap was not cosmetic: every downstream
+    ``row["sflow_config_file"].split()`` raised ``AttributeError: 'NoneType' object has no
+    attribute 'split'``, which escaped typer as a raw Python traceback rather than a CLI
+    error -- so malformed input turned into a crash. Note the asymmetry that hid it:
+    ``row_missable`` already guarded its OPTIONAL column with ``or ""`` while the REQUIRED
+    one was dereferenced unconditionally.
+    """
+    csv_file = _write_csv(tmp_path / "bad.csv", content)
+    result = runner.invoke(
+        app,
+        [
+            "batch", "--bulk-input", str(csv_file),
+            "--partition", "batch", "--account", "acct", "--nodes", "1",
+        ],
+        catch_exceptions=True,
+    )
+
+    assert not isinstance(result.exception, AttributeError), (
+        f"{case}: malformed CSV crashed with a traceback instead of a CLI error: "
+        f"{result.exception!r}"
+    )
+    assert result.exit_code == 1, case
+    assert "sflow_config_file" in result.output, case
+    # The message must locate the offending row -- "some row is bad" is not actionable
+    # for a CSV with hundreds of rows.
+    assert "row 1" in result.output, f"{case}: no row number in {result.output!r}"
+
+
+def test_bulk_input_row_check_names_the_offending_row_number(mock_sflow_app, tmp_path):
+    """With several rows, the error must point at the bad one, not the first."""
+    wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
+    csv_file = _write_csv(
+        tmp_path / "bad.csv",
+        f"sflow_config_file,TP_SIZE\n{wf},4\n{wf},8\n,16\n",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "batch", "--bulk-input", str(csv_file),
+            "--partition", "batch", "--account", "acct", "--nodes", "1",
+        ],
+        catch_exceptions=True,
+    )
+    assert not isinstance(result.exception, AttributeError)
+    assert "row 3" in result.output, result.output
+
+
+def test_read_bulk_csv_rejects_blank_config_file_at_the_ingestion_point(tmp_path):
+    """Validated in read_bulk_csv so ALL of its callers (batch, compose, run) are covered
+    by one guard rather than each dereference site growing its own."""
+    csv_file = _write_csv(tmp_path / "bad.csv", "extra,sflow_config_file\nonly_one_field\n")
+    with pytest.raises(ValueError, match="sflow_config_file"):
+        batch_mod.read_bulk_csv(csv_file)
+
+
+def test_read_bulk_csv_still_accepts_a_valid_row(tmp_path):
+    """The new per-row check must not reject well-formed input, including the
+    space-separated multi-file form."""
+    csv_file = _write_csv(
+        tmp_path / "ok.csv", "sflow_config_file,TP_SIZE\na.yaml b.yaml,4\n"
+    )
+    columns, rows = batch_mod.read_bulk_csv(csv_file)
+    assert columns == ["sflow_config_file", "TP_SIZE"]
+    assert rows[0]["sflow_config_file"] == "a.yaml b.yaml"

@@ -1292,3 +1292,98 @@ def test_backend_mpijobs_rbac_gating(routes, expected):
     backend.note_mpi_operator_routes(routes)
     has = any(r[1] == "mpijobs.kubeflow.org" for r in backend._required_permissions())
     assert has is expected
+
+
+# ---------------------------------------------------------------------------
+# MPIJob launcher log path (drain + finalize) -- previously untested
+# ---------------------------------------------------------------------------
+
+
+def _drive_mpi_execute(monkeypatch, tmp_path, *, phase="Succeeded"):
+    """Run K8sMpiOperator.execute on the operator route with everything faked."""
+    from sflow.plugins.k8s import lifecycle as k8s_life
+    from sflow.plugins.k8s import mpi_lifecycle as mpi_life
+
+    events: list = []
+
+    class _Proc:
+        returncode = None
+
+        async def wait(self):
+            return 0
+
+    class _Launcher:
+        async def run_async(self, command, **kw):
+            events.append(("apply",))
+            return 0
+
+    async def fake_discover(job, **kw):
+        return "pod/launcher-0"
+
+    async def fake_stream(log_command, dest_path):
+        events.append(("stream", dest_path))
+        return _Proc()
+
+    async def fake_tail(path, *, task_name):
+        await asyncio.sleep(3600)
+
+    async def fake_watch(mpijob_ref, launcher_ref, **kw):
+        events.append(("watch",))
+        return phase
+
+    async def fake_stop(proc, *, terminal, kill_group=False):
+        events.append(("stop", terminal))
+        return terminal
+
+    def fake_sanitize(paths):
+        events.append(("sanitize", tuple(paths)))
+
+    async def fake_exit(pod_ref, *, phase="", **kw):
+        return 0
+
+    async def fake_delete(refs, **kw):
+        events.append(("delete",))
+
+    monkeypatch.setattr(mpi_life, "discover_launcher_pod", fake_discover)
+    monkeypatch.setattr(mpi_life, "watch_mpijob_until_terminal", fake_watch)
+    monkeypatch.setattr(k8s_life, "start_pod_log_file_stream", fake_stream)
+    monkeypatch.setattr(k8s_life, "tail_file_to_console", fake_tail)
+    monkeypatch.setattr(k8s_life, "stop_log_stream", fake_stop)
+    monkeypatch.setattr(k8s_life, "sanitize_streamed_logs", fake_sanitize)
+    monkeypatch.setattr(k8s_life, "pod_exit_code", fake_exit)
+    monkeypatch.setattr(k8s_life, "delete_objects", fake_delete)
+
+    op = _op(_backend(nodes=2), ["node-0", "node-1"], gpu_count=16,
+             route="operator", has_mpi_operator=True)
+    rc = asyncio.run(
+        op.execute(
+            launcher=_Launcher(), output_logger=None,
+            env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+            task_name="mpi_server", script=["run"],
+        )
+    )
+    return rc, events
+
+
+def test_mpi_launcher_log_is_drained_then_finalized_before_delete(monkeypatch, tmp_path):
+    """The MPIJob launcher's follow must drain, not be killed mid-stream.
+
+    Killing it is what truncated <task>.log and forced the (now removed) one-shot
+    re-fetch. This path had NO test coverage when it was changed.
+    """
+    rc, events = _drive_mpi_execute(monkeypatch, tmp_path)
+    assert rc == 0
+    kinds = [e[0] for e in events]
+    assert ("stop", True) in events, f"terminal MPIJob must DRAIN its follow: {events}"
+    assert any(e[0] == "sanitize" for e in events), "the streamed log must be finalized"
+    # Ordering: watch -> stop the stream -> finalize the log -> delete the CR.
+    assert (kinds.index("watch") < kinds.index("stop")
+            < kinds.index("sanitize") < kinds.index("delete")), kinds
+    sanitized = next(e[1] for e in events if e[0] == "sanitize")
+    assert sanitized == (str(tmp_path / "mpi_server.log"),), sanitized
+
+
+def test_mpi_non_terminal_job_cuts_the_stream_instead_of_draining(monkeypatch, tmp_path):
+    """A launcher that never reached a terminal phase has no EOF to wait for."""
+    rc, events = _drive_mpi_execute(monkeypatch, tmp_path, phase="")
+    assert ("stop", False) in events, f"non-terminal must CUT, not drain: {events}"

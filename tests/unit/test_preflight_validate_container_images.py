@@ -3,8 +3,6 @@
 
 from types import SimpleNamespace
 
-import pytest
-from pydantic import ValidationError
 
 from sflow.app.assembly import preflight_validate_container_images
 from sflow.config.schema import (
@@ -107,44 +105,51 @@ def test_no_container_image_passes():
     )
 
 
-def test_placeholder_image_rejected_at_parse_time():
-    with pytest.raises(ValidationError, match="container_image.*does not look like"):
-        _config(container_image="<your-container-image>")
+def test_placeholder_image_warns_at_parse_time(image_warnings):
+    _config(container_image="<your-container-image>")
+    assert any("<your-container-image>" in m for m in image_warnings), image_warnings
 
 
-# -- literal invalid values are caught at config parse time by the Pydantic
-#    model validator in SrunOperatorConfig (before preflight even runs). --------
+# -- literal unrecognised values are reported at config parse time by the Pydantic
+#    model validator in SrunOperatorConfig (before preflight even runs).
+#
+#    BEHAVIOR CHANGE: these WARN rather than abort. is_valid_container_image is a
+#    heuristic and the references a runtime accepts outnumber the shapes it models
+#    (pyxis/enroot `registry#path:tag`, `docker://` URIs, site-local schemes), so a
+#    rejected recipe had no override short of editing sflow. The runtime reports a
+#    genuinely bad reference itself, with a better message than this regex can give.
+#    The cost of the change: a typo'd image is no longer caught before allocation. ----
 
 
-def test_literal_invalid_image_rejected_at_parse_time():
-    with pytest.raises(ValidationError, match="container_image.*does not look like"):
-        _config(container_image="not a valid image!!")
+def test_literal_unrecognised_image_warns_at_parse_time(image_warnings):
+    _config(container_image="not a valid image!!")
+    assert any("container_image" in m for m in image_warnings), image_warnings
 
 
-def test_literal_invalid_extra_args_image_rejected_at_parse_time():
-    with pytest.raises(ValidationError, match="extra_args.*does not look like"):
-        _config(extra_args=["--container-image=bad image!!"])
+def test_literal_unrecognised_extra_args_image_warns_at_parse_time(image_warnings):
+    _config(extra_args=["--container-image=bad image!!"])
+    assert any("extra_args" in m for m in image_warnings), image_warnings
 
 
 # -- template expressions that resolve to invalid values are caught by the
 #    preflight check (the unique value-add over the Pydantic validator). --------
 
 
-def test_template_resolves_to_invalid_image_raises():
-    with pytest.raises(ValueError, match="Pre-flight validation failed.*invalid container image"):
-        preflight_validate_container_images(
-            _config(container_image="${{ variables.IMG }}"),
-            _state(IMG="not a valid image!!"),
-        )
+def test_template_resolves_to_unrecognised_image_warns(image_warnings):
+    preflight_validate_container_images(
+        _config(container_image="${{ variables.IMG }}"),
+        _state(IMG="not a valid image!!"),
+    )
+    assert any(
+        "Pre-flight validation failed" in m and "invalid container image" in m
+        for m in image_warnings
+    ), image_warnings
 
 
-def test_template_in_extra_args_resolves_to_invalid_raises():
+def test_template_in_extra_args_resolves_to_unrecognised_warns(image_warnings):
     cfg = _config(extra_args=["--container-image=${{ variables.IMG }}"])
-    with pytest.raises(ValueError, match="Pre-flight validation failed.*operator 'op_srun'.*invalid container image"):
-        preflight_validate_container_images(
-            cfg,
-            _state(IMG="not a valid image!!"),
-        )
+    preflight_validate_container_images(cfg, _state(IMG="not a valid image!!"))
+    assert any("operator 'op_srun'" in m for m in image_warnings), image_warnings
 
 
 def test_template_in_extra_args_equals_resolves_to_valid():
@@ -159,26 +164,30 @@ def test_template_in_extra_args_equals_resolves_to_valid():
 #    so the Pydantic SrunOperatorConfig validator does NOT run for them) --------
 
 
-def test_invalid_task_override_image_raises():
-    with pytest.raises(ValueError, match="Pre-flight validation failed.*task.*operator override.*invalid container image"):
-        preflight_validate_container_images(
-            _config(
-                container_image="nvcr.io/valid:latest",
-                task_override_image="not valid!!",
-            ),
-            _state(),
-        )
+def test_unrecognised_task_override_image_warns(image_warnings):
+    preflight_validate_container_images(
+        _config(
+            container_image="nvcr.io/valid:latest",
+            task_override_image="not valid!!",
+        ),
+        _state(),
+    )
+    assert any(
+        "task" in m and "operator override" in m for m in image_warnings
+    ), image_warnings
 
 
-def test_invalid_task_override_extra_args_raises():
-    with pytest.raises(ValueError, match="Pre-flight validation failed.*task.*operator override.*invalid container image"):
-        preflight_validate_container_images(
-            _config(
-                container_image="nvcr.io/valid:latest",
-                task_override_extra_args=["--container-image=not valid!!"],
-            ),
-            _state(),
-        )
+def test_unrecognised_task_override_extra_args_warns(image_warnings):
+    preflight_validate_container_images(
+        _config(
+            container_image="nvcr.io/valid:latest",
+            task_override_extra_args=["--container-image=not valid!!"],
+        ),
+        _state(),
+    )
+    assert any(
+        "task" in m and "operator override" in m for m in image_warnings
+    ), image_warnings
 
 
 def test_valid_task_override_image_passes():
@@ -191,7 +200,7 @@ def test_valid_task_override_image_passes():
     )
 
 
-def test_invalid_docker_backend_default_image_raises():
+def test_unrecognised_docker_backend_default_image_warns(image_warnings):
     cfg = SflowConfig(
         version="0.1",
         backends=[
@@ -208,8 +217,8 @@ def test_invalid_docker_backend_default_image_raises():
         ),
     )
 
-    with pytest.raises(ValueError, match="Pre-flight validation failed.*backend 'docker'.*invalid container image"):
-        preflight_validate_container_images(cfg, _state(IMG="not valid!!"))
+    preflight_validate_container_images(cfg, _state(IMG="not valid!!"))
+    assert any("backend 'docker'" in m for m in image_warnings), image_warnings
 
 
 def test_kubernetes_backend_contributes_no_image_to_preflight():
@@ -257,7 +266,9 @@ def test_backend_config_exposes_container_images_for_default_operator_preflight(
     assert cfg.backends[0].container_images() == ["nvcr.io/example/app:1.0"]
 
 
-def test_operator_container_images_hook_is_validated_even_with_primary_image_attr():
+def test_operator_container_images_hook_is_validated_even_with_primary_image_attr(
+    image_warnings,
+):
     class CustomImageOperatorConfig:
         name = "op_custom"
         image = "nvcr.io/example/app:1.0"
@@ -272,8 +283,8 @@ def test_operator_container_images_hook_is_validated_even_with_primary_image_att
         workflow=SimpleNamespace(tasks=[]),
     )
 
-    with pytest.raises(
-        ValueError,
-        match="Pre-flight validation failed.*operator 'op_custom'.*invalid container image",
-    ):
-        preflight_validate_container_images(cfg, _state())
+    preflight_validate_container_images(cfg, _state())
+    assert any(
+        "operator 'op_custom'" in m and "invalid container image" in m
+        for m in image_warnings
+    ), image_warnings

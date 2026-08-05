@@ -217,9 +217,11 @@ This user guide reflects actual code behavior. Not all planned features may be a
 | Parallel/sequential replicas, sweeps | [Replicas](./replicas.md) |
 | Composable configs, sweeps, missable tasks | [Modular Workflows](./modular-workflows.md) |
 | Readiness/failure gates for services | [Probes](./probes.md) |
-| Post-execution uploads to S3 | [Uploads](./uploads.md) |
+| Examine a finished run — where to look for what | [Understanding Run Output](./run-output.md) |
 | Log and output directory structure | [Outputs & Logs](./outputs.md) |
 | Capture task metrics & structured results | [Results](./results.md) |
+| Hardware monitoring (GPU/CPU/memory/disk/network) | [Monitor](./monitor.md) |
+| Post-execution uploads to S3 | [Uploads](./uploads.md) |
 | Full sflow.yaml schema | [Configuration](./configuration.md) |
 | CLI options | [CLI Reference](./cli.md) |
 | Frequently asked questions | [FAQ](./faq.md) |

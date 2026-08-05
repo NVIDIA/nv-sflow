@@ -19,7 +19,16 @@ const USER_GUIDE_CATEGORIES = [
       "user/probes",
     ],
   },
-  { label: "Outputs & Storage", items: ["user/outputs", "user/results", "user/uploads"] },
+  {
+    label: "Understanding Run Output",
+    items: [
+      "user/run-output",
+      "user/outputs",
+      "user/results",
+      "user/monitor",
+      "user/uploads",
+    ],
+  },
   { label: "Composition & Scale", items: ["user/modular-workflows"] },
   { label: "Reference", items: ["user/quick-reference", "user/configuration", "user/cli", "user/architecture"] },
   { label: "Examples", items: ["user/samples"] },

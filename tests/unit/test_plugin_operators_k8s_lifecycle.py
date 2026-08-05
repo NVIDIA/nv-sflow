@@ -10,14 +10,18 @@ faked out so no cluster is needed)."""
 
 import asyncio
 import logging
+import os
+import time
 import subprocess
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
 from sflow.core.backend import Allocation
 from sflow.core.compute_node import ComputeNode
 from sflow.plugins.k8s import lifecycle as life
+from sflow.utils import console_text
 from sflow.plugins.backends.kubernetes import KubernetesBackend, KubernetesBackendConfig
 from sflow.plugins.operators.k8s import K8sOperator, K8sOperatorConfig
 
@@ -46,7 +50,7 @@ def _backend(namespace="ns", nodes=1, gpus_per_node=8):
 def test_watch_until_terminal_returns_on_succeeded(monkeypatch):
     phases = iter(["Running", "Running", "Succeeded"])
 
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return (0, next(phases), "")
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -57,7 +61,7 @@ def test_watch_until_terminal_returns_on_succeeded(monkeypatch):
 
 
 def test_watch_until_terminal_returns_empty_when_pod_gone(monkeypatch):
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return (1, "", "NotFound")  # rc != 0 -> phase ""
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -72,7 +76,7 @@ def test_watch_until_terminal_completes_on_container_exit_when_phase_lags(monkey
     # (exit 0): the phase lags container exit, so watch must complete NOW on the true
     # container status instead of waiting out the lag. (combined jsonpath:
     # phase|running|waiting|exitcodes)
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return (0, "Running|||0", "")
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -83,7 +87,7 @@ def test_watch_until_terminal_completes_on_container_exit_when_phase_lags(monkey
 
 
 def test_watch_until_terminal_derives_failed_from_container_exit(monkeypatch):
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return (0, "Running|||137", "")  # container terminated non-zero, phase lag
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -98,7 +102,7 @@ def test_watch_until_terminal_still_running_container_not_done(monkeypatch):
     # NOT be treated as terminal -- only phase transition or container exit ends it.
     phases = iter(["Running|2026-01-01T00:00:00Z||", "Succeeded|||0"])
 
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return (0, next(phases), "")
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -117,7 +121,7 @@ def test_pod_terminal_status_parses_combined_fields(monkeypatch):
         "Pending|||": ("Pending", False, False, False),  # nothing started yet
     }
     for out, expected in cases.items():
-        async def fake(args, *, global_args=(), _out=out):
+        async def fake(args, *, global_args=(), timeout=None, _out=out):
             return (0, _out, "")
 
         monkeypatch.setattr(life, "run_kubectl", fake)
@@ -127,7 +131,7 @@ def test_pod_terminal_status_parses_combined_fields(monkeypatch):
         assert got == expected, out
 
     # A genuinely deleted pod: kubectl exits non-zero with NotFound -> not_found=True.
-    async def gone(args, *, global_args=()):
+    async def gone(args, *, global_args=(), timeout=None):
         return (1, "", 'Error from server (NotFound): pods "t" not found')
 
     monkeypatch.setattr(life, "run_kubectl", gone)
@@ -143,7 +147,7 @@ def test_pod_terminal_status_parses_combined_fields(monkeypatch):
         "Error from server (Timeout): the request could not be completed",
         "Error from server (TooManyRequests): please try again later",
     ):
-        async def flaky(args, *, global_args=(), _e=transient):
+        async def flaky(args, *, global_args=(), timeout=None, _e=transient):
             return (1, "", _e)
 
         monkeypatch.setattr(life, "run_kubectl", flaky)
@@ -165,7 +169,7 @@ def test_watch_until_terminal_ignores_transient_api_errors(monkeypatch):
         (0, "Succeeded|||0", ""),  # finally terminal
     ]
 
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return seq.pop(0) if seq else (0, "Succeeded|||0", "")
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -180,7 +184,7 @@ def test_watch_until_terminal_detects_real_deletion(monkeypatch):
     monkeypatch.setattr(life, "_GONE_POLLS", 2)
     notfound = (1, "", 'Error from server (NotFound): pods "t" not found')
 
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return notfound
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -191,7 +195,7 @@ def test_watch_until_terminal_detects_real_deletion(monkeypatch):
 
 
 def test_pod_exit_code_reads_terminated_exit_code(monkeypatch):
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return (0, "7", "")
 
     monkeypatch.setattr(life, "run_kubectl", fake)
@@ -202,7 +206,7 @@ def test_pod_exit_code_reads_terminated_exit_code(monkeypatch):
 def test_pod_exit_code_falls_back_to_phase(monkeypatch):
     monkeypatch.setattr(life, "EXIT_CODE_RETRIES", 1)
 
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         return (0, "", "")  # exitCode never present
 
     async def no_sleep(_):
@@ -221,7 +225,7 @@ def test_pod_exit_code_falls_back_to_phase(monkeypatch):
 def test_delete_objects_issues_nonblocking_delete(monkeypatch):
     captured = []
 
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         captured.append((list(args), list(global_args)))
         return (0, "", "")
 
@@ -413,7 +417,7 @@ def test_task_exit_code_all_ok_uses_leader():
 
 
 def _fake_kubectl(phase, *, waiting="", sched=""):
-    async def fake(args, *, global_args=()):
+    async def fake(args, *, global_args=(), timeout=None):
         j = " ".join(str(a) for a in args)
         if "status.phase" in j:
             return (0, phase, "")
@@ -542,7 +546,7 @@ def test_execute_clears_status_note_after_startup(monkeypatch, tmp_path):
     async def _term(p, *, kill_group=False):
         pass
 
-    async def _finalize(*a, **k):
+    def _finalize(*a, **k):
         pass
 
     async def _exit(pod_ref, *, phase="", **kw):
@@ -555,7 +559,7 @@ def test_execute_clears_status_note_after_startup(monkeypatch, tmp_path):
     monkeypatch.setattr(life, "tail_file_to_console", _noop_tail)
     monkeypatch.setattr(life, "watch_until_terminal", _watch)
     monkeypatch.setattr(life, "terminate_process", _term)
-    monkeypatch.setattr(life, "finalize_complete_log", _finalize)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", _finalize)
     monkeypatch.setattr(life, "pod_exit_code", _exit)
     monkeypatch.setattr(life, "delete_objects", _delete)
 
@@ -626,8 +630,8 @@ def test_execute_offloads_stream_and_stops_on_terminal(monkeypatch, tmp_path):
     async def fake_terminate(p, *, kill_group=False):
         events.append(("terminate",))
 
-    async def fake_finalize(pod_refs, dest, *, prefix_size, phases, **kw):
-        events.append(("finalize", dest, tuple(pod_refs), tuple(phases)))
+    def fake_sanitize(paths):
+        events.append(("sanitize", tuple(paths)))
 
     async def fake_exit(pod_ref, *, phase="", **kw):
         events.append(("exit", phase))
@@ -640,7 +644,7 @@ def test_execute_offloads_stream_and_stops_on_terminal(monkeypatch, tmp_path):
     monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
     monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
     monkeypatch.setattr(life, "terminate_process", fake_terminate)
-    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", fake_sanitize)
     monkeypatch.setattr(life, "pod_exit_code", fake_exit)
     monkeypatch.setattr(life, "delete_objects", fake_delete)
 
@@ -663,26 +667,26 @@ def test_execute_offloads_stream_and_stops_on_terminal(monkeypatch, tmp_path):
     # tailer reads that same file.
     assert ("stream", task_log) in events
     assert ("tail", task_log) in events
-    # Complete log re-fetched once after the watch, over all pods, with their phases.
-    assert ("finalize", task_log, ("pod/decode-server-0-abc",), ("Succeeded",)) in events
+    # BEHAVIOUR CHANGE: the follow is now DRAINED on a terminal pod instead of being
+    # killed mid-stream, so <task>.log is already complete and the one-shot re-fetch is
+    # skipped -- only the TTY-sanitize pass the rebuild used to provide still runs. The
+    # guarantee under test is unchanged: the on-disk log is made final exactly once,
+    # after the watch and the exit-code read.
+    assert ("sanitize", (task_log,)) in events
     kinds = [e[0] for e in events]
-    # Status is authoritative: watch -> interrupt the stream -> read exit code
-    # (per pod) -> re-fetch the complete on-disk log (once) -> cleanup.
     assert (
         kinds.index("watch")
         < kinds.index("terminate")
         < kinds.index("exit")
-        < kinds.index("finalize")
+        < kinds.index("sanitize")
     )
-    # The terminal path finalizes exactly once -- the `finally`'s cancel-path re-fetch
-    # is guarded by `finalized` so it never runs a second time on a clean finish.
-    assert kinds.count("finalize") == 1
+    assert kinds.count("sanitize") == 1
     assert kinds[-1] == "delete"
 
 
 def test_execute_finalizes_log_before_delete_on_cancel(monkeypatch, tmp_path):
     # On SIGINT/teardown execute() is cancelled at the pod-status watch; it must still
-    # re-fetch each pod's COMPLETE log BEFORE deleting the pods, else a fast-failing
+    # finalize the streamed log BEFORE deleting the pods, else a fast-failing
     # launcher's log is lost. Simulate an idle pod, cancel mid-run, and assert finalize
     # ran before delete_objects.
     order: list[str] = []
@@ -702,7 +706,7 @@ def test_execute_finalizes_log_before_delete_on_cancel(monkeypatch, tmp_path):
     async def fake_terminate(p, *, kill_group=False):
         pass
 
-    async def fake_finalize(pod_refs, dest, *, prefix_size, phases, force=False, **kw):
+    def fake_finalize(paths):
         order.append("finalize")
 
     async def fake_exit(pod_ref, *, phase="", **kw):
@@ -715,7 +719,7 @@ def test_execute_finalizes_log_before_delete_on_cancel(monkeypatch, tmp_path):
     monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
     monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
     monkeypatch.setattr(life, "terminate_process", fake_terminate)
-    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", fake_finalize)
     monkeypatch.setattr(life, "pod_exit_code", fake_exit)
     monkeypatch.setattr(life, "delete_objects", fake_delete)
 
@@ -781,7 +785,7 @@ def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
     async def fake_exit(pod_ref, *, phase="", **kw):
         return 1 if phase == "Failed" else 0
 
-    async def fake_finalize(*a, **k):
+    def fake_finalize(*a, **k):
         pass
 
     async def fake_delete(refs, **kw):
@@ -792,7 +796,7 @@ def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
     monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
     monkeypatch.setattr(life, "terminate_process", fake_terminate)
     monkeypatch.setattr(life, "pod_exit_code", fake_exit)
-    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", fake_finalize)
     monkeypatch.setattr(life, "delete_objects", fake_delete)
 
     launcher = _FakeLauncher()
@@ -811,11 +815,12 @@ def test_execute_multinode_fails_fast_when_a_pod_dies(monkeypatch, tmp_path):
     assert worker_cancelled["v"] is True  # ... and the idle worker was cancelled
 
 
-def test_execute_force_refetches_cancelled_peer_log_before_delete(monkeypatch, tmp_path):
+def test_execute_finalizes_cancelled_peer_log_before_delete(monkeypatch, tmp_path):
     # When fail-fast / world-group resolution cancels a peer, that peer is still
-    # Running (non-terminal ""-phase), so the normal complete-log re-fetch would skip
-    # (all-or-nothing phase guard) and lose every pod's log. execute() must FORCE the
-    # re-fetch -- the pods still exist -- BEFORE the finally deletes them.
+    # Running, so its follow is CUT rather than drained (stop_log_stream terminal=False)
+    # and its <task>.log simply ends where the stream got to. That is the whole
+    # guarantee now, and it only holds if the finalize runs BEFORE the `finally`
+    # deletes the pods -- otherwise a fast-failing peer's output is gone with the pod.
     op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
     op.apply_backend_context(backend=_backend(nodes=2, gpus_per_node=8),
                              assigned_nodes=["node-0", "node-1"], artifacts=[],
@@ -827,12 +832,17 @@ def test_execute_force_refetches_cancelled_peer_log_before_delete(monkeypatch, t
     leader_ref = plan.pod_refs[0]
     order: list[str] = []
     seen: dict = {}
+    stopped: list[bool] = []
 
     async def fake_start_stream(log_command, dest_path):
         return _FakeProc()
 
     async def fake_tail(path, *, task_name):
         await asyncio.sleep(3600)
+
+    async def fake_stop_stream(proc, *, terminal, kill_group=False):
+        stopped.append(terminal)
+        return terminal
 
     async def fake_watch(pod_ref, **kw):
         if pod_ref == leader_ref:
@@ -846,10 +856,9 @@ def test_execute_force_refetches_cancelled_peer_log_before_delete(monkeypatch, t
     async def fake_exit(pod_ref, *, phase="", **kw):
         return 1 if phase == "Failed" else 0
 
-    async def fake_finalize(pod_refs, dest, *, prefix_size, phases, force=False, **kw):
+    def fake_finalize(paths):
         order.append("finalize")
-        seen["force"] = force
-        seen["phases"] = tuple(phases)
+        seen["paths"] = tuple(paths)
 
     async def fake_delete(refs, **kw):
         order.append("delete")
@@ -858,8 +867,9 @@ def test_execute_force_refetches_cancelled_peer_log_before_delete(monkeypatch, t
     monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
     monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
     monkeypatch.setattr(life, "terminate_process", fake_terminate)
+    monkeypatch.setattr(life, "stop_log_stream", fake_stop_stream)
     monkeypatch.setattr(life, "pod_exit_code", fake_exit)
-    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", fake_finalize)
     monkeypatch.setattr(life, "delete_objects", fake_delete)
 
     async def drive():
@@ -871,9 +881,27 @@ def test_execute_force_refetches_cancelled_peer_log_before_delete(monkeypatch, t
         )
 
     asyncio.run(drive())
-    assert seen["force"] is True  # cancelled peer ("" phase) -> force the re-fetch
-    assert "" in seen["phases"]  # the cancelled peer contributed a non-terminal phase
-    assert order == ["finalize", "delete"]  # re-fetch BEFORE the pods are deleted
+    # BEHAVIOUR CHANGE: there is no re-fetch (and so no `force`/`phases`) any more --
+    # a cancelled peer's <task>.log is the file its follow already streamed. Pin what
+    # replaced it, not merely that SOMETHING was finalized:
+    #   * the task's own log path is the one handed over (a multi-pod task streams
+    #     every pod into that single file, so finalizing it covers the cancelled peer);
+    #   * it happens BEFORE the delete, which is what actually saves the output.
+    assert seen["paths"] == (plan.task_log_path,), (
+        "the cancelled peer's log is the shared streamed <task>.log; that exact path "
+        f"must be finalized, got {seen.get('paths')!r}"
+    )
+    assert order == ["finalize", "delete"], (
+        "finalize must precede the pod delete, or a fast-failing peer's streamed log "
+        "dies with the pod"
+    )
+    # And each pod's stream was ended the right way for its state: the Failed leader
+    # DRAINED (its follow will hit EOF), the still-Running peer CUT (its never would).
+    assert True in stopped, "the terminal leader's follow must be drained"
+    assert False in stopped, (
+        "a peer cancelled while still Running must be cut (terminal=False): its follow "
+        f"would never reach EOF, got {stopped!r}"
+    )
 
 
 def test_run_pod_stream_status_authoritative_interrupts_stream(monkeypatch, tmp_path):
@@ -919,7 +947,7 @@ def test_run_pod_stream_status_authoritative_interrupts_stream(monkeypatch, tmp_
 
     rc, phase = asyncio.run(drive())
     assert rc == 9  # exit code from the watch's phase (Failed), not the stream
-    assert phase == "Failed"  # phase returned to execute() for the complete re-fetch
+    assert phase == "Failed"  # phase returned to execute() to drive drain-vs-cut
     assert terminated == [True]  # stream interrupted once the pod was terminal
 
 
@@ -1019,6 +1047,239 @@ def test_tail_file_to_console_streams_appended_lines(monkeypatch, tmp_path):
     assert "[mytask]" not in joined
 
 
+def _tail_once(path, *, task_name="mlperf_harness", append="", append_bytes=None):
+    """Run the tailer over ``append``ed content and return the console messages.
+
+    ``append_bytes`` writes the exact bytes instead, bypassing the platform's newline
+    translation -- required when the test is ABOUT line terminators (text mode turns
+    ``\\n`` into ``\\r\\n`` on Windows, which is a different input than intended).
+    """
+    captured: list = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    cap = _Cap()
+    life._logger.addHandler(cap)
+    old_level = life._logger.level
+    life._logger.setLevel(logging.INFO)
+    try:
+        async def drive():
+            t = asyncio.ensure_future(
+                life.tail_file_to_console(str(path), task_name=task_name)
+            )
+            await asyncio.sleep(0.05)
+            if append_bytes is not None:
+                with open(path, "ab") as fh:
+                    fh.write(append_bytes)
+            else:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(append)
+            # Wait for OUTPUT, not for wall-clock. A fixed sleep tuned to the 0.3s poll
+            # leaves ~0.2s of slack, so these tests fail on a loaded CI box for reasons
+            # that have nothing to do with the tailer. Poll for the first message, then
+            # allow one more tick to drain the rest, and cap the whole thing.
+            deadline = asyncio.get_event_loop().time() + 5.0
+            while not captured and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(life._TAIL_POLL_INTERVAL + 0.2)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+
+        asyncio.run(drive())
+    finally:
+        life._logger.removeHandler(cap)
+        life._logger.setLevel(old_level)
+    return captured
+
+
+def test_tail_collapses_a_progress_bar_burst_instead_of_rendering_all_of_it(
+    monkeypatch, tmp_path
+):
+    """THE post-run hang: one unbounded line must never reach the console renderer.
+
+    `kubectl logs -f` reads to `\\n`, so it withholds an unterminated `\\r` progress bar
+    for as long as the bar runs and then delivers an HOUR of it as a SINGLE line. That
+    line walks straight past the per-tick LINE COUNT cap (it is one line), and rendering
+    it through rich costs ~6.3us and ~300 bytes of RSS per character -- measured 25s and
+    1.15 GB for 4 MB, so tens of MB is CPU-minutes and many GB, i.e. swap. It happens on
+    the event-loop thread, which is why the whole workflow froze for ~20 minutes with
+    py-spy showing 100% CPU under tail_file_to_console.
+
+    Only the final frame was ever visible on a terminal anyway, which is exactly what
+    the launcher echoes for every other backend.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "mlperf_harness.log"
+    path.write_text("")
+    pad = "." * 120
+    bar = "".join(f"\rProcessing: {i}/20000 [{pad}]" for i in range(1, 20001))
+    assert len(bar) > 2_000_000, "the burst must be big enough to be the real input"
+
+    captured = _tail_once(path, append=bar + "\n")
+
+    joined = "\n".join(captured)
+    assert joined, "the burst must still be reported, just bounded"
+    assert len(joined) < 10 * life._TAIL_MAX_LINE_CHARS, (
+        f"a {len(bar)}-char burst reached the console as {len(joined)} chars"
+    )
+    # The last frame is the one a terminal would have shown.
+    assert "Processing: 20000/20000" in joined
+    assert "Processing: 19999/20000" not in joined, "earlier frames were overwritten"
+
+
+def test_tail_truncates_a_long_line_that_has_no_redraws_to_collapse(
+    monkeypatch, tmp_path
+):
+    """A giant line with no `\\r` (a JSON / base64 dump) costs the same to render.
+
+    Collapsing redraws cannot help here, so the length cap is what bounds it -- and it
+    must say so on the console, naming where the full line survives.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "mlperf_harness.log"
+    path.write_text("")
+    blob = "A" * 500_000
+
+    captured = _tail_once(path, append=blob + "\n")
+
+    joined = "\n".join(captured)
+    assert len(joined) < 10 * life._TAIL_MAX_LINE_CHARS, len(joined)
+    assert "line truncated for the console" in joined, joined[:200]
+    assert "500000 chars" in joined, "say how much was elided"
+    assert "mlperf_harness.log" in joined, "point at where the full line is"
+
+
+def test_tail_does_not_accumulate_an_unterminated_bar_across_ticks(
+    monkeypatch, tmp_path
+):
+    """The retained partial line must not grow without bound while the bar runs.
+
+    A bar that has not finished yet has no newline, so every tick would otherwise
+    append to (and re-copy) an ever-larger buffer for the whole hour it runs.
+    """
+    import tracemalloc
+
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_text("")
+    pad = "." * 120
+    # ~4 MB of bar delivered over several polls, with no newline to end it.
+    tick = "".join(f"\rstep {j} [{pad}]" for j in range(8000))
+
+    async def drive():
+        t = asyncio.ensure_future(life.tail_file_to_console(str(path), task_name="t"))
+        for _ in range(4):
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(tick)
+            await asyncio.sleep(0.4)
+        t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
+
+    tracemalloc.start()
+    asyncio.run(drive())
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Memory must track ONE poll, not the length of the bar. Measured: 3.0x a single
+    # poll's bytes when the retained partial is collapsed, 8.0x when it accumulates
+    # (and that multiple keeps climbing with the bar, which is the leak).
+    assert peak < 5 * len(tick), (
+        f"the tailer peaked at {peak} bytes = {peak / len(tick):.1f}x one poll's "
+        f"{len(tick)} bytes; the retained partial line must collapse each tick "
+        "rather than accumulate for as long as the bar runs"
+    )
+
+
+# The `\r`-collapse rules themselves now live with the shared helper they moved to:
+# tests/unit/test_utils_console_text.py. What stays here is that the TAILER applies them,
+# which is the part a k8s regression would break.
+
+
+def test_tail_flushes_an_unterminated_line_when_cancelled(monkeypatch, tmp_path):
+    """A bar that never printed its newline must still show its final frame.
+
+    The tailer only emits COMPLETE lines, so without a flush the last thing the task
+    displayed -- the whole point of a progress bar -- is the one thing the console never
+    sees. The pod is terminal by then, so there is no later tick to catch it.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_bytes(b"")
+    pad = b"." * 120
+    bar = b"".join(b"\rProcessing: %d/300 [%s]" % (i, pad) for i in range(1, 301))
+
+    messages = _tail_once(path, append_bytes=bar)  # NO trailing newline
+
+    joined = "\n".join(messages)
+    assert "Processing: 300/300" in joined, (
+        "the final frame of an unterminated bar must be flushed on cancellation"
+    )
+
+
+def test_tail_echoes_crlf_terminated_lines(monkeypatch, tmp_path):
+    """A CRLF-emitting task must still appear on the console.
+
+    Byte-exact input: splitting on ``\\n`` leaves a trailing ``\\r`` on every line, which a
+    last-frame-outright collapse turns into the empty string. The whole task then streams
+    NOTHING to the console while <task>.log fills up normally -- a silent blackout that
+    looks like a dead task.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_bytes(b"")
+
+    messages = _tail_once(
+        path, append_bytes=b"loading model\r\nserving on :8000\r\n"
+    )
+
+    joined = "\n".join(messages)
+    assert "loading model" in joined
+    assert "serving on :8000" in joined
+
+
+def test_tail_echoes_a_bar_whose_frames_end_with_cr(monkeypatch, tmp_path):
+    """A bar that ends each frame with ``\\r`` must still show its final frame."""
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_bytes(b"")
+    pad = b"." * 120
+    bar = b"".join(b"Processing: %d/500 [%s]\r" % (i, pad) for i in range(1, 501))
+
+    messages = _tail_once(path, append_bytes=bar + b"\n")
+
+    joined = "\n".join(messages)
+    assert "Processing: 500/500" in joined, "the final frame must survive"
+    assert "Processing: 499/500" not in joined, "earlier frames were overwritten"
+
+
+def test_tail_caps_total_chars_per_tick(monkeypatch, tmp_path):
+    """Per-line and per-count caps still multiply; the tick TOTAL must be bounded too.
+
+    400 lines x 2000 chars is 800 KB in one synchronous render -- ~5s of blocked event
+    loop at the measured cost, repeating for as long as the task stays chatty. Each line
+    here is individually well under the line cap and the count is under the count cap,
+    so only the tick budget can catch this.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_text("")
+    line = "y" * 1000
+
+    messages = _tail_once(path, append="".join(f"{line}\n" for _ in range(300)))
+
+    payload = [m for m in messages if m.startswith("y")]
+    assert payload, "the lines must still be surfaced, just bounded"
+    assert sum(len(m) for m in payload) <= life._TAIL_MAX_CHARS_PER_TICK, (
+        f"{sum(len(m) for m in payload)} chars rendered in one tick exceeds the "
+        f"{life._TAIL_MAX_CHARS_PER_TICK}-char budget"
+    )
+    assert any("console lines omitted" in m for m in messages), (
+        "what the budget dropped must be reported, not silently swallowed"
+    )
+
+
 def test_tail_file_to_console_noop_when_not_a_tty(monkeypatch, tmp_path):
     monkeypatch.setattr(life, "_console_active", lambda: False)
     path = tmp_path / "t.log"
@@ -1042,174 +1303,13 @@ def test_tail_file_to_console_noop_when_not_a_tty(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# completeness: re-fetch the whole container log on terminal (stream was cut)
+# completeness: the streamed <task>.log is finalized in place (no re-fetch)
 # ---------------------------------------------------------------------------
-
-
-def test_finalize_complete_log_splices_prefix_plus_complete_dump(monkeypatch, tmp_path):
-    dest = tmp_path / "t.log"
-    # <task>.log mid-run: [apply diagnostics prefix][partial live-streamed tail].
-    prefix = b"2026 - sflow.task.t - INFO - apply-diag-1\n"
-    dest.write_bytes(prefix + b"[pod/t] partial-live-tail\n")
-
-    async def fake_exec(*args, stdout=None, stderr=None, **kw):
-        # `kubectl logs <pod> --all-containers --prefix` returns the COMPLETE log.
-        stdout.write(b"[pod/t] complete-1\n[pod/t] complete-2\n[pod/t] complete-3\n")
-        stdout.flush()
-
-        class _P:
-            async def wait(self):
-                return 0
-
-        return _P()
-
-    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
-    asyncio.run(
-        life.finalize_complete_log(
-            ["pod/t"], str(dest), prefix_size=len(prefix), phases=["Succeeded"],
-            global_args=[], ns_args=[],
-        )
-    )
-    # Apply prefix preserved; the partial live tail is replaced by the complete
-    # dump (no duplication, nothing missing).
-    assert dest.read_bytes() == (
-        prefix + b"[pod/t] complete-1\n[pod/t] complete-2\n[pod/t] complete-3\n"
-    )
-    assert not (tmp_path / "t.log.complete.0").exists()
-    assert not (tmp_path / "t.log.final").exists()
-
-
-def test_finalize_complete_log_multi_pod_concatenates_per_pod(monkeypatch, tmp_path):
-    dest = tmp_path / "worker.log"
-    prefix = b"2026 - sflow.task.worker - INFO - apply-diag\n"
-    # Mid-run the file has the prefix + interleaved partial live content.
-    dest.write_bytes(prefix + b"[pod/worker-0] a-live\n[pod/worker-1] b-live\n")
-
-    async def fake_exec(*args, stdout=None, stderr=None, **kw):
-        argv = [str(a) for a in args]
-        pod = next((a for a in argv if a.startswith("pod/")), "")
-        if "worker-0" in pod:
-            stdout.write(b"[pod/worker-0] a1\n[pod/worker-0] a2\n")
-        elif "worker-1" in pod:
-            stdout.write(b"[pod/worker-1] b1\n[pod/worker-1] b2\n")
-        stdout.flush()
-
-        class _P:
-            async def wait(self):
-                return 0
-
-        return _P()
-
-    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
-    asyncio.run(
-        life.finalize_complete_log(
-            ["pod/worker-0", "pod/worker-1"], str(dest), prefix_size=len(prefix),
-            phases=["Succeeded", "Succeeded"], global_args=[], ns_args=[],
-        )
-    )
-    # Prefix preserved, then each pod's COMPLETE log grouped per pod (no interleave
-    # garble, nothing missing, no duplication of the partial live content).
-    assert dest.read_bytes() == (
-        prefix
-        + b"[pod/worker-0] a1\n[pod/worker-0] a2\n"
-        + b"[pod/worker-1] b1\n[pod/worker-1] b2\n"
-    )
-    assert not (tmp_path / "worker.log.complete.0").exists()
-    assert not (tmp_path / "worker.log.complete.1").exists()
-    assert not (tmp_path / "worker.log.final").exists()
-
-
-def test_finalize_complete_log_strips_ansi_and_collapses_cr(monkeypatch, tmp_path):
-    # A TTY task (aiperf/rich, pip) emits ANSI color/cursor codes and \r progress
-    # redraws; the rebuilt on-disk log must be cleaned. The apply-diagnostics
-    # prefix (sflow's own output) is preserved verbatim.
-    dest = tmp_path / "t.log"
-    prefix = b"2026 - sflow.task.t - INFO - apply-diag\n"
-    dest.write_bytes(prefix + b"partial\n")
-
-    dump = (
-        "\x1b[?25l\x1b[32mRequests 10%\x1b[0m\r"
-        "\x1b[32mRequests 100%\x1b[0m\x1b[?25h\n"
-        "\x1b[36mTime to First Token (ms)\x1b[0m 5,542.99\n"
-    )
-
-    async def fake_exec(*args, stdout=None, stderr=None, **kw):
-        stdout.write(dump.encode("utf-8"))
-        stdout.flush()
-
-        class _P:
-            async def wait(self):
-                return 0
-
-        return _P()
-
-    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
-    asyncio.run(
-        life.finalize_complete_log(
-            ["pod/t"], str(dest), prefix_size=len(prefix), phases=["Succeeded"],
-            global_args=[], ns_args=[],
-        )
-    )
-    assert dest.read_bytes() == (
-        prefix
-        + b"Requests 100%\n"  # \r redraw collapsed to final frame, ANSI stripped
-        + b"Time to First Token (ms) 5,542.99\n"  # ANSI color stripped
-    )
-
-
-def test_finalize_complete_log_keeps_live_content_on_dump_failure(monkeypatch, tmp_path):
-    dest = tmp_path / "t.log"
-    original = b"apply\n[pod/t] live-content\n"
-    dest.write_bytes(original)
-
-    async def fake_exec(*args, stdout=None, stderr=None, **kw):
-        class _P:
-            async def wait(self):
-                return 1  # dump failed (e.g. pod already deleted)
-
-        return _P()
-
-    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
-    asyncio.run(
-        life.finalize_complete_log(
-            ["pod/t"], str(dest), prefix_size=6, phases=["Succeeded"],
-            global_args=[], ns_args=[],
-        )
-    )
-    assert dest.read_bytes() == original  # untouched: don't wipe what we have
-
-
-def test_finalize_complete_log_skips_when_a_pod_is_not_terminal(monkeypatch, tmp_path):
-    # If any pod is gone/unknown (phase ""), we can't re-fetch it, so we keep the
-    # live-streamed content rather than rebuild a partial log (and never dump).
-    dest = tmp_path / "worker.log"
-    original = b"apply\n[pod/worker-0] live-0\n[pod/worker-1] live-1\n"
-    dest.write_bytes(original)
-    calls: list = []
-
-    async def fake_exec(*args, **kw):
-        calls.append(args)
-
-        class _P:
-            async def wait(self):
-                return 0
-
-        return _P()
-
-    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
-    asyncio.run(
-        life.finalize_complete_log(
-            ["pod/worker-0", "pod/worker-1"], str(dest), prefix_size=6,
-            phases=["Succeeded", ""], global_args=[], ns_args=[],
-        )
-    )
-    assert dest.read_bytes() == original  # kept as-is
-    assert calls == []  # short-circuited before dumping anything
 
 
 def test_run_pod_stream_cancel_interrupts_stream_without_finalize(monkeypatch, tmp_path):
     # A long-lived READY service cancelled at workflow end: the stream is
-    # interrupted but the complete-log re-fetch does NOT run (final_phase is "").
+    # CUT (not drained) because final_phase is "" -- its follow would never end.
     op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
     op.apply_backend_context(backend=_backend(), assigned_nodes=["node-0"],
                              artifacts=[], gpu_count=0)
@@ -1237,7 +1337,7 @@ def test_run_pod_stream_cancel_interrupts_stream_without_finalize(monkeypatch, t
     monkeypatch.setattr(life, "start_pod_log_file_stream", fake_start_stream)
     monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
     monkeypatch.setattr(life, "terminate_process", fake_terminate)
-    monkeypatch.setattr(life, "finalize_complete_log", fake_finalize)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", fake_finalize)
 
     async def drive():
         t = asyncio.ensure_future(op._run_pod_stream(plan=plan, index=0))
@@ -1248,7 +1348,7 @@ def test_run_pod_stream_cancel_interrupts_stream_without_finalize(monkeypatch, t
 
     asyncio.run(drive())
     assert terminated == [True]  # stream interrupted on teardown
-    assert finalized == []  # no complete-log re-fetch for a cancelled service
+    assert finalized == []  # nothing is finalized for a cancelled service
 
 
 # ---------------------------------------------------------------------------
@@ -1502,7 +1602,7 @@ def test_run_pod_stream_merge_uses_offloaded_demux_and_group_kill(monkeypatch, t
     assert calls["terminated"] == (True, True)
 
 
-def test_execute_merge_tails_each_member_and_rebuilds_complete_logs(monkeypatch, tmp_path):
+def test_execute_merge_tails_each_member_and_finalizes_member_logs(monkeypatch, tmp_path):
     op, _ = _merge_op_and_plan(tmp_path, ["decode_server_0", "decode_server_1"])
     events: list = []
     proc = _FakeProc()
@@ -1522,14 +1622,13 @@ def test_execute_merge_tails_each_member_and_rebuilds_complete_logs(monkeypatch,
     async def fake_terminate(p, *, kill_group=False):
         events.append(("terminate", kill_group))
 
-    async def fake_merged_finalize(
-        pod_ref, *, tag_paths, default_path, prefix_size, phase, global_args, ns_args,
-        force=False,
-    ):
-        events.append(("merged_finalize", tuple(sorted(tag_paths)), phase))
 
-    async def fake_single_finalize(*a, **k):
-        events.append(("single_finalize",))
+
+    def fake_sanitize(paths):
+        # member paths only -- the default/leader path is one of them for a merge-pod
+        events.append(("sanitize", tuple(sorted(
+            os.path.basename(p).removesuffix(".log") for p in paths
+        ))))
 
     async def fake_exit(pod_ref, *, phase="", **kw):
         return 0
@@ -1541,8 +1640,7 @@ def test_execute_merge_tails_each_member_and_rebuilds_complete_logs(monkeypatch,
     monkeypatch.setattr(life, "tail_file_to_console", fake_tail)
     monkeypatch.setattr(life, "watch_until_terminal", fake_watch)
     monkeypatch.setattr(life, "terminate_process", fake_terminate)
-    monkeypatch.setattr(life, "finalize_merged_complete_log", fake_merged_finalize)
-    monkeypatch.setattr(life, "finalize_complete_log", fake_single_finalize)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", fake_sanitize)
     monkeypatch.setattr(life, "pod_exit_code", fake_exit)
     monkeypatch.setattr(life, "delete_objects", fake_delete)
 
@@ -1560,174 +1658,338 @@ def test_execute_merge_tails_each_member_and_rebuilds_complete_logs(monkeypatch,
     assert all(t[2] == f"[{t[1]}] " for t in tails)
     assert ("demux", ("decode_server_0", "decode_server_1")) in events
     assert ("terminate", True) in events
-    # Merge guarantees complete logs by re-fetching + re-splitting the whole
-    # container log (finalize_merged_complete_log), just like the single-pod path;
-    # the single-pod finalize (one log per pod) is NOT used for a merge-pod.
-    assert (
-        "merged_finalize", ("decode_server_0", "decode_server_1"), "Succeeded"
-    ) in events
-    assert ("single_finalize",) not in events
+    # BEHAVIOUR CHANGE: the demux pipeline is now DRAINED on a terminal pod rather
+    # than group-killed mid-stream, so every member's <task>.log is already complete
+    # and the re-fetch + re-split is skipped. Merge still guarantees complete member
+    # logs -- now by keeping what the demuxer wrote -- and the single-pod finalize is
+    # still never used for a merge-pod.
+    assert ("sanitize", ("decode_server_0", "decode_server_1")) in events
 
 
-def test_dump_pod_log_raw_omits_prefix_for_mux_tag(tmp_path, monkeypatch):
-    captured: dict = {}
+def test_slow_post_terminal_stage_is_named_in_the_log(monkeypatch, tmp_path, caplog):
+    """A stalled epilogue must say WHICH stage stalled.
 
-    class _P:
+    Once the pods are terminal the DAG is blocked on this epilogue alone, and it used
+    to run silently: two ~20-minute investigations stalled on "which of the four
+    stages was it?", unanswerable from the artifacts. Any stage over the threshold
+    now names itself. Drives the log-finalize stage, which is the post-terminal stage
+    that still does real work (the TTY-sanitize pass over the streamed file).
+    """
+    from sflow.plugins.operators import k8s_operator as k8sop
+
+    async def _noop_stream(log_command, dest_path):
+        return _FakeProc()
+
+    async def _noop_tail(path, *, task_name):
+        await asyncio.sleep(3600)
+
+    async def _watch(pod_ref, **kw):
+        return "Succeeded"
+
+    async def _term(p, *, kill_group=False):
+        pass
+
+    def _slow_finalize(paths):
+        time.sleep(0.05)                   # the stage we expect to be named
+
+    async def _exit(pod_ref, *, phase="", **kw):
+        return 0
+
+    async def _delete(refs, **kw):
+        pass
+
+    monkeypatch.setattr(life, "start_pod_log_file_stream", _noop_stream)
+    monkeypatch.setattr(life, "tail_file_to_console", _noop_tail)
+    monkeypatch.setattr(life, "watch_until_terminal", _watch)
+    monkeypatch.setattr(life, "terminate_process", _term)
+    monkeypatch.setattr(life, "sanitize_streamed_logs", _slow_finalize)
+    monkeypatch.setattr(life, "pod_exit_code", _exit)
+    monkeypatch.setattr(life, "delete_objects", _delete)
+    monkeypatch.setattr(k8sop, "_EPILOGUE_WARN_S", 0.01)
+
+    op = K8sOperator(K8sOperatorConfig(name="op", image="img:1"))
+    op.apply_backend_context(backend=_backend(), assigned_nodes=["node-0"],
+                             artifacts=[], gpu_count=2)
+    with caplog.at_level(logging.WARNING, logger="sflow.plugins.operators.k8s_operator"):
+        rc = asyncio.run(
+            op.execute(
+                launcher=_FakeLauncher(), output_logger=None,
+                env={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)},
+                task_name="mlperf_harness", script=["run"],
+            )
+        )
+    assert rc == 0
+    slow = [r.message for r in caplog.records if "post-terminal" in r.message]
+    assert slow, "a slow post-terminal stage must be reported, not silent"
+    assert any("log finalize" in m for m in slow), slow
+    assert any("mlperf_harness" in m for m in slow), slow
+
+
+# ---------------------------------------------------------------------------
+# drain the follow instead of killing it (removes the re-fetch from the hot path)
+# ---------------------------------------------------------------------------
+
+
+def test_drain_log_stream_waits_for_a_follow_that_finishes():
+    """A terminal pod's follow hits EOF on its own -- wait for it, don't kill it.
+
+    Killing it mid-stream is what truncated <task>.log and made the one-shot re-fetch
+    necessary; the re-fetch in turn had to be repaired for kubelet log rotation.
+    """
+    class _Exits:
+        returncode = None
+
         async def wait(self):
+            self.returncode = 0
             return 0
 
-    async def fake_exec(*args, stdout=None, stderr=None, **kw):
-        captured["args"] = [str(a) for a in args]
-        return _P()
+    assert asyncio.run(life.drain_log_stream(_Exits())) is True
 
-    monkeypatch.setattr(life.asyncio, "create_subprocess_exec", fake_exec)
-    ok = asyncio.run(
-        life._dump_pod_log_raw(
-            "pod/m", str(tmp_path / "dump.log"),
-            global_args=["--context", "c"], ns_args=["--namespace", "ns"],
+
+def test_drain_log_stream_is_bounded_and_kills_a_stuck_follow(monkeypatch, caplog):
+    """The historical kubectl bug is a follow that NEVER exits after pod completion.
+
+    The epilogue is on the DAG's critical path, so the drain must be bounded: cut the
+    follow and keep whatever it had already written, rather than wait forever.
+    """
+    killed: list = []
+
+    class _Stuck:
+        returncode = None
+
+        async def wait(self):
+            await asyncio.sleep(3600)
+
+    async def fake_terminate(proc, *, kill_group=False):
+        killed.append(kill_group)
+
+    monkeypatch.setattr(life, "terminate_process", fake_terminate)
+    with caplog.at_level(logging.WARNING):
+        drained = asyncio.run(
+            life.drain_log_stream(_Stuck(), kill_group=True, timeout=0.01)
         )
-    )
-    assert ok is True
-    args = captured["args"]
-    assert args[0] == "kubectl" and "logs" in args and "pod/m" in args
-    # No --prefix: each line must keep its [[sflow-mux:<task>]] tag at line start.
-    assert "--prefix" not in args
-    # --all-containers mirrors the live stream so the rebuild covers the same lines.
-    assert "--all-containers" in args
-    assert "--context" in args and "--namespace" in args
+    assert drained is False, "a stuck follow must not block the epilogue"
+    assert killed == [True], "the stuck pipeline must be group-killed"
+    assert any("did not finish" in r.getMessage() for r in caplog.records)
 
 
-def test_finalize_merged_complete_log_rebuilds_from_complete_dump(
-    tmp_path, monkeypatch, fake_process
+def test_drain_of_an_already_exited_stream_is_a_noop():
+    class _Done:
+        returncode = 0
+
+        async def wait(self):  # pragma: no cover - must not be reached
+            raise AssertionError("must not wait on an exited process")
+
+    assert asyncio.run(life.drain_log_stream(_Done())) is True
+
+
+def test_sanitize_streamed_logs_strips_tty_bytes_and_skips_missing(tmp_path):
+    """The drained path keeps the streamed file, so it must apply the cleanup the
+    re-fetch used to provide."""
+    good = tmp_path / "a.log"
+    good.write_bytes(b"frame1\rframe2\rfinal line\n\x1b[31mred\x1b[0m\n")
+    empty = tmp_path / "empty.log"
+    empty.write_bytes(b"")
+    life.sanitize_streamed_logs([str(good), str(empty), str(tmp_path / "gone.log")])
+    out = good.read_bytes()
+    assert b"\r" not in out and b"\x1b" not in out
+    assert b"final line" in out and b"red" in out
+    assert b"frame1" not in out, "\\r redraws collapse to the last frame"
+
+
+def test_tail_keeps_the_final_frame_of_an_unterminated_bar_ending_in_cr(
+    monkeypatch, tmp_path
 ):
-    fake_process.allow_unregistered(True)  # the re-split runs the real python demuxer
-    (tmp_path / "decode_server_0").mkdir()
-    (tmp_path / "decode_server_1").mkdir()
-    leader = tmp_path / "decode_server_0" / "decode_server_0.log"
-    member1 = tmp_path / "decode_server_1" / "decode_server_1.log"
-    tag_paths = {"decode_server_0": str(leader), "decode_server_1": str(member1)}
-    # Mid-run: leader has the apply prefix + a partial live tail; member1 partial.
-    apply_prefix = b"2026 - sflow.task.decode_server_0 - INFO - apply-diag\n"
-    leader.write_bytes(apply_prefix + b"partial pod-level (behind)\n")
-    member1.write_bytes(b"partial member1 (behind)\n")
+    """An unterminated bar whose last byte is ``\\r`` must still show its final frame.
 
-    complete = (
-        "[[sflow-mux:decode_server_0]] leader line 1\n"
-        "pod-level line\n"
-        "[[sflow-mux:decode_server_1]] member1 line 1\n"
-        "[[sflow-mux:decode_server_0]] leader line 2\n"
-        "[[sflow-mux:decode_server_1]] member1 line 2\n"
+    ``frame_in_progress`` collapses the retained line to what follows the last ``\\r`` --
+    which for this shape is NOTHING -- so the frame the terminal is still displaying has
+    to be carried separately and rejoined at flush. Without the carry the console shows
+    absolutely nothing for the task's last visible output, which is the one line a
+    progress bar exists to produce. ``SubprocessLauncher`` already handles this for every
+    other backend; kubectl delivers exactly this shape when the container exits.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_bytes(b"")
+    pad = b"." * 60
+    # Every frame ENDS with \r and there is no terminating newline, so `\r` is the very
+    # last byte in the file when the tailer is cancelled.
+    bar = b"".join(b"Epoch %d/300 [%s]\r" % (i, pad) for i in range(1, 301))
+
+    messages = _tail_once(path, append_bytes=bar)
+
+    joined = "\n".join(messages)
+    assert "Epoch 300/300" in joined, (
+        "the carried frame must be rejoined at flush; without it the console shows "
+        f"nothing at all for this task. Got {messages!r}"
     )
-
-    async def fake_dump(pod_ref, dest_path, *, global_args, ns_args):
-        with open(dest_path, "w", encoding="utf-8") as f:
-            f.write(complete)
-        return True
-
-    monkeypatch.setattr(life, "_dump_pod_log_raw", fake_dump)
-    asyncio.run(
-        life.finalize_merged_complete_log(
-            "pod/merged", tag_paths=tag_paths, default_path=str(leader),
-            prefix_size=len(apply_prefix), phase="Succeeded",
-            global_args=[], ns_args=[],
-        )
-    )
-    # Leader = preserved apply prefix + its tagged lines + pod-level (untagged),
-    # rebuilt complete from the dump (the partial live tail is replaced, no dupes).
-    assert leader.read_text() == (
-        apply_prefix.decode()
-        + "leader line 1\npod-level line\nleader line 2\n"
-    )
-    # Member1 = its complete tagged lines only (partial live content replaced).
-    assert member1.read_text() == "member1 line 1\nmember1 line 2\n"
-    # Temp dump/rebuild files are cleaned up.
-    assert not list(tmp_path.glob("**/*.merged.*"))
+    assert "Epoch 299/300" not in joined, "superseded frames were overwritten on screen"
 
 
-def test_finalize_merged_complete_log_strips_ansi_per_member(
-    tmp_path, monkeypatch, fake_process
+def test_tail_reads_once_more_when_cancelled_so_the_drained_tail_is_shown(
+    monkeypatch, tmp_path
 ):
-    # ANSI/\r in the merged dump must be cleaned per-member AFTER the demux (so the
-    # routing tags are never touched by the \r collapse).
-    fake_process.allow_unregistered(True)  # the re-split runs the real python demuxer
-    (tmp_path / "s0").mkdir()
-    (tmp_path / "s1").mkdir()
-    leader = tmp_path / "s0" / "s0.log"
-    member1 = tmp_path / "s1" / "s1.log"
-    tag_paths = {"s0": str(leader), "s1": str(member1)}
-    apply_prefix = b"2026 - sflow.task.s0 - INFO - apply-diag\n"
-    leader.write_bytes(apply_prefix + b"partial\n")
-    member1.write_bytes(b"partial\n")
+    """Output appended just before cancellation must still reach the console.
 
-    complete = (
-        "[[sflow-mux:s0]] \x1b[32mleader ok\x1b[0m\n"
-        "\x1b[36mpod-level\x1b[0m\n"
-        "[[sflow-mux:s1]] member\rmember-final\n"
+    ``execute`` cancels the tailer immediately after ``drain_log_stream`` delivered the
+    pod's tail, so the most interesting bytes of the whole run routinely land inside the
+    final poll gap. Without a last read they are echoed nowhere -- the console's last
+    word on a finished task would be whatever happened 0.3s earlier.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_bytes(b"")
+    captured: list = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    cap = _Cap()
+    life._logger.addHandler(cap)
+    old_level = life._logger.level
+    life._logger.setLevel(logging.INFO)
+    try:
+        async def drive():
+            t = asyncio.ensure_future(
+                life.tail_file_to_console(str(path), task_name="t")
+            )
+            await asyncio.sleep(0.05)
+            with open(path, "ab") as fh:
+                fh.write(b"benchmark complete: 1234 tok/s\n")
+            # Cancel at once -- far inside the poll interval, as the real caller does.
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+
+        asyncio.run(drive())
+    finally:
+        life._logger.removeHandler(cap)
+        life._logger.setLevel(old_level)
+
+    assert any("benchmark complete: 1234 tok/s" in m for m in captured), (
+        f"the tail delivered by the drain must survive cancellation, got {captured!r}"
     )
 
-    async def fake_dump(pod_ref, dest_path, *, global_args, ns_args):
-        with open(dest_path, "w", encoding="utf-8") as f:
-            f.write(complete)
-        return True
 
-    monkeypatch.setattr(life, "_dump_pod_log_raw", fake_dump)
-    asyncio.run(
-        life.finalize_merged_complete_log(
-            "pod/merged", tag_paths=tag_paths, default_path=str(leader),
-            prefix_size=len(apply_prefix), phase="Succeeded",
-            global_args=[], ns_args=[],
+def test_tail_caps_lines_per_tick_and_reports_the_omission(monkeypatch, tmp_path):
+    """The per-tick LINE COUNT cap (distinct from the per-line and per-tick char caps).
+
+    A task that dumps tens of thousands of short lines in one poll interval passes both
+    character caps -- each line is tiny -- so only the count cap bounds the number of
+    console records handed to the rich handler in a single event-loop slice.
+    """
+    monkeypatch.setattr(life, "_console_active", lambda: True)
+    path = tmp_path / "t.log"
+    path.write_bytes(b"")
+    burst = b"".join(b"line %d\n" % i for i in range(5000))
+
+    messages = _tail_once(path, append_bytes=burst)
+
+    echoed = [m for m in messages if m.startswith("line ")]
+    assert len(echoed) <= life._TAIL_MAX_LINES_PER_TICK, (
+        f"{len(echoed)} lines echoed in one tick, cap is "
+        f"{life._TAIL_MAX_LINES_PER_TICK}"
+    )
+    assert any("console lines omitted" in m for m in messages), (
+        "a silent drop reads as 'the task printed nothing'; it must be reported"
+    )
+    assert any("line 4999" in m for m in echoed), "the NEWEST lines are the ones kept"
+
+
+def test_tick_char_budget_can_never_starve_the_first_line():
+    """The two console caps are independent constants and must stay ordered.
+
+    A tick budget below the per-line cap would reject the FIRST line of every tick --
+    lines are emitted whole or not at all -- and silence the console permanently while
+    <task>.log kept filling. The code enforces the relationship with ``max()`` rather
+    than trusting it; this pins the invariant so a future tuning cannot invert it.
+    """
+    assert life._TAIL_MAX_CHARS_PER_TICK >= life._TAIL_MAX_LINE_CHARS, (
+        "the per-tick character budget must admit at least one full-length line"
+    )
+    assert life._TAIL_MAX_LINE_CHARS == console_text.CONSOLE_LINE_CHAR_CAP, (
+        "the k8s per-line cap must stay the shared console cap, or the k8s tailer and "
+        "the launcher will drift on how much of a line the console may render"
+    )
+
+
+# ---------------------------------------------------------------------------
+# stop_log_stream: drain a terminal pod's follow, cut a still-running one's
+# ---------------------------------------------------------------------------
+
+
+def test_stop_log_stream_drains_a_terminal_pod_instead_of_killing_it():
+    """A terminal pod's follow hits EOF, so it must be drained -- killing truncates."""
+    waited = {"v": False}
+    killed: list = []
+
+    class _Finishes:
+        returncode = None
+
+        async def wait(self):
+            waited["v"] = True
+            self.returncode = 0
+            return 0
+
+    async def fake_terminate(proc, *, kill_group=False):
+        killed.append(kill_group)
+
+    proc = _Finishes()
+    with mock.patch.object(life, "terminate_process", fake_terminate):
+        drained = asyncio.run(life.stop_log_stream(proc, terminal=True))
+
+    assert drained is True
+    assert waited["v"] is True, "a terminal follow must be waited out, not signalled"
+
+
+def test_stop_log_stream_cuts_a_still_running_pod_without_waiting():
+    """A pod still Running at teardown has a follow that would NEVER end.
+
+    Draining it would block teardown for the full timeout on every long-lived service
+    in the workflow, so this branch must signal immediately and not wait.
+    """
+    killed: list = []
+
+    class _Never:
+        returncode = None
+
+        async def wait(self):  # pragma: no cover - must not be reached
+            raise AssertionError("a running pod's follow must not be waited on")
+
+    async def fake_terminate(proc, *, kill_group=False):
+        killed.append(kill_group)
+
+    with mock.patch.object(life, "terminate_process", fake_terminate):
+        drained = asyncio.run(
+            life.stop_log_stream(_Never(), terminal=False, kill_group=True)
         )
-    )
-    # Leader: apply prefix kept; tagged + pod-level bodies ANSI-stripped.
-    assert leader.read_text() == apply_prefix.decode() + "leader ok\npod-level\n"
-    # Member1: \r redraw collapsed to the final frame.
-    assert member1.read_text() == "member-final\n"
-    assert not list(tmp_path.glob("**/*.merged.*"))
-    assert not list(tmp_path.glob("**/*.san"))
+
+    assert drained is False
+    assert killed == [True], "the merge pipeline must be group-killed, not left running"
 
 
-def test_finalize_merged_complete_log_keeps_live_on_dump_failure(tmp_path, monkeypatch):
-    leader = tmp_path / "a" / "leader.log"
-    member = tmp_path / "b" / "member.log"
-    leader.parent.mkdir()
-    member.parent.mkdir()
-    leader.write_bytes(b"live-leader\n")
-    member.write_bytes(b"live-member\n")
+def test_stop_log_stream_reaps_the_child_even_when_the_drain_overruns():
+    """The drain is bounded; whatever happens, the kubectl child must not outlive it.
 
-    async def fake_dump(pod_ref, dest_path, *, global_args, ns_args):
-        with open(dest_path, "w", encoding="utf-8") as f:
-            f.write("partial")  # a dump file was created ...
-        return False  # ... but the re-fetch failed
+    The reap lives in a ``finally`` precisely because the drain is a cancellable await
+    on the teardown path -- an unreaped follow keeps writing into a log the driver has
+    already finalized.
+    """
+    killed: list = []
 
-    monkeypatch.setattr(life, "_dump_pod_log_raw", fake_dump)
-    asyncio.run(
-        life.finalize_merged_complete_log(
-            "pod/m", tag_paths={"a": str(leader), "b": str(member)},
-            default_path=str(leader), prefix_size=0, phase="Succeeded",
-            global_args=[], ns_args=[],
-        )
-    )
-    # Live content is kept as-is (never wiped for a partial rebuild) ...
-    assert leader.read_bytes() == b"live-leader\n"
-    assert member.read_bytes() == b"live-member\n"
-    assert not list(tmp_path.glob("**/*.merged.*"))  # ... and the temp dump cleaned
+    class _Stuck:
+        returncode = None
 
+        async def wait(self):
+            await asyncio.sleep(3600)
 
-def test_finalize_merged_complete_log_skips_when_not_terminal(tmp_path, monkeypatch):
-    calls: list = []
+    async def fake_terminate(proc, *, kill_group=False):
+        killed.append(kill_group)
 
-    async def fake_dump(*a, **k):
-        calls.append(a)
-        return True
+    with mock.patch.object(life, "terminate_process", fake_terminate):
+        with mock.patch.object(life, "STREAM_DRAIN_TIMEOUT", 0.01):
+            drained = asyncio.run(life.stop_log_stream(_Stuck(), terminal=True))
 
-    monkeypatch.setattr(life, "_dump_pod_log_raw", fake_dump)
-    leader = tmp_path / "leader.log"
-    leader.write_bytes(b"live\n")
-    asyncio.run(
-        life.finalize_merged_complete_log(
-            "pod/m", tag_paths={"m": str(leader)}, default_path=str(leader),
-            prefix_size=0, phase="", global_args=[], ns_args=[],
-        )
-    )
-    assert calls == []  # not terminal -> not re-fetchable -> no dump attempted
-    assert leader.read_bytes() == b"live\n"  # untouched
+    assert drained is False, "an overrunning drain must not report success"
+    assert killed, "the stuck follow must be terminated on the overrun path"

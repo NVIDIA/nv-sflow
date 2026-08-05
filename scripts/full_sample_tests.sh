@@ -48,6 +48,9 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXAMPLES_DIR="$REPO_DIR/examples"
+# Kubernetes SMOKE recipes are test fixtures, not user-facing samples, so they live
+# with the other k8s smoke fixtures rather than under examples/.
+SMOKE_RECIPE_DIR="$REPO_DIR/tests/integration/recipes/kubernetes"
 # Packaged samples (a curated SUBSET of examples/, shipped via `sflow sample`). Refreshed
 # in place from examples/ before recipe validation -- see the sample-sync step below.
 SAMPLES_DIR="$REPO_DIR/src/sflow/samples"
@@ -351,6 +354,7 @@ if true; then
     KUBERNETES_HELLO_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_hello_world.log"
     KUBERNETES_LWS_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_multinode.log"
     KUBERNETES_MPI_SMOKE_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_mpi_smoke.log"
+    KUBERNETES_LOG_BURST_DRYRUN_LOG="$BACKEND_AGNOSTIC_DIR/kubernetes_log_burst_smoke.log"
     mkdir -p "$BACKEND_AGNOSTIC_DIR"
     run_check "dry-run docker_hello_world uses docker_run default operator" \
         bash -c "sflow run \"$EXAMPLES_DIR/self_contained/docker/hello_world.yaml\" --dry-run --verbose > \"$DOCKER_HELLO_DRYRUN_LOG\" 2>&1 && \
@@ -375,10 +379,21 @@ if true; then
     # Multi-node k8s_mpi SMOKE example (bootstrap + role barrier + cpu_bind render);
     # plan-only here (the real cross-node run lives in scripts/k8s_e2e_verify.sh).
     run_check "dry-run kubernetes_mpi_smoke uses k8s_mpi operator" \
-        bash -c "sflow run \"$EXAMPLES_DIR/self_contained/kubernetes/mpi_smoke.yaml\" --dry-run --verbose > \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\" 2>&1 && \
+        bash -c "sflow run \"$SMOKE_RECIPE_DIR/mpi_smoke.yaml\" --dry-run --verbose > \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\" 2>&1 && \
             grep -F -- 'id=kubernetes' \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\" && \
             grep -F -- 'operator: k8s_mpi' \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\" && \
             grep -F -- 'Dry-run complete: k8s_mpi_smoke' \"$KUBERNETES_MPI_SMOKE_DRYRUN_LOG\""
+    # Console LOG-BURST smoke example (an unterminated \r bar that froze the driver);
+    # plan-only here -- the real burst needs a cluster AND a pty, and lives in
+    # scripts/k8s_e2e_verify.sh. This row just keeps the recipe from rotting: it mixes
+    # k8s tasks with a LOCAL-backend verdict task, which is the part most likely to
+    # break silently under backend/assembly changes.
+    run_check "dry-run kubernetes_log_burst_smoke spans k8s + local backends" \
+        bash -c "sflow run \"$SMOKE_RECIPE_DIR/log_burst_smoke.yaml\" --dry-run --verbose > \"$KUBERNETES_LOG_BURST_DRYRUN_LOG\" 2>&1 && \
+            grep -F -- 'id=kubernetes' \"$KUBERNETES_LOG_BURST_DRYRUN_LOG\" && \
+            grep -F -- 'operator: k8s' \"$KUBERNETES_LOG_BURST_DRYRUN_LOG\" && \
+            grep -F -- 'backend: driver' \"$KUBERNETES_LOG_BURST_DRYRUN_LOG\" && \
+            grep -F -- 'Dry-run complete: k8s_log_burst_smoke' \"$KUBERNETES_LOG_BURST_DRYRUN_LOG\""
 
     # NOTE: the mimic-script SMOKE recipes (reservation / cross-task IP / apply +
     # validate / log offload) are test fixtures, not user-facing examples. They live

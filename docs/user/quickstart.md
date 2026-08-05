@@ -715,7 +715,7 @@ sflow run -f hello_world.yaml \
   --tui
 ```
 
-Before allocating, sflow runs a **non-mutating RBAC pre-flight** (`kubectl auth can-i …`) for the pod/configmap/secret/log operations it needs and fails fast with an actionable message if a permission is missing. Bypass it with `SFLOW_SKIP_K8S_PREFLIGHT=1` if your cluster restricts `auth can-i`.
+Before allocating, sflow runs a **non-mutating RBAC pre-flight** (`kubectl auth can-i …`) for the pod/configmap/secret/log operations it needs and fails fast with an actionable message if a permission is missing. Only namespaced permissions it truly depends on are hard gates — denied cluster-scoped reads (`namespaces`, `nodes`) just warn, so a namespaced ServiceAccount works out of the box. Bypass the check entirely with `SFLOW_SKIP_K8S_PREFLIGHT=1`.
 
 **Prerequisites:**
 

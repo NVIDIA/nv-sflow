@@ -485,6 +485,43 @@ def test_cli_run_explicit_kubectl_args_not_flagged_generic(mock_sflow_app, tmp_p
     assert kube_cfg.generic_extra_args == ["--foo=1"]
 
 
+def test_cli_run_threads_extra_kubectl_apply_args_to_the_kubectl_config(
+    mock_sflow_app, tmp_path
+):
+    """--extra-kubectl-apply-args must reach the backend, not just be parsed.
+
+    A flag accepted by the CLI and then dropped is the classic silent defect: the run
+    looks configured and the cluster still rejects every apply. This is the one link in
+    the chain (CLI -> KubectlConfig -> backend -> kubectl wrapper) that no other test
+    covers, and it is repeatable, so both values must arrive in order.
+    """
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "run", "-f", str(wf), "--dry-run",
+            "--extra-kubectl-apply-args", "--validate=false",
+            "--extra-kubectl-apply-args", "--server-side",
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    kube_cfg = mock_sflow_app.run.call_args.kwargs["kubectl_config"]
+    assert kube_cfg.apply_args == ["--validate=false", "--server-side"]
+    # And they stay OUT of the global channel, which is the whole point of the option:
+    # kubectl rejects `kubectl --validate=false apply` as an unknown flag.
+    assert kube_cfg.extra_args == []
+    assert kube_cfg.kubectl_apply_args() == ["--validate=false", "--server-side"]
+    assert "--validate=false" not in kube_cfg.global_args()
+
+
+def test_cli_run_without_apply_args_leaves_the_channel_empty(mock_sflow_app, tmp_path):
+    """Absent the flag the config must be empty, not None -- callers do list(...) on it."""
+    wf = _min_workflow(tmp_path)
+    result = runner.invoke(app, ["run", "-f", str(wf), "--dry-run"])
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_sflow_app.run.call_args.kwargs["kubectl_config"].apply_args == []
+
+
 # -- Shared batch helper unit tests --
 
 

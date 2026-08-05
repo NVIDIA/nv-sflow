@@ -30,6 +30,7 @@ from sflow.core.command_log import (
     reset_active_command_log_router,
     set_active_command_log_router,
 )
+from sflow.core.command_trace import get_command_trace
 from sflow.core.execution_summary import SflowSummaryWriter
 from sflow.core.uploads import UploadResult
 from sflow.logging import (
@@ -185,6 +186,12 @@ class SflowApp:
         self.last_workflow_output_dir = None
 
         # load the config (supports single path or multiple paths for merging)
+        # A run starts here -- before any backend allocation, so external-command
+        # telemetry covers the preflight/reservation phase too (that is where quota
+        # rejections and reservation stalls show up). The recorder is a process-wide
+        # singleton, so this boundary is what stops a second run in the same process
+        # from inheriting the first run's counters. See core.command_trace.
+        get_command_trace().begin_run()
         files = [file] if isinstance(file, Path) else list(file)
         _loader = ConfigLoader()
         config = _loader.load_configs(

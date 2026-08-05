@@ -5,7 +5,6 @@ import asyncio
 import errno
 import logging
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -17,6 +16,13 @@ except ImportError:  # pragma: no cover - exercised by Windows import tests.
     pty = None
 
 from sflow.logging import SFLOW_TASK_STREAM_ATTR, get_logger
+from sflow.utils.console_text import (
+    clamp_for_console,
+    frame_in_progress,
+    last_visible_frame,
+    rejoin_carried_frame,
+    strip_ansi,
+)
 
 from .command import Command, format_command
 from .command_log import record_active_command
@@ -56,11 +62,19 @@ def _emit_task_output_line(
     Transient progress-bar snapshots pass ``to_file=False`` so they animate live
     on the console/TUI without polluting the persistent per-task log, which keeps
     only completed (final-state) lines.
+
+    The two destinations are deliberately asymmetric: ``<task>.log`` gets the line
+    WHOLE (it is the ground-truth record), while the console copy is clamped to
+    ``CONSOLE_LINE_CHAR_CAP``. One unbounded line rendered through the console handler
+    is enough to freeze the driver's event loop -- see :data:`~sflow.utils.console_text.
+    CONSOLE_LINE_CHAR_CAP` -- and the console is best-effort observability, so losing
+    the tail of a line there costs nothing that the log does not still have.
     """
     if output_logger and to_file:
         output_logger.info(line_str)
     if stream_console:
-        _logger.info(f"{pfx}{line_str}", extra={SFLOW_TASK_STREAM_ATTR: True})
+        shown = clamp_for_console(line_str)
+        _logger.info(f"{pfx}{shown}", extra={SFLOW_TASK_STREAM_ATTR: True})
 
 
 # How often an in-progress (carriage-return) line is surfaced to the console/TUI
@@ -77,14 +91,9 @@ _PARTIAL_FLUSH_INTERVAL = 0.4
 _MAX_PTY_READS_PER_LOOP = 8
 
 
-# Compiled once at import time: recompiling per line was a measurable cost when
-# task output is chatty (this runs for every line of every task's stdout/stderr).
-_ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-
-
-def _strip_ansi(text: str) -> str:
-    """Strip ANSI escape sequences from text."""
-    return _ANSI_ESCAPE_RE.sub("", text)
+# ANSI stripping and `\r` collapsing now live in sflow.utils.console_text, shared with
+# the k8s tailer and the on-disk log rebuild so the three cannot drift apart on how they
+# treat a progress bar. Imported above; nothing else here needs redefining.
 
 
 class SubprocessLauncher:
@@ -216,25 +225,44 @@ class SubprocessLauncher:
         # without emitting every redraw frame (and without writing to <task>.log).
         partial_text: str | None = None
         partial_at = 0.0
+        # What the terminal is CURRENTLY showing for the unfinished line but which
+        # ``buffer`` no longer holds. Collapsing the retained buffer to the in-progress
+        # frame is what keeps a never-ending progress bar from growing without bound,
+        # but when the line ends on a redraw (``...100%\r``) that frame is empty -- so
+        # the last thing the task actually displayed would be dropped, both at EOF and
+        # when the terminating newline arrives in a LATER read. Keeping it separately
+        # (rather than in ``buffer``) is deliberate: the next read appends, and
+        # appending to an already-superseded frame would splice the two together --
+        # which is why it is put back with ``rejoin_carried_frame`` (re-inserting the
+        # ``\r`` that separated them) and never by plain concatenation. Concatenating
+        # made two consecutive redraw-terminated reads render as "50%60%" instead of
+        # the "60%" a terminal shows, and that spliced line reached <task>.log too.
+        visible_prefix = ""
 
         def _feed(data: bytes) -> None:
             # Append new bytes and emit any newly-completed lines, keeping the
             # incomplete trailing line in ``buffer`` for the next read.
-            nonlocal buffer, partial_text, partial_at
+            nonlocal buffer, partial_text, partial_at, visible_prefix
             buffer += data
             # Only split on real newlines; a carriage return rewrites the CURRENT
             # line in place (progress bars), it does not start a new one.
-            text = buffer.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            text = rejoin_carried_frame(
+                visible_prefix,
+                buffer.decode("utf-8", errors="replace").replace("\r\n", "\n"),
+            )
             lines = text.split("\n")
             # Keep the trailing incomplete physical line for the next read. Collapse
             # its in-place \r redraws now so a pure progress bar (which only emits
             # \r until it finishes) can't grow the buffer without bound.
-            buffer = lines[-1].rsplit("\r", 1)[-1].encode("utf-8")
+            buffer = frame_in_progress(lines[-1]).encode("utf-8")
+            visible_prefix = (
+                "" if buffer else strip_ansi(last_visible_frame(lines[-1])).rstrip()
+            )
             for line_str in lines[:-1]:
                 # Terminal semantics: \r returns to the start of the line and the
                 # text after it overwrites what came before. Keep only the final
                 # state so a completed progress line renders once, not per redraw.
-                line_str = _strip_ansi(line_str.rsplit("\r", 1)[-1]).rstrip()
+                line_str = strip_ansi(last_visible_frame(line_str)).rstrip()
                 if not line_str:
                     continue
                 if line_str == partial_text:
@@ -262,8 +290,16 @@ class SubprocessLauncher:
             # nothing consumes them (batch / non-TTY / offload, where stream_console
             # is False and the emit would be a no-op anyway).
             if stream_console:
-                snapshot = _strip_ansi(
-                    buffer.decode("utf-8", errors="replace")
+                # ``visible_prefix`` is set only when ``buffer`` is empty (the line ended
+                # on a redraw), so exactly one of the two has content -- and a bar that
+                # pauses mid-redraw still animates instead of blanking. Rejoined (not
+                # concatenated) so the overwrite semantics hold if that ever changes.
+                snapshot = strip_ansi(
+                    last_visible_frame(
+                        rejoin_carried_frame(
+                            visible_prefix, buffer.decode("utf-8", errors="replace")
+                        )
+                    )
                 ).rstrip()
                 now = loop.time()
                 if (
@@ -282,10 +318,19 @@ class SubprocessLauncher:
                     partial_at = now
 
         def _flush_tail() -> None:
-            nonlocal buffer, partial_text
-            if buffer:
-                line_str = _strip_ansi(
-                    buffer.decode("utf-8", errors="replace").rsplit("\r", 1)[-1]
+            nonlocal buffer, partial_text, visible_prefix
+            # The stream has ended, so whatever is left is now a COMPLETE line --
+            # last_visible_frame, not frame_in_progress. ``visible_prefix`` carries the
+            # case ``buffer`` cannot: a bar whose last redraw ended with `\r`, where the
+            # in-progress frame is empty but the terminal is still showing the frame
+            # before it. Without it the task's final visible output is lost entirely.
+            if buffer or visible_prefix:
+                line_str = strip_ansi(
+                    last_visible_frame(
+                        rejoin_carried_frame(
+                            visible_prefix, buffer.decode("utf-8", errors="replace")
+                        )
+                    )
                 ).rstrip()
                 # Persist the final state to <task>.log (unless it just duplicates
                 # the last streamed snapshot).
@@ -301,6 +346,7 @@ class SubprocessLauncher:
                     # final state in the per-task log so the file is complete.
                     output_logger.info(line_str)
                 buffer = b""
+                visible_prefix = ""
                 partial_text = None
 
         def _on_readable() -> None:

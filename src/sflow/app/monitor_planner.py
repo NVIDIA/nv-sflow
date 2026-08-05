@@ -276,6 +276,18 @@ class _MonitorPlanner:
         gpus_conf = getattr(resources, "gpus", None) if resources else None
         if gpus_conf is None:
             return None
+        # Explicit indices win: watch exactly those devices rather than the
+        # first N. (Schema guarantees at least one of indices/count is set.)
+        indices = getattr(gpus_conf, "indices", None)
+        if indices is not None:
+            if isinstance(indices, str):
+                raise ValueError(
+                    "monitor resources.gpus.indices must be a list; monitor resources "
+                    "do not support ${{ }} expressions yet"
+                )
+            return [
+                _coerce_int(idx, field_name="resources.gpus.indices") for idx in indices
+            ]
         count = _coerce_int(gpus_conf.count, field_name="resources.gpus.count")
         if count <= 0:
             raise ValueError("monitor resources.gpus.count must be > 0")

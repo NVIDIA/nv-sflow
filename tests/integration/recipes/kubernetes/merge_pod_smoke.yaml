@@ -38,7 +38,7 @@ variables:
     value: default
   SERVER_IMAGE:
     description: "Any image with bash + coreutils; no GPU work is actually run"
-    value: nvcr.io/nvidia/tensorrt-llm/release:latest
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-deepseek-v4-dev.1
   GPUS_PER_NODE:
     description: "GPUs on the node; must be >= the 4 single-GPU members so they co-locate"
     type: integer

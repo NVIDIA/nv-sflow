@@ -426,25 +426,6 @@ def test_k8s_unpack_collected_tar_does_not_overwrite(tmp_path):
     assert "kept 1 existing driver file(s) (not overwritten): result.json" in summary
 
 
-def test_k8s_wait_for_marker_found(tmp_path):
-    import asyncio
-
-    from sflow.plugins.operators.k8s_operator import (
-        _SFLOW_COLLECT_READY_MARKER,
-        _wait_for_marker,
-    )
-
-    log = tmp_path / "bench.log"
-    log.write_text(f"[pod/bench] hello\n[pod/bench] staged {_SFLOW_COLLECT_READY_MARKER}\n")
-    found = asyncio.run(
-        asyncio.wait_for(
-            _wait_for_marker(str(log), _SFLOW_COLLECT_READY_MARKER.encode(), interval=0.01),
-            timeout=2,
-        )
-    )
-    assert found is True
-
-
 def test_k8s_collect_exclude_rel_lists_injected_file_artifacts():
     from sflow.plugins.operators.k8s_operator import _collect_exclude_rel
 
@@ -2209,7 +2190,7 @@ def test_open_merge_gate_execs_touch_marker(monkeypatch):
 
     calls = []
 
-    async def _fake_run_kubectl(args, *, global_args=None):
+    async def _fake_run_kubectl(args, *, global_args=None, timeout=None):
         calls.append(list(args))
         return 0, "", ""
 
@@ -2658,3 +2639,22 @@ def test_merged_member_exit_code_scans_only_the_log_tail(tmp_path):
     assert reads, "expected a bounded tail read via open(); log was read another way"
     # Whole-file read would be >5 MB; only the bounded tail may be pulled in.
     assert sum(reads) <= 16384, f"read {sum(reads)} bytes; expected a bounded tail"
+
+
+def test_k8s_wait_for_marker_found(tmp_path):
+    import asyncio
+
+    from sflow.plugins.operators.k8s_operator import (
+        _SFLOW_COLLECT_READY_MARKER,
+        _wait_for_marker,
+    )
+
+    log = tmp_path / "bench.log"
+    log.write_text(f"[pod/bench] hello\n[pod/bench] staged {_SFLOW_COLLECT_READY_MARKER}\n")
+    found = asyncio.run(
+        asyncio.wait_for(
+            _wait_for_marker(str(log), _SFLOW_COLLECT_READY_MARKER.encode(), interval=0.01),
+            timeout=2,
+        )
+    )
+    assert found is True

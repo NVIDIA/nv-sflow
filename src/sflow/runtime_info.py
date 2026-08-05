@@ -89,6 +89,17 @@ def _install_info() -> tuple[str, str | None]:
     return "direct-url", repo
 
 
+def install_info() -> tuple[str, str | None]:
+    """Public accessor for how the running sflow was installed.
+
+    Returns ``(install_mode, source)`` where ``install_mode`` is one of
+    ``editable``, ``source-tree``, ``direct-url`` or ``installed``, and ``source``
+    is the originating repo path/URL when one is recorded. ``sflow upgrade`` uses
+    this to refuse overwriting a developer's editable checkout.
+    """
+    return _install_info()
+
+
 def _find_repo_root(path: Path) -> Path | None:
     current = path if path.is_dir() else path.parent
     for candidate in (current, *current.parents):

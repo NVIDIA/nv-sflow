@@ -657,6 +657,7 @@ class K8sMpiOperator(K8sContainerOperator):
             handoff_delete_pods=self._handoff_pods,
             handoff_before_apply=self._handoff_destroy_first,
             kubectl_global_args=global_args,
+            kubectl_apply_args=list(self._kubectl_apply_args),
             allocation_id=self._allocation_id,
         )
         return _K8sExecPlan(
@@ -738,12 +739,6 @@ class K8sMpiOperator(K8sContainerOperator):
             )
             if rc != 0:
                 return rc
-            apply_prefix_size = 0
-            if plan.task_log_path:
-                try:
-                    apply_prefix_size = os.path.getsize(plan.task_log_path)
-                except OSError:
-                    apply_prefix_size = 0
             if status_note is not None:
                 status_note("waiting for MPIJob launcher")
             launcher_ref = await mpi_lifecycle.discover_launcher_pod(
@@ -775,20 +770,22 @@ class K8sMpiOperator(K8sContainerOperator):
                 ns_args=plan.ns_args,
             )
             if stream_proc is not None:
-                await k8s_lifecycle.terminate_process(stream_proc)
+                # The MPIJob has reached a terminal phase, so the launcher's follow will
+                # hit EOF -- drain it rather than killing it mid-stream, which is what
+                # used to truncate <task>.log.
+                await k8s_lifecycle.stop_log_stream(
+                    stream_proc, terminal=phase in k8s_lifecycle.TERMINAL_PHASES
+                )
                 stream_proc = None
             if tailer is not None:
                 tailer.cancel()
                 await asyncio.gather(tailer, return_exceptions=True)
                 tailer = None
-            if launcher_ref and plan.task_log_path:
-                await k8s_lifecycle.finalize_complete_log(
-                    [launcher_ref],
-                    plan.task_log_path,
-                    prefix_size=apply_prefix_size,
-                    phases=[phase],
-                    global_args=plan.global_args,
-                    ns_args=plan.ns_args,
+            if plan.task_log_path:
+                # <task>.log is the drained stream itself; all that is left of the old
+                # one-shot re-fetch is its TTY-sanitize pass.
+                await asyncio.to_thread(
+                    k8s_lifecycle.sanitize_streamed_logs, [plan.task_log_path]
                 )
             if launcher_ref:
                 return await k8s_lifecycle.pod_exit_code(

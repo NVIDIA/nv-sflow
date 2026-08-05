@@ -624,14 +624,47 @@ in a fast pre-flight (before allocation) or as pod status. Use `kubectl -n <ns> 
 ### 10.1 Access Pre-flight Failure (RBAC / namespace / unreachable)
 
 **Cause:** On a real run sflow verifies the cluster is reachable and authenticated, the
-namespace exists, and (via `kubectl auth can-i`) that the credentials hold the RBAC it needs
-(create/delete pods, configmaps, secrets; get pods/logs/nodes; DRA
-`resourceclaimtemplates`/`deviceclasses`; `computedomains` when creating one).
+namespace exists, and (via `kubectl auth can-i`) that the credentials hold the RBAC it needs.
+Only **namespaced** permissions it depends on hard-fail: create/delete pods, configmaps,
+secrets; get pods/logs; DRA `resourceclaimtemplates`; `computedomains` when creating one;
+`mpijobs` on the `k8s_mpi` operator route. Denied **cluster-scoped** reads (`namespaces`,
+`nodes`, `deviceclasses`) and a forbidden `auth can-i` only warn.
 
 **Fix:**
 - Wrong cluster/context/namespace: pass `--kubeconfig`, `--kube-context`, `--kube-namespace`.
 - Missing permission: grant the RBAC, or use a namespace where you have it.
-- To bypass the check (e.g. cluster that disallows `auth can-i`): `SFLOW_SKIP_K8S_PREFLIGHT=1`.
+- To bypass the check: `SFLOW_SKIP_K8S_PREFLIGHT=1`.
+
+**Note on `Forbidden`:** a 403 means the API *was* reached and the credentials *did*
+authenticate — it is an authorization gap, never a connectivity or kubeconfig problem. sflow
+no longer fails on 403s for permissions it does not use, so
+`namespaces "<ns>" is forbidden: User "system:serviceaccount:..." cannot get resource
+"namespaces"` — the normal result for a namespaced `Role` on a shared cluster — is only a debug
+note. If you still see it as a hard error, you are on an older sflow: bypass with
+`SFLOW_SKIP_K8S_PREFLIGHT=1`. When node reads are denied, set `gpus_per_node` explicitly (sflow
+cannot derive it from node capacity).
+
+### 10.1b `kubectl apply` rejected (validation / field manager / conflicts)
+
+**Pattern:** `error validating data: ...`, `Apply failed with N conflicts`, or an admission
+rejection on apply — at allocate (`Failed to create reservation Pod '...'`) or in a task's
+apply step.
+
+**Cause:** the cluster needs an extra flag on the `apply` subcommand (`--validate=false`,
+`--server-side`, `--force-conflicts`, `--field-manager=...`).
+
+**Fix:** pass it with `--extra-kubectl-apply-args` (repeatable), which applies to every apply
+sflow issues — allocate-time reservation/ComputeDomain/ResourceClaimTemplate *and* task pods:
+
+```bash
+sflow run -f recipe.yaml --extra-kubectl-apply-args=--validate=false
+```
+
+**Do NOT use `--extra-kubectl-args` for these.** That option carries *global* flags, which
+kubectl requires **before** the subcommand — `kubectl --validate=false apply` fails with
+`unknown flag`, and because the flag is prefixed onto *every* call it breaks `get`/`logs`/
+`delete` too, usually surfacing as a confusing pre-flight or allocation error far from the
+typo. sflow warns when it detects an apply-only flag in the global option.
 
 ### 10.2 Pod Stuck `Pending` (unschedulable)
 

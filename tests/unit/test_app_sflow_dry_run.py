@@ -220,6 +220,81 @@ class TestBuildAllocationMapLines:
         assert "GPU 0: decode_1" in rendered
         assert "GPU 3: decode_1" in rendered
 
+    def test_task_summary_and_gpu_rows_sit_at_different_depths(self):
+        # The per-GPU rows hang one level below the node's "Tasks:" summary. At
+        # equal depth "Tasks:" reads as just another GPU row, which confused
+        # people reading the dry-run map.
+        backend = SimpleNamespace(
+            allocation=Allocation(
+                allocation_id="slurm",
+                nodes=[
+                    ComputeNode(name="n0", ip_address="10.0.0.0", index=0, num_gpus=2),
+                    ComputeNode(name="n1", ip_address="10.0.0.1", index=1, num_gpus=2),
+                ],
+            )
+        )
+        tasks = [
+            SimpleNamespace(
+                name="a",
+                backend_name="slurm_cluster",
+                assigned_nodes=["n0"],
+                envs={"CUDA_VISIBLE_DEVICES": "0,1"},
+                operator=None,
+            ),
+            SimpleNamespace(
+                name="b",
+                backend_name="slurm_cluster",
+                assigned_nodes=["n1"],
+                envs={"CUDA_VISIBLE_DEVICES": "0"},
+                operator=None,
+            ),
+        ]
+
+        lines = build_allocation_map_lines(tasks, {"slurm_cluster": backend})
+
+        assert lines == [
+            "  - backend 'slurm_cluster':",
+            "    ├─ node n0",
+            "    │  ├─ Tasks: a",
+            "    │  └─ GPUs:",
+            "    │       GPU 0: a",
+            "    │       GPU 1: a",
+            # Last node closes the tree, so its children lose the trunk.
+            "    └─ node n1",
+            "       ├─ Tasks: b",
+            "       └─ GPUs:",
+            "            GPU 0: b",
+            "            GPU 1: .",
+        ]
+
+    def test_nodes_without_gpu_capacity_still_show_the_task_summary(self):
+        backend = SimpleNamespace(
+            allocation=Allocation(
+                allocation_id="slurm",
+                nodes=[
+                    ComputeNode(name="n0", ip_address="10.0.0.0", index=0, num_gpus=None)
+                ],
+            )
+        )
+        tasks = [
+            SimpleNamespace(
+                name="cpu_task",
+                backend_name="slurm_cluster",
+                assigned_nodes=["n0"],
+                envs={},
+                operator=None,
+            )
+        ]
+
+        lines = build_allocation_map_lines(tasks, {"slurm_cluster": backend})
+
+        assert lines == [
+            "  - backend 'slurm_cluster':",
+            "    └─ node n0",
+            "       ├─ Tasks: cpu_task",
+            "       └─ GPUs: n/a",
+        ]
+
     def test_uses_planner_slice_when_not_injected_into_env_kubernetes(self):
         # Cluster-scheduled backends (Kubernetes) compute CUDA_VISIBLE_DEVICES the
         # same way as every backend but do not inject it into the env. The map reads

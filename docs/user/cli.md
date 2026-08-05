@@ -48,6 +48,7 @@ Common options:
 - `--kube-compute-domain-create / --no-kube-compute-domain-create`: override `compute_domain.create`; when on (and no channel is joined), sflow stands up its own ComputeDomain CR named after the run and injects the channel into every GPU pod
 - `--kube-skip-pvc`: skip all PVC-backed volume mounts (a backend `volumes:` entry with a `claim`) in every kubernetes backend for this run, keeping `empty_dir` volumes. Debug aid for clusters that lack the recipe's PVCs — pods schedule without editing the recipe volume-by-volume. The PVC data (e.g. a model cache) is **not** mounted, so workloads that need it will fail; use for quick scheduling/plumbing checks
 - `--extra-kubectl-args <flag>`: extra global kubectl flag applied to every kubectl call (e.g. `--extra-kubectl-args=--insecure-skip-tls-verify`); repeatable
+- `--extra-kubectl-apply-args <flag>`: extra flag for the `kubectl apply` **subcommand** (e.g. `--extra-kubectl-apply-args=--validate=false`, `=--server-side`, `=--force-conflicts`); repeatable. kubectl takes global flags *before* the verb and subcommand flags *after* it, so an apply-only flag cannot go through `--extra-kubectl-args` (`kubectl --validate=false apply` is an unknown flag, and it would break every other kubectl call too). Applies to every apply sflow issues, including the allocate-time reservation objects
 - `--enable-workflow-monitor`: enable a default workflow-level hardware monitor (GPU/CPU utilization) for the run without editing the recipe
 - `--enable-task-monitor <names>`: enable a default hardware monitor bound to the named task(s); accepts a comma- or space-separated list and is repeatable (e.g. `--enable-task-monitor prefill_server,decode_server`)
 - `--offload-task-logs` / `--no-offload-task-logs`: force per-task log offload on or off, overriding each backend's `offload_task_logs`. On by default for local/docker/slurm when non-interactive (auto-falls back to streaming on a TTY/`--tui`); no effect on `k8s` (always offloads its pod log to file) or `ssh`/`python` (always stream through the driver). Use `--no-offload-task-logs` to force live streaming through the driver
@@ -305,3 +306,70 @@ Common options:
 - `--output, -o <dir>`: output directory (default: `./skills`)
 - `--force, -f`: overwrite existing files when merging into an existing directory
 - `--list, -l`: list available bundled skills
+
+## sflow upgrade
+
+Upgrade sflow in the environment you are currently running it from. `sflow update` is
+an alias for the same command.
+
+With no flags it installs the **`main` branch of the public OSS GitHub repo**:
+
+```bash
+sflow upgrade
+# -> uv pip install ... 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main'
+```
+
+> This default differs from `sflow batch`, which installs whatever ref your *current*
+> environment came from. `sflow upgrade` is an explicit "get me the latest" action.
+
+Pick a different source with `--repo` / `--branch`:
+
+```bash
+# A different branch or tag of the public repo
+sflow upgrade --branch v0.3.0
+
+# A fork or an internal mirror (defaults to its main branch)
+sflow upgrade --repo https://git.example.com/team/sflow.git
+
+# Both together
+sflow upgrade --repo https://git.example.com/team/sflow.git --branch develop
+```
+
+The install-route flags are the same ones [`sflow batch`](#sflow-batch) uses to pin the
+version installed on a compute node, so a ref you trust in a batch job is written the
+same way here:
+
+```bash
+# Equivalent to --branch develop, in the batch spelling
+sflow upgrade --sflow-version develop
+
+# repo + ref in one value
+sflow upgrade --sflow-version https://git.example.com/team/sflow.git@develop
+
+# A released wheel from a private PyPI index
+sflow upgrade --sflow-index-url https://host/artifactory/api/pypi/repo/simple \
+              --sflow-version '>=0.2,<0.3'
+
+# Editable install from a local checkout
+sflow upgrade --sflow-source-path ~/src/sflow
+```
+
+Options:
+
+- `--repo <url>`: git repository to install from (default: `https://github.com/NVIDIA/nv-sflow.git`)
+- `--branch <ref>`: git branch or tag (default: `main`)
+- `--sflow-version <ref|repo@ref|specifier>`: same syntax as `sflow batch --sflow-version`. Mutually exclusive with `--repo`/`--branch`, which encode the same thing
+- `--sflow-index-url <url>`: install from a private PyPI index; `--sflow-version` then means a PEP 440 specifier. URLs with embedded credentials are rejected — use `~/.netrc` or a credential helper
+- `--sflow-source-path <dir>`: editable install from a local checkout
+- `--force`: allow upgrading over an editable/dev install
+- `--dry-run`: print the resolved install command and exit
+
+Notes:
+
+- **Dev installs are protected.** If sflow is currently an editable or source-tree
+  install, `sflow upgrade` refuses rather than silently replacing your working
+  checkout with a released build. Pass `--force` to override.
+- `uv` is used when available (pinned to the interpreter running sflow) and `pip` is
+  the fallback. Because a branch head can move without the version string changing,
+  sflow is explicitly reinstalled rather than being skipped as "already satisfied".
+- Run `sflow --version` afterwards to confirm what you ended up with.

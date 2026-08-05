@@ -46,6 +46,7 @@ from sflow.plugins.k8s.capabilities import (
     ClusterCapability,
     detect_capability_state,
 )
+from sflow.plugins.k8s import lifecycle as k8s_lifecycle
 from sflow.plugins.k8s.shell import sanitize_name
 from sflow.plugins.k8s.probe import K8sExecProbeTransport
 from sflow.plugins.k8s.rdma import (
@@ -54,6 +55,7 @@ from sflow.plugins.k8s.rdma import (
     RdmaPlan,
     detect_rdma,
 )
+from sflow.utils.extra_args import normalize_extra_args
 from sflow.utils.node_filters import normalize_node_list, resolve_node_filters
 
 _logger = get_logger(__name__)
@@ -175,6 +177,41 @@ def _parse_k8s_minor(version: str) -> tuple[int, int] | None:
     if not minor_digits:
         return None
     return major, int(minor_digits)
+
+
+def _is_rbac_denial(err: str) -> bool:
+    """True when a kubectl error is an authorization denial (HTTP 403 Forbidden).
+
+    A 403 means the API server WAS reached and the credentials DID authenticate --
+    it only says this identity may not perform that one operation. That is a
+    materially different failure from an unreachable or unauthenticated cluster
+    (connection refused, i/o timeout, 401 Unauthorized), which no RBAC grant fixes.
+    Preflight uses the distinction to avoid reporting a permission gap as a
+    connectivity/credential problem, and to avoid blocking on permissions sflow
+    does not actually need.
+    """
+    low = err.lower()
+    return "(forbidden)" in low or "forbidden:" in low or "is forbidden" in low
+
+
+# Appended to every preflight failure that ``SFLOW_SKIP_K8S_PREFLIGHT`` can ACTUALLY
+# bypass, so the escape hatch is discoverable at the moment it is needed rather than
+# only in a docstring. Preflight is a convenience gate in front of the real cluster --
+# it can be wrong (an unusual proxy, a credential that is restricted but working, a
+# `kubectl auth can-i` the cluster withholds), and a user blocked by a wrong check has
+# no way to find the override from the error alone.
+#
+# Deliberately NOT added to the "kubectl not on PATH" failure: that check runs BEFORE
+# the bypass is ever consulted (see ``preflight_validate``), and nothing works without
+# kubectl -- offering it there would send the user down a dead end.
+#
+# The wording promises only that the CHECK is skipped, never that the run will work: if
+# the cluster really is unreachable, bypassing just moves the failure to the first pod.
+_PREFLIGHT_BYPASS_HINT = (
+    " If you believe this check is wrong (an unusual proxy, or a credential that is "
+    "restricted but working), set SFLOW_SKIP_K8S_PREFLIGHT=1 to skip preflight -- the "
+    "run then surfaces the real error at the first pod instead."
+)
 
 
 # Optional cluster infra sflow can opportunistically use (ComputeDomain/IMEX for
@@ -558,6 +595,18 @@ class KubernetesBackendConfig(BackendConfig):
     # to every task on this backend. Default 120; increase for large output trees
     # over a slow API server.
     collect_grace_seconds: Resolvable[int] = 120
+    # Master switch for the node-local output collect (the in-pod EXIT trap that tars
+    # the task's output, plus the driver-side copy). Set False to run tasks with NO
+    # sflow collect machinery in the pod at all.
+    #
+    # Worth knowing what it costs to leave on: the collect is the only part of a task's
+    # lifecycle that makes the DAG depend on something other than pod status, probes and
+    # the merge-pod marker. It arms an EXIT trap inside every pod and makes the driver
+    # wait on a sentinel the pod writes to its log -- so a task's output can be lost to
+    # log-delivery lag (measured once at 20 minutes) without the run failing. Turning it
+    # off makes task completion depend on those three signals only; outputs then have to
+    # reach the driver by a shared filesystem, `uploads:` or a PVC.
+    collect_node_local_output: Resolvable[bool] = True
     # Optional tuning for the (always-on) reserve+discover+pin behavior.
     reservation: KubernetesReservationConfig | None = None
 
@@ -654,6 +703,9 @@ class KubernetesBackend(Backend):
         # (raw int/str; the operator parses + applies it). None -> operator default.
         self._collect_max_file_size = config.collect_max_file_size
         self._collect_grace_seconds: int = int(config.collect_grace_seconds)
+        self._collect_node_local_output: bool = bool(
+            config.collect_node_local_output
+        )
         self._extra_args = [str(a) for a in (config.extra_args or [])]
         self._node_selector: dict[str, str] | None = config.node_selector
         self._host_network: bool = bool(config.host_network)
@@ -732,6 +784,9 @@ class KubernetesBackend(Backend):
         self._kubeconfig: str | None = None
         self._kube_context: str | None = None
         self._kubectl_extra_args: list[str] = []
+        # --extra-kubectl-apply-args: flags for the `apply` SUBCOMMAND only (they go
+        # after the verb, so they cannot live in _kubectl_extra_args).
+        self._kubectl_apply_args: list[str] = []
         # Node include/exclude host lists (from `--include-nodes` / `--exclude-nodes`
         # or the backend config fields), applied as hostname In/NotIn nodeAffinity on
         # the reservation pods so the whole allocation is restricted / steered.
@@ -830,6 +885,10 @@ class KubernetesBackend(Backend):
         self._kubeconfig = cfg.kubeconfig or None
         self._kube_context = cfg.context or None
         self._kubectl_extra_args = [str(a) for a in (cfg.extra_args or [])]
+        self._kubectl_apply_args = normalize_extra_args(
+            getattr(cfg, "apply_args", None)
+        )
+        self._warn_apply_only_globals()
         if cfg.namespace:
             self._namespace = str(cfg.namespace)
         cli_node_selector = getattr(cfg, "node_selector", None)
@@ -944,6 +1003,42 @@ class KubernetesBackend(Backend):
         return self._global_args()
 
     @property
+    def kubectl_apply_args(self) -> list[str]:
+        """``kubectl apply`` subcommand flags, injected into the operator wrapper."""
+        return list(self._kubectl_apply_args)
+
+    # Flags kubectl only accepts AFTER the `apply` verb. Passing one as a GLOBAL flag
+    # makes kubectl reject EVERY call ("unknown flag"), which surfaces as a confusing
+    # preflight/allocate failure far from the typo -- so name the right option instead.
+    _APPLY_ONLY_FLAGS = (
+        "--validate",
+        "--server-side",
+        "--force-conflicts",
+        "--field-manager",
+        "--prune",
+        "--overwrite",
+        "--dry-run",
+    )
+
+    def _warn_apply_only_globals(self) -> None:
+        """Warn when an apply-only flag was passed to ``--extra-kubectl-args``."""
+        misplaced = [
+            a
+            for a in self._kubectl_extra_args
+            if str(a).split("=", 1)[0] in self._APPLY_ONLY_FLAGS
+        ]
+        if not misplaced:
+            return
+        _logger.warning(
+            "Kubernetes backend '%s': %s look like 'kubectl apply' flags but were "
+            "passed as GLOBAL kubectl flags (--extra-kubectl-args). kubectl takes "
+            "global flags before the subcommand, so it will reject every call with "
+            "'unknown flag'. Pass them with --extra-kubectl-apply-args instead.",
+            self.name,
+            ", ".join(repr(a) for a in misplaced),
+        )
+
+    @property
     def namespace(self) -> str | None:
         """Backend namespace, injected into operators (one namespace per backend)."""
         return self._namespace
@@ -976,6 +1071,11 @@ class KubernetesBackend(Backend):
     def collect_grace_seconds(self) -> int:
         """Grace period (s) for the operator's node-local output collection sidecar."""
         return self._collect_grace_seconds
+
+    @property
+    def collect_node_local_output(self) -> bool:
+        """Whether tasks on this backend arm the node-local output collect at all."""
+        return self._collect_node_local_output
 
     @property
     def merge_colocated_gpu_pods(self) -> bool:
@@ -1197,19 +1297,75 @@ class KubernetesBackend(Backend):
     def _ns_args(self) -> list[str]:
         return ["--namespace", self._namespace] if self._namespace else []
 
-    async def _kubectl(self, args: list[str]) -> tuple[int, str, str]:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            *self._global_args(),
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    @staticmethod
+    def _carries_namespace(args: Sequence[str]) -> bool:
+        """True if ``args`` already selects a namespace explicitly."""
+        return any(
+            a == "-n" or a == "--namespace" or str(a).startswith("--namespace=")
+            for a in args
         )
-        stdout, stderr = await proc.communicate()
-        return (
-            proc.returncode,
-            stdout.decode(errors="replace").strip(),
-            stderr.decode(errors="replace").strip(),
+
+    def _confine_to_namespace(self, args: list[str], *, namespaced: bool) -> list[str]:
+        """Append ``--namespace <ns>`` unless the call opts out or already has one.
+
+        When the recipe backend sets ``namespace:`` (or the run passes
+        ``--kube-namespace``), EVERY namespaced kubectl call this backend makes must
+        stay inside it -- on a shared cluster the credentials are typically a
+        ServiceAccount with a Role bound to that one namespace, so a call that
+        silently falls back to the kubeconfig context's default namespace is either
+        a 403 or, worse, work landing in the wrong tenant's namespace.
+
+        Confinement is the DEFAULT here rather than something each call site has to
+        remember with ``_ns_args()``: a new call site that forgets it now inherits
+        the namespace instead of escaping it. ``namespaced=False`` is the explicit
+        opt-out for calls where ``--namespace`` is meaningless (cluster-scoped reads
+        like ``get nodes``) or would change the question asked (``auth can-i``, whose
+        scope is part of the query). A call that already carries its own ``-n`` --
+        including the deliberate cross-namespace gIB-installer probe -- is left
+        untouched.
+
+        The flag is inserted BEFORE a ``--`` separator when there is one. Appending it
+        blindly would put it after the separator on a ``kubectl exec <pod> -- cmd...``,
+        where kubectl stops parsing flags -- so ``--namespace ns`` would be handed to the
+        CONTAINER as two extra argv entries instead of selecting a namespace. Every
+        current exec call site passes ``_ns_args()`` explicitly and so never reaches
+        this, but the whole point of confining by default is that the next one does not
+        have to remember.
+        """
+        if not namespaced or not self._namespace or self._carries_namespace(args):
+            return args
+        ns_flag = ["--namespace", self._namespace]
+        if "--" in args:
+            cut = args.index("--")
+            return [*args[:cut], *ns_flag, *args[cut:]]
+        return [*args, *ns_flag]
+
+    async def _kubectl(
+        self, args: list[str], *, timeout: float | None = None, namespaced: bool = True
+    ) -> tuple[int, str, str]:
+        """Delegates to the single kubectl entry point in ``plugins.k8s.lifecycle``.
+
+        One runner for both phases: the allocation/reservation calls made here and
+        the task-phase calls made by the operator now share the same health trace, so
+        "was it kubectl or was it sflow?" is answerable across the WHOLE run --
+        reservation stalls and quota rejections included, which is where a lot of the
+        instability actually lives.
+
+        The call is confined to the backend namespace by default -- pass
+        ``namespaced=False`` for cluster-scoped calls (see
+        :meth:`_confine_to_namespace`).
+        """
+        args = self._confine_to_namespace(args, namespaced=namespaced)
+        if timeout is None:
+            # A delete that does NOT pass --wait=false blocks until the objects are
+            # actually gone (the allocation sweep was measured at 28.4s on a real run,
+            # and a long terminationGracePeriodSeconds takes longer). Give those the
+            # generous delete ceiling; anything else stays unbounded here, as before.
+            argv = [str(a) for a in args]
+            if argv[:1] == ["delete"] and "--wait=false" not in argv:
+                timeout = k8s_lifecycle.DELETE_KUBECTL_TIMEOUT
+        return await k8s_lifecycle.run_kubectl(
+            args, global_args=self._global_args(), timeout=timeout
         )
 
     async def _resolve_handoff_mode(self) -> None:
@@ -1251,25 +1407,24 @@ class KubernetesBackend(Backend):
         return rc == 0 and f"requests.{self._gpu_resource_name}" in out
 
     async def _apply_manifest(self, manifest: dict[str, Any]) -> None:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            *self._global_args(),
-            "apply",
-            "-f",
-            "-",
-            *self._ns_args(),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        # Same single runner as every other kubectl call; the manifest goes in on
+        # stdin (``apply -f -``). Creating the reservation objects is squarely in the
+        # phase we most want traced -- this is where "exceeded quota" surfaces.
         data = json.dumps(manifest, separators=(",", ":")).encode()
-        _, stderr = await proc.communicate(data)
-        if proc.returncode != 0:
+        rc, _out, err = await k8s_lifecycle.run_kubectl(
+            # --extra-kubectl-apply-args applies here too, not just to task pods:
+            # these allocate-time objects (reservation Pod, ComputeDomain,
+            # ResourceClaimTemplate) are applied BEFORE any task runs, so a cluster
+            # that needs the flag would otherwise fail the whole run at allocate.
+            ["apply", "-f", "-", *self._ns_args(), *self._kubectl_apply_args],
+            global_args=self._global_args(),
+            input=data,
+        )
+        if rc != 0:
             name = manifest.get("metadata", {}).get("name", "?")
             kind = manifest.get("kind", "object")
             raise RuntimeError(
-                f"Failed to create reservation {kind} '{name}': "
-                f"{stderr.decode(errors='replace').strip()}"
+                f"Failed to create reservation {kind} '{name}': {err}"
             )
 
     # ------------------------------------------------------------------
@@ -1373,19 +1528,11 @@ class KubernetesBackend(Backend):
         exec_args += [pod, *self._ns_args(), "--", *argv]
         if stdin is None:
             return await self._kubectl(exec_args)
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            *self._global_args(),
-            *exec_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await proc.communicate(stdin)
-        return (
-            proc.returncode,
-            out.decode(errors="replace").strip(),
-            err.decode(errors="replace").strip(),
+        # Shared runner (stdin piped in), so probe execs are traced like every other
+        # kubectl call -- a probe transport that starts failing is exactly the kind of
+        # thing the health report should show.
+        return await k8s_lifecycle.run_kubectl(
+            exec_args, global_args=self._global_args(), input=stdin
         )
 
     def probe_transport(self) -> "K8sExecProbeTransport | None":
@@ -1537,7 +1684,8 @@ class KubernetesBackend(Backend):
                 node_name,
                 "-o",
                 'jsonpath={.status.addresses[?(@.type=="InternalIP")].address}',
-            ]
+            ],
+            namespaced=False,  # nodes are cluster-scoped
         )
         if rc == 0 and out:
             return out.split()[0]
@@ -1559,7 +1707,8 @@ class KubernetesBackend(Backend):
                 node_name,
                 "-o",
                 f"jsonpath={{.metadata.labels.{escaped}}}",
-            ]
+            ],
+            namespaced=False,  # nodes are cluster-scoped
         )
         if rc == 0 and out:
             return out.strip()
@@ -1609,6 +1758,14 @@ class KubernetesBackend(Backend):
             )
 
     async def _delete_by_alloc_label(self, kind: str, alloc_id: str) -> None:
+        # NOTE: no ``--wait=false`` here (unlike the task-teardown delete) -- this sweep
+        # is the reclamation backstop and must not return before the objects are gone.
+        # It therefore blocks for the pods' termination grace period (28.4s measured on
+        # a real run), so it is bounded by DELETE_KUBECTL_TIMEOUT, never by the much
+        # shorter status-poll ceiling.
+        # No explicit timeout: _kubectl recognises a waiting delete and applies
+        # DELETE_KUBECTL_TIMEOUT itself, which keeps this call site (and the backend's
+        # own _kubectl seam that tests patch) unchanged.
         await self._kubectl(
             [
                 "delete",
@@ -1621,10 +1778,13 @@ class KubernetesBackend(Backend):
         )
 
     def _delete_by_alloc_label_sync(self, kind: str, alloc_id: str) -> None:
-        subprocess.run(
+        # Shared sync runner: this is the atexit cleanup backstop, so it is both worth
+        # tracing and the last place we want an unbounded call -- a wedged connection
+        # here hangs interpreter shutdown. Like its async twin it WAITS for termination
+        # (no ``--wait=false``), so it gets the generous delete ceiling, not the poll
+        # one: 60s would have cut short a real 28.4s sweep on a slower grace period.
+        k8s_lifecycle.run_kubectl_sync(
             [
-                "kubectl",
-                *self._global_args(),
                 "delete",
                 kind,
                 "-l",
@@ -1632,7 +1792,8 @@ class KubernetesBackend(Backend):
                 *self._ns_args(),
                 "--ignore-not-found",
             ],
-            capture_output=True,
+            global_args=self._global_args(),
+            request_timeout=f"{int(k8s_lifecycle.DELETE_KUBECTL_TIMEOUT)}s",
         )
 
     # ------------------------------------------------------------------
@@ -1640,23 +1801,19 @@ class KubernetesBackend(Backend):
     # ------------------------------------------------------------------
 
     def _kubectl_sync(
-        self, args: list[str], *, timeout: str = "10s"
+        self, args: list[str], *, timeout: str = "10s", namespaced: bool = True
     ) -> tuple[int, str, str]:
-        """Run a kubectl command synchronously (preflight), returning (rc, out, err)."""
-        argv = [
-            "kubectl",
-            *self._global_args(),
-            *args,
-            f"--request-timeout={timeout}",
-        ]
-        try:
-            result = subprocess.run(argv, capture_output=True, text=True)
-        except Exception as e:  # kubectl missing / spawn failure
-            return 1, "", str(e)
-        return (
-            result.returncode,
-            (result.stdout or "").strip(),
-            (result.stderr or "").strip(),
+        """Run a kubectl command synchronously (preflight), returning (rc, out, err).
+
+        Delegates to ``plugins.k8s.lifecycle.run_kubectl_sync`` so preflight shares the
+        one runner -- and the one health trace -- with every other kubectl call.
+        Confined to the backend namespace by default; pass ``namespaced=False`` for
+        cluster-scoped calls (see :meth:`_confine_to_namespace`).
+        """
+        return k8s_lifecycle.run_kubectl_sync(
+            self._confine_to_namespace(args, namespaced=namespaced),
+            global_args=self._global_args(),
+            request_timeout=timeout,
         )
 
     def _access_context(self) -> str:
@@ -1693,7 +1850,9 @@ class KubernetesBackend(Backend):
         """
         resource, _, group = crd_name.partition(".")
         rc, out, _err = self._kubectl_sync(
-            ["api-resources", f"--api-group={group}", "-o", "name"], timeout="10s"
+            ["api-resources", f"--api-group={group}", "-o", "name"],
+            timeout="10s",
+            namespaced=False,  # API discovery is cluster-wide
         )
         served = {ln.strip() for ln in out.splitlines() if ln.strip()}
         # Trust a positive hit even on a non-zero rc: kubectl still prints the
@@ -1704,7 +1863,9 @@ class KubernetesBackend(Backend):
             return False  # clean discovery, resource absent -> definitively not served
         # Discovery itself failed -> fall back to a direct CRD get (needs CRD RBAC).
         rc, _out, _err = self._kubectl_sync(
-            ["get", "crd", crd_name, "-o", "name"], timeout="5s"
+            ["get", "crd", crd_name, "-o", "name"],
+            timeout="5s",
+            namespaced=False,  # CRDs are cluster-scoped
         )
         return rc == 0
 
@@ -1720,7 +1881,9 @@ class KubernetesBackend(Backend):
         args = ["auth", "can-i", verb, resource]
         if namespaced and self._namespace:
             args += ["-n", self._namespace]
-        _rc, out, _err = self._kubectl_sync(args)
+        # The scope IS the question here: adding -n to a cluster-scoped can-i asks
+        # about namespaced access and answers "no", so build it above, never inject.
+        _rc, out, _err = self._kubectl_sync(args, namespaced=False)
         return bool(out) and out.splitlines()[0].strip() == "yes"
 
     def detect_capability(
@@ -1778,7 +1941,12 @@ class KubernetesBackend(Backend):
         return any(r == "operator" for r in self._mpi_operator_routes)
 
     def _required_permissions(self) -> list[tuple[str, str, bool]]:
-        """(verb, resource, namespaced) tuples for the kubectl ops sflow performs."""
+        """(verb, resource, namespaced) for the kubectl ops sflow cannot run without.
+
+        Every entry is a hard gate: a denial means the workflow WILL fail, so
+        preflight raises. Permissions that only power best-effort detection belong in
+        :meth:`_optional_permissions` instead.
+        """
         perms: list[tuple[str, str, bool]] = [
             ("create", "pods", True),
             ("delete", "pods", True),
@@ -1788,13 +1956,11 @@ class KubernetesBackend(Backend):
             ("delete", "configmaps", True),
             ("create", "secrets", True),
             ("delete", "secrets", True),
-            ("get", "nodes", False),
         ]
         if self._scheduling == "dra":
             perms += [
                 ("create", "resourceclaimtemplates.resource.k8s.io", True),
                 ("delete", "resourceclaimtemplates.resource.k8s.io", True),
-                ("get", "deviceclasses.resource.k8s.io", False),
             ]
         # ComputeDomain (Multi-Node NVLink / IMEX) is independent of GPU scheduling:
         # it can be layered on `device_plugin` GPUs (e.g. clusters that run the NVIDIA
@@ -1813,6 +1979,26 @@ class KubernetesBackend(Backend):
                 (v, MPI_OPERATOR.api_resource, MPI_OPERATOR.namespaced)
                 for v in MPI_OPERATOR.use_verbs
             ]
+        return perms
+
+    def _optional_permissions(self) -> list[tuple[str, str, bool]]:
+        """(verb, resource, namespaced) for ops that only power best-effort detection.
+
+        A denial here degrades a convenience, never the run, so preflight warns
+        instead of failing. Every entry is CLUSTER-scoped, which a namespaced
+        ServiceAccount -- the norm on a shared multi-tenant cluster -- is rarely
+        granted:
+
+        * ``get nodes`` feeds ``gpus_per_node`` derivation, the GPU-product label and
+          the kubelet-version check, each of which already degrades on failure. Node
+          IPs do NOT come from here -- they are read off the task pod's own
+          ``status.hostIP`` (namespaced ``get pods``).
+        * ``get deviceclasses`` only lets ``_preflight_check_dra`` confirm the DRA
+          DeviceClass exists; that check is warn-only too.
+        """
+        perms: list[tuple[str, str, bool]] = [("get", "nodes", False)]
+        if self._scheduling == "dra":
+            perms.append(("get", "deviceclasses.resource.k8s.io", False))
         return perms
 
     def preflight_validate(self) -> None:
@@ -1878,7 +2064,7 @@ class KubernetesBackend(Backend):
                 "-l",
                 ",".join(f"{k}={v}" for k, v in self._node_selector.items()),
             ]
-        rc, out, _err = self._kubectl_sync(args, timeout="10s")
+        rc, out, _err = self._kubectl_sync(args, timeout="10s", namespaced=False)
         if rc != 0 or not out:
             return None
         counts: list[int] = []
@@ -1944,9 +2130,17 @@ class KubernetesBackend(Backend):
 
         Runs only on real ``sflow run`` (preflight is skipped in --dry-run). Uses
         non-mutating calls: ``kubectl get namespace`` (reachability + auth +
-        namespace existence) and ``kubectl auth can-i`` for each required verb/
-        resource (RBAC). Hard-fails with an actionable message; set
-        ``SFLOW_SKIP_K8S_PREFLIGHT=1`` to bypass.
+        namespace existence) and ``kubectl auth can-i`` for each verb/resource
+        (RBAC). Set ``SFLOW_SKIP_K8S_PREFLIGHT=1`` to bypass.
+
+        It hard-fails ONLY on what genuinely blocks the run -- an unreachable or
+        unauthenticated API, a missing namespace, or a denial of a
+        :meth:`_required_permissions` entry. A 403 is not, by itself, one of those:
+        it proves the API answered and the credentials authenticated. So a forbidden
+        namespace read (sflow never needs the Namespace object), a denied
+        :meth:`_optional_permissions` entry, and a forbidden ``auth can-i`` all warn
+        and continue -- otherwise the common namespaced-ServiceAccount setup on a
+        shared cluster would be rejected for permissions it does not need.
         """
         if self._preflight_skipped():
             _logger.warning(
@@ -1962,7 +2156,8 @@ class KubernetesBackend(Backend):
         # Reachability + auth + namespace existence (an authenticated GET).
         if self._namespace:
             rc, _out, err = self._kubectl_sync(
-                ["get", "namespace", self._namespace, "-o", "name"]
+                ["get", "namespace", self._namespace, "-o", "name"],
+                namespaced=False,  # namespaces are cluster-scoped
             )
             if rc != 0:
                 low = err.lower()
@@ -1970,12 +2165,34 @@ class KubernetesBackend(Backend):
                     raise ValueError(
                         f"{prefix} Namespace '{self._namespace}' was not found{ctx}. "
                         "Create it, or select another with --kube-namespace."
+                        + _PREFLIGHT_BYPASS_HINT
                     )
-                raise ValueError(
-                    f"{prefix} Cannot reach or authenticate to the Kubernetes "
-                    f"cluster{ctx}: {err or 'kubectl could not contact the API server'}. "
-                    "Check --kubeconfig / --kube-context."
-                )
+                if _is_rbac_denial(err):
+                    # 403 -> the cluster IS reachable and the credentials DID
+                    # authenticate; this identity just may not read the Namespace
+                    # OBJECT. Reading it is not something sflow ever needs (it serves
+                    # only as an existence probe here), and `namespaces` is
+                    # cluster-scoped, so a plain namespaced Role -- what a
+                    # multi-tenant ServiceAccount normally gets -- does not grant it.
+                    # Don't block a runnable workflow on an unused permission: fall
+                    # through to the can-i loop, which checks the ones that matter.
+                    _logger.debug(
+                        "Kubernetes backend '%s': cannot read namespace '%s'%s "
+                        "(forbidden) -- skipping the existence probe; the cluster is "
+                        "reachable and authenticated. Detail: %s",
+                        self.name,
+                        self._namespace,
+                        ctx,
+                        err.strip(),
+                    )
+                else:
+                    raise ValueError(
+                        f"{prefix} Cannot reach or authenticate to the Kubernetes "
+                        f"cluster{ctx}: "
+                        f"{err or 'kubectl could not contact the API server'}. "
+                        "Check --kubeconfig / --kube-context."
+                        + _PREFLIGHT_BYPASS_HINT
+                    )
 
         # Detect the Kubeflow MPI Operator CRD so `k8s_mpi` route:auto can resolve,
         # and the RBAC check below only requires mpijobs verbs when the operator
@@ -1985,12 +2202,16 @@ class KubernetesBackend(Backend):
 
         # RBAC: verify each operation sflow performs (also re-checks reachability/
         # auth, since `kubectl auth can-i` only answers yes/no for a live, authed API).
-        denied: list[str] = []
-        for verb, resource, namespaced in self._required_permissions():
+        denied: list[str] = []  # blocks the run -> raise
+        degraded: list[str] = []  # only disables best-effort detection -> warn
+        checks = [(p, True) for p in self._required_permissions()]
+        checks += [(p, False) for p in self._optional_permissions()]
+        for (verb, resource, namespaced), required in checks:
             args = ["auth", "can-i", verb, resource]
             if namespaced and self._namespace:
                 args += ["-n", self._namespace]
-            rc, out, err = self._kubectl_sync(args)
+            # Scope is part of the question -- never auto-inject (see _can_i).
+            rc, out, err = self._kubectl_sync(args, namespaced=False)
             answer = out.splitlines()[0].strip() if out else ""
             if answer == "yes":
                 continue
@@ -2000,13 +2221,43 @@ class KubernetesBackend(Backend):
                     if namespaced and self._namespace
                     else " (cluster-scoped)"
                 )
-                denied.append(f"{verb} {resource}{scope}")
+                (denied if required else degraded).append(f"{verb} {resource}{scope}")
                 continue
+            if _is_rbac_denial(err):
+                # `auth can-i` itself is denied: it needs `create
+                # selfsubjectaccessreviews`, which a few locked-down clusters
+                # withhold. Then the RBAC preflight can answer nothing at all -- warn
+                # once and let the run proceed rather than block on a check we are
+                # unable to perform. A real gap still surfaces at the first pod.
+                _logger.warning(
+                    "Kubernetes backend '%s': skipping the RBAC preflight%s -- "
+                    "'kubectl auth can-i' is itself forbidden (%s). The cluster is "
+                    "reachable and authenticated; any missing permission will "
+                    "surface when the first pod is created.",
+                    self.name,
+                    ctx,
+                    err.strip() or "forbidden",
+                )
+                denied.clear()
+                degraded.clear()
+                break
             # Neither yes nor no -> the API is unreachable or auth failed.
             raise ValueError(
                 f"{prefix} Cannot reach or authenticate to the Kubernetes "
                 f"cluster{ctx}: {err or 'kubectl auth can-i did not return a result'}. "
                 "Check --kubeconfig / --kube-context."
+                + _PREFLIGHT_BYPASS_HINT
+            )
+
+        if degraded:
+            _logger.warning(
+                "Kubernetes backend '%s': the credentials lack optional "
+                "cluster-scoped permissions%s: %s. The workflow still runs, but "
+                "node-level detection is unavailable -- set 'gpus_per_node' "
+                "explicitly so GPU pods request a schedulable count.",
+                self.name,
+                ctx,
+                "; ".join(degraded),
             )
 
         if denied:
@@ -2014,8 +2265,11 @@ class KubernetesBackend(Backend):
                 f"{prefix} The current credentials lack Kubernetes permissions "
                 f"required to run this workflow{ctx}: "
                 + "; ".join(denied)
-                + ". Grant these (RBAC), pick a different --kube-context, or set "
-                "SFLOW_SKIP_K8S_PREFLIGHT=1 to bypass this check."
+                + ". Grant these (RBAC), or pick a different --kube-context."
+                # Same suffix as every other bypassable preflight failure -- this
+                # message had its own hand-rolled copy, which is exactly how the
+                # wording drifts apart.
+                + _PREFLIGHT_BYPASS_HINT
             )
 
     def _detect_kubelet_versions(self) -> list[str] | None:
@@ -2038,12 +2292,14 @@ class KubernetesBackend(Backend):
                 "-l",
                 ",".join(f"{k}={v}" for k, v in self._node_selector.items()),
             ]
-        rc, out, _err = self._kubectl_sync(args, timeout="10s")
+        rc, out, _err = self._kubectl_sync(args, timeout="10s", namespaced=False)
         if rc == 0 and out.split():
             return out.split()
         # Fallback: API server version (can't list nodes -> approximate).
         rc, out, _err = self._kubectl_sync(
-            ["version", "-o", "jsonpath={.serverVersion.gitVersion}"], timeout="10s"
+            ["version", "-o", "jsonpath={.serverVersion.gitVersion}"],
+            timeout="10s",
+            namespaced=False,
         )
         return [out.strip()] if rc == 0 and out.strip() else None
 
@@ -2098,7 +2354,9 @@ class KubernetesBackend(Backend):
         """
         if self._preflight_skipped():
             return
-        rc_api, out_api, _ = self._kubectl_sync(["api-versions"], timeout="10s")
+        rc_api, out_api, _ = self._kubectl_sync(
+            ["api-versions"], timeout="10s", namespaced=False
+        )
         if rc_api == 0 and RESOURCE_API_VERSION not in out_api.split():
             served = [
                 line
@@ -2115,7 +2373,9 @@ class KubernetesBackend(Backend):
                 f" (found {', '.join(served)})" if served else "",
             )
         rc, _out, _err = self._kubectl_sync(
-            ["get", "deviceclass", self._gpu_device_class, "-o", "name"], timeout="5s"
+            ["get", "deviceclass", self._gpu_device_class, "-o", "name"],
+            timeout="5s",
+            namespaced=False,  # DeviceClasses are cluster-scoped
         )
         if rc != 0:
             _logger.warning(
@@ -2179,7 +2439,7 @@ class KubernetesBackend(Backend):
                 "-l",
                 ",".join(f"{k}={v}" for k, v in self._node_selector.items()),
             ]
-        rc, out, _err = self._kubectl_sync(args, timeout="5s")
+        rc, out, _err = self._kubectl_sync(args, timeout="5s", namespaced=False)
         if rc == 0 and out:
             # jsonpath joins matches with spaces; the products repeat per node, so
             # take the first non-empty token.
@@ -2761,7 +3021,9 @@ class KubernetesBackend(Backend):
         node = (node or "").strip()
         if rc != 0 or not node:
             return "", {}
-        rc, out, _err = await self._kubectl(["get", "node", node, "-o", "json"])
+        rc, out, _err = await self._kubectl(
+            ["get", "node", node, "-o", "json"], namespaced=False
+        )
         if rc != 0 or not out:
             return node, {}
         try:

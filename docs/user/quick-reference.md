@@ -116,6 +116,7 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 | `cpu_request` | | int / expr | `null` | CPU request for pods without GPUs (requests-only; opt-in). |
 | `collect_max_file_size` | | int / string | `null` (10 MiB) | Per-file cap for collecting a task's node-local output back to the driver; `0` disables. |
 | `collect_grace_seconds` | | int / expr | `120` | Grace period (s) to copy node-local output before pod teardown. |
+| `collect_node_local_output` | | bool | `true` | Master switch for the node-local output collect. Left on, the DAG waits on a sentinel the pod writes to its log, so a task's output can be lost to log-delivery lag; `false` runs tasks with **no** sflow collect machinery in the pod — completion then depends only on pod status, probes and the merge-pod marker, and outputs must reach the driver via a shared filesystem, `uploads:` or a PVC. |
 | `gib_installer_namespace` | | string / expr | `kube-system` | Namespace of the GKE gIB (`nccl-rdma-installer`) DaemonSet. |
 | `extra_args` | | list[string] | `null` | Extra backend arguments (reserved). |
 | `dra` | | object | `null` | DRA GPU-allocation options (see below); used when `scheduling: dra`. |

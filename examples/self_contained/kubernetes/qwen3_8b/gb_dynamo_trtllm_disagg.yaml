@@ -292,7 +292,17 @@ workflow:
         failure:
           log_watch:
             match_pattern: "Traceback (most recent call last)"
-            match_count: 5
+            # Disagg startup races the readiness probe: BOTH workers readiness-probe
+            # end-to-end through the frontend, but the router can only satisfy that
+            # once prefill AND decode have registered. Whichever registers first gets
+            # the probe traffic alone and logs
+            # "ValueError: Disaggregated params are required for decode mode" -- one
+            # traceback per probe (every `interval` below) until its peer is up. A
+            # slow engine load (419s observed on a busy cluster, ~20 probes) therefore
+            # burns straight through a small budget and fails a server that is in fact
+            # healthy. 50 tolerates that startup burst while still catching a real
+            # crash loop, which produces tracebacks without pause.
+            match_count: 50
           interval: 30
 
     - name: decode_server
@@ -332,7 +342,17 @@ workflow:
         failure:
           log_watch:
             match_pattern: "Traceback (most recent call last)"
-            match_count: 5
+            # Disagg startup races the readiness probe: BOTH workers readiness-probe
+            # end-to-end through the frontend, but the router can only satisfy that
+            # once prefill AND decode have registered. Whichever registers first gets
+            # the probe traffic alone and logs
+            # "ValueError: Disaggregated params are required for decode mode" -- one
+            # traceback per probe (every `interval` below) until its peer is up. A
+            # slow engine load (419s observed on a busy cluster, ~20 probes) therefore
+            # burns straight through a small budget and fails a server that is in fact
+            # healthy. 50 tolerates that startup burst while still catching a real
+            # crash loop, which produces tracebacks without pause.
+            match_count: 50
           interval: 30
 
     - name: benchmark

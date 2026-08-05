@@ -430,23 +430,70 @@ are **CLI flags on `sflow run`**, not YAML:
   `--extra-kubectl-args=--insecure-skip-tls-verify` or `--extra-kubectl-args=--request-timeout=30s`.
   The generic `--extra-args` is also forwarded here, so `--extra-args=--request-timeout=30s` works
   too; `--extra-kubectl-args` is just the kubectl-only form and wins on a conflicting option.
+- `--extra-kubectl-apply-args TEXT` (repeatable) — a flag for the **`kubectl apply` subcommand**,
+  e.g. `--extra-kubectl-apply-args=--validate=false` or `=--server-side`. kubectl takes global
+  flags *before* the verb and subcommand flags *after* it, so an apply-only flag cannot go through
+  `--extra-kubectl-args`: `kubectl --validate=false apply` is an unknown flag, and it would break
+  every other kubectl call too. sflow warns if it spots one in the global option.
 
 They are applied to every `kubectl` call sflow makes (allocation, node discovery, the per-task
 apply/logs/delete, and cleanup). Credentials always live in the kubeconfig, never in the recipe.
+
+`--extra-kubectl-apply-args` covers **every** apply sflow issues — the allocate-time reservation
+Pod, ComputeDomain CR and ResourceClaimTemplate as well as each task's env Secret and Pod — so a
+cluster that needs the flag doesn't fail at allocation before any task starts:
+
+```bash
+# cluster rejects client-side schema validation
+sflow run -f recipe.yaml --kube-namespace ml-team \
+  --extra-kubectl-apply-args=--validate=false
+```
 
 ```bash
 sflow run -f recipe.yaml \
   --kubeconfig ~/.kube/prod.config --kube-context prod-east --kube-namespace ml-team
 ```
 
+#### Namespace confinement
+
+When the backend sets `namespace:` (or the run passes `--kube-namespace`, which overrides it),
+**every namespaced kubectl call that backend makes is pinned to that namespace** — pods,
+configmaps, secrets, events, logs, exec, MPIJobs and the reservation objects alike. Nothing falls
+back to the kubeconfig context's default namespace, so credentials scoped to a single namespace
+(a `Role` bound to one namespace — the usual shared-cluster ServiceAccount) work, and a run can
+never land work in another tenant's namespace. Rendered manifests also carry
+`metadata.namespace`, so `kubectl apply` targets it explicitly.
+
+Two deliberate exceptions:
+
+- **Cluster-scoped reads** — `get nodes`, `api-resources`, `get crd`, `get deviceclass`,
+  `kubectl version`. A namespace is meaningless for these; all of them are best-effort and warn
+  rather than fail when denied (see the pre-flight below).
+- **`gib_installer_namespace`** (default `kube-system`) — a warn-only probe for the GKE gIB RDMA
+  installer, which lives outside your namespace by design. Denied access just skips the gIB lib
+  mounts.
+
 On a real run (not `--dry-run`), sflow runs a fast pre-flight before allocating anything to
-confirm the access is usable: it verifies the cluster is reachable and authenticated, that the
-namespace exists, and — via `kubectl auth can-i` (non-mutating) — that the credentials hold the
-RBAC needed for the operations sflow performs (create/delete pods, configmaps and secrets; get
-pods, pod logs and nodes; plus the DRA `resourceclaimtemplates`/`deviceclasses`, and
-`computedomains` when `compute_domain.create` is on). It fails fast with an actionable message
-(missing permission, wrong namespace, or unreachable cluster) instead of leaving pods stuck.
-Set `SFLOW_SKIP_K8S_PREFLIGHT=1` to bypass the check.
+confirm the access is usable: it verifies the cluster is reachable and authenticated and — via
+`kubectl auth can-i` (non-mutating) — that the credentials hold the RBAC sflow needs. It fails
+fast with an actionable message instead of leaving pods stuck. Set `SFLOW_SKIP_K8S_PREFLIGHT=1`
+to bypass the check.
+
+Only what actually blocks the run is a hard failure:
+
+- **Hard-fails** — an unreachable or unauthenticated cluster, a namespace that does not exist,
+  or a denial of a **namespaced** permission sflow depends on: create/delete pods, configmaps
+  and secrets; get pods and pod logs; plus the DRA `resourceclaimtemplates`, `computedomains`
+  when `compute_domain.create` is on, and `mpijobs` on the `k8s_mpi` operator route.
+- **Warns and continues** — a denial of a **cluster-scoped** read (`namespaces`, `nodes`,
+  `deviceclasses`), or an `auth can-i` that is itself forbidden. These only power best-effort
+  detection, so a namespaced ServiceAccount (a `Role` bound inside one namespace, common on a
+  shared cluster) runs fine without them.
+
+A `403 Forbidden` is never reported as a connectivity or credential problem — it proves the API
+answered and the credentials authenticated. When node reads are denied, set `gpus_per_node`
+explicitly: sflow cannot derive it from node capacity, and GPU pods would otherwise request a
+count the cluster may not be able to schedule.
 
 ### Host namespaces (`host_network`, `host_ipc`) — privileged
 
@@ -610,6 +657,7 @@ backends:
     #   gpu_product_label_key: nvidia.com/gpu.product   # node label read for NVLink-scope detection
     #   gib_installer_namespace: kube-system            # where the GKE gIB (nccl-rdma-installer) DaemonSet lives
     #   collect_grace_seconds: 120                      # grace window (s) for copying node-local outputs back
+    #   collect_node_local_output: true                 # false = no sflow collect machinery in the pod at all
     # Multi-Node NVLink (IMEX ComputeDomain) is a top-level block, independent of
     # `scheduling` (works with device_plugin or dra). Join an existing domain for
     # cross-node NVLink (MNNVL): name its channel, or `auto` to claim the sole
@@ -779,6 +827,34 @@ task pod depends on whether the namespace enforces a GPU `ResourceQuota`:
 > The heartbeat log while waiting for placeholders is throttled by
 > `SFLOW_K8S_WAIT_HEARTBEAT_SECS` (advanced).
 
+### Task logs (`<task>.log`)
+
+Each pod's `kubectl logs -f` is redirected straight into the task's `<task>.log`, and that file
+**is** the log — there is no post-run rebuild. sflow used to re-fetch each pod's whole container
+log with a one-shot `kubectl logs` and replace the streamed file with it; that was removed
+because the **kubelet rotates container logs**, so the re-fetch returned only the last window and
+a one-hour server was persisted as its final 11 seconds.
+
+Once a pod is terminal its follow is **drained** (bounded), so it delivers its tail and the file
+ends complete. A pod that is still `Running` at teardown — cancelled by a fail-fast peer, or by
+`Ctrl-C` — has its follow **cut** instead (against a live pod it would never end on its own), so
+its log simply ends where the stream did.
+
+For a **multi-pod** task every pod's follow appends to the same `<task>.log`, so the file is
+ordered **chronologically, interleaved across pods** — not grouped per pod as the old rebuild
+produced. `kubectl logs --prefix` tags every line with its pod, so lines stay attributable.
+
+:::note Migration note: parsing a multi-pod log
+Anything that parses `<task>.log` must not assume per-pod contiguity. A `result:` pattern that
+takes the **last** match now takes the last one **in time** across all pods, not the last one in
+the final pod's block — match on the pod prefix if you need a specific pod's value.
+:::
+
+Console/TUI output is **best-effort**: it is only for live observation, is length-capped per line,
+and can be cut early. The on-disk `<task>.log` is the ground truth — it is never truncated (once
+the stream ends it is only cleaned in place of TTY control bytes and superseded `\r` redraw
+frames).
+
 ### Output directories inside pods (`SFLOW_*`)
 
 `SFLOW_OUTPUT_DIR` / `SFLOW_WORKFLOW_OUTPUT_DIR` / `SFLOW_TASK_OUTPUT_DIR` point at the
@@ -817,6 +893,15 @@ before exiting on its own (so a slow/dead driver can never hang the pod), and th
 must have `tar` (used by `kubectl cp`). Automatic output collection runs for **single-pod
 `k8s`** only: `k8s_mpi` launchers `exec mpirun` (no post-run hook) and merged members are
 typically long-running servers — for those, persist outputs with `uploads:` / a PVC.
+
+**Turning it off (`collect_node_local_output: false`).** Set it on the `kubernetes` backend to
+run tasks with **no** sflow collect machinery in the pod at all — no `EXIT` trap, no driver-side
+copy. Worth knowing what it costs to leave on (the default `true`): the collect is the only part
+of a task's lifecycle that makes the DAG depend on something other than pod status, probes and
+the merge-pod marker, because the driver waits on a **sentinel the pod writes to its log** — so a
+task's output can be lost to log-delivery lag (measured once at 20 minutes) without the run
+failing. With it off, task completion depends on those three signals only, and outputs have to
+reach the driver by a shared filesystem, `uploads:` (S3) or a PVC.
 
 ```yaml
 operators:

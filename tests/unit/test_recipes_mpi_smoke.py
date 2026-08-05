@@ -9,6 +9,9 @@ transparent mpirun shim tee's its OWN launch echo (``[SFLOW_RANK] r=${OMPI_COMM_
 ... host=$(hostname)``) into the same ``ranks.txt``, so an unanchored grep over-counts both
 ranks and hosts and the smoke test would falsely FAIL on every cluster run. This is the
 CI-side guard for that fix (the recipe itself only runs on a real multi-node cluster).
+
+The recipe is a test fixture, not a user-facing sample, so it lives under
+``tests/integration/recipes/kubernetes/`` with the other k8s smoke recipes.
 """
 
 import shutil
@@ -18,7 +21,7 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_MPI_SMOKE = _REPO_ROOT / "examples/self_contained/kubernetes/mpi_smoke.yaml"
+_MPI_SMOKE = _REPO_ROOT / "tests/integration/recipes/kubernetes/mpi_smoke.yaml"
 
 # A realistic ranks.txt: the shim's tee'd launch echo (literal r=${...}, host=$(hostname))
 # followed by 4 real ranks across 2 hosts.

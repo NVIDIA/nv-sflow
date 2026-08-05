@@ -35,12 +35,19 @@ from sflow.logging import configure_logging, get_logger
 from sflow.resolution import enrich_error_with_location
 from sflow.runtime_info import log_runtime_info
 from sflow.utils.extra_args import dedup_merge_extra_args
+from sflow.utils.install import (
+    DEFAULT_SFLOW_GIT_URL,
+    sflow_git_install_url,
+    sflow_index_url_error,
+    sflow_pypi_requirement,
+    sflow_version_error,
+)
 from sflow.utils.slurm import emit_gpus_per_node_semantics_warning
 
 _logger = get_logger(__name__)
 
 _sflow_app = SflowApp()
-_DEFAULT_SFLOW_GIT_URL = "https://github.com/NVIDIA/nv-sflow.git"
+_DEFAULT_SFLOW_GIT_URL = DEFAULT_SFLOW_GIT_URL
 
 
 def _detect_slurm_account() -> str | None:
@@ -239,88 +246,12 @@ def _resolve_effective_sflow_version(sflow_version: str | None) -> str | None:
         return None
 
 
-def _sflow_git_install_url(sflow_version_or_url: str | None) -> str:
-    """Return a pip-compatible git URL for installing sflow."""
-    value = sflow_version_or_url or "main"
-    parsed = urlparse(value)
-    if parsed.scheme and parsed.netloc:
-        if parsed.scheme.startswith("git+"):
-            return value
-        return f"git+{value}"
-    return f"git+{_DEFAULT_SFLOW_GIT_URL}@{value}"
-
-
-def _sflow_pypi_requirement(sflow_version: str | None) -> str:
-    """Build the ``sflow`` requirement for a PyPI-index install (PyPI route).
-
-    ``sflow_version`` is a PEP 440 version/specifier already validated by
-    :func:`_sflow_version_error`: a bare version is pinned (``0.2.1`` ->
-    ``sflow==0.2.1``), an operator-led spec is kept (``>=0.2,<0.3`` ->
-    ``sflow>=0.2,<0.3``), and an empty value installs the latest (``sflow``).
-    """
-    spec = (sflow_version or "").strip()
-    if not spec:
-        return "sflow"
-    if spec[0] in "=<>!~":
-        return f"sflow{spec}"
-    return f"sflow=={spec}"
-
-
-def _sflow_version_error(sflow_version: str | None, *, registry: bool) -> str | None:
-    """Sanity-check ``--sflow-version`` for the active install route.
-
-    ``--sflow-version`` drives two mutually-exclusive routes:
-
-    * **git** (``registry=False``, i.e. no ``--sflow-index-url``): a git
-      branch/tag or a ``repo-url@ref``, installed as ``sflow @ git+...``.
-    * **PyPI index** (``registry=True``, ``--sflow-index-url`` set): a PEP 440
-      version (``0.2.1``) or specifier (``>=0.2,<0.3``), installed as
-      ``sflow==...`` from that index.
-
-    Returns an error message, or ``None`` when the value is acceptable. An empty
-    value is always accepted -- each route has a sensible default (git falls back
-    to the running env's ref; PyPI installs the latest).
-    """
-    spec = (sflow_version or "").strip()
-    if not spec:
-        return None
-
-    if not registry:
-        # Git route: refs and repo URLs never contain whitespace -- reject it as a
-        # likely mistake (a stray version spec, shell-quoted args, ...).
-        if any(ch.isspace() for ch in spec):
-            return (
-                f"--sflow-version '{sflow_version}' is not a valid git ref or repo URL "
-                "(whitespace is not allowed). Pass a branch/tag like 'main' or a "
-                "'repo-url@ref'; for a PyPI version, add --sflow-index-url."
-            )
-        return None
-
-    # PyPI route: a plain PEP 440 version/specifier only -- never a package name,
-    # URL or PEP 508 direct reference, which would otherwise be embedded verbatim
-    # into the generated install command. The structural reject of '@' / '://' /
-    # whitespace is unconditional; the PEP 440 parse needs ``packaging`` and is
-    # skipped (best-effort) when it is unavailable.
-    pypi_message = (
-        f"--sflow-version '{sflow_version}' is not a valid PyPI version specifier "
-        "(required with --sflow-index-url). Use a plain version like '0.2.1' or a "
-        "specifier like '>=0.2,<0.3'; package names, URLs and '@' direct references "
-        "are not allowed."
-    )
-    if "@" in spec or "://" in spec or any(ch.isspace() for ch in spec):
-        return pypi_message
-    try:
-        from packaging.specifiers import InvalidSpecifier, SpecifierSet
-    except ImportError:
-        return None
-    # Bare versions ('0.2.1', '0.2.*') aren't specifiers on their own, so pin them
-    # with '==' before parsing; operator-led values are validated as written.
-    candidate = spec if spec[0] in "=<>!~" else f"=={spec}"
-    try:
-        SpecifierSet(candidate)
-    except InvalidSpecifier:
-        return pypi_message
-    return None
+# Install-spec helpers are shared with `sflow upgrade`; see sflow.utils.install.
+# The module-private aliases are kept so existing call sites (and tests) that
+# reference them by their original names keep working.
+_sflow_git_install_url = sflow_git_install_url
+_sflow_pypi_requirement = sflow_pypi_requirement
+_sflow_version_error = sflow_version_error
 
 
 def _resolve_sbatch_extra_args(
@@ -1876,7 +1807,8 @@ def read_bulk_csv(csv_path: Path) -> tuple[list[str], list[dict]]:
     """Read and validate a bulk-input CSV file.
 
     Returns (columns, rows).
-    Raises ValueError if the file is empty or lacks the ``sflow_config_file`` column.
+    Raises ValueError if the file is empty, lacks the ``sflow_config_file`` column, has
+    no data rows, or has a row that leaves that required column blank.
     """
     import csv
 
@@ -1892,6 +1824,24 @@ def read_bulk_csv(csv_path: Path) -> tuple[list[str], list[dict]]:
         rows = list(reader)
     if not rows:
         raise ValueError(f"CSV file has no data rows: {csv_path}")
+    # A present HEADER is not the same as a present VALUE. ``csv.DictReader`` pads a row
+    # that has fewer fields than the header with None, so a short row yields
+    # ``{"sflow_config_file": None}`` and sails past the column check above -- then every
+    # downstream ``row["sflow_config_file"].split()`` raises AttributeError, which escapes
+    # typer as a raw traceback instead of a CLI error. Validating here, at the one place
+    # every caller (batch, compose, run) reads a bulk CSV, fixes all of those at once and
+    # keeps the guard from having to be re-derived at each dereference.
+    #
+    # Rejecting rather than coercing to "" is deliberate: an empty file list is not a
+    # runnable row, so coercion would only defer the failure to a less obvious place.
+    for number, row in enumerate(rows, start=1):
+        if not (row.get("sflow_config_file") or "").strip():
+            raise ValueError(
+                f"CSV data row {number} has no value for the required "
+                f"'sflow_config_file' column: {csv_path}. Every row must name at least "
+                "one YAML config file (space-separate several to merge them). A row with "
+                "fewer fields than the header will do this -- check for a missing comma."
+            )
     return columns, rows
 
 
@@ -3150,25 +3100,10 @@ def batch(
         )
         raise typer.Exit(code=1)
 
-    if sflow_index_url is not None:
-        parsed_sflow_index_url = urlparse(sflow_index_url)
-        if (
-            parsed_sflow_index_url.username is not None
-            or parsed_sflow_index_url.password is not None
-        ):
-            typer.echo(
-                "Error: --sflow-index-url must not contain embedded credentials; "
-                "use ~/.netrc or a credential helper on the compute node instead.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        if parsed_sflow_index_url.query or parsed_sflow_index_url.fragment:
-            typer.echo(
-                "Error: --sflow-index-url must not include query parameters or fragments; "
-                "use ~/.netrc or a credential helper on the compute node instead.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
+    index_url_error = sflow_index_url_error(sflow_index_url)
+    if index_url_error:
+        typer.echo(f"Error: {index_url_error}", err=True)
+        raise typer.Exit(code=1)
 
     # Sanity-check --sflow-version for whichever install route is active: a git
     # ref/URL by default, or a PyPI version/specifier when --sflow-index-url is

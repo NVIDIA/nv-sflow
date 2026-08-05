@@ -1,0 +1,123 @@
+# GPU placement: `count`, `indices`, and both together.
+#
+# `resources.gpus` accepts `count`, `indices`, or both:
+#
+#   count only     index-agnostic. Takes any contiguous idle run of that many
+#                  GPUs, but never straddles a node boundary.
+#   indices only   pins those device ids on the first node where all of them
+#                  are free. The node scan restarts at node 0 every time, so a
+#                  later task can backfill slots an earlier one left idle.
+#   count+indices  `count` is the total across nodes, `indices` the per-node
+#                  slice, so the task spans count/len(indices) nodes.
+#
+# With the defaults below (4 nodes x 4 GPUs) the planner produces:
+#
+#   node0  GPU 0,1 -> pin_low          GPU 2,3 -> backfill_high
+#   node1  GPU 0,1 -> pin_low_again    GPU 2,3 -> flexible
+#   node2  GPU 0,1 -> fanout
+#   node3  GPU 0,1 -> fanout
+#
+# Run `sflow run examples/self_contained/slurm/gpu_indices.yaml --dry-run --verbose`
+# to see that map before submitting anything.
+#
+# Note: GPU indices must be non-negative (unlike `resources.nodes.indices`,
+# which allows Python-style negatives), and they are rejected on the Kubernetes
+# backend, where the device plugin / DRA assigns the physical devices.
+version: "0.1"
+
+variables:
+  # Slurm configuration. These can be overridden by `sflow batch` / `sflow run`.
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: "00:10:00"
+  SLURM_NODES:
+    description: "Number of Slurm nodes"
+    value: 4
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    value: 4
+
+artifacts:
+  # Declared so sample/bulk tests can override the standard sample artifact.
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    # Planning-only: lets sflow pack and slice GPU indices per task. It does not
+    # add a Slurm --gpus-per-node flag (use extra_args for that).
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+workflow:
+  name: gpu_indices
+  tasks:
+    # --- Rule: indices only -------------------------------------------------
+    - name: pin_low
+      resources:
+        gpus:
+          indices: [0, 1]
+          # Hold the slots for the whole workflow so the placement below is
+          # deterministic; without this, downstream tasks would reuse them.
+          release_after: workflow_completion
+      script:
+        - echo "pin_low GPUs: $CUDA_VISIBLE_DEVICES"   # -> 0,1 on node0
+        - nvidia-smi
+
+    # node0's 0,1 are taken, so this one skips to the next node.
+    - name: pin_low_again
+      depends_on: [pin_low]
+      resources:
+        gpus:
+          indices: [0, 1]
+          release_after: workflow_completion
+      script:
+        - echo "pin_low_again GPUs: $CUDA_VISIBLE_DEVICES"   # -> 0,1 on node1
+        - nvidia-smi
+
+    # node0's 2,3 are still idle, so the scan comes back to node0.
+    - name: backfill_high
+      depends_on: [pin_low_again]
+      resources:
+        gpus:
+          indices: [2, 3]
+          release_after: workflow_completion
+      script:
+        - echo "backfill_high GPUs: $CUDA_VISIBLE_DEVICES"   # -> 2,3 on node0
+        - nvidia-smi
+
+    # --- Rule: count + indices ----------------------------------------------
+    # 4 GPUs total, 2 per node -> 2 nodes, same slots on each.
+    - name: fanout
+      depends_on: [backfill_high]
+      resources:
+        gpus:
+          count: 4
+          indices: [0, 1]
+          release_after: workflow_completion
+      script:
+        - echo "fanout GPUs: $CUDA_VISIBLE_DEVICES"   # -> 0,1 on node2 and node3
+        - nvidia-smi
+
+    # --- Rule: count only ---------------------------------------------------
+    # No indices: takes whatever contiguous pair is still free on one node.
+    - name: flexible
+      depends_on: [fanout]
+      resources:
+        gpus:
+          count: 2
+          release_after: workflow_completion
+      script:
+        - echo "flexible GPUs: $CUDA_VISIBLE_DEVICES"   # -> 2,3 on node1
+        - nvidia-smi

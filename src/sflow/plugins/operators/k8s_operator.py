@@ -22,6 +22,7 @@ import os
 import shlex
 import shutil
 import tarfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -97,24 +98,70 @@ def _warn_manifest_overrides(task_name: str, conflicts: Sequence[str]) -> None:
 # completion. (``kubectl logs`` splits lines at 16 KiB, which corrupts any large base64
 # blob AND floods the console -- so the log is used only for the tiny readiness marker.)
 _SFLOW_COLLECT_READY_MARKER = "[[sflow-collect-ready]]"  # pod -> log: staged, copy me
+# pod -> log: the task produced nothing collectable, so no archive is coming. Without
+# this the collector waits for a marker that will never be printed, and the driver
+# cannot tell a healthy no-output task from output that was staged but never
+# announced -- so every no-output task drew a "output was NOT collected" warning.
+_SFLOW_COLLECT_NONE_MARKER = "[[sflow-collect-none]]"
 _SFLOW_COLLECT_TGZ = ".sflow_collect.tgz"    # staged archive (under SFLOW_OUTPUT_DIR)
 _SFLOW_COLLECT_DONE = ".sflow_collect_done"  # driver -> pod: cp done, you may exit
 # Max seconds the pod keeps its container alive awaiting the driver's copy before exiting
 # on its own (so a dead/slow driver can never hang the pod).
 _SFLOW_COLLECT_GRACE_SECONDS = 120
+# How often the WAITING pod RE-ANNOUNCES its readiness marker.
+#
+# The marker rides the pod's stdout, and the kubelet can DESTROY that channel outright:
+# once a container log exceeds ``containerLogMaxSize`` (10 MiB default) the kubelet
+# renames the whole file and starts an empty one, and ``kubectl logs`` / ``logs -f`` only
+# ever serve the CURRENT file -- everything in the rotated file is unreachable forever.
+# Measured on a GB300 cluster (kubelet v1.34.3): a pod that wrote ~30 MB left a
+# 29,772,304-byte ``0.log.<ts>`` beside a 0-byte ``0.log``, and ``kubectl logs`` returned
+# 0 bytes -- no task output, no marker. The rotation monitor polls rather than enforcing
+# per-write, so one burst overshoots the cap and then the whole file is rotated at once.
+#
+# A single announcement is therefore not enough: the pod must keep saying it, so that a
+# rotation which ate the first copy still leaves one in the POST-rotation log. Costs
+# nothing (one line per interval, only while the handshake is unresolved) and keeps the
+# trigger on the log channel, so the healthy path still execs nothing into a live pod.
+_SFLOW_COLLECT_REANNOUNCE_SECONDS = 10
 # How often the driver rescans the offloaded log for the readiness marker (local file
 # reads only -- no kubectl -- so it is cheap for a task of any duration).
 _SFLOW_COLLECT_POLL_INTERVAL = 1.0
+# How often a still-waiting collector reports what it is waiting for. The collect is the
+# one part of a task's lifecycle that can stall the DAG without any error, and it does so
+# silently: a real run sat 20 minutes between its pod finishing and the workflow ending
+# with nothing logged, so the post-mortem had to be reconstructed from file mtimes. These
+# heartbeats make the next one self-explaining -- each line says whether <task>.log is
+# still growing, which separates "task is simply still running" from "the log stream
+# died" from "the marker was printed but never delivered".
+_MARKER_WAIT_HEARTBEAT_S = 30.0
+# Ceiling for the PRE-COPY pod-phase check ONLY. Much tighter than the usual poll
+# timeout because that check runs INSIDE the pod's collect_grace_seconds countdown --
+# a full-length stall there would eat the copy window before the copy starts.
+#
+# Scoped to that check ON PURPOSE. An earlier design also polled the running pod for its
+# staged archive and reused this ceiling for it -- wrong on both counts: that poll raced
+# no window, and a 5s cap only served to kill healthy `kubectl exec` calls mid-handshake
+# (rc=124 against a serving TRT-LLM pod, which then died with SIGTERM). The collect is
+# triggered from the log sentinels now and nothing execs into a running pod.
+_SFLOW_COLLECT_PHASE_TIMEOUT = 5.0
 
 # Default per-file cap for auto-collecting a K8s task's node-local output dir back to the
 # driver. Files larger than this are skipped with a warning -- sync those via ``uploads:``
 # / a PVC. Override per task with ``collect_max_file_size`` (0 disables collection).
 _SFLOW_COLLECT_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB
 
-# Bound on the cancel-path complete-log re-fetch (``execute``'s ``finally``): a SIGINT'd
-# run re-fetches each pod's log before deleting the pods, but that best-effort fetch must
+# Bound on the cancel-path log finalize (``execute``'s ``finally``): a SIGINT'd run still
+# sanitizes the streamed log before deleting the pods, but that best-effort pass must
 # never let teardown hang -- so cap it and fall through to the pod delete on timeout.
 _SFLOW_FINALIZE_ON_CANCEL_TIMEOUT = 30.0
+
+# Once a task's pods are terminal, nothing else is driving the workflow: every second
+# the post-terminal epilogue spends is a second the DAG is blocked on a task whose work
+# is already done, and it spends them without logging anything. Two separate 20-minute
+# investigations came down to "which of these four stages was it?" -- unanswerable from
+# the artifacts, because the window was silent. Name any stage that outlasts this.
+_EPILOGUE_WARN_S = 20.0
 
 # How much of a merged member's log tail ``merged_member_exit_code`` scans for the
 # member-done marker. The orchestrator polls it once per tick (1s) for every
@@ -216,7 +263,10 @@ def _sflow_output_collect_trap(
     ``exclude_rel`` -- injected ``file://`` artifacts every pod shares and the driver already
     has), stages them into ONE tar.gz on the writable output emptyDir, prints the readiness
     marker, then keeps the container alive up to ``grace_seconds`` for the driver to
-    ``kubectl cp`` the archive out and extract the ones missing on the host. In the pod's
+    ``kubectl cp`` the archive out and extract the ones missing on the host. While it
+    waits it RE-ANNOUNCES that marker every ``_SFLOW_COLLECT_REANNOUNCE_SECONDS``, so a
+    container-log rotation that discarded the first announcement cannot orphan the
+    archive (see that constant). In the pod's
     emptyDir the workflow dir only holds files THIS pod created, so scanning it is safe.
     ``set +ex`` silences xtrace/errexit so a recipe's ``set -x``/``set -e`` can neither flood
     the log with the wait loop nor abort the block. The task's real exit code is preserved
@@ -226,6 +276,13 @@ def _sflow_output_collect_trap(
     limit = int(max_bytes)
     grace = int(grace_seconds)
     marker = _SFLOW_COLLECT_READY_MARKER
+    none_marker = _SFLOW_COLLECT_NONE_MARKER
+    # Derived, not fixed: `collect_grace_seconds` is user-configurable, and a window
+    # shorter than the interval would produce ZERO re-announcements -- silently removing
+    # the rotation protection from exactly the configuration that can least afford to
+    # lose the marker. Guarantee at least a few repeats inside any window, and never 0
+    # (a modulus of 0 is a shell arithmetic error, not a skipped branch).
+    reannounce = max(1, min(int(_SFLOW_COLLECT_REANNOUNCE_SECONDS), grace // 3))
     # Skip injected file:// artifacts (identical in every pod, already on the driver) so
     # shared files aren't re-tarred/​re-copied by every task pod.
     excl = "".join(f" ! -path {shlex.quote(p)}" for p in exclude_rel)
@@ -255,22 +312,64 @@ def _sflow_output_collect_trap(
             # Stage the <= cap files (whole workflow subtree) into ONE tar.gz on the
             # (writable) output emptyDir.
             f'      ( cd {scan} && find . -type f ! -size {big}{excl}'
-            f" -print0 2>/dev/null | tar czf {tgz} --null -T - 2>/dev/null ) || true",
+            # Tar to a .part then RENAME so the archive is never observable while
+            # tar is still writing it: a rename is atomic, a half-written tar is a
+            # corrupt copy. The readiness marker below is only echoed after this
+            # completes, so ordering already implies a whole file -- this also holds if
+            # anything ever probes for the archive directly instead of the marker.
+            f" -print0 2>/dev/null | tar czf {tgz}.part --null -T - 2>/dev/null )"
+            f" && mv -f {tgz}.part {tgz} || true",
+            # LOAD-BEARING blank line. `kubectl logs -f` reassembles CRI partial-line
+            # entries and only emits once a line TERMINATES, so a task whose tail is an
+            # unterminated `\r` progress bar (tqdm, aiperf, pip) freezes the follow: the
+            # driver's <task>.log stops growing and everything printed afterwards --
+            # including the sentinel below -- is withheld with it. Measured live on an
+            # MLPerf harness: kubectl held 253,871 bytes containing 2,149 CRs and ZERO
+            # newlines, so the marker only surfaced ~20 minutes later when the stream
+            # finally closed, and the DAG waited that whole time. Emitting a newline
+            # first closes the pending line and flushes it, so the sentinel is delivered
+            # promptly instead of queueing behind a progress bar.
+            '      echo ""',
             # Signal readiness (tiny log line -- NOT the file bytes), then wait, bounded,
             # for the driver to copy + acknowledge (touch the done-sentinel).
             '      echo "sflow: ${_sflow_n} output file(s) staged from'
             f' $SFLOW_WORKFLOW_OUTPUT_DIR; awaiting driver copy to the driver-side'
             f' filesystem {marker}"',
             "      _i=0",
-            f'      while [ ! -f {done} ] && [ "$_i" -lt {grace} ]; do sleep 1;'
-            " _i=$((_i+1)); done",
+            f'      while [ ! -f {done} ] && [ "$_i" -lt {grace} ]; do',
+            "        sleep 1; _i=$((_i+1))",
+            # Re-announce, because the announcement above may have been DESTROYED rather
+            # than merely delayed: a container-log rotation makes everything written
+            # before it unreachable to `kubectl logs` (see the constant). Each repeat
+            # lands in the post-rotation log, so the handshake recovers within one
+            # interval instead of the archive dying with the pod.
+            f"        if [ $((_i % {reannounce})) -eq 0 ]; then",
+            '          echo "sflow: still awaiting driver copy after ${_i}s;'
+            " re-announcing in case a container-log rotation discarded the first"
+            f' announcement {marker}"',
+            "        fi",
+            "      done",
             f'      if [ -f {done} ]; then echo "sflow: driver copy complete; exiting.";'
             f' else echo "sflow: driver copy window ({grace}s) elapsed; exiting."; fi',
             f"      rm -f {tgz} {done} 2>/dev/null || true",
             "    else",
+            '      echo ""',  # same partial-line flush as above
             '      echo "sflow: no new in-pod output files in'
-            ' $SFLOW_WORKFLOW_OUTPUT_DIR; nothing to collect back to the driver"',
+            f' $SFLOW_WORKFLOW_OUTPUT_DIR; nothing to collect back to the driver'
+            f' {none_marker}"',
             "    fi",
+            # The trap RAN but the output dir is unusable -- the preamble's `mkdir -p`
+            # failed (read-only mount), or SFLOW_OUTPUT_DIR was unset by the recipe.
+            # Announce it anyway: without a sentinel here the driver's collector waits
+            # out the whole grace window and then reports "the container either died
+            # before its EXIT trap ran, or the trap's output was never delivered" --
+            # neither of which happened. Every path through this trap now emits exactly
+            # one sentinel, so "no sentinel at all" keeps its precise meaning.
+            "  else",
+            '    echo ""',  # same partial-line flush as above
+            '    echo "sflow: no usable in-pod output directory'
+            f' ($SFLOW_WORKFLOW_OUTPUT_DIR); nothing to collect back to the driver'
+            f' {none_marker}"',
             "  fi",
             "  exit $__sflow_rc",
             "}",
@@ -280,15 +379,40 @@ def _sflow_output_collect_trap(
 
 
 async def _wait_for_marker(
-    log_path: str, marker: bytes, *, interval: float = _SFLOW_COLLECT_POLL_INTERVAL
+    log_path: str,
+    marker: bytes,
+    *,
+    interval: float = _SFLOW_COLLECT_POLL_INTERVAL,
+    task_name: str = "",
+    heartbeat: float = _MARKER_WAIT_HEARTBEAT_S,
+    stop_marker: bytes | None = None,
 ) -> bool:
     """Incrementally scan the offloaded ``<task>.log`` for ``marker`` (local reads only,
     no kubectl). Returns ``True`` once it appears; otherwise loops until the caller
     cancels it (which ``execute`` does the instant the pod is terminal). A small tail
-    overlap catches a marker split across two reads."""
+    overlap catches a marker split across two reads.
+
+    Emits a heartbeat every ``heartbeat`` seconds naming what it is still waiting for and
+    whether ``<task>.log`` is still growing. That one fact separates the three ways this
+    wait ends badly, which previously had to be inferred from file mtimes after the run:
+
+    * log still growing        -> the task is simply still running (normal)
+    * log stopped, pod alive   -> the stream stalled; the marker may be printed but
+                                  undelivered (`kubectl logs -f` has been observed 20
+                                  minutes behind), so the collect window may be closing
+    * log never grew at all    -> the log stream never attached
+
+    ``stop_marker`` is a second sentinel meaning "no archive is coming" (the task
+    produced nothing collectable). Seeing it returns False, so the caller can stop
+    cleanly instead of waiting out a marker that will never be printed.
+    """
     pos = 0
     tail = b""
-    keep = max(0, len(marker) - 1)
+    keep = max(0, max(len(marker), len(stop_marker or b"")) - 1)
+    started = time.monotonic()
+    last_growth = started
+    last_beat = started
+    last_size = -1
     while True:
         chunk = b""
         try:
@@ -298,11 +422,38 @@ async def _wait_for_marker(
                 pos = fh.tell()
         except OSError:
             pass
+        now = time.monotonic()
+        if pos != last_size:
+            last_size = pos
+            last_growth = now
         if chunk:
             data = tail + chunk
             if marker in data:
+                _logger.info(
+                    f"[{task_name}] collect-ready marker seen after "
+                    f"{now - started:.0f}s; copying the staged output archive"
+                )
                 return True
+            if stop_marker is not None and stop_marker in data:
+                _logger.info(
+                    f"[{task_name}] task reported no collectable output after "
+                    f"{now - started:.0f}s; nothing to copy back"
+                )
+                return False
             tail = data[-keep:] if keep else b""
+        if now - last_beat >= heartbeat:
+            last_beat = now
+            quiet = now - last_growth
+            state = (
+                f"{log_path} is still growing ({pos} bytes) -- task likely still running"
+                if quiet < heartbeat
+                else f"{log_path} has not grown for {quiet:.0f}s ({pos} bytes) -- the "
+                "log stream may have stalled, so a printed marker could go undelivered"
+            )
+            _logger.info(
+                f"[{task_name}] still waiting for the collect-ready marker after "
+                f"{now - started:.0f}s: {state}"
+            )
         await asyncio.sleep(interval)
 
 
@@ -618,6 +769,8 @@ class K8sContainerOperator(Operator):
         )
         # Max seconds the pod stays alive awaiting the driver's kubectl cp of its output.
         self._collect_grace_seconds: int = _SFLOW_COLLECT_GRACE_SECONDS
+        # Backend master switch; False = no collect machinery in the pod at all.
+        self._collect_enabled: bool = True
         # Pod CPU/memory (requests-only policy). The cpu/memory overrides come from
         # the operator's flat fields; memory/limits depend only on the override so
         # are resolved here, while the CPU *request* baseline (cpu_per_gpu /
@@ -644,6 +797,8 @@ class K8sContainerOperator(Operator):
         # CLI-level kube access flags (from `sflow run`), prefixed onto every
         # kubectl call in the per-task wrapper; read from the backend below.
         self._kubectl_global_args: list[str] = []
+        # `kubectl apply` subcommand flags (--extra-kubectl-apply-args).
+        self._kubectl_apply_args: list[str] = []
         # Backend allocation id, stamped onto every task object as the allocation
         # label so the backend's label-selector sweep can delete them all.
         self._allocation_id: str | None = None
@@ -763,6 +918,10 @@ class K8sContainerOperator(Operator):
                 f"touch {shlex.quote(marker)}",
             ],
             global_args=list(self._kubectl_global_args),
+            # Called from the ORCHESTRATOR's poll loop every tick, so an unbounded
+            # exec here stalls the whole DAG, not just one task. Idempotent (mkdir -p
+            # + touch), so a timeout is retried on the next tick.
+            timeout=k8s_lifecycle.POLL_KUBECTL_TIMEOUT,
         )
         if rc != 0:
             _logger.debug(
@@ -856,6 +1015,9 @@ class K8sContainerOperator(Operator):
         self._collect_grace_seconds = int(
             getattr(backend, "collect_grace_seconds", _SFLOW_COLLECT_GRACE_SECONDS)
         )
+        self._collect_enabled = bool(
+            getattr(backend, "collect_node_local_output", True)
+        )
         if self.config.node_selector is not None:
             self._node_selector = self.config.node_selector
         else:
@@ -925,6 +1087,9 @@ class K8sContainerOperator(Operator):
         # CLI-level kube access flags, applied to every kubectl call in the wrapper.
         self._kubectl_global_args = list(
             getattr(backend, "kubectl_global_args", []) or []
+        )
+        self._kubectl_apply_args = list(
+            getattr(backend, "kubectl_apply_args", []) or []
         )
 
     def _effective_tolerations(self) -> list[dict[str, Any]]:
@@ -1572,6 +1737,7 @@ class K8sContainerOperator(Operator):
             handoff_delete_pods=self._handoff_pods,
             handoff_before_apply=self._handoff_destroy_first,
             kubectl_global_args=global_args,
+            kubectl_apply_args=list(self._kubectl_apply_args),
             allocation_id=self._allocation_id,
         )
         log_stream_commands = [
@@ -1707,9 +1873,21 @@ class K8sContainerOperator(Operator):
             # kubectl-cp collection is single-pod only: the driver copies from ONE pod,
             # so arming the wait-trap on a multi-node pod-set would make the workers
             # (never copied) idle for the full grace before exiting.
+            # ``collect_grace_seconds: 0`` means the pod does not wait for the driver
+            # at all, so there is no window in which a copy could ever land. Arming the
+            # trap anyway would stage an archive nobody collects and hand the driver a
+            # 0s copy budget (an instant timeout reported as "did not finish within
+            # 0s", which reads like a slow copy rather than a disabled feature). Treat
+            # it as the opt-out it is: skip the collect on both sides.
+            # ``collect_node_local_output: false`` on the backend turns the whole
+            # mechanism off -- no EXIT trap in the pod, no driver-side collector. Task
+            # completion then depends only on pod status, readiness probes and the
+            # merge-pod done-marker, with nothing exec'ing into a running pod.
             if (
                 n == 1
+                and self._collect_enabled
                 and self._collect_max_file_bytes > 0
+                and self._collect_grace_seconds > 0
                 and envs.get("SFLOW_OUTPUT_DIR")
             ):
                 # Exclude injected file:// artifacts (shared by every pod, already on the
@@ -1725,6 +1903,15 @@ class K8sContainerOperator(Operator):
                     )
                 ]
                 collect_output = True
+            # KNOWN LIMITATION when the collect trap is NOT armed (`collect_node_local
+            # _output: false`, `collect_grace_seconds: 0`, multi-node pod-sets): nothing
+            # emits the newline that flushes a dangling partial line, so a task ending
+            # mid-progress-bar leaves its tail undelivered until the stream closes.
+            # Deliberately NOT fixed by injecting a flush trap into every task: task
+            # completion in those configurations is driven by pod status rather than the
+            # log, so the practical cost is a late console line, and the fix would add an
+            # EXIT trap (silently superseded by any trap the user's own script registers)
+            # to every rendered manifest.
             script = preamble + script
 
         # K8s-native artifact injection (file:// -> ConfigMap, fs:// -> PVC/hostPath).
@@ -1899,6 +2086,7 @@ class K8sContainerOperator(Operator):
             handoff_delete_pods=self._handoff_pods,
             handoff_before_apply=self._handoff_destroy_first,
             kubectl_global_args=global_args,
+            kubectl_apply_args=list(self._kubectl_apply_args),
             allocation_id=self._allocation_id,
         )
         log_stream_commands = [
@@ -2009,12 +2197,17 @@ class K8sContainerOperator(Operator):
         coroutine is cancelled). Any failed pod fails the whole task (a multi-node
         task is one unit); otherwise the leader pod's exit code is the task's.
 
-        Once the pod watches have resolved (every pod terminal, or one pod failed
-        and its still-running peers were cancelled) and their live streams are
-        interrupted, the on-disk ``<task>.log``
-        is REBUILT from a one-shot re-fetch of each pod's COMPLETE container log
-        (see ``finalize_complete_log``) -- a double-confirm that the saved file is
-        complete before the orchestrator runs probes + output/result parsing on it.
+        Once the pod watches have resolved (every pod terminal, or one pod failed and
+        its still-running peers were cancelled), each terminal pod's follow is DRAINED
+        so ``<task>.log`` -- which ``kubectl logs -f`` has been writing live -- ends
+        complete, and is then finalized in place (TTY-sanitize only) before the
+        orchestrator runs probes + output/result parsing on it.
+
+        Multi-pod note: every pod's follow APPENDS to the same ``<task>.log``, so the
+        file is ordered CHRONOLOGICALLY (interleaved across pods), not grouped per pod
+        as the deleted re-fetch used to rebuild it. ``kubectl logs --prefix`` tags every
+        line with its pod, so lines stay attributable; anything parsing this file must
+        not assume per-pod contiguity.
         The console/TUI stream is only for live observation and may be cut early;
         the disk log is ground truth. The ``finally`` stops the tailer and deletes
         the task's objects either way.
@@ -2023,11 +2216,9 @@ class K8sContainerOperator(Operator):
             task_name=task_name, script=list(script), envs=dict(env)
         )
         tailers: list[asyncio.Future] = []
-        # Re-fetch the complete log exactly once: normally on the terminal path below,
-        # else (cancelled first) in the ``finally`` before the pods are deleted.
-        # ``apply_prefix_size`` is bound here so the ``finally`` can use it.
+        # Finalize <task>.log exactly once: normally on the terminal path below, else
+        # (cancelled first) in the ``finally`` before the pods are deleted.
         finalized = False
-        apply_prefix_size = 0
         # Single-pod node-local output collector (kubectl cp), run concurrently with the
         # pod-status watch below; None unless this task stages output for collection.
         collector: asyncio.Future | None = None
@@ -2048,6 +2239,24 @@ class K8sContainerOperator(Operator):
         # prefix-namespaced launcher env (avoids envFrom collisions in the shared
         # container); pass that instead of the leader's plain env.
         apply_env = plan.merge_launcher_env if plan.merge_launcher_env is not None else env
+        # Post-terminal stage clock. Armed only once the pods are terminal, because
+        # only from then on is the DAG blocked on this epilogue rather than on the
+        # workload. Defined out here so the `finally` teardown is timed too -- a stall
+        # in the pod delete is just as invisible as one in the log finalize is.
+        _stage_t0: float | None = None
+
+        def _stage(name: str) -> None:
+            nonlocal _stage_t0
+            if _stage_t0 is None:
+                return  # pods still running: this time belongs to the workload
+            dt = time.monotonic() - _stage_t0
+            _stage_t0 = time.monotonic()
+            if dt >= _EPILOGUE_WARN_S:
+                _logger.warning(
+                    f"[{task_name}] post-terminal {name} took {dt:.1f}s -- the pod "
+                    "had already finished, so the workflow was blocked on this"
+                )
+
         try:
             rc = await launcher.run_async(
                 plan.apply_command,
@@ -2068,12 +2277,6 @@ class K8sContainerOperator(Operator):
             # Bytes already in <task>.log after apply == the driver/apply
             # diagnostics the launcher flushed (before any pod log). We preserve
             # this prefix when we rebuild the file from the complete pod logs.
-            apply_prefix_size = 0
-            if plan.task_log_path:
-                try:
-                    apply_prefix_size = os.path.getsize(plan.task_log_path)
-                except OSError:
-                    apply_prefix_size = 0
             # Decoupled console tailer(s), reading the offloaded log file(s) from
             # disk (TTY only) -- independent of the file writers so a chatty pod can
             # never re-saturate the event loop via the console path. A single pod
@@ -2151,38 +2354,52 @@ class K8sContainerOperator(Operator):
                 ],
                 mpi_world_group=plan.mpi_world_group,
             )
+            # From here the pods are done and the DAG is waiting on this epilogue alone:
+            # arm the stage clock so a stall names itself instead of going silent.
+            _stage_t0 = time.monotonic()
             # The pod is terminal now. If it produced output, the collector already
             # copied it back and released the pod (that's WHY it went terminal); if it
             # produced none, no marker ever came -- so stop the (still-scanning) collector.
             if collector is not None:
                 if not collector.done():
+                    # Still scanning => NEITHER sentinel arrived. A task with nothing
+                    # to collect announces that too, so this is not the ordinary
+                    # no-output case -- it means the trap's lines never reached
+                    # <task>.log at all: the container died before running the trap
+                    # (OOM-kill, SIGKILL, eviction), or `kubectl logs -f` had not
+                    # delivered them yet (observed 20 minutes behind, which cost a real
+                    # run its whole output tree).
+                    _logger.warning(
+                        f"[{task_name}] pod reached a terminal phase without either "
+                        "collect sentinel appearing in "
+                        f"{plan.task_log_path}: node-local output was NOT collected. "
+                        "The container either died before its EXIT trap ran, or the "
+                        "trap's output was never delivered -- compare the heartbeat "
+                        "lines above to see whether the log was still growing. Raise "
+                        "`collect_grace_seconds`, or set `collect_node_local_output: "
+                        "false` to drop the mechanism."
+                    )
                     collector.cancel()
                 await asyncio.gather(collector, return_exceptions=True)
                 collector = None
-            # Cancelled peers have no result -> "" phase (skips their log re-fetch).
-            phases = [r[1] if r is not None else "" for r in results]
-            # All pods are terminal and their live streams are cut. Stop the
-            # console tailer(s), then re-fetch every pod's COMPLETE log and rename it
-            # into <task>.log -- so the on-disk log is complete (ground truth) for
-            # the probes + output/result parsing the orchestrator runs next.
+                _stage("output-collector join")
+            # All pods are terminal and their live streams have been drained. Stop
+            # the console tailer(s), then make <task>.log final -- it is the streamed
+            # file itself, so this is just the TTY-sanitize pass. It must still happen
+            # BEFORE the orchestrator's probes + output/result parsing, which scan it.
             if tailers:
                 for t in tailers:
                     t.cancel()
                 await asyncio.gather(*tailers, return_exceptions=True)
                 tailers = []
-            # Guarantee the on-disk log is complete (the live follow was cut on
-            # terminal): re-fetch the pod's whole container log and rebuild <task>.log.
-            # Single pod -> one log per pod (finalize_complete_log). Merge-pod -> one
-            # container log carrying every member, re-split by the mux tag into each
-            # member's <task>.log (finalize_merged_complete_log). Same guarantee both.
-            # A peer cancelled by fail-fast / world-group resolution is still Running
-            # (non-terminal ""-phase), which would make the all-or-nothing re-fetch skip
-            # and drop every pod's log. Force it -- the pods still exist here, and the
-            # `finally` deletes them only after -- so the launcher + peer logs survive.
-            force_refetch = not all(p in ("Succeeded", "Failed") for p in phases)
-            await self._finalize_task_log(
-                plan, apply_prefix_size, phases, force=force_refetch
-            )
+                _stage("log-tailer join")
+            # <task>.log is the streamed file and each terminal pod's follow has been
+            # drained into it, so finalizing is just the TTY-sanitize pass. A peer
+            # cancelled by fail-fast / world-group resolution had its stream cut while
+            # still Running -- its log simply ends there, which is what actually
+            # happened to it.
+            await self._finalize_task_log(plan)
+            _stage("log finalize")
             finalized = True
             # Any failed pod fails the whole task; otherwise the leader's code.
             return k8s_lifecycle.task_exit_code(results)
@@ -2201,14 +2418,14 @@ class K8sContainerOperator(Operator):
                     t.cancel()
             if tailers:
                 await asyncio.gather(*tailers, return_exceptions=True)
-            # Cancelled before the normal re-fetch: pull each pod's COMPLETE log BEFORE
-            # deleting the pods, else a fast-failing launcher's log is lost. Bounded +
-            # best-effort so teardown always reaches the delete and the cancel survives.
+            # Cancelled before the normal finalize: still clean the streamed log before
+            # teardown. Bounded + best-effort so teardown always reaches the delete and
+            # the cancel survives.
             _cancelled: asyncio.CancelledError | None = None
             if not finalized and plan.task_log_path:
                 try:
                     await asyncio.wait_for(
-                        self._finalize_task_log(plan, apply_prefix_size, [], force=True),
+                        self._finalize_task_log(plan),
                         timeout=_SFLOW_FINALIZE_ON_CANCEL_TIMEOUT,
                     )
                 except asyncio.CancelledError as exc:
@@ -2220,6 +2437,7 @@ class K8sContainerOperator(Operator):
             await k8s_lifecycle.delete_objects(
                 plan.cleanup_refs, global_args=plan.global_args, ns_args=plan.ns_args
             )
+            _stage("pod delete")
             if _cancelled is not None:
                 raise _cancelled
 
@@ -2237,7 +2455,8 @@ class K8sContainerOperator(Operator):
         """Copy the pod's staged node-local output back to the driver via ``kubectl cp``.
 
         Runs concurrently with the pod-status watch. Waits (scanning the offloaded log,
-        no kubectl) for the entrypoint's readiness marker -- emitted once it has staged
+        no kubectl on the healthy path) for the entrypoint's readiness marker -- emitted
+        repeatedly once it has staged
         ``$SFLOW_OUTPUT_DIR/<tgz>`` and is holding the container open -- then copies that
         one archive out and extracts it into the driver's WORKFLOW output dir (``dest_dir``)
         WITHOUT overwriting existing files, so both per-task outputs and workflow-level
@@ -2251,20 +2470,77 @@ class K8sContainerOperator(Operator):
         name = pod_ref.split("/", 1)[-1]
         tgz_remote = f"{output_dir.rstrip('/')}/{_SFLOW_COLLECT_TGZ}"
         done_remote = f"{output_dir.rstrip('/')}/{_SFLOW_COLLECT_DONE}"
-        # Block until the pod signals it staged output (or we're cancelled once terminal).
-        await _wait_for_marker(log_path, _SFLOW_COLLECT_READY_MARKER.encode())
+        # Wait for the pod's readiness marker in the offloaded <task>.log (local reads,
+        # no kubectl). Deliberately NOT a pod probe: polling the pod with `kubectl exec`
+        # put 42 execs into a readiness-probed TRT-LLM server during GPU autotuning
+        # before it died with SIGTERM. The cost of that choice is a handshake only as
+        # reliable as log delivery -- `kubectl logs -f` once took 20 minutes to surface
+        # these lines, and a container-log ROTATION discards them for good -- which is
+        # why the pod REPEATS the marker while it waits (see the trap) rather than
+        # announcing once. Raise `collect_grace_seconds`, or set
+        # `collect_node_local_output: false` to remove the mechanism entirely, if that
+        # trade is wrong for a workload.
+        staged = await _wait_for_marker(
+            log_path,
+            _SFLOW_COLLECT_READY_MARKER.encode(),
+            task_name=task_name,
+            stop_marker=_SFLOW_COLLECT_NONE_MARKER.encode(),
+        )
+        if not staged:
+            return  # the task announced it had nothing to collect -- not a problem
+        # The pod only holds itself open for ``collect_grace_seconds``; if we lost that
+        # race it has already exited and its container is gone. Both the cp and the
+        # done-sentinel exec run commands INSIDE that container, so against a terminal
+        # pod they do not fail fast -- kubectl blocks until the API server eventually
+        # answers "cannot exec into a container in a completed pod" (~20 min observed),
+        # and ``execute`` cannot return until this collector settles, hanging the whole
+        # workflow. Nothing is recoverable at this point (the staged archive died with
+        # the pod), so say so loudly instead of stalling, and never touch the pod again.
+        phase = await k8s_lifecycle.get_pod_phase(
+            pod_ref,
+            global_args=global_args,
+            ns_args=ns_args,
+            timeout=_SFLOW_COLLECT_PHASE_TIMEOUT,
+        )
+        if phase in k8s_lifecycle.TERMINAL_PHASES:
+            _logger.warning(
+                f"[{task_name}] pod is already {phase}: its output-collect window "
+                f"({self._collect_grace_seconds}s) expired before the driver copied, so "
+                "the staged node-local output was DISCARDED with the pod. Raise "
+                "`collect_grace_seconds` on the kubernetes backend for tasks with large "
+                "outputs."
+            )
+            return
         local_tgz = os.path.join(dest_dir, _SFLOW_COLLECT_TGZ)
         try:
             os.makedirs(dest_dir, exist_ok=True)
+            # Bounded by the pod's own grace window: it stops waiting at that point, so a
+            # cp still running past it can only be copying out of a dying container.
             rc, _, err = await k8s_lifecycle.run_kubectl(
                 ["cp", f"{name}:{tgz_remote}", local_tgz, *[str(a) for a in ns_args]],
                 global_args=global_args,
+                timeout=float(self._collect_grace_seconds),
             )
             if rc == 0 and os.path.exists(local_tgz):
                 with open(local_tgz, "rb") as fh:
                     blob = fh.read()
                 extracted, skipped = _unpack_collected_tar(blob, dest_dir)
                 _logger.info(f"[{task_name}] {_collect_summary_line(dest_dir, extracted, skipped)}")
+            elif rc == k8s_lifecycle.KUBECTL_TIMEOUT_RC:
+                # The copy outlived the pod's patience: the pod stops waiting after
+                # collect_grace_seconds and exits MID-COPY, so finishing is impossible
+                # (and continuing would block on a dead container). The archive is
+                # simply bigger than this window allows -- `kubectl cp` streams a tar
+                # through the API server's exec channel at only a few MB/s -- so the
+                # one actionable fix is a longer window, which widens BOTH the pod's
+                # wait and this timeout (they share collect_grace_seconds).
+                _logger.warning(
+                    f"[{task_name}] node-local output collection ABANDONED: the copy did "
+                    f"not finish within collect_grace_seconds ({self._collect_grace_seconds}s), "
+                    "so the pod stopped waiting and its staged output was discarded. "
+                    "Raise `collect_grace_seconds` on the kubernetes backend (it bounds both "
+                    "the pod's wait and this copy) for tasks with large outputs."
+                )
             else:
                 _logger.warning(
                     f"[{task_name}] kubectl cp of node-local output failed "
@@ -2279,56 +2555,47 @@ class K8sContainerOperator(Operator):
             except OSError:
                 pass
             # Release the pod (it exits with the user script's code) even if cp failed.
+            # Bounded: if the pod went terminal while the cp ran, this exec would
+            # otherwise block on a completed container and wedge the driver -- and the
+            # pod needs no releasing once it has already exited.
             await k8s_lifecycle.run_kubectl(
                 [
                     "exec", name, *[str(a) for a in ns_args],
                     "--", "sh", "-c", f"touch {shlex.quote(done_remote)}",
                 ],
                 global_args=global_args,
+                timeout=k8s_lifecycle.POLL_KUBECTL_TIMEOUT,
             )
 
-    async def _finalize_task_log(
-        self,
-        plan: _K8sExecPlan,
-        prefix_size: int,
-        phases: Sequence[str],
-        *,
-        force: bool = False,
-    ) -> None:
-        """Re-fetch each pod's COMPLETE container log and rebuild ``<task>.log``.
+    async def _finalize_task_log(self, plan: _K8sExecPlan) -> None:
+        """Make ``<task>.log`` final: strip TTY control bytes from the streamed file.
 
-        Shared by the normal terminal path and the cancel/teardown path (``execute``'s
-        ``finally``): the live ``kubectl logs -f`` follow is cut the instant a pod is
-        terminal (or on teardown), so the on-disk log may miss the tail. A one-shot
-        re-fetch rebuilds it complete -- single pod -> ``finalize_complete_log``,
-        merge-pod -> ``finalize_merged_complete_log``. ``force`` fetches irrespective of
-        pod phase (the cancel path can't know the phases and must save a fast-failing
-        launcher's log before the pods are deleted). Best-effort: the underlying
-        finalizers never raise and keep the live content if a re-fetch fails.
+        ``<task>.log`` IS the log -- ``kubectl logs -f`` writes it live, and a terminal
+        pod's follow is DRAINED (:func:`k8s_lifecycle.drain_log_stream`) so it ends
+        complete. sflow used to rebuild this file from a one-shot ``kubectl logs``
+        re-fetch; that was removed because the kubelet rotates container logs, so the
+        re-fetch returned only the last window and replaced an hour of streamed output
+        with its final 11 seconds. All that survives of the rebuild is the pass that
+        cleaned TTY control bytes.
+
+        Run off the event loop: the sanitize walks the whole file line-at-a-time
+        (~266 MB/s measured), so a multi-GB log would otherwise stall the driver during
+        teardown -- the exact class of silent block this epilogue had before.
+
+        NOTE: ``asyncio.to_thread`` is NOT cancellable. The cancel path bounds its
+        ``await`` (``_SFLOW_FINALIZE_ON_CANCEL_TIMEOUT``) so teardown always reaches the
+        pod delete, but the worker thread runs to completion in the background and can
+        briefly delay interpreter exit on a very large log. That is deliberate: the
+        alternative is either blocking teardown or leaving the log unsanitized.
         """
         if not plan.task_log_path:
             return
-        if plan.merge_tag_paths:
-            await k8s_lifecycle.finalize_merged_complete_log(
-                plan.pod_refs[0],
-                tag_paths=plan.merge_tag_paths,
-                default_path=plan.task_log_path,
-                prefix_size=prefix_size,
-                phase=phases[0] if phases else "",
-                global_args=plan.global_args,
-                ns_args=plan.ns_args,
-                force=force,
-            )
-        else:
-            await k8s_lifecycle.finalize_complete_log(
-                plan.pod_refs,
-                plan.task_log_path,
-                prefix_size=prefix_size,
-                phases=phases,
-                global_args=plan.global_args,
-                ns_args=plan.ns_args,
-                force=force,
-            )
+        # For a merge-pod the leader's path is ALSO one of the member paths, so de-dup
+        # before handing them over (the second pass would only re-clean clean output).
+        paths = list(dict.fromkeys(
+            [plan.task_log_path, *(plan.merge_tag_paths or {}).values()]
+        ))
+        await asyncio.to_thread(k8s_lifecycle.sanitize_streamed_logs, paths)
 
     async def _run_pod_stream(
         self, *, plan: _K8sExecPlan, index: int
@@ -2372,15 +2639,17 @@ class K8sContainerOperator(Operator):
                 pod_ref, global_args=plan.global_args, ns_args=plan.ns_args
             )
         finally:
-            # The log is a side channel: interrupt it the instant the pod is terminal
-            # (or on teardown) -- the on-disk log is made complete afterwards by the
-            # one-shot re-fetch in execute (finalize_complete_log for a single pod,
-            # finalize_merged_complete_log for a merge-pod), so cutting the follow
-            # here never loses the tail. The merge pipeline is a process group
-            # (kubectl + demuxer) -> signal the whole group.
+            # The merge pipeline is a process group (kubectl + demuxer) -> signal the
+            # whole group.
             if stream_proc is not None:
-                await k8s_lifecycle.terminate_process(
-                    stream_proc, kill_group=is_merge
+                # Terminal pod -> drain the follow so it delivers its tail (killing it
+                # mid-stream is what used to truncate <task>.log). Still-Running pod at
+                # teardown -> cut it, since its follow would never end. Either way the
+                # stream process does not outlive this task.
+                await k8s_lifecycle.stop_log_stream(
+                    stream_proc,
+                    terminal=final_phase in k8s_lifecycle.TERMINAL_PHASES,
+                    kill_group=is_merge,
                 )
         exit_code = await k8s_lifecycle.pod_exit_code(
             pod_ref,

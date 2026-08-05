@@ -822,3 +822,88 @@ def test_probes_default_to_local_transport():
         HttpPostProbe(url="http://x", type=ProbeType.READINESS)._transport,
         LocalProbeTransport,
     )
+
+
+def _log_watch_task(tmp_path: Path, contents: str):
+    """A Task whose <task>.log holds ``contents``, plus its path."""
+    wf_out = tmp_path / "wf"
+    (wf_out / "svc").mkdir(parents=True)
+    log_path = wf_out / "svc" / "svc.log"
+    log_path.write_text(contents)
+    t = Task(
+        name="svc",
+        logger=_DummyLogger(),  # type: ignore[arg-type]
+        operator=BashOperator(BashOperatorConfig(name="bash")),
+    )
+    t.envs["SFLOW_WORKFLOW_OUTPUT_DIR"] = str(wf_out)
+    return t, log_path
+
+
+def test_log_watch_matches_far_beyond_the_summary_clip_limit(tmp_path: Path):
+    """Matching reads the RAW line; only the summary trace is length-capped.
+
+    `_clip` shortens the "last line seen" recorded in sflow_summary.log, and it slices
+    long lines rather than flattening them in full so a multi-megabyte line cannot cost
+    the event loop a full copy per probe tick. It must stay strictly cosmetic: a pattern
+    that appears only past the clip limit -- here ~200 KB into one line, far beyond both
+    the 160-char trace cap and the 4096-char exact-flatten threshold -- must still fire.
+    """
+    marker = "APPLICATION_IS_READY"
+    long_line = "x" * 200_000 + marker + "y" * 200_000 + "\n"
+    t, _ = _log_watch_task(tmp_path, long_line)
+
+    p = LogWatchProbe(
+        regex_pattern=marker, type=ProbeType.READINESS, interval=0, timeout=1
+    )
+    assert asyncio.run(p.probe(t)) is True, (
+        "the probe must match on the raw line; clipping is for the trace only"
+    )
+    # And the trace it records stays short, without losing the truncation marker.
+    assert len(p._attempt_detail) < 400, p._attempt_detail
+
+
+def test_log_watch_trace_is_unchanged_for_ordinary_lines(tmp_path: Path):
+    """The clip fast-path must be byte-identical to flattening the whole line."""
+    t, _ = _log_watch_task(tmp_path, "loading\tmodel weights   \nstill loading\n")
+
+    p = LogWatchProbe(
+        regex_pattern="READY", type=ProbeType.READINESS, interval=0, timeout=1
+    )
+    assert asyncio.run(p.probe(t)) is False
+    # Tabs flattened to spaces, surrounding whitespace stripped, nothing truncated.
+    assert "'still loading'" in p._attempt_detail, p._attempt_detail
+    assert "..." not in p._attempt_detail, "a short line must not be marked truncated"
+
+
+def test_log_watch_trace_of_a_long_indented_line_still_shows_content(tmp_path: Path):
+    """A deeply-indented huge line must not clip down to a bare "...".
+
+    Past the exact-flatten threshold the line is SLICED before ``.strip()`` runs, so a
+    window exactly the width of the clip limit would be spent entirely on leading
+    whitespace and render as no content at all -- the one case where the fast path
+    could report less than the exact path it stands in for.
+    """
+    indented = " " * 400 + "PAYLOAD " + "z" * 200_000
+    t, _ = _log_watch_task(tmp_path, indented + "\n")
+
+    p = LogWatchProbe(
+        regex_pattern="READY", type=ProbeType.READINESS, interval=0, timeout=1
+    )
+    assert asyncio.run(p.probe(t)) is False
+    assert "PAYLOAD" in p._attempt_detail, p._attempt_detail
+    assert "..." in p._attempt_detail, "a sliced line genuinely drops content"
+
+
+def test_log_watch_matches_a_pattern_split_across_progress_bar_frames(tmp_path: Path):
+    """A `\\r` bar must not hide a marker printed on the same physical line.
+
+    `str.splitlines` breaks on `\\r`, so each redraw frame is its own "line" for the
+    trace -- but the MATCH runs over the whole decoded chunk, so a marker emitted after
+    a bar (with no newline between them) still counts.
+    """
+    t, _ = _log_watch_task(tmp_path, "step 1\rstep 2\rstep 3\rSERVER_READY\n")
+
+    p = LogWatchProbe(
+        regex_pattern="SERVER_READY", type=ProbeType.READINESS, interval=0, timeout=1
+    )
+    assert asyncio.run(p.probe(t)) is True
