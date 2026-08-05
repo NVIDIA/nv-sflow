@@ -799,8 +799,9 @@ fi
 # Part 3: Infmax multi-node batch suites
 # =============================================================================
 # SFLOW_E2E_SKIP_INFMAX=1 drops this part only. The infmax benchmark suites are run by
-# prenyx-ci-automation on real GB200 (see scripts/trigger_prenyx_e2e.py), which owns that
-# hardware plus the Slurm polling, result enrichment and public-data diffing. Skipping them
+# prenyx-ci-automation on real GB200, which owns that hardware plus the Slurm polling,
+# result enrichment and public-data diffing. (The trigger lives in the internal pipeline;
+# this file is mirrored to OSS, so it does not name the internal script.) Skipping them
 # here keeps the two pipelines from submitting the same suites twice; Parts 1 and 2 (the
 # sample suite) are unaffected, and that is the coverage this job exists for.
 if [ "${SFLOW_E2E_SKIP_INFMAX:-}" = "1" ]; then

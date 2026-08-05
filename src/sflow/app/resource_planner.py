@@ -21,6 +21,21 @@ GpuReservation = tuple[int, int, str, str]
 NodeReservation = tuple[str, str]
 
 
+def _contiguous_runs(indices: list[int]) -> list[tuple[int, int]]:
+    """Collapse an index set into ``(start, end_exclusive)`` runs.
+
+    ``[0, 1, 3]`` -> ``[(0, 2), (3, 4)]``. Lets a pinned index set reuse the
+    interval-based reservation bookkeeping.
+    """
+    runs: list[tuple[int, int]] = []
+    for idx in sorted(set(indices)):
+        if runs and idx == runs[-1][1]:
+            runs[-1] = (runs[-1][0], idx + 1)
+        else:
+            runs.append((idx, idx + 1))
+    return runs
+
+
 @dataclass(frozen=True)
 class ResourcePlacement:
     """Final resource placement for one concrete task replica."""
@@ -298,6 +313,36 @@ class GpuReservationPlanner(ReservationPolicyPlanner):
             return start
         return None
 
+    def reserved_indices(
+        self,
+        *,
+        backend_name: str,
+        node_name: str,
+        task_name: str,
+    ) -> set[int]:
+        """GPU indices on this node that ``task_name`` may not take."""
+        taken: set[int] = set()
+        for start, end, _owner, _release_after in self.conflicting_reservations(
+            (backend_name, node_name), task_name
+        ):
+            taken.update(range(start, end))
+        return taken
+
+    def indices_available(
+        self,
+        *,
+        backend_name: str,
+        node_name: str,
+        task_name: str,
+        indices: list[int],
+    ) -> bool:
+        taken = self.reserved_indices(
+            backend_name=backend_name,
+            node_name=node_name,
+            task_name=task_name,
+        )
+        return not taken.intersection(indices)
+
     def reserve(
         self,
         *,
@@ -311,6 +356,29 @@ class GpuReservationPlanner(ReservationPolicyPlanner):
         self.reservations.setdefault((backend_name, node_name), []).append(
             (start, start + count, task_name, release_after)
         )
+
+    def reserve_indices(
+        self,
+        *,
+        backend_name: str,
+        node_name: str,
+        task_name: str,
+        indices: list[int],
+    ) -> None:
+        """Reserve an arbitrary (possibly non-contiguous) index set.
+
+        Stored as one interval per contiguous run so every existing consumer of
+        ``reservations`` -- conflict detection, ``first_available_start`` hole
+        walking, the blocker/timeline diagnostics -- keeps working unchanged.
+        """
+        for run_start, run_end in _contiguous_runs(indices):
+            self.reserve(
+                backend_name=backend_name,
+                node_name=node_name,
+                task_name=task_name,
+                start=run_start,
+                count=run_end - run_start,
+            )
 
 
 class NodeReservationPlanner(ReservationPolicyPlanner):
@@ -508,6 +576,22 @@ class ResourcePlacementPlanner:
                 and "release_after" in getattr(nodes_resource_conf, "model_fields_set", set())
             )
 
+            # Pinning device indices only means something where sflow itself
+            # hands the task its devices via CUDA_VISIBLE_DEVICES. On Kubernetes
+            # the device plugin / DRA picks the physical GPUs, so honouring the
+            # request is impossible -- fail at plan time rather than silently
+            # running on whatever devices the cluster hands out.
+            gpus_indices_raw = getattr(gpus_resource_conf, "indices", None)
+            if gpus_indices_raw is not None and not getattr(
+                getattr(backend, "capabilities", None), "supports_gpu_env", True
+            ):
+                raise ValueError(
+                    f"Task '{concrete_node_name}': backend '{backend.name}' does not support "
+                    "pinning GPU device indices (resources.gpus.indices) -- the cluster's "
+                    "device plugin / DRA assigns the physical devices. Use "
+                    "resources.gpus.count to size the request instead."
+                )
+
             assigned_nodes, nodes_inferred_from_gpus = self._assigned_nodelist(
                 task_name=concrete_node_name,
                 base_task_name=base_task_name,
@@ -520,6 +604,7 @@ class ResourcePlacementPlanner:
                 nodes_count_raw=getattr(nodes_resource_conf, "count", None),
                 nodes_exclude_raw=getattr(nodes_resource_conf, "exclude", None),
                 gpus_count_raw=getattr(gpus_resource_conf, "count", None),
+                gpus_indices_raw=gpus_indices_raw,
             )
             cuda_visible = self._cuda_visible_devices(
                 task_name=concrete_node_name,
@@ -527,20 +612,28 @@ class ResourcePlacementPlanner:
                 assigned_nodes=assigned_nodes,
                 replica_index=replica_index,
                 gpus_count_raw=getattr(gpus_resource_conf, "count", None),
+                gpus_indices_raw=gpus_indices_raw,
             )
 
-            # Resolve the requested GPU count once for the placement.
+            # Resolve the requested GPU count once for the placement. With
+            # pinned indices and no explicit count, the task holds len(indices)
+            # GPUs on each assigned node.
             gpu_count: int | None = None
             if gpus_resource_conf is not None:
-                gpu_count = self._resolve_int(
-                    concrete_node_name,
-                    field="resources.gpus.count",
-                    value=gpus_resource_conf.count,
-                )
-                if gpu_count <= 0:
-                    raise ValueError(
-                        f"Task '{concrete_node_name}' resources.gpus.count must be > 0, got {gpu_count}"
+                if gpus_resource_conf.count is not None:
+                    gpu_count = self._resolve_int(
+                        concrete_node_name,
+                        field="resources.gpus.count",
+                        value=gpus_resource_conf.count,
                     )
+                    if gpu_count <= 0:
+                        raise ValueError(
+                            f"Task '{concrete_node_name}' resources.gpus.count must be > 0, got {gpu_count}"
+                        )
+                else:
+                    gpu_count = len(
+                        self._resolve_gpu_indices(concrete_node_name, gpus_indices_raw)
+                    ) * max(1, len(assigned_nodes))
 
             release_after: dict[str, str] = {}
             has_readiness = self.gpu_planner.has_readiness.get(concrete_node_name, False)
@@ -714,6 +807,47 @@ class ResourcePlacementPlanner:
             for i, value in enumerate(resolved_values)
         ]
 
+    def _resolve_gpu_indices(self, task_name: str, raw: Any) -> list[int]:
+        """Resolve and validate ``resources.gpus.indices`` for one task.
+
+        Negative indices are rejected (unlike ``resources.nodes.indices``):
+        ``CUDA_VISIBLE_DEVICES`` is a literal device list, so ``-1`` would name a
+        different device on nodes with different ``gpus_per_node``.
+        """
+        indices = self._resolve_int_list(
+            task_name, field="resources.gpus.indices", values=raw
+        )
+        if not indices:
+            raise ValueError(
+                f"Task '{task_name}' resources.gpus.indices must not be empty"
+            )
+        negative = [i for i in indices if i < 0]
+        if negative:
+            raise ValueError(
+                f"Task '{task_name}' resources.gpus.indices must be non-negative, "
+                f"got {negative}; GPU indices are absolute device ids, not "
+                "Python-style offsets"
+            )
+        if len(set(indices)) != len(indices):
+            raise ValueError(
+                f"Task '{task_name}' resources.gpus.indices contains duplicates: {indices}"
+            )
+        return indices
+
+    @staticmethod
+    def _node_gpu_capacity(node: Any) -> int | None:
+        """``num_gpus`` for a node, or None when unknown/non-positive."""
+        if node is None:
+            return None
+        num_gpus = getattr(node, "num_gpus", None)
+        if num_gpus is None:
+            return None
+        try:
+            cap = int(num_gpus)
+        except (TypeError, ValueError):
+            return None
+        return cap if cap > 0 else None
+
     def _assigned_nodelist(
         self,
         *,
@@ -728,6 +862,7 @@ class ResourcePlacementPlanner:
         nodes_count_raw: Any | None,
         nodes_exclude_raw: Any | None,
         gpus_count_raw: Any | None,
+        gpus_indices_raw: Any | None = None,
     ) -> tuple[list[str], bool]:
         capabilities = getattr(runtime_backend, "capabilities", None)
         if capabilities is not None and not getattr(
@@ -921,6 +1056,91 @@ class ResourcePlacementPlanner:
             _reserve_nodes_if_needed(selected_node_names)
             return selected_node_names, False
 
+        if gpus_indices_raw is not None and runtime_backend.allocation is not None:
+            # Pinned GPU indices drive node selection: find the first node(s)
+            # whose requested slots are all free. Scanning always restarts at
+            # node 0, so a task asking for low indices can backfill a node whose
+            # high indices are already taken (and vice versa).
+            indices = self._resolve_gpu_indices(task_name, gpus_indices_raw)
+            per_node = len(indices)
+            nodes_needed = 1
+            if gpus_count_raw is not None:
+                total = self._resolve_int(
+                    task_name, field="resources.gpus.count", value=gpus_count_raw
+                )
+                if total <= 0:
+                    raise ValueError(
+                        f"Task '{task_name}' resources.gpus.count must be > 0, got {total}"
+                    )
+                if total % per_node != 0:
+                    raise ValueError(
+                        f"Task '{task_name}' requests {total} GPUs pinned to indices "
+                        f"{indices} ({per_node} per node), but resources.gpus.count must "
+                        f"be a positive multiple of len(resources.gpus.indices)="
+                        f"{per_node} so every node gets the same slots."
+                    )
+                nodes_needed = total // per_node
+
+            alloc_nodes_map = {n.name: n for n in runtime_backend.allocation.nodes}
+            chosen: list[str] = []
+            out_of_range: list[tuple[str, int]] = []
+            busy: list[str] = []
+            for node in alloc_nodes:
+                # An unknown capacity (a local/docker backend without
+                # gpus_per_node) only blocks the range check -- reservations are
+                # still tracked per node, so the availability check must still
+                # run or two tasks pinning the same indices would double-book
+                # the same node instead of backfilling onto a later free one.
+                cap = self._node_gpu_capacity(alloc_nodes_map.get(node.name))
+                if cap is not None and max(indices) >= cap:
+                    out_of_range.append((node.name, cap))
+                    continue
+                if self.gpu_planner.indices_available(
+                    backend_name=runtime_backend.name,
+                    node_name=node.name,
+                    task_name=task_name,
+                    indices=indices,
+                ):
+                    chosen.append(node.name)
+                    if len(chosen) == nodes_needed:
+                        break
+                else:
+                    busy.append(node.name)
+
+            if len(chosen) < nodes_needed:
+                detail = ""
+                if out_of_range:
+                    caps = sorted({str(cap) for _n, cap in out_of_range})
+                    detail += (
+                        f" GPU index {max(indices)} is out of range on "
+                        f"{len(out_of_range)} node(s) (gpus_per_node="
+                        f"{'/'.join(caps)})."
+                    )
+                if busy:
+                    detail += (
+                        f" Requested slots are already reserved on: "
+                        f"{', '.join(busy)}."
+                    )
+                blockers = (
+                    self.gpu_planner.format_blockers(
+                        backend_name=runtime_backend.name,
+                        node_name=busy[0],
+                        task_name=task_name,
+                    )
+                    if busy
+                    else ""
+                )
+                raise ValueError(
+                    f"Task '{task_name}' resources.gpus.indices {indices} needs "
+                    f"{nodes_needed} node(s) with those slots free, but only "
+                    f"{len(chosen)} of {len(alloc_nodes)} allocated node(s) qualify."
+                    f"{detail}"
+                    f"{blockers}"
+                )
+            _raise_if_nodes_unavailable(chosen)
+            _reserve_nodes_if_needed(chosen)
+            return chosen, True
+
         if gpus_count_raw is not None and runtime_backend.allocation is not None:
             gpus_needed = self._resolve_int(
                 task_name,
@@ -1037,6 +1257,85 @@ class ResourcePlacementPlanner:
         _reserve_nodes_if_needed(node_names)
         return node_names, False
 
+    def _pinned_cuda_visible_devices(
+        self,
+        *,
+        task_name: str,
+        runtime_backend: Backend,
+        assigned_nodes: list[str],
+        gpus_count_raw: Any | None,
+        gpus_indices_raw: Any,
+    ) -> str:
+        """Reserve the pinned GPU slots on every assigned node.
+
+        The same indices are used on each node, so the returned string is just
+        the index list -- in the order the user wrote it, since
+        ``CUDA_VISIBLE_DEVICES`` order defines the device remapping.
+        """
+        indices = self._resolve_gpu_indices(task_name, gpus_indices_raw)
+
+        if gpus_count_raw is not None and assigned_nodes:
+            total = self._resolve_int(
+                task_name, field="resources.gpus.count", value=gpus_count_raw
+            )
+            expected = len(indices) * len(assigned_nodes)
+            if total != expected:
+                raise ValueError(
+                    f"Task '{task_name}' resources.gpus.count={total} does not match its "
+                    f"placement: {len(indices)} pinned GPU index/indices {indices} on "
+                    f"{len(assigned_nodes)} assigned node(s) {assigned_nodes} = {expected} "
+                    f"GPUs. Adjust resources.gpus.count or the node selection."
+                )
+
+        alloc_nodes_by_name = (
+            {n.name: n for n in runtime_backend.allocation.nodes}
+            if runtime_backend.allocation
+            else {}
+        )
+        for n_name in assigned_nodes:
+            # As in the index scan above: an unknown capacity only skips the
+            # range check. The conflict check below still applies, and it is the
+            # only guard on this route because explicit resources.nodes bypasses
+            # the scan that would otherwise move the task to a free node.
+            cap = self._node_gpu_capacity(alloc_nodes_by_name.get(n_name))
+            if cap is not None and max(indices) >= cap:
+                raise ValueError(
+                    f"Task '{task_name}' resources.gpus.indices {indices} exceed node "
+                    f"'{n_name}' capacity (gpus_per_node={cap}; valid: 0..{cap - 1})"
+                )
+            if not self.gpu_planner.indices_available(
+                backend_name=runtime_backend.name,
+                node_name=n_name,
+                task_name=task_name,
+                indices=indices,
+            ):
+                taken = sorted(
+                    self.gpu_planner.reserved_indices(
+                        backend_name=runtime_backend.name,
+                        node_name=n_name,
+                        task_name=task_name,
+                    ).intersection(indices)
+                )
+                blockers = self.gpu_planner.format_blockers(
+                    backend_name=runtime_backend.name,
+                    node_name=n_name,
+                    task_name=task_name,
+                )
+                raise ValueError(
+                    f"Task '{task_name}' requests GPU indices {indices} on node "
+                    f"'{n_name}', but {taken} are already reserved."
+                    f"{blockers}"
+                )
+
+        for n_name in assigned_nodes:
+            self.gpu_planner.reserve_indices(
+                backend_name=runtime_backend.name,
+                node_name=n_name,
+                task_name=task_name,
+                indices=indices,
+            )
+        return ",".join(str(i) for i in indices)
+
     def _cuda_visible_devices(
         self,
         *,
@@ -1045,8 +1344,9 @@ class ResourcePlacementPlanner:
         assigned_nodes: list[str],
         replica_index: int,
         gpus_count_raw: Any | None,
+        gpus_indices_raw: Any | None = None,
     ) -> str | None:
-        if gpus_count_raw is None:
+        if gpus_count_raw is None and gpus_indices_raw is None:
             return None
         # Even when a backend will NOT inject CUDA_VISIBLE_DEVICES (supports_gpu_env
         # is False, e.g. Kubernetes, where the cluster/DRA assigns the physical
@@ -1055,6 +1355,15 @@ class ResourcePlacementPlanner:
         # (otherwise every GPU task packs onto the first node). The returned slice
         # is only turned into an env var downstream via Backend.resource_env(),
         # which returns {} for supports_gpu_env=False.
+        if gpus_indices_raw is not None:
+            return self._pinned_cuda_visible_devices(
+                task_name=task_name,
+                runtime_backend=runtime_backend,
+                assigned_nodes=assigned_nodes,
+                gpus_count_raw=gpus_count_raw,
+                gpus_indices_raw=gpus_indices_raw,
+            )
+
         count = self._resolve_int(
             task_name,
             field="resources.gpus.count",

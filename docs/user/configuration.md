@@ -267,6 +267,16 @@ workflow:
       count: 2
 ```
 
+`resources.gpus` takes `count`, `indices`, or both (at least one is required). `count` alone is index-agnostic and packs the task into any contiguous idle GPU run on a single node. `indices` pins specific device ids on the first node where they are all free. With both, `count` is the total across nodes and `indices` the per-node slice, so the task spans `count / len(indices)` nodes using the same slots on each — see [Resources](./resources.md#pin-specific-gpus-with-indices):
+
+```yaml
+- name: pinned
+  resources:
+    gpus:
+      count: 8         # total across nodes
+      indices: [0, 1]  # -> 4 nodes x GPUs 0,1 on 4-GPU nodes
+```
+
 `resources.nodes.release_after` and `resources.gpus.release_after` control when that resource kind can be reused by later tasks in the DAG. Node reservations are only exclusive when `resources.nodes.release_after` is explicitly set; when omitted, both `resources.nodes.indices` and `resources.nodes.count` are placement constraints and may overlap with other planned tasks. GPU reservations infer the safe behavior when omitted: tasks without readiness probes release GPUs after task completion for downstream dependents, while tasks with readiness probes keep GPUs until workflow completion because they may still be running after they become ready. Use `task_ready` when a task can release a resource after its readiness probe succeeds, `task_completion` when the resource can be reused after the task reaches any terminal status (`COMPLETED`, `FAILED`, `TIMEOUT`, or `CANCELLED`), or `workflow_completion` to explicitly reserve it for the whole workflow:
 
 ```yaml

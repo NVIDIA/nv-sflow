@@ -682,7 +682,8 @@ workflow:
 ```yaml
 resources:
   gpus:
-    count: 4                    # CUDA_VISIBLE_DEVICES slicing
+    count: 4                    # CUDA_VISIBLE_DEVICES slicing (total across nodes)
+    indices: [0, 1]             # optional: pin to specific GPU device ids per node
     release_after: workflow_completion   # optional: when the GPU reservation frees
   nodes:
     indices: [0]                # pin to specific node indices
@@ -691,8 +692,17 @@ resources:
     release_after: workflow_completion   # optional
 ```
 
-GPU allocation:
-- Each task/replica gets `count` GPUs via `CUDA_VISIBLE_DEVICES`
+GPU allocation (at least one of `count` / `indices` is required):
+- `count` alone is index-agnostic: the task gets any contiguous idle run of `count`
+  GPUs, and a run never straddles a node boundary (only GPUs 2,3 free on node0 and
+  the task needs 4 → it skips to node1's GPU 0)
+- `indices` alone pins those device ids on the first node where all of them are free;
+  the node scan restarts at node 0 each time, so later tasks backfill idle slots
+- `count` + `indices`: `count` is the total, `indices` the per-node slice, so the task
+  spans `count / len(indices)` nodes using the same slots on each. `count` must be a
+  positive multiple of `len(indices)`
+- GPU indices must be non-negative (no Python-style `-1`), and `CUDA_VISIBLE_DEVICES`
+  preserves the order written
 - GPUs are sliced sequentially across replicas on each node
 - Total GPUs across all tasks must not exceed `nodes * gpus_per_node`
 
@@ -701,7 +711,9 @@ reservation can be reused by other tasks. For GPUs it is inferred when omitted (
 readiness probe hold until workflow completion; probe-less tasks release after completion).
 Dry-run rehearses these lifetimes across the DAG.
 
-**Kubernetes:** `gpus.count` is a per-task total split evenly across the assigned nodes (must
+**Kubernetes:** `gpus.indices` is rejected at plan time (the device plugin/DRA picks the
+physical devices, so a pin cannot be honored — use `count`).
+`gpus.count` is a per-task total split evenly across the assigned nodes (must
 be a multiple of the node count); for an ordinary pod the device-plugin/DRA assigns physical
 devices, so `CUDA_VISIBLE_DEVICES` is left unset — but when co-located GPU tasks are merged
 into one pod (`merge_colocated_gpu_pods`, default `auto`) sflow sets a per-member

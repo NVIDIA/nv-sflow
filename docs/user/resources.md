@@ -173,9 +173,55 @@ workflow:
       script: ["run_benchmark.sh"]
 ```
 
+A `count`-only request is **index-agnostic**: sflow gives the task any contiguous run of idle GPUs. A run never straddles a node boundary — if a 4-GPU task finds only GPUs 2,3 free on the first node, it skips that node entirely and starts at GPU 0 of the next one.
+
 If a GPU request cannot fit on one node but is an exact multiple of `backends.<name>.gpus_per_node`, sflow can expand the task across multiple nodes. If the request is not a valid multiple or the selected pool is too small, validation fails before execution.
 
 This `CUDA_VISIBLE_DEVICES` packing applies to the **local**, **slurm**, and **docker** backends. Kubernetes assigns GPUs differently — see below.
+
+### Pin specific GPUs with `indices`
+
+Use `resources.gpus.indices` when a task must land on particular device IDs — NUMA/NVLink affinity, reproducing a vendor benchmark topology, or steering around a known-bad device.
+
+Indices are 0-based device IDs on each node and must be **non-negative** (unlike `resources.nodes.indices`, which allows Python-style negatives). `CUDA_VISIBLE_DEVICES` preserves the order you write, so `indices: [1, 0]` exports `1,0`.
+
+**`indices` alone** — the task takes exactly those devices on the **first node where they are all free**. The scan restarts at node 0 for every task, so low-numbered nodes stay reachable for later tasks:
+
+```yaml
+workflow:
+  name: wf
+  tasks:
+    - name: a
+      resources: {gpus: {indices: [0, 1], release_after: workflow_completion}}
+      script: ["run.sh"]
+    - name: b                     # node0's 0,1 are taken -> b lands on node1
+      depends_on: [a]
+      resources: {gpus: {indices: [0, 1], release_after: workflow_completion}}
+      script: ["run.sh"]
+    - name: c                     # node0's 2,3 are still idle -> c backfills node0
+      depends_on: [b]
+      resources: {gpus: {indices: [2, 3], release_after: workflow_completion}}
+      script: ["run.sh"]
+```
+
+**`count` + `indices`** — `count` is the **total** across nodes and `indices` is the per-node slice, so the task fans out over `count / len(indices)` nodes and uses the same slots on each. With 4-GPU nodes, `count: 8` and `indices: [0, 1]` gives GPUs 0,1 on four nodes:
+
+```yaml
+resources:
+  gpus:
+    count: 8
+    indices: [0, 1]
+```
+
+`count` must be a positive multiple of `len(indices)`. If the task also pins nodes via `resources.nodes`, those nodes win and `count` must equal `len(indices) × (number of assigned nodes)`.
+
+Indices may also come from an expression, like `indices: "${{ variables.GPU_IDS }}"`.
+
+At least one of `count` or `indices` is required under `resources.gpus`. Non-contiguous sets such as `indices: [0, 2]` are allowed, and a later task can take the gaps.
+
+:::note Not available on Kubernetes
+`resources.gpus.indices` is rejected at plan time on the Kubernetes backend: the device plugin or DRA picks the physical devices, so sflow cannot honor a pin. Use `resources.gpus.count` there.
+:::
 
 ## GPUs on Kubernetes
 

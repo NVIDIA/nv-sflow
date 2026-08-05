@@ -172,21 +172,29 @@ def build_allocation_map_lines(tasks: list[Any], backends: dict[str, Any]) -> li
                     owners.append(task.name)
 
         lines.append(f"  - backend '{backend_name}':")
-        for node_name in ordered_node_names:
+        for position, node_name in enumerate(ordered_node_names):
             entry = node_map[node_name]
             num_gpus = entry["num_gpus"]
             task_names = _unique_preserve(entry["tasks"])
-            lines.append(f"    ├─ node {node_name}")
+            is_last_node = position == len(ordered_node_names) - 1
+            # Lead with the node's task summary, then hang the per-GPU breakdown
+            # one level deeper. At equal depth the "Tasks:" line reads as just
+            # another GPU row, which is what the extra indent avoids.
+            node_glyph = "└─" if is_last_node else "├─"
+            cont = "   " if is_last_node else "│  "
+            lines.append(f"    {node_glyph} node {node_name}")
+            lines.append(
+                f"    {cont}├─ Tasks: "
+                + (", ".join(task_names) if task_names else "(none)")
+            )
             if num_gpus is not None and num_gpus > 0:
+                lines.append(f"    {cont}└─ GPUs:")
                 for gpu_idx in range(num_gpus):
                     owners = _unique_preserve(entry["gpu_owners"].get(gpu_idx, []))
                     label = " -> ".join(owners) if owners else "."
-                    lines.append(f"    │  GPU {gpu_idx}: {label}")
+                    lines.append(f"    {cont}     GPU {gpu_idx}: {label}")
             else:
-                lines.append("    │  GPUs: n/a")
-            lines.append(
-                "    │  Tasks: " + (", ".join(task_names) if task_names else "(none)")
-            )
+                lines.append(f"    {cont}└─ GPUs: n/a")
     return lines
 
 

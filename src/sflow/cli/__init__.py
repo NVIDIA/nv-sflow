@@ -93,6 +93,7 @@ def _register_commands() -> None:
         sample,  # noqa: F401
         compose,  # noqa: F401
         skill,  # noqa: F401
+        upgrade,  # noqa: F401
     )
 
 

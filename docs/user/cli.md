@@ -306,3 +306,70 @@ Common options:
 - `--output, -o <dir>`: output directory (default: `./skills`)
 - `--force, -f`: overwrite existing files when merging into an existing directory
 - `--list, -l`: list available bundled skills
+
+## sflow upgrade
+
+Upgrade sflow in the environment you are currently running it from. `sflow update` is
+an alias for the same command.
+
+With no flags it installs the **`main` branch of the public OSS GitHub repo**:
+
+```bash
+sflow upgrade
+# -> uv pip install ... 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main'
+```
+
+> This default differs from `sflow batch`, which installs whatever ref your *current*
+> environment came from. `sflow upgrade` is an explicit "get me the latest" action.
+
+Pick a different source with `--repo` / `--branch`:
+
+```bash
+# A different branch or tag of the public repo
+sflow upgrade --branch v0.3.0
+
+# A fork or an internal mirror (defaults to its main branch)
+sflow upgrade --repo https://git.example.com/team/sflow.git
+
+# Both together
+sflow upgrade --repo https://git.example.com/team/sflow.git --branch develop
+```
+
+The install-route flags are the same ones [`sflow batch`](#sflow-batch) uses to pin the
+version installed on a compute node, so a ref you trust in a batch job is written the
+same way here:
+
+```bash
+# Equivalent to --branch develop, in the batch spelling
+sflow upgrade --sflow-version develop
+
+# repo + ref in one value
+sflow upgrade --sflow-version https://git.example.com/team/sflow.git@develop
+
+# A released wheel from a private PyPI index
+sflow upgrade --sflow-index-url https://host/artifactory/api/pypi/repo/simple \
+              --sflow-version '>=0.2,<0.3'
+
+# Editable install from a local checkout
+sflow upgrade --sflow-source-path ~/src/sflow
+```
+
+Options:
+
+- `--repo <url>`: git repository to install from (default: `https://github.com/NVIDIA/nv-sflow.git`)
+- `--branch <ref>`: git branch or tag (default: `main`)
+- `--sflow-version <ref|repo@ref|specifier>`: same syntax as `sflow batch --sflow-version`. Mutually exclusive with `--repo`/`--branch`, which encode the same thing
+- `--sflow-index-url <url>`: install from a private PyPI index; `--sflow-version` then means a PEP 440 specifier. URLs with embedded credentials are rejected — use `~/.netrc` or a credential helper
+- `--sflow-source-path <dir>`: editable install from a local checkout
+- `--force`: allow upgrading over an editable/dev install
+- `--dry-run`: print the resolved install command and exit
+
+Notes:
+
+- **Dev installs are protected.** If sflow is currently an editable or source-tree
+  install, `sflow upgrade` refuses rather than silently replacing your working
+  checkout with a released build. Pass `--force` to override.
+- `uv` is used when available (pinned to the interpreter running sflow) and `pip` is
+  the fallback. Because a branch head can move without the version string changing,
+  sflow is explicitly reinstalled rather than being skipped as "already satisfied".
+- Run `sflow --version` afterwards to confirm what you ended up with.

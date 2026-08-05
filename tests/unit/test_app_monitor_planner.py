@@ -6,6 +6,8 @@
 import asyncio
 import logging
 
+import pytest
+
 from sflow.app.assembly import build_state
 from sflow.config.schema import SflowConfig
 
@@ -507,3 +509,71 @@ def test_task_monitor_default_targets_bound_task_nodes(tmp_path):
     work = state.workflow.get_task("work")
     assert work.monitor is not None
     assert work.monitor.nodes == ["slurm-node1"]
+
+
+def test_monitor_gpu_indices_watch_exactly_those_devices(tmp_path):
+    """``monitor.resources.gpus.indices`` selects specific devices.
+
+    ``docs/user/monitor.md`` documents ``gpus: { count | indices }``, but the
+    schema only accepted ``count`` until ``resources.gpus.indices`` was added --
+    this pins the documented form to real behavior.
+    """
+    state = _build(
+        {
+            "name": "wf",
+            "tasks": [
+                {
+                    "name": "work",
+                    "script": ["echo work"],
+                    "resources": {"nodes": {"indices": [0]}},
+                    "monitor": {"resources": {"gpus": {"indices": [2, 5]}}},
+                }
+            ],
+        },
+        tmp_path,
+    )
+    work = state.workflow.get_task("work")
+    assert work.monitor is not None
+    # Not range(count) -- the exact devices asked for, order preserved.
+    assert work.monitor.gpus == [2, 5]
+
+
+def test_monitor_gpu_count_still_means_first_n_devices(tmp_path):
+    state = _build(
+        {
+            "name": "wf",
+            "tasks": [
+                {
+                    "name": "work",
+                    "script": ["echo work"],
+                    "resources": {"nodes": {"indices": [0]}},
+                    "monitor": {"resources": {"gpus": {"count": 3}}},
+                }
+            ],
+        },
+        tmp_path,
+    )
+    work = state.workflow.get_task("work")
+    assert work.monitor.gpus == [0, 1, 2]
+
+
+def test_monitor_gpu_indices_expression_is_rejected_with_a_clear_message(tmp_path):
+    # Monitor resources are not run through the expression resolver, so an
+    # expression here would silently mean "no GPUs" without this guard.
+    with pytest.raises(ValueError, match="do not support"):
+        _build(
+            {
+                "name": "wf",
+                "tasks": [
+                    {
+                        "name": "work",
+                        "script": ["echo work"],
+                        "resources": {"nodes": {"indices": [0]}},
+                        "monitor": {
+                            "resources": {"gpus": {"indices": "${{ variables.IDS }}"}}
+                        },
+                    }
+                ],
+            },
+            tmp_path,
+        )

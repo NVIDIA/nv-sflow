@@ -179,6 +179,13 @@ def _get_task_gpu_plan(config: dict, variables: dict) -> list[dict]:
                 elif raw_gc != 0:
                     gpu_count = 0
                     gpu_unresolved = True
+                # indices-only: the task holds len(indices) GPUs per node.
+                if not gpu_count and not gpu_unresolved:
+                    raw_idx = gpus.get("indices")
+                    if isinstance(raw_idx, list):
+                        gpu_count = len(raw_idx)
+                    elif raw_idx is not None:
+                        gpu_unresolved = True
             nodes = resources.get("nodes", {})
             if isinstance(nodes, dict):
                 idx = nodes.get("indices")
