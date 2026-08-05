@@ -327,6 +327,17 @@ def run(
             "(e.g. --extra-kubectl-args=--insecure-skip-tls-verify). Repeatable.",
         ),
     ] = None,
+    extra_kubectl_apply_args: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--extra-kubectl-apply-args",
+            help="Extra flag for the 'kubectl apply' subcommand only "
+            "(e.g. --extra-kubectl-apply-args=--validate=false). Applied to every "
+            "apply sflow issues, including the allocate-time reservation objects. "
+            "Use this rather than --extra-kubectl-args for apply-only flags: global "
+            "flags go BEFORE the subcommand, where kubectl rejects them. Repeatable.",
+        ),
+    ] = None,
     include_nodes: IncludeNodesOption = None,
     exclude_nodes: ExcludeNodesOption = None,
     enable_workflow_monitor: EnableWorkflowMonitorOption = False,
@@ -557,6 +568,10 @@ def run(
             rdma=kube_rdma,
             handoff=kube_handoff,
             extra_args=kubectl_args,
+            # apply-only flags stay OUT of the generic --extra-args fan-in: those are
+            # spread across salloc/docker/kubectl-global channels, and a flag meant
+            # for one backend's apply has no meaning as a global kubectl flag.
+            apply_args=list(extra_kubectl_apply_args or []),
             generic_extra_args=generic_kubectl_args,
         )
 

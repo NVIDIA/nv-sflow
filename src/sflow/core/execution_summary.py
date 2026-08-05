@@ -13,8 +13,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sflow.core.loop_watchdog import EventLoopWatchdog
 from sflow.utils.gpu import parse_cuda_visible_devices
 
+from .command_trace import get_command_trace
 from .task import Task, TaskStatus
 from .uploads import UploadResult
 from .workflow import Workflow
@@ -96,6 +98,11 @@ class SflowSummaryWriter:
         self._uploads: list[UploadResult] = []
         self._task_started: dict[str, float] = {}
         self._task_ready: dict[str, float] = {}
+        # When a merge-pod member's in-pod gate opened, i.e. when it actually began
+        # work. A gated member is "submitted" with the rest of its shared pod but sits
+        # blocked until its in-group dependency is met, so submission time would
+        # otherwise report it as running (and as the longest task) the whole time.
+        self._task_ungated: dict[str, float] = {}
         self._task_finished: dict[str, float] = {}
         self._render_task: asyncio.Task[None] | None = None
         self._render_dirty = False
@@ -126,6 +133,19 @@ class SflowSummaryWriter:
         self._started_at = datetime.now().astimezone()
         self._started_monotonic = time.monotonic()
         self._status = "RUNNING"
+        # Stream every external-command invocation next to the run's other artifacts,
+        # so a post-mortem can align kubectl/sbatch activity with the Timeline below
+        # even when the driver was killed mid-hang. See core.command_trace.
+        get_command_trace().attach_file(self._output_dir / "command_trace.jsonl")
+        # Arm the event-loop stall detector for the life of the run. A stalled loop
+        # cannot log its own symptoms (sflow's records are emitted from that thread),
+        # so without this a freeze leaves no evidence at all -- the last one had to be
+        # caught by attaching py-spy to the live process before it recovered.
+        self._loop_watchdog = EventLoopWatchdog(self._output_dir / "loop_stalls.txt")
+        try:
+            self._loop_watchdog.start()
+        except RuntimeError:  # no running loop (sync/dry-run callers)
+            self._loop_watchdog = None
         self._schedule_render()
 
     def task_unblocked(self, task: Task, **_: Any) -> None:
@@ -133,7 +153,14 @@ class SflowSummaryWriter:
 
     def task_submitted(self, task: Task, **_: Any) -> None:
         self._task_started[task.name] = time.monotonic()
-        self._append_event("SUBMITTED", task)
+        # A merge-pod member is launched with its whole shared pod, but a member with
+        # in-group dependencies blocks in its in-pod gate until they are met. Say so,
+        # otherwise the row reads as "running" from here on.
+        gated_on = list(getattr(task, "merge_gate_after", None) or [])
+        details = (
+            [f"gated_on={','.join(gated_on)}"] if gated_on else []
+        )
+        self._append_event("SUBMITTED", task, extra_details=details)
 
     def task_completed(self, task: Task, **_: Any) -> None:
         self._task_finished[task.name] = time.monotonic()
@@ -179,6 +206,17 @@ class SflowSummaryWriter:
         details = [f"reason={reason}"] if reason else []
         self._append_event("CANCELLED", task, extra_details=details)
         self._failure_hints.append(self._format_failure_hint(task, reason, None))
+
+    def task_gate_opened(self, task: Task, **_: Any) -> None:
+        """A merge-pod member's in-pod gate opened: its work starts NOW.
+
+        Emitted when every dependency in ``merge_gate_after`` is met. Recording it
+        gives the timeline an honest start, and lets the duration chart measure the
+        work rather than the wait -- without disturbing the GPU/node usage charts,
+        which correctly count the shared pod as occupied from submission.
+        """
+        self._task_ungated[task.name] = time.monotonic()
+        self._append_event("UNGATED", task)
 
     def task_ready(self, task: Task, **_: Any) -> None:
         ready_at = time.monotonic()
@@ -241,6 +279,11 @@ class SflowSummaryWriter:
         self._status = status or self._status
         if detail:
             self._workflow_detail = detail
+        # The run is over: stop pinging the loop so teardown/interpreter exit is not
+        # held up, and so a legitimately quiet shutdown is never reported as a stall.
+        if getattr(self, "_loop_watchdog", None) is not None:
+            self._loop_watchdog.stop()
+            self._loop_watchdog = None
         self._schedule_render()
         self.flush()
 
@@ -392,6 +435,7 @@ class SflowSummaryWriter:
         lines.extend(["", "Node Usage Chart", "----------------"])
         lines.extend(self._node_usage_chart_lines(tasks))
         lines.extend(self._node_topology_lines())
+        lines.extend(self._command_trace_lines())
 
         lines.extend(["", "Command Logs", "------------"])
         existing_command_logs = {
@@ -527,7 +571,13 @@ class SflowSummaryWriter:
         if event.event == "UNBLOCKED":
             return "dependencies satisfied; ready to submit"
         if event.event == "SUBMITTED":
-            return f"attempt={event.attempt or '-'}"
+            base = f"attempt={event.attempt or '-'}"
+            # A merge-pod member is launched with its shared pod but blocks in its
+            # in-pod gate; without this the row reads as "running" from here on.
+            gated_on = event.details.get("gated_on")
+            if gated_on:
+                return f"{base}; gated in shared pod, waiting on {gated_on}"
+            return base
         if event.event == "COMPLETED":
             return "exit=" + event.details.get("exit", "0")
         if event.event == "FAILED":
@@ -549,6 +599,8 @@ class SflowSummaryWriter:
             return event.details.get("reason", "cancelled")
         if event.event == "READY":
             return "readiness satisfied"
+        if event.event == "UNGATED":
+            return "in-pod gate opened; work starts now"
         return event.status or ""
 
     def _duration_chart_lines(self, tasks: list[Task]) -> list[str]:
@@ -562,7 +614,10 @@ class SflowSummaryWriter:
         label_width = self._chart_label_width(task.name for task in tasks)
         lines = []
         for task in tasks:
-            start = self._task_started.get(task.name)
+            # For a gated merge-pod member the bar starts when its gate opened: it was
+            # parked in the shared pod until then, so submission-to-finish would
+            # over-report it (a 5s client read as 40s in a real run).
+            start = self._task_ungated.get(task.name) or self._task_started.get(task.name)
             if start is None:
                 bar = "." * width
                 duration = 0.0
@@ -802,6 +857,18 @@ class SflowSummaryWriter:
         if not self._network_warnings:
             return []
         return ["", "Network Warnings", "----------------", *self._network_warnings]
+
+    def _command_trace_lines(self) -> list[str]:
+        """Render external-command (kubectl/…) health, or [] when nothing ran.
+
+        Written even for a CANCELLED/failed run, which is exactly when it is needed:
+        the first question after a stall is "was the tool healthy?", and this answers
+        it without re-running anything. See :mod:`sflow.core.command_trace`.
+        """
+        # Hand over the run's start so the rows carry the same ``+elapsed`` column as
+        # the Timeline -- the two sections are meant to be read side by side.
+        since = self._started_at.timestamp() if self._started_at else None
+        return get_command_trace().summary_lines(since=since)
 
     def _node_topology_lines(self) -> list[str]:
         """Render the 'Node Topology' section from each backend's reservation-stage

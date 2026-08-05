@@ -322,9 +322,11 @@ def test_invalid_container_images(image: str):
     assert not is_valid_container_image(image), f"Expected invalid: {image}"
 
 
-def test_srun_operator_rejects_invalid_container_image():
-    with pytest.raises(ValidationError, match="container_image.*does not look like"):
-        SrunOperatorConfig(name="op", container_image="not a valid image!!")
+def test_srun_operator_warns_on_unrecognised_container_image(image_warnings):
+    """BEHAVIOR CHANGE: config parsing no longer fails on an unrecognised image."""
+    cfg = SrunOperatorConfig(name="op", container_image="not a valid image!!")
+    assert cfg.container_image == "not a valid image!!", "the value is kept as given"
+    assert any("container_image" in m for m in image_warnings), image_warnings
 
 
 def test_srun_operator_accepts_valid_registry_image():
@@ -346,25 +348,41 @@ def test_srun_operator_accepts_template_variable_image():
     assert cfg.container_image == "${{ variables.CONTAINER_IMAGE }}"
 
 
-def test_srun_operator_rejects_placeholder_image():
-    with pytest.raises(ValidationError, match="container_image.*does not look like"):
-        SrunOperatorConfig(name="op", container_image="<your-container-image>")
+def test_srun_operator_warns_on_placeholder_image(image_warnings):
+    cfg = SrunOperatorConfig(name="op", container_image="<your-container-image>")
+    assert cfg.container_image == "<your-container-image>"
+    assert any("container_image" in m for m in image_warnings), image_warnings
 
 
-def test_srun_operator_rejects_invalid_image_in_extra_args_equals():
-    with pytest.raises(ValidationError, match="extra_args.*does not look like"):
-        SrunOperatorConfig(
-            name="op",
-            extra_args=["--container-image=not a valid image!!"],
-        )
+def test_srun_operator_warns_on_unrecognised_image_in_extra_args_equals(image_warnings):
+    SrunOperatorConfig(
+        name="op",
+        extra_args=["--container-image=not a valid image!!"],
+    )
+    assert any("extra_args" in m for m in image_warnings), image_warnings
 
 
-def test_srun_operator_rejects_invalid_image_in_extra_args_space():
-    with pytest.raises(ValidationError, match="extra_args.*does not look like"):
-        SrunOperatorConfig(
-            name="op",
-            extra_args=["--container-image", "not a valid image!!"],
-        )
+def test_srun_operator_warns_on_unrecognised_image_in_extra_args_space(image_warnings):
+    SrunOperatorConfig(
+        name="op",
+        extra_args=["--container-image", "not a valid image!!"],
+    )
+    assert any("extra_args" in m for m in image_warnings), image_warnings
+
+
+def test_srun_operator_accepts_pyxis_enroot_image_in_extra_args(image_warnings):
+    """The reported regression: a valid pyxis/enroot URI aborted the whole run.
+
+    ``registry#path:tag`` is the documented enroot form, so it must be accepted
+    outright -- not merely downgraded to a warning.
+    """
+    image = "nvcr.io#nvidia/ai-dynamo/sglang-runtime:1.2.0-deepseek-v4-cuda13-dev.3"
+    cfg = SrunOperatorConfig(
+        name="op",
+        extra_args=["--container-image", image, "--container-mount-home"],
+    )
+    assert image in cfg.extra_args
+    assert image_warnings == [], "a valid enroot URI must not even warn"
 
 
 def test_srun_operator_accepts_valid_image_in_extra_args():

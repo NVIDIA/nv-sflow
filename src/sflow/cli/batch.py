@@ -1876,7 +1876,8 @@ def read_bulk_csv(csv_path: Path) -> tuple[list[str], list[dict]]:
     """Read and validate a bulk-input CSV file.
 
     Returns (columns, rows).
-    Raises ValueError if the file is empty or lacks the ``sflow_config_file`` column.
+    Raises ValueError if the file is empty, lacks the ``sflow_config_file`` column, has
+    no data rows, or has a row that leaves that required column blank.
     """
     import csv
 
@@ -1892,6 +1893,24 @@ def read_bulk_csv(csv_path: Path) -> tuple[list[str], list[dict]]:
         rows = list(reader)
     if not rows:
         raise ValueError(f"CSV file has no data rows: {csv_path}")
+    # A present HEADER is not the same as a present VALUE. ``csv.DictReader`` pads a row
+    # that has fewer fields than the header with None, so a short row yields
+    # ``{"sflow_config_file": None}`` and sails past the column check above -- then every
+    # downstream ``row["sflow_config_file"].split()`` raises AttributeError, which escapes
+    # typer as a raw traceback instead of a CLI error. Validating here, at the one place
+    # every caller (batch, compose, run) reads a bulk CSV, fixes all of those at once and
+    # keeps the guard from having to be re-derived at each dereference.
+    #
+    # Rejecting rather than coercing to "" is deliberate: an empty file list is not a
+    # runnable row, so coercion would only defer the failure to a less obvious place.
+    for number, row in enumerate(rows, start=1):
+        if not (row.get("sflow_config_file") or "").strip():
+            raise ValueError(
+                f"CSV data row {number} has no value for the required "
+                f"'sflow_config_file' column: {csv_path}. Every row must name at least "
+                "one YAML config file (space-separate several to merge them). A row with "
+                "fewer fields than the header will do this -- check for a missing comma."
+            )
     return columns, rows
 
 

@@ -65,3 +65,26 @@ def test_node_filters_are_not_kubectl_config_fields():
     field_names = {f.name for f in dataclasses.fields(KubectlConfig)}
     assert "exclude_nodes" not in field_names
     assert "include_nodes" not in field_names
+
+
+def test_apply_args_are_not_global_args_but_mark_non_empty():
+    # --extra-kubectl-apply-args are flags for the `apply` SUBCOMMAND. kubectl only
+    # accepts them AFTER the verb, so they must stay out of global_args() (where they
+    # would be rejected as unknown flags on every call) while still making the config
+    # non-empty so it gets applied to the backend.
+    cfg = KubectlConfig(apply_args=["--validate=false"])
+    assert cfg.global_args() == []
+    assert cfg.is_empty() is False
+    assert cfg.kubectl_apply_args() == ["--validate=false"]
+
+
+def test_apply_args_are_shell_split_like_other_extra_args():
+    # A bundled entry must not reach kubectl as one unparsable argv token.
+    cfg = KubectlConfig(apply_args=["--validate=false --server-side"])
+    assert cfg.kubectl_apply_args() == ["--validate=false", "--server-side"]
+
+
+def test_apply_args_and_global_args_stay_separate():
+    cfg = KubectlConfig(extra_args=["--insecure-skip-tls-verify"], apply_args=["--validate=false"])
+    assert cfg.global_args() == ["--insecure-skip-tls-verify"]
+    assert cfg.kubectl_apply_args() == ["--validate=false"]

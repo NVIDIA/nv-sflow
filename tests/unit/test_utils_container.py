@@ -1,7 +1,5 @@
 from types import SimpleNamespace
 
-import pytest
-
 from sflow.utils.container import (
     CONTAINER_IMAGE_INVALID_HINT,
     append_missing_mounts,
@@ -58,13 +56,30 @@ def test_extract_container_images_from_extra_args_supports_both_spellings():
     ]
 
 
-def test_validate_container_image_reference_uses_shared_hint():
-    with pytest.raises(ValueError) as exc_info:
-        validate_container_image_reference("not a valid image!!", source="operator image")
+def test_validate_container_image_reference_warns_instead_of_raising(image_warnings):
+    """BEHAVIOR CHANGE: an unrecognised reference warns, it no longer aborts the run.
 
-    message = str(exc_info.value)
+    ``is_valid_container_image`` is a heuristic. The references a runtime actually
+    accepts (pyxis/enroot ``registry#path:tag``, ``docker://`` URIs, site-local schemes)
+    outnumber the shapes it models, and a recipe it rejected had no override short of
+    editing sflow. The runtime stays the real authority.
+    """
+    validate_container_image_reference("not a valid image!!", source="operator image")
+
+    assert len(image_warnings) == 1
+    message = image_warnings[0]
     assert "operator image does not look like a valid container image" in message
     assert CONTAINER_IMAGE_INVALID_HINT in message
+    assert "not a valid image!!" in message, "the warning must name the offending value"
+
+
+def test_validate_container_image_reference_accepts_pyxis_enroot_uri(image_warnings):
+    """``registry#path:tag`` is the documented pyxis/enroot form and must not warn."""
+    validate_container_image_reference(
+        "nvcr.io#nvidia/ai-dynamo/sglang-runtime:1.2.0-deepseek-v4-cuda13-dev.3",
+        source="srun operator config: '--container-image' in extra_args",
+    )
+    assert image_warnings == []
 
 
 def test_validate_container_image_reference_skips_deferred_values():

@@ -1,0 +1,274 @@
+version: "0.1"
+
+# Regression gate for THE post-run hang: an sflow driver frozen by ONE enormous log line.
+# No model, no GPU work -- it reproduces a mechanism measured live, not a guessed one.
+#
+# WHAT HAPPENED IN PRODUCTION (mlperf_harness, trtllm_ifb-20260731-100017-f0bc28)
+# -------------------------------------------------------------------------------
+# `kubectl logs -f` reads its stream up to `\n`, so a task whose output is a tqdm-style
+# progress bar -- `\r`-separated frames with NO newline -- has its whole run WITHHELD:
+# <task>.log stops growing and the follow delivers nothing for as long as the bar runs.
+#
+#     kubectl logs (one-shot) : 271,494 bytes
+#     followed <task>.log     :  17,623 bytes   <- frozen, ends exactly at the last \n
+#     the 253,871-byte gap    : 2,149 carriage returns, ZERO newlines
+#     follow process          : alive the whole time -- withholding, not crashed
+#
+# When the task finally exits, the bar terminates and kubectl flushes the WHOLE
+# accumulation into <task>.log as a SINGLE line. The driver's console tailer then handed
+# that one line to the rich console handler, whose cost is dominated by MEMORY rather
+# than regex: ~6.3us and ~300 BYTES OF RSS PER CHARACTER (measured 500 KB -> 3.1s and
+# 145 MB; 4 MB -> 25s and 1.15 GB). Tens of MB is therefore CPU-MINUTES and several GB,
+# which on a normally loaded host also means swap. It runs on the EVENT-LOOP thread, so
+# while it renders NOTHING else in the driver ticks -- no pod-status watch, no DAG poll.
+# py-spy caught the driver at 100% CPU inside `tail_file_to_console` with the harness pod
+# already Completed, the DAG frozen ~20 minutes, then a clean finish once it drained.
+#
+# The two guards that must hold, and which this recipe exercises:
+#   * `\r` redraws collapse to their final frame (the only frame a terminal ever showed),
+#     which is what the launcher already does for every non-k8s backend;
+#   * any line still over the cap is TRUNCATED for the console -- <task>.log keeps all
+#     of it, so nothing is lost.
+#
+# HOW A REGRESSION IS DETECTED
+# ----------------------------
+# Not by wall-clock (scripts/k8s_e2e_verify.sh allows 1800s, which would hide a 50s
+# freeze) but by a side effect the frozen driver cannot fake. The pod stages its output
+# and holds its container open for COLLECT_GRACE_SECONDS waiting for the driver to
+# `kubectl cp` it out. Every step of that handshake is an await on the same event loop the
+# render is blocking -- the readiness-marker read, the pod-phase check, the copy itself --
+# so the window closes with the archive still in the pod, and it is DISCARDED when the pod
+# exits. `hang_guard` then finds the files missing and FAILS the workflow. Verified both
+# ways on a GB300 cluster at the defaults below: with the guards in place the run is
+# COMPLETED with all 3 files collected; with the console `\r`-collapse removed the same
+# run is FAILED with "3/3 output file(s) missing" (the marker was read at 3s, then the
+# freeze ate the rest of the window). The detector is the real symptom the production run
+# suffered, not a proxy for it.
+#
+# SIZING IS LOAD-BEARING IN BOTH DIRECTIONS
+# -----------------------------------------
+# The burst must be large enough to freeze a REGRESSED driver for longer than
+# COLLECT_GRACE_SECONDS, and small enough that it still REACHES the driver at all:
+#
+#   * too small -> even a regressed driver renders it inside the window; no signal.
+#   * too LARGE -> the kubelet destroys it before the driver sees a byte. Once a
+#     container log passes containerLogMaxSize (10 MiB default) the kubelet renames the
+#     whole file and starts an empty one, and `kubectl logs` / `logs -f` only ever serve
+#     the CURRENT file. Measured here (kubelet v1.34.3) at BURST_FRAMES=200000: a
+#     29,772,304-byte `0.log.<ts>` beside a 0-byte `0.log`, `kubectl logs` returning
+#     0 bytes, and <task>.log arriving with no bar in it at all -- the flood never
+#     happens and the test would pass VACUOUSLY.
+#
+# So `hang_guard` asserts BOTH: that the burst arrived, and that the output survived. A
+# cluster with a smaller containerLogMaxSize fails with "lower BURST_FRAMES" instead of
+# going quietly green.
+#
+# THE CONSOLE HALF NEEDS A PTY
+# ----------------------------
+# `tail_file_to_console` returns immediately when stdout is not a TTY, so the flood only
+# happens on an interactive run. Run it under a pseudo-terminal:
+#
+#   script -qec "sflow run tests/integration/recipes/kubernetes/log_burst_smoke.yaml" /dev/null
+#
+# Without a TTY this recipe still covers the collect handshake surviving a container-log
+# rotation, but NOT the hang -- and scripts/k8s_e2e_verify.sh redirects sflow's stdout,
+# so it runs in that weaker mode today.
+
+variables:
+  K8S_NAMESPACE:
+    description: "Kubernetes namespace for all pods"
+    value: default
+  SERVER_IMAGE:
+    description: "Any image with bash + coreutils; no GPU work is actually run"
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-deepseek-v4-dev.1
+  GPUS_PER_NODE:
+    description: "GPUs on the node"
+    type: integer
+    value: 4
+  BURST_FRAMES:
+    description: >-
+      Number of `\r` progress-bar frames the one-shot emits with NO newline between them.
+      All of it lands in <task>.log as a SINGLE line the instant the task exits. At the
+      default BURST_FRAME_WIDTH each frame is ~146 bytes, so 55000 frames is ~8 MB: about
+      51s of console render for a regressed driver (against a 30s collect window), while
+      still sitting under the kubelet's 10 MiB default containerLogMaxSize so the burst
+      actually reaches the driver. Read the SIZING note in the header before changing it
+      -- raising this past the rotation threshold makes the test pass without testing.
+    type: integer
+    value: 55000
+  BURST_FRAME_WIDTH:
+    description: >-
+      Characters per frame (~118 in the measured run). Frames x width is the single-line
+      length the driver must render in one go, and both the CPU and the memory cost scale
+      with it, so this and BURST_FRAMES together set the freeze duration.
+    type: integer
+    value: 120
+  COLLECT_GRACE_SECONDS:
+    description: >-
+      How long the pod holds its container open waiting for the driver's `kubectl cp`.
+      This is the detector's timer, and it is squeezed between two MEASURED walls: a
+      healthy handshake needs ~15s (marker read at 3-4s, then a ~7-10s `kubectl cp`, which
+      is exec-channel startup rather than the 200 KB payload -- 10s was tried and FAILED
+      on a healthy driver), while the freeze it must catch is ~51s at the default burst
+      size, whose own ceiling is the kubelet's 10 MiB log rotation. 30s sits between them
+      with ~2x margin each way. Raise it if a slow control plane makes this flaky; lower
+      it and healthy runs start failing.
+    type: integer
+    value: 30
+
+artifacts:
+  - name: HANG_GUARD
+    uri: file://hang_guard.sh
+    content: |
+      # Driver-side verdict. Runs on the LOCAL backend (not in a pod) so it can see what
+      # actually landed on the driver's filesystem after burst_task finished.
+      set -uo pipefail
+      run_dir="$SFLOW_WORKFLOW_OUTPUT_DIR"
+      task_log="$run_dir/burst_task/burst_task.log"
+      out_dir="$run_dir/burst_task/burst_out"
+      frames="${{ variables.BURST_FRAMES }}"
+      rc=0
+
+      # 1. Did the burst actually reach the driver? <task>.log is `\r`-collapsed when the
+      #    task is finalized, so the bar's LAST frame is what survives. Absent means the
+      #    kubelet rotated the container log away before the follow read it, so the flood
+      #    -- the thing under test -- never happened.
+      echo "[hang_guard] checking that the burst reached $task_log"
+      if grep -q "Processing: ${frames}/${frames}" "$task_log"; then
+        echo "[hang_guard] OK: the ${frames}-frame burst was delivered to the driver"
+      else
+        echo "[hang_guard] INCONCLUSIVE: no bar in $task_log -- the kubelet almost"
+        echo "[hang_guard] certainly rotated the container log away before the follow"
+        echo "[hang_guard] read it, so the console flood never happened and this run"
+        echo "[hang_guard] tested nothing. Lower BURST_FRAMES until the burst stays"
+        echo "[hang_guard] under this cluster's containerLogMaxSize (10 MiB default)."
+        rc=1
+      fi
+
+      # 2. Did the output survive? The pod waited only COLLECT_GRACE_SECONDS for the
+      #    driver to copy it. A driver frozen rendering the burst cannot read the pod's
+      #    readiness marker in time, the window closes, and the staged archive dies with
+      #    the pod -- exactly what the production run lost.
+      echo "[hang_guard] checking collected node-local output in $out_dir"
+      missing=0
+      for n in 1 2 3; do
+        [ -s "$out_dir/part_$n.txt" ] || missing=$((missing + 1))
+      done
+      if [ "$missing" -eq 0 ]; then
+        echo "[hang_guard] OK: all 3 output file(s) collected -- the driver stayed"
+        echo "[hang_guard] responsive through the burst"
+      else
+        echo "[hang_guard] FAIL: ${missing}/3 output file(s) missing. The driver did not"
+        echo "[hang_guard] copy them within COLLECT_GRACE_SECONDS, which is what happens"
+        echo "[hang_guard] when one huge log line is rendered to the console on the"
+        echo "[hang_guard] event-loop thread. Check <task>.log's longest line and look"
+        echo "[hang_guard] for 'output-collect window expired' in sflow.log."
+        rc=1
+      fi
+
+      [ "$rc" -eq 0 ] && echo "[hang_guard] PASS"
+      exit "$rc"
+
+backends:
+  - name: cluster
+    type: kubernetes
+    default: true
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    nodes: 1
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    scheduling: device_plugin
+    # Separate pods, as in production: the healthy service and the bursting one-shot were
+    # distinct pods with distinct log streams. Merging them would collapse the contrast
+    # this recipe depends on.
+    merge_colocated_gpu_pods: "off"
+    # Left ON deliberately: the collect handshake is what detects the hang.
+    collect_node_local_output: true
+    # The detector's timer -- see the variable.
+    collect_grace_seconds: ${{ variables.COLLECT_GRACE_SECONDS }}
+    reservation:
+      timeout: 1200
+
+  # The verdict runs on the driver host, which is the only place that can see whether the
+  # collected files actually landed.
+  - name: driver
+    type: local
+    nodes: 1
+
+operators:
+  - name: gpu
+    type: k8s
+    image: ${{ variables.SERVER_IMAGE }}
+    run_as_root: true
+
+workflow:
+  name: k8s_log_burst_smoke
+  tasks:
+    # --- the CONTROL: newline-terminated output, so its follow keeps delivering. If this
+    # one also stalls, the problem is not partial-line reassembly.
+    - name: stream_server
+      operator: gpu
+      resources:
+        gpus:
+          count: 1
+      script:
+        - set -euo pipefail
+        - echo "[smoke] stream_server starting in $(hostname)"
+        - echo "STREAM_SERVER READY"
+        - |
+          i=0
+          while :; do
+            i=$((i + 1))
+            printf '[stream_server] heartbeat %d -- newline-terminated, follow stays healthy\n' "$i"
+            sleep 2
+          done
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "STREAM_SERVER READY"
+          timeout: 600
+          interval: 5
+        # This control task cannot raise, but the probe belongs here anyway: it reads the
+        # same <task>.log the burst lands in, so it is the second consumer that a
+        # regression would starve.
+        failure:
+          log_watch:
+            regex_pattern: "Traceback \\(most recent call last\\)"
+
+    # --- the SUBJECT: an unterminated \r bar, then output, then exit.
+    - name: burst_task
+      operator: gpu
+      depends_on: [stream_server]
+      resources:
+        gpus:
+          count: 1
+      script:
+        - set -euo pipefail
+        - echo "[smoke] burst_task starting in $(hostname)"
+        # Normal, newline-terminated lines first: these DO get delivered, so the frozen
+        # byte count afterwards is unambiguous evidence of where delivery stopped.
+        - echo "[smoke] burst_task: pre-bar output (this reaches <task>.log immediately)"
+        - |
+          # The bar: `printf` with a leading \r and NO trailing newline, repeated. This is
+          # what tqdm/aiperf/pip do, and what kubectl withholds. Fork-free so the frames
+          # accumulate fast.
+          pad=$(head -c ${{ variables.BURST_FRAME_WIDTH }} < /dev/zero | tr '\0' '.')
+          n=${{ variables.BURST_FRAMES }}
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            i=$((i + 1))
+            printf '\rProcessing: %d/%d [%s]' "$i" "$n" "$pad"
+          done
+          # NOTE: deliberately no trailing newline. The bar stays unterminated, exactly as
+          # in production -- the EXIT trap's flush is what closes it.
+        # Produce output so the collect trap arms: whether these files reach the driver is
+        # the pass/fail signal hang_guard reads.
+        - mkdir -p "$SFLOW_TASK_OUTPUT_DIR/burst_out"
+        - for n in 1 2 3; do head -c 50000 /dev/urandom | base64 > "$SFLOW_TASK_OUTPUT_DIR/burst_out/part_$n.txt"; done
+        - 'echo "[smoke] burst_task wrote $(ls "$SFLOW_TASK_OUTPUT_DIR/burst_out" | wc -l) output file(s); exiting now"'
+
+    # --- the VERDICT (TERMINAL): fails the workflow if the burst froze the driver.
+    - name: hang_guard
+      backend: driver
+      depends_on: [burst_task]
+      script:
+        - bash ${{ artifacts.HANG_GUARD.path }}

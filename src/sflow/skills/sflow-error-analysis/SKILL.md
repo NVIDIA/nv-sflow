@@ -73,6 +73,37 @@ Figure out which you have, then follow that path below.
   <task_name>_0/               # replica 0
 ```
 
+### Which sink holds which information
+
+Each sink has a fixed scope and lines are **never mirrored between them**, so reading the
+wrong file looks exactly like "sflow logged nothing". Pick by what you are looking for:
+
+| Looking for | Read | Deliberately absent from |
+|-------------|------|--------------------------|
+| The workload's own stdout/stderr — traceback, CUDA OOM, server banner, probe markers | `<task>/<task>.log` | `sflow.log` |
+| Orchestration — backend allocation, pod scheduling waits, probe firing, k8s output-collection, teardown, RBAC denials | `sflow.log` | `<task>/<task>.log` |
+| Per-task status, failure hints, **Probe Traces**, External Command Health, timeline | `sflow_summary.log` | — |
+| The exact command sflow launched | `*_cmds.log` (per family, e.g. `bash_cmds.log`) | — |
+| Failed / slow external calls with timings | `command_trace.jsonl` | — |
+| The manifest actually applied (k8s) | `<task>/<task>.k8s.yaml` | — |
+| Parsed metrics | `<task>/result.json`, run-level `results.json` | — |
+
+The split is by *writer*, not by topic: `<task>.log` receives only that task's own logger
+plus (on k8s) the `kubectl logs -f` redirect, while every driver-side module logger writes
+to `sflow.log`. The console shows both — task output echoed there is tagged so `sflow.log`
+drops it.
+
+Two consequences that cost real debugging time:
+
+- **A `[task_name]` prefix does not mean the line is in `<task>.log`.** Driver-side lines
+  are prefixed with the task name for readability but still go to `sflow.log`. On k8s that
+  includes the whole output-collection handshake — `still waiting for the collect-ready
+  marker`, `pod reached a terminal phase without either collect sentinel appearing`,
+  `output-collect window ... expired`, `collection ABANDONED`. Grep `sflow.log` for those,
+  not the task log.
+- **`log_watch` probes only ever see `<task>.log`.** They cannot match orchestration lines,
+  so a readiness/failure pattern must appear in the workload's own output.
+
 - **Parsed results:** a task with a `result:` block writes `<task>/result.json`
   (`ok`/`values`/`errors`) and updates the run-level `results.json`. Result parsing is
   **best-effort** — a missed regex or failed `required:` spec logs a warning and sets
@@ -88,6 +119,13 @@ Figure out which you have, then follow that path below.
   (`sflow_output/%j-sflow-submit.out` / `.err`).
 - **Kubernetes:** `kubectl describe pod <pod>` and `kubectl get events` for
   scheduling/image issues the pod log can't show.
+- **Kubernetes — a short `<task>.log` may be a delivery gap, not a quiet task.** That file
+  is exactly what `kubectl logs -f` delivered; there is no post-run re-fetch (a re-fetch
+  only returns the *current* container log, so it used to replace an hour of output with
+  its last few seconds). A container-log rotation can stall the follow on kubelet < 1.29,
+  and content written before the follow attached is unreachable. If output you know the pod
+  produced is missing, check `sflow.log` for the preflight kubelet-version warning and for
+  a rotation note before suspecting the workload.
 
 ## Step 4 — Root-cause & fix
 

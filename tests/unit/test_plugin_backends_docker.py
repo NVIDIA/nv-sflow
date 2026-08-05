@@ -4,7 +4,6 @@
 import asyncio
 
 import pytest
-from pydantic import ValidationError
 
 from sflow.app.run_support import configure_task_runtime
 from sflow.plugins.backends.docker import DockerBackend, DockerBackendConfig
@@ -244,9 +243,12 @@ def test_docker_backend_dry_run_details_describe_multi_host_config():
     assert details["gpus_per_node"] == "8"
 
 
-def test_docker_run_operator_rejects_invalid_literal_image_at_parse_time():
-    with pytest.raises(ValidationError, match="image.*does not look like"):
-        DockerRunOperatorConfig(name="docker", image="<replace-me>")
+def test_docker_run_operator_warns_on_unrecognised_literal_image(image_warnings):
+    """BEHAVIOR CHANGE: an unrecognised image warns instead of failing config parsing."""
+    config = DockerRunOperatorConfig(name="docker", image="<replace-me>")
+
+    assert config.image == "<replace-me>", "the value is kept as given"
+    assert any("<replace-me>" in m for m in image_warnings), image_warnings
 
 
 def test_docker_run_operator_allows_templated_image_at_parse_time():

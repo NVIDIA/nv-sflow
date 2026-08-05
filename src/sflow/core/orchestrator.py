@@ -1073,6 +1073,16 @@ class Orchestrator:
                     if dep.status in (TaskStatus.READY, TaskStatus.COMPLETED):
                         if await opener(dep_name):
                             self._merge_gates_opened.add(key)
+                            # Once EVERY dependency of this member is open, its in-pod
+                            # subshell stops waiting and its work actually begins. Tell
+                            # the summary, so the timeline shows a real start instead of
+                            # implying the member ran from submission (it was parked in
+                            # the shared pod), and so its duration measures work, not wait.
+                            if all(
+                                (member_name, d) in self._merge_gates_opened
+                                for d in (getattr(member, "merge_gate_after", []) or [])
+                            ):
+                                self._record_summary("task_gate_opened", member)
 
     def _surface_network_fallback(self, task: Task) -> None:
         """Warn + record when a task's pod(s) degraded RDMA -> TCP at runtime.

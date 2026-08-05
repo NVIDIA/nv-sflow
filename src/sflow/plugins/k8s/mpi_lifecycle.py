@@ -58,6 +58,7 @@ async def discover_launcher_pod(
         rc, out, _ = await k8s_lifecycle.run_kubectl(
             ["get", "pods", "-l", selector, *ns_args, "-o", "name"],
             global_args=global_args,
+            timeout=k8s_lifecycle.POLL_KUBECTL_TIMEOUT,
         )
         if rc == 0 and out.strip():
             # `kubectl get -o name` -> "pod/<name>" (first line if several).
@@ -83,8 +84,13 @@ async def mpijob_condition(
             "jsonpath={.status.conditions[?(@.type==\"%s\")].status}" % cond
         )
         rc, out, _ = await k8s_lifecycle.run_kubectl(
+            # Bounded like the plain-pod status poll: this is the MPI task's
+            # completion signal, so an unbounded call here wedges the driver for the
+            # kernel's TCP retransmission window with no log output. A timeout just
+            # retries on the next tick of watch_mpijob_until_terminal.
             ["get", mpijob_ref, *ns_args, "-o", jsonpath],
             global_args=global_args,
+            timeout=k8s_lifecycle.POLL_KUBECTL_TIMEOUT,
         )
         if rc == 0 and out.strip() == "True":
             return cond

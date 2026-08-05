@@ -123,7 +123,7 @@ def test_render_task_pod_defaults_to_nvidia_gpu():
 def test_gpu_quota_probe_uses_configured_resource_name(monkeypatch):
     be = KubernetesBackend(_cfg(namespace="ns", gpu_resource_name="amd.com/gpu"))
 
-    async def _kubectl(args):
+    async def _kubectl(args, **_kw):
         # The device is advertised under requests.<resource-name> in the quota.
         return 0, '{"requests.amd.com/gpu":"8"}', ""
 
@@ -168,7 +168,7 @@ def test_gib_installer_namespace_override(monkeypatch):
     be = KubernetesBackend(_cfg(gib_installer_namespace="gpu-operator"))
     seen: dict = {}
 
-    async def _kubectl(args):
+    async def _kubectl(args, **_kw):
         seen["args"] = list(args)
         return 0, "nccl-rdma-installer-abc", ""
 
@@ -182,7 +182,7 @@ def test_gib_installer_namespace_defaults_to_kube_system(monkeypatch):
     be = KubernetesBackend(_cfg())
     seen: dict = {}
 
-    async def _kubectl(args):
+    async def _kubectl(args, **_kw):
         seen["args"] = list(args)
         return 0, "nccl-rdma-installer-abc", ""
 
@@ -200,7 +200,7 @@ def test_gpu_product_label_key_override(monkeypatch):
     be = KubernetesBackend(_cfg(gpu_product_label_key="custom.io/gpu-product"))
     seen: dict = {}
 
-    def _kubectl_sync(args, timeout=None):
+    def _kubectl_sync(args, timeout=None, **_kw):
         seen["args"] = list(args)
         return 0, "H100", ""
 
@@ -215,7 +215,7 @@ def test_gpu_product_label_key_defaults_to_nvidia(monkeypatch):
     be = KubernetesBackend(_cfg())
     seen: dict = {}
 
-    def _kubectl_sync(args, timeout=None):
+    def _kubectl_sync(args, timeout=None, **_kw):
         seen["args"] = list(args)
         return 0, "GB200", ""
 
@@ -303,7 +303,7 @@ def test_detect_node_gpu_capacity_queries_allocatable(monkeypatch):
     be = KubernetesBackend(_cfg(scheduling="device_plugin"))
     seen: dict = {}
 
-    def _kubectl_sync(args, timeout=None):
+    def _kubectl_sync(args, timeout=None, **_kw):
         seen["args"] = list(args)
         return 0, "8 4 8", ""  # heterogeneous pool -> representative max
 
@@ -317,7 +317,7 @@ def test_detect_node_gpu_capacity_honors_custom_resource_name(monkeypatch):
     be = KubernetesBackend(_cfg(scheduling="device_plugin", gpu_resource_name="amd.com/gpu"))
     seen: dict = {}
 
-    def _kubectl_sync(args, timeout=None):
+    def _kubectl_sync(args, timeout=None, **_kw):
         seen["args"] = list(args)
         return 0, "6", ""
 
@@ -329,7 +329,7 @@ def test_detect_node_gpu_capacity_honors_custom_resource_name(monkeypatch):
 
 def test_detect_node_gpu_capacity_none_when_query_fails(monkeypatch):
     be = KubernetesBackend(_cfg(scheduling="device_plugin"))
-    monkeypatch.setattr(be, "_kubectl_sync", lambda args, timeout=None: (1, "", "err"))
+    monkeypatch.setattr(be, "_kubectl_sync", lambda args, timeout=None, **_kw: (1, "", "err"))
     assert be._detect_node_gpu_capacity() is None
 
 
@@ -341,7 +341,7 @@ def test_detect_node_gpu_capacity_none_when_query_fails(monkeypatch):
 def test_preflight_dra_warns_when_ga_api_not_served(monkeypatch, caplog):
     be = KubernetesBackend(_cfg(scheduling="dra", namespace="ns"))
 
-    def _sync(args, timeout=None):
+    def _sync(args, timeout=None, **_kw):
         if args[:1] == ["api-versions"]:
             return 0, "v1\napps/v1\nresource.k8s.io/v1beta1\n", ""
         if args[:2] == ["get", "deviceclass"]:
@@ -361,7 +361,7 @@ def test_preflight_dra_warns_when_ga_api_not_served(monkeypatch, caplog):
 def test_preflight_dra_quiet_when_ga_api_served(monkeypatch, caplog):
     be = KubernetesBackend(_cfg(scheduling="dra", namespace="ns"))
 
-    def _sync(args, timeout=None):
+    def _sync(args, timeout=None, **_kw):
         if args[:1] == ["api-versions"]:
             return 0, "v1\nresource.k8s.io/v1\nresource.k8s.io/v1beta1\n", ""
         if args[:2] == ["get", "deviceclass"]:

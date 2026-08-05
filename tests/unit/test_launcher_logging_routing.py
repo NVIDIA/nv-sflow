@@ -12,6 +12,8 @@ Per-task subprocess output must always be written to the per-task logger
 import asyncio
 import logging
 import os
+import threading
+import time
 from contextlib import contextmanager
 
 import pytest
@@ -179,6 +181,34 @@ def _fake_one_line_subprocess(monkeypatch, line: bytes = b"ROUTEDLINE\n") -> Non
     monkeypatch.setattr(launcher_mod, "record_active_command", lambda *a, **k: None)
 
 
+def _fake_streamed_subprocess(monkeypatch, chunks, gap: float = 0.05) -> None:
+    """Like :func:`_fake_one_line_subprocess` but delivers ``chunks`` as SEPARATE reads.
+
+    The single-shot helper pre-loads the whole payload, so the launcher drains it in one
+    ``_feed`` call -- which cannot exercise anything that only happens ACROSS reads. A
+    background writer with a gap between chunks makes each one its own readable event,
+    which is what a real progress bar looks like and where the carried-frame handling
+    actually lives.
+    """
+    read_fd, write_fd = os.pipe()
+
+    def _writer() -> None:
+        try:
+            for chunk in chunks:
+                time.sleep(gap)
+                os.write(write_fd, chunk)
+        finally:
+            os.close(write_fd)
+
+    threading.Thread(target=_writer, daemon=True).start()
+    slave_fd = os.open(os.devnull, os.O_WRONLY)
+    monkeypatch.setattr(launcher_mod.pty, "openpty", lambda: (read_fd, slave_fd))
+    monkeypatch.setattr(
+        launcher_mod.subprocess, "Popen", lambda *a, **k: _ExitedProcess()
+    )
+    monkeypatch.setattr(launcher_mod, "record_active_command", lambda *a, **k: None)
+
+
 @pytest.mark.skipif(
     launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
 )
@@ -272,6 +302,42 @@ def test_run_async_streams_in_progress_progress_snapshot_without_newline(monkeyp
 @pytest.mark.skipif(
     launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
 )
+def test_run_async_keeps_the_final_frame_of_a_bar_that_ends_on_a_redraw(monkeypatch):
+    """A bar whose LAST frame is followed by ``\\r`` must still record that frame.
+
+    The other ``\\r`` cases here put the carriage return at the START of each frame, so
+    the text after the final one is the final state. Plenty of tools do the opposite and
+    terminate each frame with ``\\r`` instead. Taking the text after the last ``\\r``
+    outright then yields the empty string, and the task's last visible output -- the
+    completed progress line -- is silently dropped from both <task>.log and the console.
+    """
+    monkeypatch.setattr(launcher_mod, "_console_streams_task_output", lambda: False)
+    _fake_one_line_subprocess(
+        monkeypatch,
+        # Ends on a redraw, with no newline: exactly what _flush_tail sees at EOF.
+        line=b"downloading 10%\rdownloading 100%\r",
+    )
+
+    out_logger, task_cap = _make_output_logger()
+    with _capture_root_logger():
+        rc = asyncio.run(
+            SubprocessLauncher().run_async(
+                ["bash", "-c", "ignored-fake"],
+                output_logger=out_logger,
+                task_name="t",
+            )
+        )
+
+    assert rc == 0
+    msgs = [r.getMessage() for r in task_cap.records]
+    assert msgs == ["downloading 100%"], (
+        "the final frame must survive a trailing \\r; got %r" % (msgs,)
+    )
+
+
+@pytest.mark.skipif(
+    launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
+)
 def test_run_async_keeps_output_off_root_when_not_tty(monkeypatch):
     # Headless/batch: the per-task output must not reach the root logger at all.
     monkeypatch.setattr(launcher_mod, "_console_streams_task_output", lambda: False)
@@ -293,3 +359,68 @@ def test_run_async_keeps_output_off_root_when_not_tty(monkeypatch):
     # ... but nothing per-task is streamed to the root logger.
     streamed = [r for r in root_cap.records if getattr(r, SFLOW_TASK_STREAM_ATTR, False)]
     assert streamed == []
+
+
+@pytest.mark.skipif(
+    launcher_mod.pty is None, reason="PTY-based launching unavailable on this platform"
+)
+def test_run_async_does_not_splice_consecutive_redraw_terminated_reads(monkeypatch):
+    """Two reads that EACH end on a redraw must not be concatenated into one line.
+
+    Carrying the superseded frame is what keeps a bar's final state alive when the
+    terminating newline lands in a later read -- but the carry has to be put back with
+    the ``\\r`` that separated it, because ``\\r`` means "return to column 0 and
+    overwrite". Plain concatenation produced "50%60%100%": a line the task never
+    displayed, persisted verbatim into <task>.log by the tail flush. A read boundary
+    landing right after a carriage return is all it takes.
+    """
+    monkeypatch.setattr(launcher_mod, "_console_streams_task_output", lambda: False)
+    _fake_streamed_subprocess(
+        monkeypatch,
+        # Each chunk is its own read and each ends on a redraw, so the carry is armed
+        # and then rejoined three times over -- the exact sequence that spliced.
+        [b"Epoch  50%\r", b"Epoch  60%\r", b"Epoch 100%\r"],
+    )
+
+    out_logger, task_cap = _make_output_logger()
+    with _capture_root_logger():
+        rc = asyncio.run(
+            SubprocessLauncher().run_async(
+                ["bash", "-c", "ignored-fake"], output_logger=out_logger, task_name="t"
+            )
+        )
+
+    assert rc == 0
+    msgs = [r.getMessage() for r in task_cap.records]
+    assert msgs == ["Epoch 100%"], (
+        "only the last frame was ever on screen; a splice would give "
+        f"'Epoch  50%Epoch  60%Epoch 100%'. Got {msgs!r}"
+    )
+
+
+def test_console_echo_is_clamped_while_the_task_log_keeps_the_whole_line():
+    """The two destinations must be asymmetric: bounded console, complete file.
+
+    An unbounded line rendered through the console handler is what freezes the driver's
+    event loop, and that path is reachable from every backend the launcher serves -- not
+    just k8s. But <task>.log is the ground-truth record, so the clamp must never reach
+    it: the console is best-effort observability, the file is not.
+    """
+    huge = "J" * (4 * 1024 * 1024)
+
+    out_logger, task_cap = _make_output_logger()
+    with _capture_root_logger() as root_cap:
+        _emit_task_output_line(
+            huge, pfx="[t] ", output_logger=out_logger, stream_console=True
+        )
+
+    (persisted,) = [r.getMessage() for r in task_cap.records]
+    assert persisted == huge, "<task>.log must keep every byte of the line"
+
+    (echoed,) = [
+        r.getMessage()
+        for r in root_cap.records
+        if getattr(r, SFLOW_TASK_STREAM_ATTR, False)
+    ]
+    assert len(echoed) < 10_000, f"console echo still unbounded at {len(echoed)} chars"
+    assert "truncated for the console" in echoed, "the reader must be told it was cut"

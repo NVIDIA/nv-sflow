@@ -8,14 +8,22 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
-# Matches remote registry references: [registry[:port]/][org/]name[:tag][@digest]
+from sflow.logging import get_logger
+
+_logger = get_logger(__name__)
+
+# Matches remote registry references: [registry[:port]/][org/]name[:tag][@digest].
+# ``#`` is accepted because pyxis/enroot separate the registry from the image path with
+# it -- ``nvcr.io#nvidia/ai-dynamo/sglang-runtime:1.2.0`` is the documented URI form and
+# is what ``--container-image`` is usually given on Slurm.
 _REGISTRY_IMAGE_RE = re.compile(
-    r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*(@[a-zA-Z][a-zA-Z0-9]*:[a-fA-F0-9]+)?$"
+    r"^[a-zA-Z0-9][a-zA-Z0-9._/:#-]*(@[a-zA-Z][a-zA-Z0-9]*:[a-fA-F0-9]+)?$"
 )
 
 CONTAINER_IMAGE_INVALID_HINT = (
-    "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag') "
-    "or a local .sqsh file path (e.g. '/path/to/image.sqsh')"
+    "Expected a remote registry reference (e.g. 'nvcr.io/org/image:tag', "
+    "'nvcr.io#org/image:tag') or a local .sqsh file path "
+    "(e.g. '/path/to/image.sqsh')"
 )
 
 
@@ -37,7 +45,21 @@ def validate_container_image_reference(
     source: str,
     error_prefix: str | None = None,
 ) -> None:
-    """Raise a standard error if *image* is a concrete invalid image reference."""
+    """WARN (never raise) when *image* does not match a shape we recognise.
+
+    This used to abort the run, and it should not have. :func:`is_valid_container_image`
+    is a heuristic regex, and the set of references a container runtime actually accepts
+    is larger than it models -- pyxis/enroot alone take ``registry#path:tag``,
+    ``docker://`` URIs and site-local schemes, and a rejected recipe had no override
+    short of editing sflow. A non-match therefore means "sflow did not recognise this",
+    not "this is wrong", which is a warning's job.
+
+    The runtime remains the real authority: an image reference that is genuinely bad
+    fails at pull/enroot time with a message from the tool that actually resolves it,
+    which is more accurate than anything this regex could say.
+
+    ``error_prefix`` is kept (callers pass it) and now prefixes the warning.
+    """
     if image is None:
         return
     image_str = str(image)
@@ -45,9 +67,11 @@ def validate_container_image_reference(
         return
     if not is_valid_container_image(image_str):
         prefix = f"{error_prefix}: " if error_prefix else ""
-        raise ValueError(
+        _logger.warning(
             f"{prefix}{source} does not look like a valid container image. "
-            f"{CONTAINER_IMAGE_INVALID_HINT}, got: '{image_str}'"
+            f"{CONTAINER_IMAGE_INVALID_HINT}, got: '{image_str}'. "
+            "Continuing anyway -- the container runtime will report it if it is "
+            "genuinely unusable."
         )
 
 

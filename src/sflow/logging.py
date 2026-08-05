@@ -19,6 +19,7 @@ _DEFAULT_NON_TTY_WIDTH = 200
 # in <task>/<task>.log.
 SFLOW_TASK_STREAM_ATTR = "sflow_task_stream"
 
+
 # ``logging.captureWarnings`` redirects Python ``warnings.warn`` output to this
 # logger. It sits outside the ``sflow`` namespace, so sflow's console + file
 # handlers must be mirrored onto it or warnings would print only to stderr and

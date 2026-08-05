@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import gc
 import logging
 import re
 from pathlib import Path
@@ -802,3 +803,64 @@ def test_probe_trace_refreshes_while_task_stays_running(tmp_path):
     writer.flush()
     text = summary_path.read_text(encoding="utf-8")
     assert "step 2" in text and "step 1" not in text
+
+
+def _writer_and_workflow(tmp_path):
+    tg = TaskGraph()
+    tg.dag.add_node("t", _task("t", tmp_path))
+    workflow = Workflow(name="wf", task_graph=tg)
+    return SflowSummaryWriter(tmp_path / "sflow_summary.log"), workflow
+
+
+def test_summary_writer_arms_and_disarms_the_loop_watchdog(tmp_path):
+    """The stall detector is only useful if the run actually arms and releases it.
+
+    Armed too late (or not at all) and a freeze leaves no evidence -- the failure mode
+    is self-concealing, since sflow's own log records come from the thread that is
+    blocked. Left armed after the run and a quiet shutdown gets reported as a stall,
+    and the daemon thread keeps pinging through interpreter exit.
+    """
+    writer, workflow = _writer_and_workflow(tmp_path)
+    states: dict = {}
+
+    async def _exercise() -> None:
+        writer.start(
+            workflow=workflow,
+            output_dir=tmp_path,
+            runtime_info_text="runtime",
+            command_log_paths={},
+        )
+        states["armed"] = writer._loop_watchdog is not None
+        writer.workflow_finished(status="COMPLETED")
+        states["released"] = writer._loop_watchdog is None
+
+    asyncio.run(_exercise())
+
+    assert states["armed"], "the watchdog must be armed for the life of the run"
+    assert states["released"], "the watchdog must be released when the run ends"
+
+
+def test_summary_writer_skips_the_watchdog_outside_a_running_loop(tmp_path, recwarn):
+    """A synchronous caller must degrade cleanly, not arm a watchdog on a dead loop.
+
+    ``EventLoopWatchdog.start`` raises when there is no running loop; the writer has to
+    catch that and carry on. If it ever stopped raising, a sync caller would get a
+    watcher thread that reports a false stall 30 seconds later and writes a stack dump
+    -- and `start()` must not leave an un-awaited coroutine behind either.
+    """
+    writer, workflow = _writer_and_workflow(tmp_path)
+
+    writer.start(                      # no running loop: this must not raise
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+
+    assert writer._loop_watchdog is None, "no loop to watch means no watchdog"
+    assert not (tmp_path / "loop_stalls.txt").exists()
+    gc.collect()
+    assert not [
+        w for w in recwarn.list if issubclass(w.category, RuntimeWarning)
+    ], "arming must not leak an un-awaited beat coroutine"
+    writer.workflow_finished(status="COMPLETED")   # must be a no-op, not an AttributeError
