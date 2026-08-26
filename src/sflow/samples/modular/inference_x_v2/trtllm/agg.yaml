@@ -1,7 +1,7 @@
 # TensorRT-LLM aggregated (non-disaggregated) server task and its configuration.
 # Merge all files for a complete run:
 #   sflow compose slurm_config.yaml common_workflow.yaml trtllm/agg.yaml benchmark_aiperf.yaml \
-#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.8.0 \
+#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0 \
 #     --missable-tasks prefill_server --missable-tasks decode_server
 
 version: "0.1"

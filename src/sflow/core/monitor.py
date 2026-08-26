@@ -92,6 +92,13 @@ class TaskResourceView:
     scopes: list[str] = field(default_factory=list)
     report_formats: list[str] = field(default_factory=lambda: ["csv", "svg"])
     window_tasks: list[str] = field(default_factory=list)
+    log_window: dict[str, Any] | None = None
+    # Every monitor owner that asked for this folder. Views are deduped by label,
+    # so a task covered by both the workflow monitor and its own monitor keeps the
+    # FIRST `triggered_by` -- counting folders by that alone credits them all to
+    # the workflow and reports the task monitor as writing nothing. Plan-time only
+    # (not in `to_spec`).
+    contributors: list[str] = field(default_factory=list)
     cross: bool = False  # True for a used_by_tasks (B monitored-by A) view
 
     def to_spec(self) -> dict[str, Any]:
@@ -107,6 +114,7 @@ class TaskResourceView:
             "scopes": list(self.scopes),
             "formats": list(self.report_formats),
             "window_tasks": list(self.window_tasks),
+            "log_window": self.log_window,
             "cross": bool(self.cross),
         }
 

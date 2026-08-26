@@ -431,7 +431,10 @@ class _SflowTextualApp(App[None]):
         layout: vertical;
     }
     #header {
-        height: 5;
+        /* _header_text() renders 5 lines and the round border costs 2 rows, so
+           anything less than 7 silently clips the last lines -- which is how the
+           elapsed clock and the output dir went missing. */
+        height: 7;
         border: round gray;
         padding: 0 1;
     }
@@ -491,6 +494,10 @@ class _SflowTextualApp(App[None]):
     def on_mount(self) -> None:
         self.query_one("#logs", RichLog).focus()
         self.refresh_from_owner(force=True)
+        # The header carries a wall clock and an elapsed counter, but refreshes
+        # are event-driven -- with no task transitions or log lines the clock
+        # would sit frozen. Tick the header (only) once a second.
+        self.set_interval(1.0, self._update_header)
 
     def action_interrupt(self) -> None:
         self._owner._request_interrupt()
@@ -504,7 +511,14 @@ class _SflowTextualApp(App[None]):
         self._update_logs(force=force)
 
     def _update_header(self) -> None:
-        self.query_one("#header", Static).update(self._owner._header_text())
+        # Guarded here rather than at each call site: the 1s timer can land after
+        # the widget is gone (teardown after exit()), and an exception inside a
+        # Textual callback surfaces in the UI. Same best-effort stance as
+        # RichTui.refresh().
+        try:
+            self.query_one("#header", Static).update(self._owner._header_text())
+        except Exception:
+            pass
 
     def _task_rows(
         self, tasks: list[Task]

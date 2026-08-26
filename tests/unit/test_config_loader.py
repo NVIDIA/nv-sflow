@@ -266,3 +266,56 @@ def test_strip_missable_noop_without_workflow():
     stripped = strip_missable_tasks(config, ["anything"])
     assert stripped == []
     assert config == {"version": "0.1"}
+
+
+def test_load_config_warns_that_timeout_is_not_enforced(tmp_path, caplog):
+    """`timeout:` is accepted but nothing reads it, so a recipe that sets one
+    LOOKS bounded and is not. The field cannot simply be removed (these models
+    forbid extra keys, so every config setting it would stop loading), so the
+    warning is what stops it lying."""
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+version: "0.1"
+workflow:
+  name: wf
+  timeout: 115m
+  tasks:
+    - name: t1
+      timeout: 30m
+      script:
+        - echo hi
+    - name: t2
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    with caplog.at_level("WARNING"):
+        ConfigLoader().load_config(p)
+
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "does not enforce it" in msg
+    assert "workflow" in msg and "t1" in msg
+    # t2 sets no timeout, so it must not be named.
+    assert "t2" not in msg
+
+
+def test_load_config_is_quiet_when_no_timeout_is_set(tmp_path, caplog):
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+version: "0.1"
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    with caplog.at_level("WARNING"):
+        ConfigLoader().load_config(p)
+
+    assert "does not enforce it" not in "\n".join(r.message for r in caplog.records)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import tempfile
 import threading
 import time
@@ -14,7 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from sflow.core.loop_watchdog import EventLoopWatchdog
-from sflow.utils.gpu import parse_cuda_visible_devices
+from sflow.utils.gpu import (
+    parse_cuda_visible_devices,
+    task_gpu_indices,
+    task_gpu_record,
+)
 
 from .command_trace import get_command_trace
 from .task import Task, TaskStatus
@@ -69,6 +74,21 @@ class _TimelineEvent:
     attempt: int | None
     status: str | None
     details: dict[str, str]
+
+
+def _resource_row_key(label: str) -> tuple[tuple[int, object], ...]:
+    """Natural sort key so chart rows read node-by-node, GPU 0..N.
+
+    Rows are otherwise emitted in "whichever task touched this resource first"
+    order, which interleaves nodes. Plain string order is no good either -- it
+    puts "GPU 10" before "GPU 2" and "node10" before "node2" -- so digit runs
+    compare numerically. The (0, str) / (1, int) tags keep str and int from ever
+    being compared with each other.
+    """
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part)
+        for part in re.split(r"(\d+)", label)
+    )
 
 
 class SflowSummaryWriter:
@@ -430,6 +450,7 @@ class SflowSummaryWriter:
         lines.extend(["", "Timeline", "--------"])
         lines.extend(self._timeline_lines())
         lines.extend(self._probe_trace_lines())
+        lines.extend(self._gpu_assignment_lines(tasks))
         lines.extend(["", "GPU Usage Chart", "---------------"])
         lines.extend(self._gpu_usage_chart_lines(tasks))
         lines.extend(["", "Node Usage Chart", "----------------"])
@@ -630,6 +651,68 @@ class SflowSummaryWriter:
             )
         return lines
 
+    def _gpu_assignment_lines(self, tasks: list[Task]) -> list[str]:
+        """Per-task PHYSICAL GPU ids, next to what the task itself saw.
+
+        Containerized backends re-index: a task handed physical GPUs 2,3,6,7 sees
+        ``CUDA_VISIBLE_DEVICES=0,1,2,3`` inside its container. So the value a task
+        can print about itself is useless for answering "which card did this
+        actually run on" -- the question you need when reading a profile, chasing a
+        thermal or ECC event, or lining a run up against ``nvidia-smi`` output.
+
+        Both columns are shown because the mapping is the point; the hint is added
+        only when some task's two views really differ: the containerized (docker)
+        case, and Slurm on a GRES partition, where the step re-derives its slice
+        positionally from what slurmstepd handed it (a partial allocation makes
+        plan ``0,1`` mean physical ``3,5``). On a non-GRES partition the columns
+        match and the section just confirms it. Kubernetes contributes no rows at all: its device plugin
+        picks the devices, so sflow never learns their physical ids and inventing
+        them here would be worse than saying nothing.
+        """
+        rows: list[tuple[str, str, str]] = []
+        for task in tasks:
+            physical = self._task_gpu_ids(task)
+            if not physical:
+                continue
+            # The step's OWN numbering, straight from its placement record. The
+            # planner's env is the HOST slice, so reading it here printed the
+            # physical ids in the in-container column and vice versa: a task
+            # planned for host 2,3 that a container renumbered to 0,1 was reported
+            # as physical 0,1 / in-container 2,3 -- backwards, and impossible.
+            record = task_gpu_record(task)
+            in_step = record.get("cuda_visible_devices", "")
+            if in_step.startswith("<"):  # <env-not-set> / <set-as-empty>
+                in_step = ""
+            visible = [
+                str(i)
+                for i in parse_cuda_visible_devices(
+                    in_step or task.envs.get("CUDA_VISIBLE_DEVICES")
+                )
+            ]
+            rows.append((task.name, ",".join(physical), ",".join(visible) or "-"))
+        if not rows:
+            return []
+
+        lines = ["", "GPU Assignment", "--------------"]
+        if any(physical != visible for _name, physical, visible in rows):
+            lines.append(
+                "Hint: this backend re-indexes devices inside the container, so the "
+                "task's own"
+            )
+            lines.append(
+                "      CUDA_VISIBLE_DEVICES is NOT the physical GPU id -- use the "
+                "left column."
+            )
+        name_width = max(len("Task"), *(len(name) for name, _p, _v in rows))
+        phys_width = max(len("Physical GPUs"), *(len(p) for _n, p, _v in rows))
+        lines.append(
+            f"{'Task':<{name_width}}  {'Physical GPUs':<{phys_width}}  In-container"
+        )
+        lines.append(f"{'-' * name_width}  {'-' * phys_width}  {'-' * 12}")
+        for name, physical, visible in rows:
+            lines.append(f"{name:<{name_width}}  {physical:<{phys_width}}  {visible}")
+        return lines
+
     def _gpu_usage_chart_lines(self, tasks: list[Task]) -> list[str]:
         rows: list[tuple[str, Task]] = []
         for task in tasks:
@@ -703,7 +786,9 @@ class SflowSummaryWriter:
             )
         lines.append("")
 
-        for label, row_tasks in grouped_rows.items():
+        for label, row_tasks in sorted(
+            grouped_rows.items(), key=lambda item: _resource_row_key(item[0])
+        ):
             track = ["."] * width
             for task in row_tasks:
                 start = self._task_started.get(task.name)
@@ -820,12 +905,9 @@ class SflowSummaryWriter:
 
     @staticmethod
     def _task_gpu_ids(task: Task) -> list[str]:
-        return [
-            str(gpu_id)
-            for gpu_id in parse_cuda_visible_devices(
-                task.envs.get("CUDA_VISIBLE_DEVICES")
-            )
-        ]
+        # Physical devices, not the container-visible env: docker re-indexes every
+        # container to 0..N-1, so reading the env would draw every task on GPU 0.
+        return [str(gpu_id) for gpu_id in task_gpu_indices(task)]
 
     def _end_summary_lines(self, tasks: list[Task]) -> list[str]:
         counts = Counter(str(task.status) for task in tasks)

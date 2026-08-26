@@ -35,6 +35,14 @@ variables:
   TP_SIZE:
     description: "Tensor parallel size (Qwen3-0.6B fits on a single GPU)"
     value: 1
+  SERVER_GPUS:
+    description: "GPUs the server reserves (>= TP_SIZE); sflow pins the container to exactly these devices"
+    type: integer
+    value: 1
+  GPUS_PER_NODE:
+    description: "GPUs on this machine -- the planning ceiling, not a reservation. Raise it on a multi-GPU box so other sflow runs can use the rest."
+    type: integer
+    value: 1
   MAX_RUNNING_REQUESTS:
     description: "Max concurrent requests the server will schedule"
     value: 32
@@ -77,13 +85,17 @@ backends:
     # only a fallback. Kept in sync with SGLANG_IMAGE for consistency.
     image: ${{ variables.SGLANG_IMAGE }}
     nodes: 1
-    gpus_per_node: 1
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
 
 operators:
   - name: sglang_runtime
     type: docker_run
     image: ${{ variables.SGLANG_IMAGE }}
-    gpus: all                      # expose local GPU(s) to the container
+    # No `gpus:` here on purpose. The task's resources.gpus.count drives it, so
+    # sflow reserves that many physical GPUs and pins the container to exactly
+    # those devices. `gpus: all` would instead hand the container every GPU on
+    # the box regardless of what is free, which collides with any other sflow run
+    # sharing the machine.
     extra_args:
       - --network=host             # share host networking so the client reaches localhost:PORT
       - --shm-size=16g             # SGLang needs ample shared memory
@@ -100,6 +112,13 @@ workflow:
   tasks:
     - name: sglang_server
       operator: sglang_runtime
+      # Reserve GPUs for this task. sflow picks free devices from the
+      # machine-local registry and pins the container to them, so a second
+      # concurrent `sflow run` lands on different GPUs instead of fighting over
+      # these. Inside the container they appear as CUDA_VISIBLE_DEVICES=0,..,N-1.
+      resources:
+        gpus:
+          count: ${{ variables.SERVER_GPUS }}
       # Advertised service port (metadata; the container uses host networking).
       ports:
         - port: ${{ variables.PORT }}

@@ -294,6 +294,10 @@ backends:
     # mounts: ["/data:/data:ro"]
     # workdir: /workspace
     # extra_args: ["--shm-size=16g"]
+    # wait_for_gpus: 600      # GPUs are reserved per task across concurrent runs on
+    #                         # the host. Unset = fail fast when too few are free;
+    #                         # 0 = wait forever; N = wait up to N seconds.
+    #                         # Overridden by --wait-for-gpus / SFLOW_WAIT_FOR_GPUS.
     # hosts:                  # optional multi-host pool (each needs docker_host OR context)
     #   - { name: dgx-a, docker_host: "ssh://dgx-a", ip_address: 10.0.0.11, gpus_per_node: 8 }
     #   - { name: dgx-b, context: dgx-b-context,    ip_address: 10.0.0.12, gpus_per_node: 8 }
@@ -701,6 +705,9 @@ GPU allocation (at least one of `count` / `indices` is required):
 - `count` + `indices`: `count` is the total, `indices` the per-node slice, so the task
   spans `count / len(indices)` nodes using the same slots on each. `count` must be a
   positive multiple of `len(indices)`
+- `count` + `resources.nodes`: the pinned nodes win, so `count` must be a positive
+  multiple of the assigned node count and `count / nodes` must fit the smallest node.
+  `nodes.count: 2` + `gpus.count: 1` is rejected (one GPU cannot span two nodes)
 - GPU indices must be non-negative (no Python-style `-1`), and `CUDA_VISIBLE_DEVICES`
   preserves the order written
 - GPUs are sliced sequentially across replicas on each node
@@ -868,6 +875,9 @@ workflow:
           gpus: { count: 8 }     # reporting filter (GPUs to include)
         scopes:
           gpu: {}
+        window:                    # task monitor only; requires report.enabled
+          start: WARMUP_FINISHED
+          end: BENCHMARK_FINISHED
         report: { enabled: true }
 ```
 
@@ -889,19 +899,30 @@ workflow:
 | `interval`  | int         | Default sample interval in ms (default `5000`, min `100`) |
 | `scopes`    | dict        | Active scopes; omit to enable all built-ins             |
 | `resources` | dict        | `nodes` / `gpus` (like `tasks.resources`) + `used_by_tasks` |
-| `report`    | dict        | `enabled` (bool) + `format` (default `[csv, svg]`; `png` is optional) |
+| `window`    | dict        | Optional task-log `start` / `end` markers for report clipping |
+| `report`    | dict        | `enabled` (bool, **default `true`** -- set `false` to skip report folders) + `format` (default `[csv, svg]`; `png` is optional) |
 
 Scopes: `cpu`, `gpu` (accepts `fields:` to override the `nvidia-smi` query),
 `memory`, `disk`, `network` (each accepts `enabled`/`interval`), and `custom`
 (`script: [...]`). When `scopes` is omitted entirely, all built-ins are enabled.
+
+For `window`, each boundary is a literal string or
+`{ pattern: string-or-list, select: first-or-last }`. Prefix regular expressions
+with `re:` or `regex:`. Defaults are `start:first` and `end:last`; matching uses
+the task owner's final attempt, and `end` is selected only from matches after the
+resolved `start`. Unresolved markers keep raw data, write
+`window_not_found.json`, and skip the affected detailed report (a resolved one
+writes `window.json`).
 
 ### Outputs
 
 - `<run>/sflow_monitor.log` — terminal-friendly overview (min/avg/max tables +
   ASCII sparkline timelines), sibling to `sflow_summary.log`.
 - `<run>/sflow_monitor/raw/` — raw per-node CSV samples.
-- `<run>/sflow_monitor/<consumer>/` — detailed timeline + summary CSVs and an SVG
-  timeline for each monitor with `report.enabled` (`format` defaults to
+- `<run>/sflow_monitor/{lifecycle,windowed}/<consumer>/` — grouped by what sets the
+  time range (lifecycle events vs `monitor.window` markers); detailed timeline +
+  summary CSVs and an SVG
+  timeline for each monitor unless `report.enabled: false` (`format` defaults to
   `[csv, svg]`, both pure-stdlib). Add `png` for a raster chart (needs the
   optional `sflow[monitor]` / matplotlib extra; skipped gracefully if absent).
 
@@ -1034,6 +1055,9 @@ sflow run -f config.yaml --artifact LOCAL_MODEL_PATH=fs:///new/path
 
 - `sflow --version` / `-V`: print version + runtime/install details (no subcommand).
 - `--dry-run`, `--tui`: validate/plan; Rich TUI.
+- `--skip-artifact-check`: a missing local `fs://` artifact path warns instead of failing the
+  run, and is left alone rather than created as an empty directory. For paths that exist only
+  where the task runs (e.g. Slurm compute nodes). `sflow batch` forwards it into the job.
 - `--include-nodes` / `--exclude-nodes`: backend-agnostic node pool control (comma-separated,
   quoted whitespace, or repeatable; union over recipe `include_nodes`/`exclude_nodes`).
 - Extra backend args (de-duped by option, CLI wins): `--extra-args` / `-e` (generic — Slurm

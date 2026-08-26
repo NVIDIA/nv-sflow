@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from sflow.utils.gpu import parse_cuda_visible_devices
+from sflow.utils.gpu import planned_gpu_indices
 
 _logger = logging.getLogger(__name__)
 
@@ -147,15 +147,13 @@ def build_allocation_map_lines(tasks: list[Any], backends: dict[str, Any]) -> li
             if not assigned_nodes and alloc.nodes:
                 assigned_nodes = [node.name for node in alloc.nodes]
 
-            # Use the planner's computed GPU slice (CUDA_VISIBLE_DEVICES), which is
-            # calculated uniformly for every backend. It is carried on the task even
-            # when not injected into the execution env (e.g. Kubernetes, where the
-            # cluster/DRA assigns physical devices); fall back to the env for callers
-            # that only populate task.envs.
-            gpu_indices = parse_cuda_visible_devices(
-                getattr(task, "cuda_visible_devices", None)
-                or getattr(task, "envs", {}).get("CUDA_VISIBLE_DEVICES")
-            )
+            # The planner's computed GPU slice, which is calculated uniformly for
+            # every backend and is carried on the task even when not injected into
+            # the execution env (e.g. Kubernetes, where the cluster/DRA assigns the
+            # physical devices). This map is a dry-run view of the PLAN, so the
+            # planner's slice -- not what a task later turns out to have reserved --
+            # is the right thing to show; see planned_gpu_indices.
+            gpu_indices = planned_gpu_indices(task)
 
             for node_name in assigned_nodes:
                 if node_name not in node_map:

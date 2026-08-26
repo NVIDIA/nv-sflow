@@ -216,8 +216,8 @@ stateDiagram-v2
 
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
-| **`sflow run`** | Execute a workflow | `--dry-run`, `--tui`, `--bulk-input/--row`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M`, `--extra-args/-e`, `--output-dir`, `--log-level`, `--enable-workflow-monitor`, `--enable-task-monitor`, `--include-nodes/--exclude-nodes`, `--kubeconfig`, `--kube-context`, `--kube-namespace`, `--kube-node-selector`, `--kube-compute-domain-channel`, `--kube-compute-domain-create`, `--extra-kubectl-args` |
-| **`sflow batch`** | Generate Slurm sbatch scripts | `--submit`, `--bulk-input` (CSV sweeps), `--bulk-submit` (YAML folders), `--row`, `--nodes`, `--partition`, `--account`, `--time`, `--resolve`, `--sflow-version`, `--enable-workflow-monitor`, `--enable-task-monitor`, `--include-nodes/--exclude-nodes` |
+| **`sflow run`** | Execute a workflow | `--dry-run`, `--tui`, `--bulk-input/--row`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M`, `--skip-artifact-check`, `--extra-args/-e`, `--output-dir`, `--log-level`, `--enable-workflow-monitor`, `--enable-task-monitor`, `--include-nodes/--exclude-nodes`, `--kubeconfig`, `--kube-context`, `--kube-namespace`, `--kube-node-selector`, `--kube-compute-domain-channel`, `--kube-compute-domain-create`, `--extra-kubectl-args` |
+| **`sflow batch`** | Generate Slurm sbatch scripts | `--submit`, `--bulk-input` (CSV sweeps), `--bulk-submit` (YAML folders), `--row`, `--nodes`, `--partition`, `--account`, `--time`, `--resolve`, `--skip-artifact-check`, `--sflow-version`, `--enable-workflow-monitor`, `--enable-task-monitor`, `--include-nodes/--exclude-nodes` |
 | **`sflow compose`** | Merge multiple YAMLs into one | `--resolve`, `--validate`, `--bulk-input`, `--row`, `--missable-tasks/-M`, `-o/--output` |
 | **`sflow visualize`** | Render DAG as image/mermaid | `--format` (png/svg/pdf/mermaid/dot), `--show-variables`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M` |
 | **`sflow sample`** | List/copy example workflows | `--list`, `--force`, `-o/--output` |

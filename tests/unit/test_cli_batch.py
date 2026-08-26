@@ -1313,6 +1313,33 @@ def test_bulk_input_results_csv_marks_failed_rows(tmp_path):
     assert rows[1]["sflow_batch_dir"] == bulk_dirs[0].name
 
 
+def test_dry_run_failure_keeps_the_reason_not_just_the_header():
+    """A multi-line reason is reported in full, indented under the row.
+
+    Config validation errors arrive as 'Configuration validation failed:\\n<detail>',
+    so keeping only the first line reported the header and dropped every word that
+    said what was actually wrong.
+    """
+    error = ValueError(
+        "Configuration validation failed:\n"
+        "2 validation errors for SflowConfig\n"
+        "workflow.tasks.0.probes.readiness.log_watch\n"
+        "  Value error, Only one of 'regex_pattern' or 'match_pattern' may be set"
+    )
+    detail = batch_mod._failure_detail(error)
+
+    assert detail.startswith("Configuration validation failed:")
+    assert "2 validation errors for SflowConfig" in detail
+    assert "Value error, Only one of" in detail
+    # continuation lines are indented so they sit under the "  [1] " prefix
+    assert all(line.startswith("      ") for line in detail.splitlines()[1:])
+
+
+def test_dry_run_failure_handles_an_empty_message():
+    detail = batch_mod._failure_detail(ValueError())
+    assert detail  # something is always reported
+
+
 def test_bulk_input_dry_run_failures_shown_at_end(tmp_path):
     """Dry-run failures are listed in a prominent block at the end."""
     wf = _write_workflow_with_vars(tmp_path / "wf.yaml")
@@ -1584,7 +1611,7 @@ class TestNormalizeColValue:
 
     def test_container_image_skipped(self):
         assert (
-            _normalize_col_value("nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0") is None
+            _normalize_col_value("nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0") is None
         )
 
     def test_container_image_with_org_skipped(self):
@@ -1599,7 +1626,7 @@ def test_derive_row_name_container_image_skipped():
     rows = [
         {
             "sflow_config_file": "wf.yaml",
-            "IMAGE": "nvcr.io/nvidia/vllm-runtime:0.8.0",
+            "IMAGE": "nvcr.io/nvidia/vllm-runtime:1.3.0",
             "SLURM_NODES": "2",
         },
         {
@@ -5119,6 +5146,11 @@ def test_batch_script_installs_editable_from_source_path(
     # does not recurse into its own destination / sibling jobs' growing copies.
     assert "--exclude='.sflow_venv*'" in script_content
     assert "--exclude='.sflow_src*'" in script_content
+    # Also correctness-critical, and not about size: pip/uv write partial *.tmp
+    # files under .cache while sibling jobs bootstrap, and rsync exits 24 when one
+    # vanishes mid-transfer -- fatal to the bootstrap, so the job dies with no
+    # output dir at all.
+    assert "--exclude=.cache" in script_content
     # The per-job source copy is cleaned up with the venv on exit/signal.
     assert '${SFLOW_SRC_DIR:+"$SFLOW_SRC_DIR"}' in script_content
 
@@ -5285,3 +5317,272 @@ def test_read_bulk_csv_still_accepts_a_valid_row(tmp_path):
     columns, rows = batch_mod.read_bulk_csv(csv_file)
     assert columns == ["sflow_config_file", "TP_SIZE"]
     assert rows[0]["sflow_config_file"] == "a.yaml b.yaml"
+
+
+# ---------------------------------------------------------------------------
+# --nodes vs the CSV's node column
+# ---------------------------------------------------------------------------
+
+
+def _write_workflow_with_nodes(path: Path) -> Path:
+    """A workflow whose node count is a variable, as the infmax recipes have it."""
+    path.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: SLURM_NODES\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: serve\n"
+        "      script:\n"
+        "        - echo ${{ variables.SLURM_NODES }}\n"
+    )
+    return path
+
+
+def _nodes_csv(tmp_path, wf, *rows: int):
+    body = "".join(f"{wf},{n}\n" for n in rows)
+    return _write_csv(tmp_path / "jobs.csv", f"sflow_config_file,SLURM_NODES\n{body}")
+
+
+def _run_bulk(csv_file, out_dir, *extra):
+    return runner.invoke(
+        app,
+        ["batch", "--bulk-input", str(csv_file), "--partition", "batch", "--account", "acct",
+         "--output-dir", str(out_dir), *extra],
+    )
+
+
+def test_cli_nodes_matching_the_csv_is_accepted(mock_sflow_app, tmp_path):
+    """The same number in both places is how a run normally states its size."""
+    wf = _write_workflow_with_nodes(tmp_path / "wf.yaml")
+    result = _run_bulk(_nodes_csv(tmp_path, wf, 4), tmp_path / "out", "--nodes", "4")
+    assert result.exit_code == 0, result.output
+    assert "does not match" not in result.output
+
+
+def test_cli_nodes_disagreeing_with_the_csv_is_rejected(mock_sflow_app, tmp_path):
+    wf = _write_workflow_with_nodes(tmp_path / "wf.yaml")
+    result = _run_bulk(_nodes_csv(tmp_path, wf, 6), tmp_path / "out", "--nodes", "4")
+
+    assert result.exit_code != 0
+    output = result.output + str(result.exception or "")
+    assert "--nodes=4" in output and "row 1 says 6" in output
+    assert "SLURM_NODES" in output  # says which column, and how to resolve it
+    assert "drop --nodes" in output
+
+
+def test_only_the_selected_rows_are_checked(mock_sflow_app, tmp_path):
+    """A row this run is not submitting cannot block it."""
+    wf = _write_workflow_with_nodes(tmp_path / "wf.yaml")
+    csv_file = _nodes_csv(tmp_path, wf, 4, 6)
+
+    ok = _run_bulk(csv_file, tmp_path / "out1", "--nodes", "4", "--row", "1")
+    assert ok.exit_code == 0, ok.output
+
+    clash = _run_bulk(csv_file, tmp_path / "out2", "--nodes", "4", "--row", "2")
+    assert clash.exit_code != 0
+    assert "row 2 says 6" in clash.output + str(clash.exception or "")
+
+
+def test_a_set_override_is_what_the_row_says(mock_sflow_app, tmp_path):
+    """--set replaces the CSV cell, so it is the number --nodes has to match."""
+    wf = _write_workflow_with_nodes(tmp_path / "wf.yaml")
+    csv_file = _nodes_csv(tmp_path, wf, 6)
+
+    ok = _run_bulk(csv_file, tmp_path / "out1", "--nodes", "4", "--set", "SLURM_NODES=4")
+    assert ok.exit_code == 0, ok.output
+
+    clash = _run_bulk(csv_file, tmp_path / "out2", "--nodes", "4", "--set", "SLURM_NODES=8")
+    assert clash.exit_code != 0
+    output = clash.output + str(clash.exception or "")
+    assert "--set SLURM_NODES" in output and "says 8" in output
+
+
+def test_a_csv_without_a_node_column_still_needs_cli_nodes(mock_sflow_app, tmp_path):
+    """The pre-existing guard for the other direction is untouched."""
+    wf = _write_workflow_with_nodes(tmp_path / "wf.yaml")
+    csv_file = _write_csv(tmp_path / "jobs.csv", f"sflow_config_file,TP_SIZE\n{wf},4\n")
+
+    result = _run_bulk(csv_file, tmp_path / "out")
+    assert result.exit_code != 0
+    assert "--nodes was not provided" in result.output + str(result.exception or "")
+
+
+def test_node_count_column_is_deterministic_across_hash_seeds(fake_process):
+    """Two node columns must not resolve by PYTHONHASHSEED.
+
+    `_NODE_COLUMN_NAMES` is a frozenset, so iterating it directly made the answer depend
+    on the per-process string hash seed: the count a run was submitted with was a coin
+    flip, and the column the conflict message named could disagree with the value it was
+    complaining about. Checked in subprocesses because the seed is fixed at startup --
+    in-process this would flake rather than fail.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "from sflow.cli.batch import _node_count_column;"
+        "print(_node_count_column({'NUM_NODES': '2', 'SLURM_NODES': '6'}))"
+    )
+    # conftest installs an autouse fake_process; let these two real calls through.
+    fake_process.pass_command([sys.executable, "-c", code], occurrences=2)
+    # Seeds 0 and 1 put the two names in opposite hash order, so an unsorted scan
+    # disagrees between exactly these two runs.
+    answers = {
+        subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        ).stdout.strip()
+        for seed in ("0", "1")
+    }
+    assert answers == {"('NUM_NODES', 2)"}, answers
+
+
+def test_the_reported_column_is_the_one_whose_value_conflicted(mock_sflow_app, tmp_path):
+    """With two node columns, the message must name the column it actually read."""
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: SLURM_NODES\n"
+        "    value: 1\n"
+        "  - name: NUM_NODES\n"
+        "    value: 1\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: serve\n"
+        "      script:\n"
+        "        - echo ${{ variables.SLURM_NODES }} ${{ variables.NUM_NODES }}\n"
+    )
+    csv_file = _write_csv(
+        tmp_path / "jobs.csv", f"sflow_config_file,NUM_NODES,SLURM_NODES\n{wf},2,6\n"
+    )
+
+    result = _run_bulk(csv_file, tmp_path / "out", "--nodes", "4")
+    assert result.exit_code != 0
+    output = result.output + str(result.exception or "")
+    # NUM_NODES sorts first, so 2 is the value taken -- and 2 is what must be quoted.
+    assert "row 1 says 2" in output
+    assert "NUM_NODES" in output
+
+
+# --nodes vs the config's own node count: a warning, not a refusal
+
+
+def _write_slurm_workflow(path: Path, nodes: int = 6) -> Path:
+    """A config whose slurm backend states its own node count, as real recipes do."""
+    path.write_text(
+        'version: "0.1"\n'
+        "variables:\n"
+        "  - name: SLURM_NODES\n"
+        f"    value: {nodes}\n"
+        "backends:\n"
+        "  - name: slurm_cluster\n"
+        "    type: slurm\n"
+        "    default: true\n"
+        "    time: 30\n"
+        "    partition: batch\n"
+        "    account: acct\n"
+        "    gpus_per_node: 8\n"
+        "    nodes: ${{ variables.SLURM_NODES }}\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: serve\n"
+        "      script:\n"
+        "        - echo ${{ variables.SLURM_NODES }}\n"
+    )
+    return path
+
+
+def _batch_single(wf, out_dir, *extra):
+    return runner.invoke(
+        app,
+        ["batch", "--file", str(wf), "--partition", "batch", "--account", "acct",
+         "--output-dir", str(out_dir), *extra],
+    )
+
+
+def test_single_job_nodes_mismatch_warns_and_still_generates(mock_sflow_app, tmp_path):
+    """The config-driven paths warn where --bulk-input refuses.
+
+    Here the node count lives in the config, where --nodes has always been allowed to
+    size the allocation on its own -- so a mismatch must not break a run that works
+    today. It must not be silent either: nothing else notices until the job is already
+    allocated and the slurm backend logs `config_nodes=... env_nodes=...`.
+    """
+    wf = _write_slurm_workflow(tmp_path / "wf.yaml", nodes=6)
+    result = _batch_single(wf, tmp_path / "out", "--nodes", "4")
+
+    assert result.exit_code == 0, result.output
+    # the node-count warning specifically -- the backend emits others of its own
+    assert "--nodes=4 does not match" in result.output
+    assert "wf.yaml says 6" in result.output
+
+
+def test_single_job_matching_nodes_is_quiet(mock_sflow_app, tmp_path):
+    wf = _write_slurm_workflow(tmp_path / "wf.yaml", nodes=6)
+    result = _batch_single(wf, tmp_path / "out", "--nodes", "6")
+
+    assert result.exit_code == 0, result.output
+    assert "does not match" not in result.output
+
+
+def test_a_derived_node_count_never_warns_about_itself(mock_sflow_app, tmp_path):
+    """Without -N the count is derived FROM the config, so comparing it back is noise."""
+    wf = _write_slurm_workflow(tmp_path / "wf.yaml", nodes=6)
+    result = _batch_single(wf, tmp_path / "out")
+
+    assert "does not match" not in result.output
+
+
+def test_a_literal_backend_node_count_is_compared_too(mock_sflow_app, tmp_path):
+    """The number need not come from a variable -- it is the backend's `nodes` that
+    sizes the recipe, however it was written."""
+    wf = tmp_path / "wf.yaml"
+    wf.write_text(
+        'version: "0.1"\n'
+        "backends:\n"
+        "  - name: slurm_cluster\n"
+        "    type: slurm\n"
+        "    default: true\n"
+        "    time: 30\n"
+        "    partition: batch\n"
+        "    account: acct\n"
+        "    gpus_per_node: 8\n"
+        "    nodes: 6\n"
+        "workflow:\n"
+        "  name: test_wf\n"
+        "  tasks:\n"
+        "    - name: serve\n"
+        "      script:\n"
+        "        - echo hi\n"
+    )
+    result = _batch_single(wf, tmp_path / "out", "--nodes", "4")
+
+    assert result.exit_code == 0, result.output
+    assert "wf.yaml says 6" in result.output
+
+
+def test_bulk_submit_nodes_mismatch_warns(mock_sflow_app, tmp_path):
+    """The same warning on the --bulk-submit path, which also had neither check."""
+    src = tmp_path / "configs"
+    src.mkdir()
+    _write_slurm_workflow(src / "wf.yaml", nodes=6)
+
+    result = runner.invoke(
+        app,
+        ["batch", "--bulk-submit", str(src), "--partition", "batch", "--account", "acct",
+         "--output-dir", str(tmp_path / "out"), "--nodes", "4"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "--nodes=4 does not match" in result.output
+    assert "wf.yaml says 6" in result.output

@@ -1,0 +1,366 @@
+# GPU placement regression matrix: every combination that can break the slice.
+#
+# sflow plans a per-task CUDA_VISIBLE_DEVICES and re-applies it inside the step.
+# Four things independently decide what a task ends up holding:
+#
+#   * container or not  -- pyxis/enroot pass through only the task's devices and
+#                          RENUMBER them from 0, so a task planned for 2,3 sees
+#                          them as 0,1. A bare srun step sees the whole node.
+#   * slice offset      -- a plan starting at 0 survives renumbering by accident,
+#                          which is why only the high-offset task ever broke.
+#   * concurrency       -- two tasks sharing a node must land on disjoint GPUs.
+#   * node count        -- a multi-node plan is ONE node's slice, applied
+#                          independently on every node. sflow guarantees the slice
+#                          is uniform (gpus.count is divided by the node count and
+#                          every node takes the same offsets), so the same flat
+#                          plan must resolve correctly in each node's own step.
+#
+# Counting GPUs is not enough: a task can hold the right NUMBER of the WRONG
+# devices and look perfectly healthy. So the first task records EACH node's
+# index -> UUID map on bare metal, before anything is carved, and every later task
+# proves by UUID that it holds the physical GPUs it was planned for -- per node,
+# because a multi-node task's nodes each have their own map.
+#
+# Asserting rather than echoing is the point. The recipes that only printed their
+# devices passed while holding nothing at all -- a decode server planned for 2,3
+# inside a 2-GPU container numbered 0,1 saw no GPU, and the first CUDA call died
+# reporting an unsupported architecture.
+version: "0.1"
+
+variables:
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: your_slurm_account
+  SLURM_PARTITION:
+    description: "SLURM partition"
+    value: your_slurm_partition
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit"
+    value: "00:10:00"
+  SLURM_NODES:
+    description: >-
+      Number of Slurm nodes. Two, so the multi-node cases are real: a per-node
+      slice that is right on node 0 and wrong on node 1 is invisible at one node,
+      and that is the shape every multi-node server recipe uses.
+    # Typed, because boxed_multinode_high multiplies it. Untyped it is a STRING,
+    # and `${{ variables.SLURM_NODES * 2 }}` repeats it into "22" rather than
+    # doubling it -- valid YAML, valid expression, wrong number.
+    type: integer
+    value: 2
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    value: 4
+  PLACEMENT_IMAGE:
+    description: "Any GPU-enabled image; nvidia-smi is injected by the runtime."
+    value: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0
+
+artifacts:
+  # Declared so sample/bulk tests can override the standard sample artifact.
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
+  # One assertion, mounted at the same path on every node, instead of the same
+  # forty lines of shell pasted into each task. EXPECT_HOST is the only input.
+  - name: ASSERT_PLACEMENT
+    uri: file://assert_placement.sh
+    content: |
+      # Prove by UUID that THIS rank holds the physical GPUs it was planned for.
+      # Reads EXPECT_HOST (planned HOST indices, comma separated) from the env.
+      set -u
+      me=$(basename "$SFLOW_TASK_OUTPUT_DIR")
+      run_dir=$(dirname "$SFLOW_TASK_OUTPUT_DIR")
+      # Per NODE, not per task: every rank of a multi-node task runs this body, and
+      # each node has its own index -> UUID map. Reading node 0's map on node 1
+      # would compare against the wrong hardware and "pass" for the wrong reason.
+      node="${SFLOW_TASK_NODE_NAME:-$(hostname -s)}"
+      map=$(ls "$run_dir"/node_gpu_map*/map."$node".txt 2>/dev/null | head -1)
+
+      echo "SFLOW_GPU_PROBE task=$me node=$node planned_host=$EXPECT_HOST CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+      nvidia-smi -L | sed "s/^/SFLOW_GPU_PROBE $node visible: /"
+
+      if [ -z "$map" ]; then
+        echo "FAIL: no index -> UUID map recorded for node $node" >&2
+        exit 1
+      fi
+      # Are the planned ordinals even addressable in THIS namespace? A carved
+      # container renumbers from 0, so host ordinals can name nothing at all.
+      # An UNSET CUDA_VISIBLE_DEVICES is legal and means "every visible device",
+      # so `-i` must be omitted rather than passed empty -- and it must not be
+      # dereferenced bare under `set -u`.
+      if ! got=$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "$CUDA_VISIBLE_DEVICES"} \
+                   --query-gpu=uuid --format=csv,noheader); then
+        echo "FAIL: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>} is not addressable on $node" >&2
+        exit 1
+      fi
+      # Per-node filenames: ranks of a multi-node task share one output dir, so a
+      # single gpus.txt would have them overwriting each other's evidence.
+      printf '%s\n' "$got" | sort > "$SFLOW_TASK_OUTPUT_DIR/gpus.$node.txt"
+      # And are they the RIGHT ones? Resolve the planned HOST indices through this
+      # node's bare-metal map; holding the correct count of the wrong devices is
+      # the failure mode a count-only check cannot see.
+      for i in $(echo "$EXPECT_HOST" | tr ',' ' '); do
+        grep "^$i," "$map" | cut -d, -f2
+      done | sort > "$SFLOW_TASK_OUTPUT_DIR/want.$node.txt"
+      if ! diff -q "$SFLOW_TASK_OUTPUT_DIR/want.$node.txt" \
+                   "$SFLOW_TASK_OUTPUT_DIR/gpus.$node.txt" >/dev/null; then
+        echo "FAIL: $node planned host GPU(s) $EXPECT_HOST, but holds different devices" >&2
+        echo "  want: $(tr '\n' ' ' < "$SFLOW_TASK_OUTPUT_DIR/want.$node.txt")" >&2
+        echo "  got : $(tr '\n' ' ' < "$SFLOW_TASK_OUTPUT_DIR/gpus.$node.txt")" >&2
+        exit 1
+      fi
+      echo "OK: $node holds host GPU(s) $EXPECT_HOST, confirmed by UUID"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  # One rank per node throughout: the assertion describes what a NODE holds, and
+  # extra ranks would each re-run it against the same devices for no new signal.
+  - name: bare
+    type: srun
+    ntasks_per_node: 1
+  - name: boxed
+    type: srun
+    container_image: ${{ variables.PLACEMENT_IMAGE }}
+    ntasks_per_node: 1
+
+workflow:
+  name: gpu_placement_matrix
+  tasks:
+    # Ground truth, taken bare metal with no `resources.gpus` so nothing is carved
+    # and no placement prelude runs. Runs on EVERY node (no `resources.nodes`), and
+    # each rank writes its own file, so the multi-node assertions below have a map
+    # for the node they actually landed on. Every assertion is relative to this.
+    - name: node_gpu_map
+      operator: bare
+      script:
+        - env | grep SLURM
+        - |
+          set -u
+          node="${SFLOW_TASK_NODE_NAME:-$(hostname -s)}"
+          nvidia-smi --query-gpu=index,uuid --format=csv,noheader | tr -d ' ' \
+            > "$SFLOW_TASK_OUTPUT_DIR/map.$node.txt"
+          sed "s/^/SFLOW_GPU_PROBE node_map $node: /" "$SFLOW_TASK_OUTPUT_DIR/map.$node.txt"
+
+    # --- bare srun: the step sees the whole node, so the planned ordinals must
+    # --- survive untouched. Both run at once, on disjoint halves.
+    - name: bare_low
+      operator: bare
+      depends_on: [node_gpu_map]
+      resources:
+        gpus:
+          indices: [0, 1]
+      script:
+        - export EXPECT_HOST="0,1"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    - name: bare_high
+      operator: bare
+      depends_on: [node_gpu_map]
+      resources:
+        gpus:
+          indices: [2, 3]
+      script:
+        - export EXPECT_HOST="2,3"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # --- containerised: the runtime already carved and renumbered, so re-applying
+    # --- host ordinals here is what broke. boxed_high is the regression case.
+    - name: boxed_low
+      operator: boxed
+      depends_on: [bare_low, bare_high]
+      resources:
+        gpus:
+          indices: [0, 1]
+      script:
+        - export EXPECT_HOST="0,1"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    - name: boxed_high
+      operator: boxed
+      depends_on: [bare_low, bare_high]
+      resources:
+        gpus:
+          indices: [2, 3]
+      script:
+        - export EXPECT_HOST="2,3"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # A single GPU at a high offset: renumbering turns 3 into 0, so an off-by-one
+    # in the remap shows up here and nowhere else.
+    - name: boxed_one_high
+      operator: boxed
+      depends_on: [boxed_low, boxed_high]
+      resources:
+        gpus:
+          indices: [3]
+      script:
+        - export EXPECT_HOST="3"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # --- MULTI-NODE. `gpus.count` is the TOTAL over the task's nodes and every
+    # --- node takes the SAME offsets, so count/nodes must divide evenly. One flat
+    # --- plan therefore has to resolve correctly in each node's own step -- and
+    # --- each node proves it against its OWN bare-metal map, so a slice that is
+    # --- right on node 0 and wrong on node 1 fails here instead of shipping.
+    - name: bare_multinode
+      operator: bare
+      depends_on: [boxed_one_high]
+      resources:
+        # `nodes.count` is what forces the spread: `gpus.count` alone would fit on
+        # one node and the planner would place it there. count/nodes = 1 GPU per
+        # node, so the plan is "0" and both nodes must resolve it against their own
+        # hardware. This is the divide-the-total path every server recipe uses.
+        nodes:
+          count: ${{ variables.SLURM_NODES }}
+        gpus:
+          count: ${{ variables.SLURM_NODES }}
+      script:
+        - export EXPECT_HOST="0"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # The multi-node case that matters: containerised AND at a high offset, so
+    # every renumbering hazard is in play on more than one node at once. Pinned
+    # indices repeat on each node, which is the other multi-node planner path.
+    - name: boxed_multinode_high
+      operator: boxed
+      depends_on: [bare_multinode]
+      resources:
+        gpus:
+          # A TOTAL instead of a topology. With no `nodes:` here, `indices` is
+          # the per-node slice and the planner spreads the task over
+          # count / len(indices) nodes -- 4 / 2 = 2. This is the one route where
+          # the node count is an OUTPUT of the GPU ask rather than an input, which
+          # is how a recipe states things when it knows how many GPUs it needs but
+          # not how they are laid out.
+          count: ${{ variables.SLURM_NODES * 2 }}  # 2 = len(indices) below
+          indices: [2, 3]
+      script:
+        - export EXPECT_HOST="2,3"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # --- AUTO-PLANNED (`gpus.count`, no `indices`). Everything above pins the
+    # --- devices by hand, so it proves the RE-APPLY path but never the PLANNER.
+    # --- These let sflow choose, which is what every real recipe does: the task
+    # --- cannot state an expected slice up front, so it asserts against the plan
+    # --- the prelude exported ($SFLOW_GPU_PLAN) -- still resolved to UUIDs
+    # --- through this node's bare-metal map, so "the planner picked something"
+    # --- and "the step actually holds it" remain separate claims.
+    # ---
+    # --- Chained rather than concurrent: 2x2 + 4x1 + 8 would need 16 GPUs and the
+    # --- allocation has 8.
+
+    # Two replicas of two GPUs: the packing case. The planner must hand replica 0
+    # and replica 1 DISJOINT pairs on the same node, which is the collision the
+    # whole slice mechanism exists to prevent.
+    - name: bare_count_2x2
+      operator: bare
+      depends_on: [boxed_multinode_high]
+      replicas:
+        count: 2
+        policy: parallel
+      resources:
+        gpus:
+          count: 2
+      script:
+        - export EXPECT_HOST="$SFLOW_GPU_PLAN"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    - name: boxed_count_2x2
+      operator: boxed
+      depends_on: [bare_count_2x2]
+      replicas:
+        count: 2
+        policy: parallel
+      resources:
+        gpus:
+          count: 2
+      script:
+        - export EXPECT_HOST="$SFLOW_GPU_PLAN"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # One GPU each, four ways: the finest packing, and the shape most likely to
+    # hand two replicas the same device if the planner ever miscounts.
+    - name: bare_count_1x4
+      operator: bare
+      depends_on: [boxed_count_2x2]
+      replicas:
+        count: 4
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+      script:
+        - export EXPECT_HOST="$SFLOW_GPU_PLAN"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    - name: boxed_count_1x4
+      operator: boxed
+      depends_on: [bare_count_1x4]
+      replicas:
+        count: 4
+        policy: parallel
+      resources:
+        gpus:
+          count: 1
+      script:
+        - export EXPECT_HOST="$SFLOW_GPU_PLAN"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # More GPUs than one node has, with no `nodes:` hint: the planner has to
+    # spread it itself and divide the total evenly, so every node runs the same
+    # flat plan against different physical cards.
+    - name: bare_count_8
+      operator: bare
+      depends_on: [boxed_count_1x4]
+      resources:
+        gpus:
+          count: 8
+      script:
+        - export EXPECT_HOST="$SFLOW_GPU_PLAN"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    - name: boxed_count_8
+      operator: boxed
+      depends_on: [bare_count_8]
+      resources:
+        gpus:
+          count: 8
+      script:
+        - export EXPECT_HOST="$SFLOW_GPU_PLAN"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # Concurrency: boxed_low and boxed_high held the node at the same time, so
+    # their devices must be disjoint. Sharing one is the collision this placement
+    # logic exists to prevent, and it is invisible from inside either task.
+    - name: verify_disjoint
+      operator: bare
+      # Terminal on purpose: the e2e checker treats this task's OK line as proof
+      # that the WHOLE matrix ran, so it has to sit downstream of the last case.
+      depends_on: [boxed_count_8]
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - |
+          set -u
+          run_dir=$(dirname "$SFLOW_TASK_OUTPUT_DIR")
+          low=$(ls "$run_dir"/boxed_low*/gpus.*.txt 2>/dev/null | head -1)
+          high=$(ls "$run_dir"/boxed_high*/gpus.*.txt 2>/dev/null | head -1)
+          if [ -z "$low" ] || [ -z "$high" ]; then
+            echo "FAIL: concurrent tasks left no gpus.*.txt to compare" >&2
+            exit 1
+          fi
+          shared=$(sort "$low" "$high" | uniq -d)
+          if [ -n "$shared" ]; then
+            echo "FAIL: concurrent tasks shared GPU(s): $shared" >&2
+            exit 1
+          fi
+          echo "OK: concurrent tasks held disjoint GPUs"

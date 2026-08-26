@@ -686,3 +686,103 @@ def test_gpu_resource_config_accepts_count_only():
 
 def test_gpu_resource_config_accepts_indices_only():
     assert GpuResourceConfig(indices=[0, 1]).count is None
+
+
+# ---------------------------------------------------------------------------
+# Node reservation is opt-in, and stays opt-in across a serialization round trip
+# ---------------------------------------------------------------------------
+
+
+def test_node_pin_alone_does_not_claim_the_node():
+    """Placement is not exclusion: CPU-only tasks pinned to a node share it.
+
+    nats, etcd, a frontend and a benchmark client all sit on node 0 of an inference
+    recipe. None of them names a release policy, so none of them claims the node.
+    """
+    placements = _plan(
+        [
+            _task("nats", nodes=NodeResourceConfig(indices=[0])),
+            _task("etcd", nodes=NodeResourceConfig(indices=[0])),
+            _task("bench", nodes=NodeResourceConfig(indices=[0])),
+        ],
+        backend=_backend(nodes=2, gpus_per_node=4),
+    )
+    shared = [placements[n].assigned_nodes for n in ("nats", "etcd", "bench")]
+    assert shared == [shared[0]] * 3, shared  # all three on the same node
+    assert len(shared[0]) == 1
+
+
+def test_naming_a_policy_is_what_claims_the_node():
+    with pytest.raises(ValueError, match="do not remain available"):
+        _plan(
+            [
+                _task("holder", nodes=NodeResourceConfig(indices=[0], release_after=HOLD)),
+                _task("intruder", nodes=NodeResourceConfig(indices=[0], release_after=HOLD)),
+            ],
+            backend=_backend(nodes=2, gpus_per_node=4),
+        )
+
+
+def test_a_dumped_and_reloaded_config_plans_the_same_way():
+    """The plan must not change because the config went through YAML.
+
+    `sflow compose` writes a config out, and `sflow batch` writes one for its dry run
+    whenever --nodes / --gpus-per-node re-plan the backends. A dump materializes every
+    default, so anything that reads "was this field set?" flips -- which turned every
+    node-pinned task into a reservation holder and failed plans that were fine from
+    source.
+    """
+    tasks = [
+        _task("nats", nodes=NodeResourceConfig(indices=[0])),
+        _task("etcd", nodes=NodeResourceConfig(indices=[0])),
+        _task("bench", nodes=NodeResourceConfig(indices=[0])),
+    ]
+    from_source = _plan(tasks, backend=_backend(nodes=2, gpus_per_node=4))
+
+    config = SflowConfig(version="0.1", workflow=WorkflowConfig(name="wf", tasks=tasks))
+    reloaded = SflowConfig.model_validate(config.model_dump(mode="json", exclude_none=True))
+    after_round_trip = _plan(
+        list(reloaded.workflow.tasks), backend=_backend(nodes=2, gpus_per_node=4)
+    )
+
+    assert {n: p.assigned_nodes for n, p in after_round_trip.items()} == {
+        n: p.assigned_nodes for n, p in from_source.items()
+    }
+
+
+def test_an_explicit_null_policy_reports_the_same_as_omitting_it():
+    """`release_after: null` names no policy, and the REPORT has to agree with the plan.
+
+    A placement's `resource_release_after` feeds the dry-run log and the execution
+    summary. Deciding it from "was the field assigned?" rather than from its value made
+    it announce `releases nodes after task completion` for a task the planner had
+    correctly given no reservation to -- so these two configs, which mean exactly the
+    same thing, described themselves differently.
+    """
+    omitted = _plan(
+        [_task("pinned", nodes=NodeResourceConfig(indices=[0]))],
+        backend=_backend(nodes=2, gpus_per_node=4),
+    )
+    explicit_null = _plan(
+        [_task("pinned", nodes=NodeResourceConfig(indices=[0], release_after=None))],
+        backend=_backend(nodes=2, gpus_per_node=4),
+    )
+
+    assert "nodes" not in omitted["pinned"].resource_release_after
+    assert (
+        explicit_null["pinned"].resource_release_after
+        == omitted["pinned"].resource_release_after
+    )
+
+
+def test_a_named_policy_survives_the_round_trip_too():
+    """The opposite direction: an explicit claim must not be lost by a dump."""
+    tasks = [
+        _task("holder", nodes=NodeResourceConfig(indices=[0], release_after=HOLD)),
+        _task("intruder", nodes=NodeResourceConfig(indices=[0], release_after=HOLD)),
+    ]
+    config = SflowConfig(version="0.1", workflow=WorkflowConfig(name="wf", tasks=tasks))
+    reloaded = SflowConfig.model_validate(config.model_dump(mode="json", exclude_none=True))
+
+    with pytest.raises(ValueError, match="do not remain available"):
+        _plan(list(reloaded.workflow.tasks), backend=_backend(nodes=2, gpus_per_node=4))

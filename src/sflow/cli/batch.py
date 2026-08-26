@@ -559,6 +559,7 @@ def _generate_sbatch_script(
     enable_task_monitors: list[str] | None = None,
     include_nodes: list[str] | None = None,
     exclude_nodes: list[str] | None = None,
+    skip_artifact_check: bool = False,
 ) -> str:
     """Generate the content of an sbatch script that wraps ``sflow run``.
 
@@ -582,6 +583,11 @@ def _generate_sbatch_script(
     if missable_tasks:
         for mt in missable_tasks:
             sflow_cmd_parts.extend(["--missable-tasks", shlex.quote(mt)])
+
+    # Forwarded to the inner `sflow run`: batch's own preflight is a dry run (which
+    # already only warns), so the hard failure this suppresses happens in the job.
+    if skip_artifact_check:
+        sflow_cmd_parts.append("--skip-artifact-check")
 
     if enable_workflow_monitor:
         sflow_cmd_parts.append("--enable-workflow-monitor")
@@ -742,6 +748,13 @@ def _generate_sbatch_script(
             "dist",
             "*.egg-info",
             "__pycache__",
+            # NOT just size: pip/uv write partial `*.tmp` files under .cache while
+            # other jobs are still bootstrapping, and rsync exits 24 ("some files
+            # vanished") when one disappears mid-transfer -- which the bootstrap
+            # treats as fatal, so the whole Slurm job dies seconds in with no output
+            # directory at all. A shared, concurrently-written cache must never be
+            # part of the copy source.
+            ".cache",
             ".pytest_cache",
             ".ruff_cache",
             ".mypy_cache",
@@ -956,6 +969,7 @@ class BatchLauncherRequest:
     enable_task_monitors: list[str] | None = None
     include_nodes: list[str] | None = None
     exclude_nodes: list[str] | None = None
+    skip_artifact_check: bool = False
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1093,18 @@ class SlurmBatchLaunchStrategy:
                     dry_run_nodes=request.cli_nodes,
                     dry_run_gpus_per_node=request.cli_gpus_per_node,
                 )
+        else:
+            # -N was given, so nothing above derived the config's own number -- but
+            # `slurm_backends` was already resolved at the top of this method, so
+            # comparing the two costs nothing and catches a mismatch that is otherwise
+            # invisible until the job is allocated.
+            conflict = _node_count_conflict(
+                cli_nodes=nodes,
+                config_nodes=slurm_backends[0].nodes if slurm_backends else None,
+                origin=request.files[0].name if request.files else "the config",
+            )
+            if conflict is not None:
+                messages.append(conflict)
 
         gpus_per_node = request.cli_gpus_per_node
         if gpus_per_node is None:
@@ -1106,6 +1132,7 @@ class SlurmBatchLaunchStrategy:
             files=request.files,
             set_var=request.set_var,
             artifact=request.artifact,
+            skip_artifact_check=request.skip_artifact_check,
             missable_tasks=request.missable_tasks,
             log_level=request.log_level,
             workspace_dir=request.workspace_dir,
@@ -1465,25 +1492,132 @@ def build_row_naming_ctx(
     )
 
 
-def _first_node_column_int(source: "dict[str, Any]") -> int | None:
-    """First parseable node-count column value (as int) from a name->value map, or None.
+def _node_count_column(source: "dict[str, Any]") -> "tuple[str, int] | None":
+    """First parseable node-count column as ``(name, value)``, or None.
 
-    Scans ``_NODE_COLUMN_NAMES`` in order. ``source`` is a merged override map (e.g.
-    ``all_overrides`` / a var map) so a CLI ``--set`` value already wins over the CSV
-    cell. A present-but-non-numeric value is SKIPPED (the scan continues) rather than
-    aborting, so one malformed column can't mask a good one. Single source of truth for
-    the node-column peek used by the naming and both bulk paths.
+    Scans ``_NODE_COLUMN_NAMES`` in SORTED order. Iterating the frozenset directly made
+    the answer depend on PYTHONHASHSEED: a CSV carrying two node columns picked a
+    different one per process, so the count a run was submitted with was a coin flip,
+    and the column named by the conflict message below could disagree with the value it
+    was complaining about.
+
+    ``source`` is a merged override map (e.g. ``all_overrides`` / a var map) so a CLI
+    ``--set`` value already wins over the CSV cell. A present-but-non-numeric value is
+    SKIPPED (the scan continues) rather than aborting, so one malformed column can't
+    mask a good one. Single source of truth for the node-column peek used by the naming,
+    both bulk paths, and the conflict checks.
     """
-    for col in _NODE_COLUMN_NAMES:
+    for col in sorted(_NODE_COLUMN_NAMES):
         raw = source.get(col)
         val = raw.strip() if isinstance(raw, str) else raw
         if val in (None, ""):
             continue
         try:
-            return int(val)
+            return col, int(val)
         except (ValueError, TypeError):
             continue
     return None
+
+
+def _first_node_column_int(source: "dict[str, Any]") -> int | None:
+    """Just the count from :func:`_node_count_column`."""
+    found = _node_count_column(source)
+    return found[1] if found is not None else None
+
+
+def _node_count_conflict_message(*, nodes: int, source: str, listed: str) -> str:
+    """Why two node counts cannot both be right. Shared by every path that has both.
+
+    ``--nodes`` sizes the sbatch allocation. The config's own number sizes the *recipe*:
+    the backend's node count and the ``match_count`` of readiness probes. The same number
+    in both is fine and is the normal way to run -- but when they differ, the quiet
+    precedence rule (``--nodes`` wins for sbatch, the config keeps its own value)
+    allocates one number of nodes and plans the workflow for another: probes wait on a
+    node that was never allocated, or the job holds nodes nothing will ever use.
+    """
+    return (
+        f"--nodes={nodes} does not match the node count this run would use: {listed} "
+        f"(from {source}). --nodes sizes the sbatch allocation, while that number sizes "
+        f"the workflow inside it -- the backend's node count and the match_count of "
+        f"readiness probes -- so two different numbers means the job is allocated one "
+        f"size and the recipe plans for another. Use the same number in both, or drop "
+        f"--nodes and let {source} size both."
+    )
+
+
+def _reject_conflicting_node_counts(
+    *,
+    rows: "list[dict[str, str]]",
+    row_indices: "set[int] | None",
+    nodes: int | None,
+    cli_var_map: dict[str, str],
+    csv_path: Path,
+) -> None:
+    """Refuse a bulk run whose two node counts disagree.
+
+    See :func:`_node_count_conflict_message` for why they cannot both be right. This is
+    the ``--bulk-input`` path, where the CSV states the size per row, so a disagreement
+    is unambiguously a mistake and is refused outright. The config-driven paths only warn
+    -- see :func:`_node_count_conflict`.
+
+    Only the rows this run actually submits are checked, and a ``--set`` of the node
+    variable counts as the row's value, since it overrides the CSV cell.
+    """
+    if nodes is None:
+        return
+
+    conflicts: list[tuple[int, str, int]] = []
+    for idx, row in enumerate(rows, start=1):
+        if row_indices is not None and idx not in row_indices:
+            continue
+        # CLI --set wins over the CSV cell, the same merge the row overrides use.
+        found = _node_count_column({**row, **cli_var_map})
+        if found is not None and found[1] != nodes:
+            conflicts.append((idx, found[0], found[1]))
+
+    if not conflicts:
+        return
+
+    # Name the column the conflicting value actually came from, rather than re-scanning
+    # for one: with two node columns present those are not necessarily the same column.
+    column = conflicts[0][1]
+    source = (
+        f"--set {column}"
+        if column in cli_var_map
+        else f"the {column} column of {csv_path.name}"
+    )
+    listed = ", ".join(f"row {idx} says {value}" for idx, _col, value in conflicts[:5])
+    if len(conflicts) > 5:
+        listed += f", and {len(conflicts) - 5} more"
+
+    raise ValueError(
+        _node_count_conflict_message(nodes=nodes, source=source, listed=listed)
+    )
+
+
+def _node_count_conflict(
+    *, cli_nodes: int | None, config_nodes: "int | None", origin: str
+) -> str | None:
+    """The warning for a ``--nodes`` that disagrees with the config's own node count.
+
+    ``--bulk-input`` REFUSES its version of this (:func:`_reject_conflicting_node_counts`):
+    a CSV node column is that row's declared size, so a mismatch there is a mistake. Here
+    the number lives in the config, where ``--nodes`` has always been allowed to size the
+    allocation on its own -- so this only says so, and the caller decides where to print
+    it (the plan's message list, or straight to stderr in a bulk loop).
+
+    Worth saying at all because the mismatch is otherwise invisible until the job is
+    already allocated: the slurm backend logs ``config_nodes=... env_nodes=...`` and
+    continues, then srun asks for more tasks than there are nodes and readiness probes
+    wait on a ``match_count`` that can never arrive.
+    """
+    if cli_nodes is None or config_nodes is None or int(config_nodes) == cli_nodes:
+        return None
+    return "  Warning: " + _node_count_conflict_message(
+        nodes=cli_nodes,
+        source=f"the node count in {origin}",
+        listed=f"{origin} says {config_nodes}",
+    )
 
 
 def _resolve_node_count(
@@ -2006,6 +2140,25 @@ def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
     return sorted(set(valid))
 
 
+def _failure_detail(error: Exception, indent: str = "      ") -> str:
+    """Render an exception for the end-of-run failure block, reason included.
+
+    The failure list used to keep ``str(e).split("\\n")[0]``, which is wrong for
+    exactly the errors that need explaining: a pydantic ``ValidationError`` renders as
+    a header line followed by one stanza per problem, and the config loader wraps it as
+    ``"Configuration validation failed:\\n<detail>"``. The first line is the header, so
+    a bad config was reported as ``Configuration validation failed:`` and nothing else
+    -- the run knew which field was wrong and threw that away.
+
+    So the whole message is kept: first line inline with the caller's ``[idx]`` prefix,
+    the rest indented under it. Not truncated -- an error long enough to be a problem
+    to read has not turned up, and a cap that hides the tail of a validation error
+    would reintroduce the bug this exists to fix.
+    """
+    lines = str(error).splitlines() or [repr(error)]
+    return "\n".join([lines[0]] + [f"{indent}{line}" for line in lines[1:]])
+
+
 def _run_bulk_submit(
     *,
     yaml_files: list[Path],
@@ -2033,6 +2186,7 @@ def _run_bulk_submit(
     enable_task_monitors: list[str] | None = None,
     include_nodes: list[str] | None = None,
     exclude_nodes: list[str] | None = None,
+    skip_artifact_check: bool = False,
 ) -> None:
     """Process multiple self-contained sflow YAML configs as individual batch jobs."""
     import re as _re
@@ -2148,9 +2302,8 @@ def _run_bulk_submit(
                 )
         except Exception as e:
             failed_count += 1
-            err_short = str(e).split("\n")[0]
             summary.append(f"  [{idx}] {yaml_file.name}: SKIPPED (dry-run failed)")
-            failures.append(f"  [{idx}] {yaml_file.name}: {err_short}")
+            failures.append(f"  [{idx}] {yaml_file.name}: {_failure_detail(e)}")
             fail_row: dict[str, str] = {
                 "sflow_config_file": str(yaml_file),
                 "job_name": job_name,
@@ -2182,12 +2335,24 @@ def _run_bulk_submit(
                     )
             except Exception:
                 pass
+        else:
+            # Both numbers exist on this path too: --nodes for the allocation, the
+            # config's own for the recipe. This loop does not go through the strategy's
+            # plan(), so derive the config's number the same way plan() would.
+            conflict = _node_count_conflict(
+                cli_nodes=row_nodes,
+                config_nodes=_derive_nodes([yaml_file], cli_overrides=cli_set_var),
+                origin=yaml_file.name,
+            )
+            if conflict is not None:
+                typer.echo(conflict, err=True)
 
         script = _batch_launch_strategy("slurm").generate(
             BatchLauncherRequest(
                 files=[yaml_file],
                 set_var=cli_set_var,
                 artifact=cli_artifact,
+                skip_artifact_check=skip_artifact_check,
                 missable_tasks=missable_tasks,
                 log_level=log_level,
                 workspace_dir=workspace_dir,
@@ -2344,6 +2509,7 @@ def _run_bulk_edit(
     enable_task_monitors: list[str] | None = None,
     include_nodes: list[str] | None = None,
     exclude_nodes: list[str] | None = None,
+    skip_artifact_check: bool = False,
 ) -> None:
     """Generate (and optionally submit) one sbatch job per CSV row.
 
@@ -2406,6 +2572,13 @@ def _run_bulk_edit(
     row_indices: set[int] | None = None
     if row_selectors:
         row_indices = set(parse_row_selector(row_selectors, n_rows=len(rows)))
+    _reject_conflicting_node_counts(
+        rows=rows,
+        row_indices=row_indices,
+        nodes=nodes,
+        cli_var_map=cli_var_map,
+        csv_path=csv_path,
+    )
     naming_ctx = build_row_naming_ctx(
         rows, fallback_base=job_name, cli_nodes=nodes, cli_var_overrides=cli_var_map
     )
@@ -2486,9 +2659,8 @@ def _run_bulk_edit(
                 )
         except Exception as e:
             failed_count += 1
-            err_short = str(e).split("\n")[0]
             summary.append(f"  [{idx}] SKIPPED: ({overrides_desc})")
-            dry_run_failures.append(f"  [{idx}] {err_short}")
+            dry_run_failures.append(f"  [{idx}] {_failure_detail(e)}")
             result_row["slurm_job_id"] = "FAILED"
             result_row["sflow_output_dir"] = ""
             result_row["sflow_batch_dir"] = bulk_dir.name
@@ -2545,6 +2717,7 @@ def _run_bulk_edit(
                 files=config_files,
                 set_var=set_var or None,
                 artifact=artifacts or None,
+                skip_artifact_check=skip_artifact_check,
                 missable_tasks=effective_missable,
                 log_level=log_level,
                 workspace_dir=workspace_dir,
@@ -2861,6 +3034,15 @@ def batch(
             resolve_path=True,
         ),
     ] = None,
+    skip_artifact_check: Annotated[
+        bool,
+        typer.Option(
+            "--skip-artifact-check",
+            help="Do not fail when an fs:// artifact path does not exist locally; "
+            "warn and continue. Forwarded to the `sflow run` inside the submitted "
+            "job, for paths that only exist on the compute nodes.",
+        ),
+    ] = False,
     missable_tasks: Annotated[
         Optional[List[str]],
         typer.Option(
@@ -3123,6 +3305,7 @@ def batch(
                 cli_files=list(src_files or []) + list(file or []),
                 cli_set_var=set_var,
                 cli_artifact=artifact,
+                skip_artifact_check=skip_artifact_check,
                 log_level=log_level,
                 workspace_dir=workspace_dir,
                 output_dir=output_dir,
@@ -3191,6 +3374,7 @@ def batch(
                 yaml_files=yaml_files,
                 cli_set_var=set_var,
                 cli_artifact=artifact,
+                skip_artifact_check=skip_artifact_check,
                 log_level=log_level,
                 workspace_dir=workspace_dir,
                 output_dir=output_dir,
@@ -3319,6 +3503,7 @@ def batch(
             files=files,
             set_var=set_var,
             artifact=artifact,
+            skip_artifact_check=skip_artifact_check,
             missable_tasks=missable_tasks,
             log_level=log_level,
             workspace_dir=workspace_dir,

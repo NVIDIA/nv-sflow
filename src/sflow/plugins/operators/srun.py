@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -21,6 +22,9 @@ from sflow.core.log_offload import (
 )
 from sflow.core.operator import Operator, OperatorConfig
 from sflow.core.operator_registry import register_operator
+from sflow.utils.gpu import GPU_MARKER_FILE
+from sflow.logging import get_logger
+from sflow.utils.extra_args import normalize_extra_args
 from sflow.utils.container import (
     append_runtime_mounts as append_runtime_mount_specs,
     extract_container_images_from_extra_args,
@@ -29,6 +33,8 @@ from sflow.utils.container import (
     merge_container_mounts_from_extra_args,
     validate_container_image_reference,
 )
+
+_logger = get_logger(__name__)
 
 register_command_family("slurm", {"srun"}, filename="slurm_cmds.log")
 
@@ -58,6 +64,177 @@ def _slurm_runtime_env_prelude() -> list[str]:
         f'if [ -n "{source_expr}" ]; then export {target}="{source_expr}"; fi'
         for target, source_expr in _SLURM_TO_SFLOW_RUNTIME_ENV
     ]
+
+
+# Slot values are sflow's planned GPU slice ("2,3"); they are applied as
+# POSITIONS within the device list the step actually observes, never as raw
+# device ids -- a partial allocation can arrive as "3,5,6,7", where sflow's
+# slot 1 means the device Slurm calls 5.
+# A plan is what the planner emits: comma-joined non-negative device indices, and
+# nothing else. Anything outside this never reaches the shell text below.
+_PLAN_RE = re.compile(r"(?:0|[1-9]\d*)(?:,(?:0|[1-9]\d*))*")
+
+# Thin banner carried INTO the generated command (the long rationale stays a
+# Python comment below). Someone reading a failing srun line needs one sentence
+# on why sflow is touching CUDA_VISIBLE_DEVICES at all -- without it this block
+# looks like the thing that broke their GPUs, when it is the thing keeping the
+# planned placement.
+_GPU_PLACEMENT_BANNER = """\
+# --- sflow GPU placement (begin) -------------------------------------------
+# Names this task's planned GPUs by looking their UUIDs up among the devices the
+# step can really see. Without it a step handed the whole allocation (GRES) or
+# renumbered by a container runtime lands on the wrong cards.
+"""
+
+# Closing half of the wrap, so it is obvious where sflow's block stops and the
+# task's own script starts.
+_GPU_PLACEMENT_FOOTER = """\
+# --- sflow GPU placement (end) ---------------------------------------------
+"""
+
+# The placement logic lives in gpu_placement.sh next to this module, staged once
+# per run and SOURCED by each step, rather than pasted into every srun command.
+# Sourced, not executed: it exports CUDA_VISIBLE_DEVICES into the task's shell.
+# Read that file for the reasoning; keeping it out of the command line means a
+# failing srun line stays readable, and every task shares one copy.
+_GPU_PLACEMENT_SCRIPT = Path(__file__).with_name("gpu_placement.sh")
+
+
+def _stage_gpu_placement_script(workflow_out_dir: str | None) -> str | None:
+    """Write the placement script into the run's output dir; return its path.
+
+    Lands under the workflow output dir, which is shared storage on Slurm by
+    construction -- that is what lets every node source the same file.
+
+    Idempotent: many tasks launch at once and would otherwise fight over it.
+    Returns None when it cannot be written, and the caller then skips placement
+    entirely rather than running it from somewhere the nodes cannot read.
+    """
+    if not workflow_out_dir:
+        return None
+    try:
+        target = Path(workflow_out_dir) / ".sflow" / "gpu_placement.sh"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = _GPU_PLACEMENT_SCRIPT.read_text()
+        if not target.exists() or target.read_text() != body:
+            # Atomic: a step may be sourcing this path while another driver writes it.
+            tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+            tmp.write_text(body)
+            os.replace(tmp, target)
+        return str(target)
+    except OSError:
+        return None
+
+
+def _gpu_placement_prelude(
+    cuda_visible_devices: str | None,
+    *,
+    gpus_per_task: str | None = None,
+    workflow_out_dir: str | None = None,
+) -> list[str]:
+    """Re-apply sflow's planned GPU slice from *inside* the job step.
+
+    sflow exports ``CUDA_VISIBLE_DEVICES`` from the driver and relies on srun
+    ``--export=ALL`` to carry it. That holds only on a partition without GPU
+    GRES. Where GRES is configured, two documented Slurm behaviours combine to
+    discard it:
+
+    * a step that requests no GRES "is allocated all of the generic resources
+      that have been requested by the job" (srun(1)), so every concurrent sflow
+      step sees the *whole* allocation; and
+    * "CUDA_VISIBLE_DEVICES is set for each job step" by slurmstepd
+      (slurm.schedmd.com/gres.html), which runs after ``--export``, so Slurm is
+      the last writer and sflow's per-task slice is overwritten.
+
+    Every worker then sees the same device list, picks ordinal 0, and collides
+    on one physical GPU (the reported OOM). This prelude is spliced into the
+    step's ``bash -c`` body, so it runs after slurmstepd and after any container
+    runtime -- last writer wins, and placement is restored without adding a
+    single Slurm flag.
+
+    ``CUDA_VISIBLE_DEVICES`` cannot be trusted as an OBSERVATION of what the step
+    sees. sflow exports its plan and srun runs with ``--export=ALL``, so the value
+    arriving in the step is often just that plan echoed back -- using it to decide
+    "what do I have" is circular. A container runtime (pyxis/enroot) carves by
+    passing through only this task's devices and renumbers them from 0, so the
+    inherited value can name HOST ordinals that do not exist here at all: on
+    ptyche a decode server planned for ``2,3`` ran in a container holding exactly
+    two GPUs numbered ``0,1``, kept ``2,3`` because the counts matched, and died
+    with "No CUDA GPUs are available". The prefill server planned for ``0,1``
+    survived only because its plan happened to match the renumbering.
+
+    So the staged script does not reason about that value at all. It probes the
+    devices the step can really see and looks up the physical UUIDs the driver
+    resolved this task's plan to (``SFLOW_PLANNED_GPU_UUIDS``), then names the
+    indices they turned out to have here -- one rule for every shape, because a
+    UUID is the only identity that survives a layer renumbering from 0. Where
+    there is no map to check against (probe failed, node names disagree, no
+    nvidia-smi in the step) it degrades to the older index arithmetic: equal
+    counts keep the step's own numbering, a larger visible set narrows
+    positionally.
+
+    Only ``--gpus-per-task`` skips this, not ``gres``/``gpus``. Those two make
+    Slurm carve per STEP, not per rank, so every rank still sees the same set and
+    the checks below stay meaningful -- a step granted fewer devices than the task
+    was planned for is then a real over-ask, and aborting is the right answer.
+    ``--gpus-per-task`` is the one that carves per RANK, which is what breaks the
+    premise:
+    that flag makes the step request GRES, so Slurm carves per RANK instead of
+    handing the step the whole allocation. Every rank then sees only its own
+    devices -- fewer than the task's slice -- and the count check below would abort
+    all of them with "step has 1 GPU(s) but this task was planned for 8". Slurm's
+    own GRES accounting already keeps those per-rank sets disjoint, which is the
+    collision this prelude exists to prevent, so there is nothing left to re-apply.
+    """
+    if not cuda_visible_devices:
+        return []
+    if gpus_per_task:
+        _logger.debug(
+            "srun --gpus-per-task=%s carves GPUs per rank, so Slurm already owns "
+            "this task's placement; skipping sflow's in-step GPU remap.",
+            gpus_per_task,
+        )
+        return []
+    # The plan is interpolated into shell text, so it is validated first. Every value
+    # sflow's planner produces is a comma-joined list of non-negative ints, but this
+    # reads `envs`, and ANY workflow variable named CUDA_VISIBLE_DEVICES lands there
+    # verbatim for a task that declares no `resources.gpus` (Backend.resource_env
+    # returns {} with no slice to override it). A value like `0'; rm -rf x; :'` would
+    # otherwise close the quote and run as a command in the job step.
+    if not _PLAN_RE.fullmatch(cuda_visible_devices):
+        # Not an sflow plan, so there are no positional slots to remap against --
+        # skip the prelude rather than guess. The value still reaches the step via
+        # `--export=ALL`, i.e. exactly the behaviour from before this prelude existed.
+        _logger.warning(
+            "CUDA_VISIBLE_DEVICES=%r is not a comma-separated list of non-negative "
+            "integers; skipping sflow's in-step GPU placement for this task. On a "
+            "GRES-configured partition its GPU placement is then Slurm's, not sflow's.",
+            cuda_visible_devices,
+        )
+        return []
+    staged = _stage_gpu_placement_script(workflow_out_dir)
+    if not staged:
+        # Nowhere the compute nodes can read it from. Skip placement rather than
+        # paste a second copy of the logic into the command line: that would mean
+        # two delivery paths to keep honest, and the failure that gets us here --
+        # an unwritable workflow output dir -- has already broken the run's logs.
+        # Skipping leaves CUDA_VISIBLE_DEVICES exactly as exported, which is the
+        # behaviour from before this prelude existed.
+        _logger.warning(
+            "Could not stage the GPU placement script under %r; skipping sflow's "
+            "in-step GPU placement for this task. On a GRES-configured partition "
+            "its placement is then Slurm's, not sflow's.",
+            workflow_out_dir,
+        )
+        return []
+    # One shared copy, sourced. `.` and not `bash`: the script exports into this
+    # shell, which a child process could not do.
+    body = (
+        f"export SFLOW_GPU_PLAN='{cuda_visible_devices}'\n"
+        f"export SFLOW_GPU_MARKER='{GPU_MARKER_FILE}'\n"
+        f'. "{staged}"\n'
+    )
+    return [_GPU_PLACEMENT_BANNER + body + _GPU_PLACEMENT_FOOTER]
 
 
 def _is_valid_container_image(image: str) -> bool:
@@ -404,15 +581,25 @@ class SrunOperator(Operator):
         if _has_container and all_mounts:
             command.add_opt("--container-mounts", ",".join(all_mounts))
 
-        for arg in filtered_extra_args:
-            command.add_opt(arg)
+        for arg in normalize_extra_args(filtered_extra_args):
+            command.add_arg(arg)
 
         command.add_arg("bash")
         command.add_arg("-c")
         # Env is injected by SubprocessLauncher(env=...) and srun --export=ALL will propagate it
         # to remote tasks. The prelude uses only Slurm-provided variable names, so values are
         # resolved inside the step rather than embedded in the logged command.
-        script_body = "\n".join([*_slurm_runtime_env_prelude(), *list(script)])
+        script_body = "\n".join(
+            [
+                *_slurm_runtime_env_prelude(),
+                *_gpu_placement_prelude(
+                    envs.get("CUDA_VISIBLE_DEVICES"),
+                    gpus_per_task=c.gpus_per_task,
+                    workflow_out_dir=envs.get("SFLOW_WORKFLOW_OUTPUT_DIR"),
+                ),
+                *list(script),
+            ]
+        )
         if offload:
             command.add_arg(
                 self._wrap_script_with_prefixer(script_body, envs, task_name)

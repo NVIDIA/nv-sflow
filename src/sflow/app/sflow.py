@@ -42,6 +42,7 @@ from sflow.logging import (
 )
 from sflow.runtime_info import format_runtime_info
 from sflow.utils.container import collect_container_mounts
+from sflow.utils.gpu import count_visible_devices
 from sflow.utils.logging import (
     build_allocation_map_lines,
     build_resource_rehearsal_lines,
@@ -166,6 +167,9 @@ class SflowApp:
         # Surfaced in the dry-run Plan so users can see where the job's logs will land.
         sbatch_output: str | None = None,
         sbatch_error: str | None = None,
+        # Demote a missing local fs:// artifact path from a hard error to a warning
+        # (`--skip-artifact-check`), for paths that only exist where the task runs.
+        skip_artifact_check: bool = False,
         tui: bool = False,
         tui_log_buffer: deque[logging.LogRecord] | None = None,
         tui_log_lock: threading.Lock | None = None,
@@ -377,7 +381,9 @@ class SflowApp:
                     config.variables,
                     workspace_dir=ws_dir,
                     dry_run=dry_run,
-                    skip_local_fs_validation=config_uses_offhost_backend(config),
+                    skip_local_fs_validation=(
+                        config_uses_offhost_backend(config) or skip_artifact_check
+                    ),
                 )
 
                 # build the state:
@@ -393,6 +399,9 @@ class SflowApp:
                     }
                     if workspace_dir is not None:
                         build_kw["workspace_dir"] = ws_dir
+                    # Passed only when set, so the default call signature is unchanged.
+                    if skip_artifact_check:
+                        build_kw["skip_artifact_check"] = True
                     state = await build_state(config, **build_kw)
                 finally:
                     # If build_state was cancelled and did not return a state, there's nothing we can do here.
@@ -938,18 +947,81 @@ class SflowApp:
                             f"  {'node collectors:':<21}{reg.collector_count} "
                             f"(deduped, one per node)"
                         )
+                        # A consumer's own `report` flag only covers the standalone
+                        # whole-pool folder, so a task monitor with
+                        # `report.enabled: true` has it False and used to print
+                        # `report=no` -- reading as "this monitor writes nothing".
+                        # Count the folders it actually produces instead. Count by
+                        # `contributors` (every owner that asked for the view), NOT
+                        # `triggered_by`: a task covered by both the workflow monitor
+                        # and its own keeps only the first owner there, which would
+                        # credit its folder to the workflow and report the task
+                        # monitor as writing nothing -- the bug this block fixes.
+                        #
+                        # Group names and the gpu label come from the writer, so a
+                        # change there can never leave the plan advertising paths or
+                        # subsets that do not match what gets written.
+                        from sflow.monitoring.postprocess_monitor_timeline import (
+                            LIFECYCLE_DIRNAME,
+                            WINDOWED_DIRNAME,
+                            gpu_label,
+                        )
+
+                        folders_by_owner: dict[str, int] = {}
+                        for view in reg.task_views:
+                            for owner in view.contributors or [view.triggered_by]:
+                                folders_by_owner[owner] = (
+                                    folders_by_owner.get(owner, 0) + 1
+                                )
                         for consumer in reg.consumers:
-                            gpu_str = (
-                                "all"
-                                if consumer.gpus is None
-                                else ",".join(str(g) for g in consumer.gpus)
+                            gpu_str = gpu_label(consumer.gpus)
+                            folders = folders_by_owner.get(consumer.owner, 0) + (
+                                1 if consumer.report else 0
                             )
                             _logger.info(f"  [{consumer.name}] ({consumer.owner})")
                             _logger.info(
                                 f"      nodes={', '.join(consumer.nodes) or 'none'} "
                                 f"gpus={gpu_str} scopes={','.join(consumer.scopes) or 'all'} "
-                                f"report={'yes' if consumer.report else 'no'}"
+                                f"report={'yes' if folders else 'no'}"
+                                f"{f' ({folders} folders)' if folders else ''}"
                             )
+                        # Every folder that will be written: the whole-pool
+                        # aggregates plus each per-task view, tagged with what
+                        # decides its time range.
+                        def _window_desc(view) -> str:
+                            """Spell out the markers, so a typo is visible in the
+                            plan instead of after the run as an empty report."""
+                            if not view.log_window:
+                                return "task lifecycle window"
+                            parts = []
+                            for edge in ("start", "end"):
+                                spec = view.log_window.get(edge) or {}
+                                patterns = " | ".join(
+                                    str(x) for x in (spec.get("pattern") or [])
+                                )
+                                parts.append(
+                                    f"{edge}={patterns!r} ({spec.get('select')})"
+                                )
+                            return "log-marker window: " + ", ".join(parts)
+
+                        planned_folders = [
+                            (f"{LIFECYCLE_DIRNAME}/{c.name}", "whole-run aggregate")
+                            for c in reg.consumers
+                            if c.report
+                        ] + [
+                            (
+                                f"{WINDOWED_DIRNAME if v.log_window is not None else LIFECYCLE_DIRNAME}"
+                                f"/{v.label}",
+                                _window_desc(v),
+                            )
+                            for v in reg.task_views
+                        ]
+                        if planned_folders:
+                            _logger.info(
+                                f"  {'report folders:':<21}{len(planned_folders)}"
+                            )
+                            for label, kind in planned_folders:
+                                _logger.info(f"      {label}/  ({kind})")
 
                     log_dry_run_envelope(f"Dry-run complete: {config.workflow.name}")
 
@@ -1232,15 +1304,10 @@ class SflowApp:
             )
 
         def _gpu_label(task) -> str:
-            cuda = task.envs.get("CUDA_VISIBLE_DEVICES")
-            if not cuda:
-                return ""
-            # "0,1,2" -> 3
-            try:
-                n = len([x for x in cuda.split(",") if x.strip() != ""])
-            except Exception:
-                n = 0
-            return f" gpus={n}"
+            # "0,1,2" -> 3. Via the shared counter so the range form ("0-3" -> 4)
+            # is expanded rather than counted as a single device.
+            n = count_visible_devices(task.envs.get("CUDA_VISIBLE_DEVICES"))
+            return f" gpus={n}" if n else ""
 
         # -----------------------------------------------------------------
         # REQ-6.9: Visualization grouping (replicas) - SRD style

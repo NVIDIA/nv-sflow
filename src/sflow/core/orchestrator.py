@@ -11,6 +11,7 @@ from sflow.logging import CoalescingFileHandler, get_logger
 
 from .command import Command
 from .launcher import SubprocessLauncher
+from .operator import Operator, ResourcesUnavailable
 from .outputs import collect_task_outputs
 from .results import collect_task_result
 from .probe import Probe, ProbeStatus, ProbeTimeoutError, ProbeType
@@ -67,6 +68,11 @@ class Orchestrator:
         self._monitor_registry: "MonitorRegistry | None" = monitor_registry
         # Owners of task monitors currently held (acquired, not yet released).
         self._held_monitors: dict[str, "MonitorConsumer"] = {}
+        # Orphan sweeps (dead-owner leftovers from crashed prior runs) already
+        # executed this run, keyed by command. They reap by owner liveness rather
+        # than by task, so the same sweep repeated per task would only re-pay the
+        # container-daemon round trip on every single launch.
+        self._completed_stale_reaps: set[str] = set()
 
         # Merge-pod gates already opened this run: (member_name, dep_name) pairs.
         # An in-group dependency that reached READY/COMPLETED had its in-pod gate
@@ -625,6 +631,14 @@ class Orchestrator:
             ]
             if any(p.status != ProbeStatus.TRIGGERED for p in readiness_probes):
                 return
+            # Hand the reusable resources back BEFORE flipping to READY. READY is
+            # what unblocks the dependent the planner packed onto these very GPUs,
+            # so the claim must already be gone by the time anything can observe
+            # the transition. Releasing after would leave a window -- today a
+            # narrow one, since submission runs on this same coroutine, but that
+            # is a coincidence of the loop's shape, not a guarantee. Ordering it
+            # this way makes the invariant hold no matter who observes READY.
+            await self._release_ready_reusable_resources(task)
             task.status = TaskStatus.READY
             self._record_summary("task_ready", task)
             self._surface_network_fallback(task)
@@ -634,6 +648,7 @@ class Orchestrator:
                 except KeyError:
                     continue
                 if ftask.status == TaskStatus.RUNNING:
+                    await self._release_ready_reusable_resources(ftask)
                     ftask.status = TaskStatus.READY
                     self._record_summary("task_ready", ftask)
                     self._surface_network_fallback(ftask)
@@ -681,6 +696,62 @@ class Orchestrator:
             return []
         try:
             return list(operator.teardown_commands(task_name=task.name))
+        except Exception:
+            return []
+
+    async def _release_ready_reusable_resources(self, task: Task) -> None:
+        """Hand back resources the planner marked reusable once the task is READY.
+
+        ``resources.gpus.release_after: task_ready`` means later tasks may take
+        this task's GPUs while it keeps serving -- the planner packs them onto the
+        same devices on that basis. An operator that also holds a machine-local
+        reservation (docker) must let go at the same moment, or it blocks the very
+        reuse that was planned and the dependent task fails to acquire.
+
+        Offloaded to a thread because the release takes a cross-process file lock
+        (bounded, but up to ``_LOCK_TIMEOUT_S`` if a holder is wedged) and this
+        runs on the event loop that drives every other task's probes. Still
+        ``await``ed rather than fired-and-forgotten: the hand-back must be visible
+        in the registry *before* READY propagates to the dependent that was packed
+        onto these GPUs, or that task's acquire races the release and fails.
+        """
+        if getattr(task, "resource_release_after", {}).get("gpus") != "task_ready":
+            return
+        operator = getattr(task, "operator", None)
+        if operator is None or type(operator).release_resources is (
+            Operator.release_resources
+        ):
+            return
+        try:
+            # reusable=True: the task keeps running on the resource, it just
+            # stops holding the claim. The operator needs that distinction --
+            # dropping the record outright would let its own still-live workload
+            # be re-read as a foreign one and block the planned reuse.
+            await asyncio.to_thread(
+                operator.release_resources, task_name=task.name, reusable=True
+            )
+        except Exception:
+            # Best-effort, like the finally-path release: a cleanup error must not
+            # replace the task's real outcome. But it is not harmless -- the
+            # dependent the planner packed onto these GPUs will now fail to
+            # acquire, and its error ("0 free") points nowhere near the cause. Log
+            # it where the user will actually see it, same as that path does.
+            _logger.warning(
+                "Task '%s': handing back READY-reusable resources failed; tasks "
+                "the planner packed onto its GPUs may not be able to acquire them",
+                task.name,
+                exc_info=True,
+            )
+
+    def _container_stale_reap_commands(self, task: Task) -> list[Command]:
+        """Reap commands for *orphaned* containers from crashed prior runs, or
+        ``[]``. Safe to run before launch: only dead-owner containers are removed,
+        never a concurrent run's live ones."""
+        operator = getattr(task, "operator", None)
+        if operator is None:
+            return []
+        try:
+            return list(operator.stale_reap_commands(task_name=task.name))
         except Exception:
             return []
 
@@ -732,14 +803,61 @@ class Orchestrator:
         self._subprocess_tasks.clear()
 
     async def _launch_task_with_timeout(self, task: Task, timeout: int | None = None):
-        # Reap any stale container from a crashed prior run / previous attempt so a
-        # deterministic --name cannot collide ("name already in use"). Only container
-        # operators declare teardown commands; when there are some, offload the
-        # blocking reap to a thread so a slow `docker` daemon can't stall the loop.
-        # Ordinary tasks skip this entirely (no await), preserving launch timing.
-        stale_reap = self._container_teardown_commands(task)
+        # Reap orphaned containers left by *crashed* prior runs (dead owning PID)
+        # before launching, so their leftovers don't accumulate. This must not
+        # touch a live concurrent run's containers, so it reaps by dead-owner, not
+        # by name. Only container operators declare these; when there are some,
+        # offload the blocking reap to a thread so a slow `docker` daemon can't
+        # stall the loop. Ordinary tasks skip this entirely (no await).
+        # Each distinct sweep runs at most once per run: it reaps by dead owner,
+        # not by task, so repeating it before every launch would just re-pay the
+        # container-daemon round trip without finding anything new.
+        stale_reap = [
+            cmd
+            for cmd in self._container_stale_reap_commands(task)
+            if cmd.as_str() not in self._completed_stale_reaps
+        ]
         if stale_reap:
+            self._completed_stale_reaps.update(cmd.as_str() for cmd in stale_reap)
             await asyncio.to_thread(self._run_teardown_commands, stale_reap)
+
+        operator = getattr(task, "operator", None)
+        acquires = (
+            operator is not None
+            and type(operator).acquire_resources is not Operator.acquire_resources
+        )
+
+        async def _acquire() -> None:
+            """Acquire this task's external resources just before launch.
+
+            e.g. the docker operator reserves its GPUs and pins the container to
+            them; held only while the task runs, released in the finally. Only
+            operators that override the hook take part -- ordinary tasks skip it
+            entirely, so their launch timing is unchanged.
+
+            Each attempt is offloaded to a thread (it does blocking file-lock and
+            subprocess work) but must not block: an operator that wants to wait
+            says so with ResourcesUnavailable and we sleep HERE, on the event
+            loop. That keeps a waiting task cancellable and inside its `timeout`
+            -- sleeping in the worker thread instead would detach from the task
+            and leave the driver unkillable, since the interpreter joins executor
+            threads on the way out.
+            """
+            while True:
+                try:
+                    acquired_gpus = await asyncio.to_thread(
+                        operator.acquire_resources,
+                        task_name=task.name,
+                        envs=task.envs,
+                    )
+                except ResourcesUnavailable as e:
+                    await asyncio.sleep(e.retry_after)
+                    continue
+                # Record the physical devices actually claimed so run reporting
+                # names the real GPUs instead of the planner's provisional slice.
+                if acquired_gpus:
+                    task.reserved_gpu_indices = list(acquired_gpus)
+                return
 
         def _run():
             # Operators that orchestrate their own multi-step, driver-managed run
@@ -770,17 +888,99 @@ class Orchestrator:
                 task_name=task.name,
             )
 
+        async def _acquire_and_run():
+            # Acquire INSIDE the timeout, so `timeout:` bounds a GPU wait and not
+            # just the run.
+            if acquires:
+                await _acquire()
+            return await _run()
+
         try:
+            # Called inside the try so a cancellation still reaches the release below.
+            # wait_for, not `async with asyncio.timeout(...)`: that is 3.11+ and we
+            # support 3.10. It raises asyncio.TimeoutError -- the builtin only from
+            # 3.11 -- so catch that spelling, not TimeoutError.
             if timeout:
-                async with asyncio.timeout(timeout):
-                    return await _run()
-            else:
-                return await _run()
+                return await asyncio.wait_for(_acquire_and_run(), timeout)
+            return await _acquire_and_run()
         finally:
             # Runs on success, failure, timeout, and cancellation -- the only path
             # that guarantees the container is gone if the launch process was
             # SIGKILLed before it could honor --rm.
             self._teardown_task_containers(task)
+            # Release the task's acquired resources (e.g. give its reserved GPUs
+            # back to the registry). Best-effort; never break the run.
+            #
+            # Offloaded to a thread for the same reason the READY hand-back is
+            # (see _release_ready_reusable_resources): the release takes a
+            # cross-process file lock that is bounded but not instant -- up to
+            # gpu_reservation._LOCK_TIMEOUT_S if a holder is wedged -- and this
+            # runs on the event loop that drives every other task's probes.
+            # Calling it inline would stall the whole run at every task teardown.
+            #
+            # The await is safe in a `finally`: once asyncio.to_thread has handed
+            # the call to the executor, the worker runs to completion whatever
+            # happens to this coroutine, so a cancellation arriving mid-release
+            # can cost us the *wait* but never the release itself.
+            if acquires:
+                await asyncio.to_thread(
+                    self._release_task_resources,
+                    operator,
+                    task,
+                    # Hand over rather than publish when the planner scheduled a
+                    # later task of THIS run onto these devices. The successor has
+                    # not been submitted yet (that takes another poll tick), and in
+                    # that gap a concurrent `sflow run` would happily take a device
+                    # this workflow is still counting on -- failing the successor
+                    # with "0 free" on a placement that was perfectly valid.
+                    # `handover` keeps the claim owned by this run: the successor
+                    # can take it, outsiders cannot. The last task on a device is
+                    # not flagged, so completing IT frees the device for real.
+                    #
+                    # Also reached on failure/cancellation, where the successor will
+                    # never run. Holding is the safe direction (never hands away a
+                    # device the run may still need) and the run-end sweep
+                    # (release_all_for_pid) clears anything left over.
+                    handover=bool(getattr(task, "gpus_reused_downstream", False)),
+                )
+
+    @staticmethod
+    def _release_task_resources(
+        operator: Operator, task: Task, *, handover: bool
+    ) -> None:
+        """Release one task's acquired resources. Runs in a worker thread.
+
+        Swallows its own errors rather than letting them reach the caller: this is
+        cleanup running in a ``finally``, and raising would replace the task's real
+        outcome with a teardown error.
+        """
+        try:
+            if handover:
+                operator.release_resources(task_name=task.name, handover=True)
+            else:
+                # Pass nothing when it would only restate the default. An operator
+                # overriding release_resources with the older `(*, task_name)`
+                # signature then keeps working for the ordinary release, as it did
+                # before hand-over existed -- otherwise it would TypeError on EVERY
+                # task, and since this is best-effort that failure would quietly
+                # leak its claim for the rest of the run. Such an operator still
+                # breaks on the hand-over branch above, exactly as it already does
+                # on the READY path -- and an operator written against the older
+                # `(*, task_name, reusable=False)` signature now breaks there too,
+                # since that branch passes `handover`. Both are the documented
+                # limit of what an out-of-tree operator gets for free.
+                operator.release_resources(task_name=task.name)
+        except Exception:
+            # A failure leaks the task's claim (its GPUs stay reserved) for the
+            # rest of the run and would otherwise strand every later task with an
+            # unexplained "0 free" -- so say so, with the traceback, at a level the
+            # user actually sees.
+            _logger.warning(
+                "Task '%s': releasing acquired resources failed; its "
+                "reservation may stay held for the rest of the run",
+                task.name,
+                exc_info=True,
+            )
 
     async def _cancel_sibling_subprocess_tasks(
         self,

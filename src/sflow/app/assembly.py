@@ -181,6 +181,7 @@ def resolve_artifacts(
     output_dir: Any | None = None,
     materialize: bool = False,
     remote_filesystem: bool = False,
+    skip_fs_existence_check: bool = False,
 ) -> SflowState:
     return _resolve_artifacts_impl(
         config,
@@ -190,6 +191,7 @@ def resolve_artifacts(
         output_dir=output_dir,
         materialize=materialize,
         remote_filesystem=remote_filesystem,
+        skip_fs_existence_check=skip_fs_existence_check,
     )
 
 
@@ -1498,6 +1500,7 @@ def build_task_graph(
                         )
         task.backend_name = backend.name
         task.resource_release_after.update(placement.resource_release_after)
+        task.gpus_reused_downstream = bool(placement.gpus_reused_downstream)
         # Optional retry policy (REQ-3.6).
         if t_conf.retries:
             retry_count = _resolve_int(
@@ -1654,16 +1657,24 @@ async def build_state(
     output_dir: Any | None = None,
     source_files: list[Any] | None = None,
     kubectl_config: Any | None = None,
+    skip_artifact_check: bool = False,
 ) -> SflowState:
     """
     Build runtime state from configuration (composition root).
 
-    This is intentionally kept out of core to avoid core importing plugins.
+    Kept out of core because this is the PLAN-TIME side of the split: it turns a
+    validated config into runtime objects, while core owns what happens once
+    they exist. Not because core may not import plugins -- it already does, in
+    the four registry self-population calls (core/backend_registry.py:56 and
+    its siblings), so defending that invariant here would be defending one
+    that is already false.
     """
     from pathlib import Path
 
-    if source_files:
-        resolver.source_files = [Path(f) for f in source_files]
+    # Assigned unconditionally: `resolver` is module-global, so a conditional
+    # assignment leaves the PREVIOUS run's files in place and visualize() (which
+    # passes none) then points its error hints at the wrong YAML.
+    resolver.source_files = [Path(f) for f in source_files] if source_files else []
 
     # Seed an empty workflow/state; we will populate task graph after resolution/allocation.
     wf = Workflow(name=config.workflow.name, task_graph=TaskGraph())
@@ -1711,6 +1722,12 @@ async def build_state(
             output_dir=output_dir,
             materialize=allocate,
             remote_filesystem=backends_execute_offhost(state),
+            # Scoped to the fs:// existence check ONLY. It must not ride on
+            # `remote_filesystem`, which additionally means "an off-host backend
+            # injects file:// inline content into the pod" -- on slurm/local there is
+            # no such backend, so an absolute file:// inline artifact would stop being
+            # written on the controller and never be written anywhere.
+            skip_fs_existence_check=skip_artifact_check,
         )
 
         # Top-level variables may defer references to backends.* and artifacts.*

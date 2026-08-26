@@ -2,19 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import gc
 import logging
 import re
 from pathlib import Path
 
 import pytest
 import sflow.core.execution_summary as execution_summary_mod
-from sflow.core.execution_summary import SflowSummaryWriter
+from sflow.core.execution_summary import (
+    SflowSummaryWriter,
+    _resource_row_key,
+)
 from sflow.core.task import Task, TaskStatus
 from sflow.core.uploads import UploadResult
 from sflow.core.task_graph import TaskGraph
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
+import gc
 
 
 def _task(name: str, tmp_path: Path) -> Task:
@@ -180,50 +183,6 @@ def test_summary_renders_network_warnings_section(tmp_path):
     assert (
         "decode_server_0: RDMA NIC unusable in 1/1 pod(s) (all ports DOWN)" in text
     )
-
-
-def test_summary_renders_node_topology_section(tmp_path):
-    # A backend's reservation-stage CPU/NUMA/GPU probe surfaces in a dedicated
-    # 'Node Topology' section so it's visible when reviewing results later. Read from
-    # the backend at render time (report is populated during allocation).
-    tg = TaskGraph()
-    server = _task("decode_server_0", tmp_path)
-    tg.dag.add_node("decode_server_0", server)
-    workflow = Workflow(name="wf", task_graph=tg)
-
-    class _FakeBackend:
-        node_topology_report = "gb300-node-a:\nnproc=144\ncpuset=0-143"
-
-    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
-    writer.start(
-        workflow=workflow, output_dir=tmp_path, runtime_info_text="rt",
-        command_log_paths={}, backends={"cluster": _FakeBackend()},
-    )
-    writer.workflow_finished(status="READY")
-
-    text = (tmp_path / "sflow_summary.log").read_text()
-    assert "Node Topology" in text
-    assert "[backend cluster]" in text
-    assert "nproc=144" in text and "cpuset=0-143" in text
-
-
-def test_summary_omits_node_topology_when_no_backend_report(tmp_path):
-    # A backend with no topology report (non-K8s, or probe skipped) -> no section.
-    tg = TaskGraph()
-    server = _task("s", tmp_path)
-    tg.dag.add_node("s", server)
-    workflow = Workflow(name="wf", task_graph=tg)
-
-    class _NoTopoBackend:
-        node_topology_report = None
-
-    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
-    writer.start(
-        workflow=workflow, output_dir=tmp_path, runtime_info_text="rt",
-        command_log_paths={}, backends={"local": _NoTopoBackend()},
-    )
-    writer.workflow_finished(status="READY")
-    assert "Node Topology" not in (tmp_path / "sflow_summary.log").read_text()
 
 
 def test_summary_omits_network_warnings_section_when_none(tmp_path):
@@ -805,6 +764,166 @@ def test_probe_trace_refreshes_while_task_stays_running(tmp_path):
     assert "step 2" in text and "step 1" not in text
 
 
+def test_gpu_chart_uses_physical_devices_not_container_visible_env(tmp_path):
+    """Two docker tasks on disjoint GPUs must not be drawn on the same rows.
+
+    A containerized backend re-indexes every container to CUDA_VISIBLE_DEVICES=
+    0..N-1, so reading that env would show both tasks on GPU 0/1. The chart must
+    use the devices actually reserved (or, before launch, the planner's slice).
+    """
+    tg = TaskGraph()
+    a = _task("a", tmp_path)
+    a.assigned_nodes = ["node-a"]
+    a.cuda_visible_devices = "0,1"
+    a.envs["CUDA_VISIBLE_DEVICES"] = "0,1"  # what the container sees
+    a.reserved_gpu_indices = [4, 5]  # what it actually got at launch
+
+    b = _task("b", tmp_path)
+    b.assigned_nodes = ["node-a"]
+    b.cuda_visible_devices = "2,3"
+    b.envs["CUDA_VISIBLE_DEVICES"] = "0,1"  # identical env, different GPUs
+    b.reserved_gpu_indices = [6, 7]
+
+    tg.dag.add_node("a", a)
+    tg.dag.add_node("b", b)
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=Workflow(name="wf", task_graph=tg),
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+    for task in (a, b):
+        task.attempts = 1
+        writer.task_submitted(task)
+        task.status = TaskStatus.COMPLETED
+        writer.task_completed(task)
+    writer.workflow_finished(status="COMPLETED")
+
+    gpu_lines = _section_lines(
+        (tmp_path / "sflow_summary.log").read_text(),
+        "GPU Usage Chart",
+        "Node Usage Chart",
+    )
+    joined = "\n".join(gpu_lines)
+    for index in (4, 5, 6, 7):
+        assert f"node-a GPU {index} " in joined
+    # The virtual container indices must not appear as if they were physical.
+    assert "node-a GPU 0 " not in joined
+    assert "node-a GPU 1 " not in joined
+
+
+def test_gpu_chart_falls_back_to_the_planner_slice_before_launch(tmp_path):
+    # No reservation recorded (every non-docker backend, or a task that has not
+    # launched): the planner's slice is still better than the container env.
+    tg = TaskGraph()
+    task = _task("t", tmp_path)
+    task.assigned_nodes = ["node-a"]
+    task.cuda_visible_devices = "2,3"
+    task.envs["CUDA_VISIBLE_DEVICES"] = "0,1"
+    tg.dag.add_node("t", task)
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=Workflow(name="wf", task_graph=tg),
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+    task.attempts = 1
+    writer.task_submitted(task)
+    task.status = TaskStatus.COMPLETED
+    writer.task_completed(task)
+    writer.workflow_finished(status="COMPLETED")
+
+    joined = "\n".join(
+        _section_lines(
+            (tmp_path / "sflow_summary.log").read_text(),
+            "GPU Usage Chart",
+            "Node Usage Chart",
+        )
+    )
+    assert "node-a GPU 2 " in joined and "node-a GPU 3 " in joined
+    assert "node-a GPU 0 " not in joined
+
+
+def test_gpu_chart_omits_backends_that_do_not_assign_visible_devices(tmp_path):
+    """A k8s task must not appear on invented GPU rows.
+
+    Kubernetes never injects CUDA_VISIBLE_DEVICES -- the device plugin / DRA picks
+    the physical GPUs -- so the planner's slice is a capacity-planning artifact,
+    not a record of which devices the pod used.
+    """
+    tg = TaskGraph()
+    task = _task("k8s_task", tmp_path)
+    task.assigned_nodes = ["node-a"]
+    task.cuda_visible_devices = "2,3"  # planner slice, no env injected
+    tg.dag.add_node("k8s_task", task)
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=Workflow(name="wf", task_graph=tg),
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+    task.attempts = 1
+    writer.task_submitted(task)
+    task.status = TaskStatus.COMPLETED
+    writer.task_completed(task)
+    writer.workflow_finished(status="COMPLETED")
+
+    text = (tmp_path / "sflow_summary.log").read_text()
+    gpu_lines = _section_lines(text, "GPU Usage Chart", "Node Usage Chart")
+    joined = "\n".join(gpu_lines)
+    assert "GPU 2" not in joined and "GPU 3" not in joined
+    assert "(no GPU timings)" in joined
+    # The node chart still covers it -- only device attribution is withheld.
+    assert "node-a" in "\n".join(_section_lines(text, "Node Usage Chart", "Command Logs"))
+
+
+def test_summary_renders_node_topology_section(tmp_path):
+    # A backend's reservation-stage CPU/NUMA/GPU probe surfaces in a dedicated
+    # 'Node Topology' section so it's visible when reviewing results later. Read from
+    # the backend at render time (report is populated during allocation).
+    tg = TaskGraph()
+    server = _task("decode_server_0", tmp_path)
+    tg.dag.add_node("decode_server_0", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    class _FakeBackend:
+        node_topology_report = "gb300-node-a:\nnproc=144\ncpuset=0-143"
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow, output_dir=tmp_path, runtime_info_text="rt",
+        command_log_paths={}, backends={"cluster": _FakeBackend()},
+    )
+    writer.workflow_finished(status="READY")
+
+    text = (tmp_path / "sflow_summary.log").read_text()
+    assert "Node Topology" in text
+    assert "[backend cluster]" in text
+    assert "nproc=144" in text and "cpuset=0-143" in text
+
+
+def test_summary_omits_node_topology_when_no_backend_report(tmp_path):
+    # A backend with no topology report (non-K8s, or probe skipped) -> no section.
+    tg = TaskGraph()
+    server = _task("s", tmp_path)
+    tg.dag.add_node("s", server)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    class _NoTopoBackend:
+        node_topology_report = None
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow, output_dir=tmp_path, runtime_info_text="rt",
+        command_log_paths={}, backends={"local": _NoTopoBackend()},
+    )
+    writer.workflow_finished(status="READY")
+    assert "Node Topology" not in (tmp_path / "sflow_summary.log").read_text()
+
+
 def _writer_and_workflow(tmp_path):
     tg = TaskGraph()
     tg.dag.add_node("t", _task("t", tmp_path))
@@ -864,3 +983,198 @@ def test_summary_writer_skips_the_watchdog_outside_a_running_loop(tmp_path, recw
         w for w in recwarn.list if issubclass(w.category, RuntimeWarning)
     ], "arming must not leak an un-awaited beat coroutine"
     writer.workflow_finished(status="COMPLETED")   # must be a no-op, not an AttributeError
+
+
+# ---------------------------------------------------------------------------
+# GPU Assignment: physical device ids vs what the task itself could see
+# ---------------------------------------------------------------------------
+
+
+def _gpu_task(name, tmp_path, *, reserved=None, visible=None, planned=None):
+    task = _task(name, tmp_path)
+    if reserved is not None:
+        task.reserved_gpu_indices = list(reserved)
+    if planned is not None:
+        task.cuda_visible_devices = planned
+    if visible is not None:
+        task.envs["CUDA_VISIBLE_DEVICES"] = visible
+    return task
+
+
+def _render(tmp_path, tasks, name="wf"):
+    tg = TaskGraph()
+    for task in tasks:
+        tg.dag.add_node(task.name, task)
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=Workflow(name=name, task_graph=tg),
+        output_dir=tmp_path,
+        runtime_info_text="rt",
+        command_log_paths={},
+    )
+    writer.workflow_finished(status="COMPLETED")
+    return (tmp_path / "sflow_summary.log").read_text()
+
+
+def test_gpu_assignment_reports_physical_ids_not_the_container_view(tmp_path):
+    """A docker task handed physical GPUs 2,3 sees CUDA_VISIBLE_DEVICES=0,1. The
+    summary must answer "which card did this run on", which the task's own env
+    cannot -- so both columns are shown."""
+    task = _gpu_task("trainer", tmp_path, reserved=[2, 3], visible="0,1")
+    text = _render(tmp_path, [task])
+
+    assert "GPU Assignment" in text
+    section = text.split("GPU Assignment", 1)[1]
+    row = [ln for ln in section.splitlines() if ln.startswith("trainer")][0]
+    assert "2,3" in row, row
+    assert row.index("2,3") < row.index("0,1"), "physical column must come first"
+
+
+def test_gpu_assignment_warns_only_when_the_two_views_differ(tmp_path):
+    """The hint is the whole reason the section exists on docker; on a backend
+    that does not re-index it would be a lie, so it must not appear."""
+    remapped = _gpu_task("docker_task", tmp_path, reserved=[6, 7], visible="0,1")
+    assert "re-indexes devices" in _render(tmp_path, [remapped])
+
+    # Slurm-style: the env IS the physical slice, so no remap and no hint.
+    plain = _gpu_task("slurm_task", tmp_path, planned="2,3", visible="2,3")
+    text = _render(tmp_path, [plain])
+    assert "GPU Assignment" in text
+    assert "re-indexes devices" not in text
+
+
+def test_gpu_assignment_is_omitted_when_no_task_used_a_gpu(tmp_path):
+    text = _render(tmp_path, [_task("cpu_only", tmp_path)])
+    assert "GPU Assignment" not in text
+
+
+def test_gpu_assignment_skips_backends_that_never_expose_device_ids(tmp_path):
+    """Kubernetes: the device plugin picks the GPUs and injects no env, so sflow
+    never learns their physical ids. Printing the planner's provisional slice
+    would invent numbers the pod never used."""
+    k8s_task = _task("k8s_task", tmp_path)
+    k8s_task.cuda_visible_devices = "0,1"  # plan-time only; no env injected
+    assert "GPU Assignment" not in _render(tmp_path, [k8s_task])
+
+
+def test_gpu_assignment_lists_every_gpu_task(tmp_path):
+    tasks = [
+        _gpu_task("server", tmp_path, reserved=[1, 2], visible="0,1"),
+        _gpu_task("client", tmp_path, reserved=[3], visible="0"),
+        _task("report", tmp_path),
+    ]
+    section = _render(tmp_path, tasks).split("GPU Assignment", 1)[1]
+    assert any(ln.startswith("server") and "1,2" in ln for ln in section.splitlines())
+    assert any(ln.startswith("client") and "3" in ln for ln in section.splitlines())
+    assert not any(ln.startswith("report") for ln in section.splitlines())
+
+
+def test_gpu_usage_chart_rows_sorted_by_node_then_gpu_index(tmp_path):
+    """Rows read node-by-node, GPU 0..N.
+
+    They are collected in task order, so without an explicit sort the chart
+    interleaves nodes by "which task touched this GPU first" -- e.g. a warmup
+    task holding GPUs 0,2 on two nodes pushes every GPU 1,3 row to the bottom.
+    """
+    tg = TaskGraph()
+    tasks = []
+    # warmup grabs GPUs 0 and 2 on both nodes; workers take 1 and 3 afterwards.
+    for name, gpus in (("warmup", [0, 2]), ("worker", [1, 3])):
+        task = _task(name, tmp_path)
+        task.assigned_nodes = ["node2", "node10"]
+        task.reserved_gpu_indices = list(gpus)
+        tg.dag.add_node(name, task)
+        tasks.append(task)
+    workflow = Workflow(name="wf", task_graph=tg)
+
+    writer = SflowSummaryWriter(tmp_path / "sflow_summary.log")
+    writer.start(
+        workflow=workflow,
+        output_dir=tmp_path,
+        runtime_info_text="runtime",
+        command_log_paths={},
+    )
+    for task in tasks:
+        writer.task_submitted(task)
+        task.status = TaskStatus.COMPLETED
+        writer.task_completed(task)
+    writer.workflow_finished(status="COMPLETED")
+
+    rows = [
+        line.split("|")[0].strip()
+        for line in _section_lines(
+            (tmp_path / "sflow_summary.log").read_text(),
+            "GPU Usage Chart",
+            "Node Usage Chart",
+        )
+        if "|" in line
+    ]
+    # node2 before node10 (numeric, not lexicographic), GPUs ascending within.
+    assert rows == [
+        "node2 GPU 0",
+        "node2 GPU 1",
+        "node2 GPU 2",
+        "node2 GPU 3",
+        "node10 GPU 0",
+        "node10 GPU 1",
+        "node10 GPU 2",
+        "node10 GPU 3",
+    ], rows
+    assert rows == sorted(rows, key=_resource_row_key)
+
+
+def test_gpu_assignment_reads_the_in_container_view_from_the_placement_record(tmp_path):
+    """The planner's env is the HOST slice, so it cannot be the in-container column.
+
+    A Slurm step planned for host 2,3 that a container renumbered to 0,1 was
+    reported as physical 0,1 / in-container 2,3 -- backwards, and impossible. The
+    step's own numbering only exists in the record it writes.
+    """
+    from sflow.utils.gpu import GPU_MARKER_FILE
+
+    task = _gpu_task("worker", tmp_path, visible="2,3")
+    out = Path(task.envs["SFLOW_TASK_OUTPUT_DIR"])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / GPU_MARKER_FILE).write_text(
+        "0,1\n"
+        "action=verified\n"
+        "cuda_visible_devices=0,1\n"
+        "planned_host_indices=2,3\n"
+    )
+
+    row = [
+        ln
+        for ln in _render(tmp_path, [task]).split("GPU Assignment", 1)[1].splitlines()
+        if ln.startswith("worker")
+    ][0]
+    # Physical = the planned HOST indices the step PROVED it holds, by UUID.
+    # In-container = what the step itself was numbered.
+    assert row.index("2,3") < row.index("0,1"), row
+
+
+def test_gpu_assignment_falls_back_to_the_env_when_the_record_says_unset(tmp_path):
+    """`<env-not-set>` is a sentinel, not a device list.
+
+    The guard used to test for a parenthesised spelling the script never writes,
+    so it never fired -- it only looked right because the sentinel happens to
+    parse to no indices.
+    """
+    from sflow.utils.gpu import GPU_MARKER_FILE
+
+    task = _gpu_task("worker", tmp_path, visible="4,5")
+    out = Path(task.envs["SFLOW_TASK_OUTPUT_DIR"])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / GPU_MARKER_FILE).write_text(
+        "4,5\naction=fallback\ncuda_visible_devices=<env-not-set>\n"
+    )
+
+    row = [
+        ln
+        for ln in _render(tmp_path, [task]).split("GPU Assignment", 1)[1].splitlines()
+        if ln.startswith("worker")
+    ][0]
+    # Both columns must read 4,5: the sentinel is discarded and the task's env
+    # supplies the in-container view. With the old guard the sentinel survived,
+    # parsed to no indices, and that column silently rendered as "-".
+    assert row.count("4,5") == 2, row
+    assert "<env-not-set>" not in row, row

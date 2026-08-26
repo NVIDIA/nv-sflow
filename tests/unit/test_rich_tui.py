@@ -14,6 +14,9 @@ from sflow.core.task import Task, TaskStatus
 from sflow.core.task_graph import TaskGraph
 from sflow.core.workflow import Workflow
 from sflow.plugins.operators.bash import BashOperator, BashOperatorConfig
+from pathlib import Path
+
+from sflow.ui import rich_tui as rich_tui_module
 from sflow.ui.rich_tui import RichTui, RichTuiConfig, _SflowTextualApp
 
 
@@ -448,3 +451,30 @@ def test_rich_tui_ctrl_c_key_requests_interrupt():
     asyncio.run(_run_app())
 
     assert events == ["interrupt"]
+
+
+def test_header_box_is_tall_enough_for_every_rendered_line():
+    """A short #header silently CLIPS its last lines rather than scrolling.
+
+    The elapsed clock is the 4th of 5 rendered lines, so a height that forgot to
+    budget for the round border (2 rows) hid it completely -- the box looked fine
+    and the text was simply gone.
+    """
+    import re as _re
+
+    tui = RichTui(None, attach_log_handler=False)
+    rendered = tui._header_text().split("\n")
+    assert any("elapsed" in line for line in rendered), rendered
+
+    height = int(
+        _re.search(r"#header \{.*?height: (\d+);", _SflowTextualApp.CSS, _re.S).group(1)
+    )
+    # +2 for the round border's top and bottom rows.
+    assert height >= len(rendered) + 2, (height, len(rendered))
+
+
+def test_header_is_ticked_on_a_timer_not_only_on_events():
+    """Elapsed must keep advancing while no task transitions and no logs arrive."""
+    source = Path(rich_tui_module.__file__).read_text(encoding="utf-8")
+    on_mount = source.split("def on_mount")[1].split("    def ")[0]
+    assert "set_interval" in on_mount and "_update_header" in on_mount, on_mount

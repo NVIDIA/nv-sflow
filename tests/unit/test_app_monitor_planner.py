@@ -438,6 +438,48 @@ def test_task_monitor_emits_only_that_task(tmp_path):
     assert reports["b"]["nodes"] == ["slurm-node1"]
 
 
+def test_task_log_window_survives_workflow_report_merge(tmp_path):
+    state = _build(
+        {
+            "name": "wf",
+            "monitor": {
+                "scopes": {"cpu": {}},
+                "report": {"enabled": True, "format": ["csv"]},
+            },
+            "tasks": [
+                {
+                    "name": "bench",
+                    "script": ["echo b"],
+                    "resources": {"nodes": {"indices": [0]}},
+                    "monitor": {
+                        "scopes": {"gpu": {}},
+                        "report": {"enabled": True, "format": ["svg"]},
+                        "window": {
+                            "start": {"pattern": ["WARMUP_DONE", "re:^ready$"]},
+                            "end": {
+                                "pattern": "BENCHMARK_DONE",
+                                "select": "first",
+                            },
+                        },
+                    },
+                }
+            ],
+        },
+        tmp_path,
+    )
+    report = _task_reports(state)["bench"]
+    assert report["scopes"] == ["cpu", "gpu"]
+    assert report["formats"] == ["csv", "svg"]
+    assert report["window_tasks"] == ["bench"]
+    assert report["log_window"] == {
+        "start": {
+            "pattern": ["WARMUP_DONE", "re:^ready$"],
+            "select": "first",
+        },
+        "end": {"pattern": ["BENCHMARK_DONE"], "select": "first"},
+    }
+
+
 def test_used_by_tasks_emits_cross_views_windowed_by_owner(tmp_path):
     """A used_by_tasks monitor (owner A watching B) yields B__monitored_by__A
     views over B's resources, windowed to A's run."""
@@ -457,6 +499,7 @@ def test_used_by_tasks_emits_cross_views_windowed_by_owner(tmp_path):
                     "monitor": {
                         "report": {"enabled": True},
                         "resources": {"used_by_tasks": ["server"]},
+                        "window": {"start": "WARMUP_DONE", "end": "RUN_DONE"},
                     },
                 },
             ],
@@ -472,21 +515,39 @@ def test_used_by_tasks_emits_cross_views_windowed_by_owner(tmp_path):
     assert view["gpus"] == [0, 1, 2, 3]
     # The reporting window comes from the OWNER (bench), not the monitored task.
     assert view["window_tasks"] == ["bench"]
+    assert view["log_window"] == {
+        "start": {"pattern": ["WARMUP_DONE"], "select": "first"},
+        "end": {"pattern": ["RUN_DONE"], "select": "last"},
+    }
     assert "monitored by bench" in view["title"]
 
 
 def test_report_disabled_emits_no_task_views(tmp_path):
-    """A monitor without report.enabled samples but produces no task views."""
+    """A monitor with report.enabled=false samples but produces no task views."""
     state = _build(
         {
             "name": "wf",
-            "monitor": {"interval": 1000},  # no report block
+            "monitor": {"interval": 1000, "report": {"enabled": False}},
             "tasks": [{"name": "a", "script": ["echo a"]}],
         },
         tmp_path,
     )
     assert state.monitor_registry is not None
     assert state.monitor_registry.report_spec()["task_reports"] == []
+
+
+def test_report_is_enabled_by_default(tmp_path):
+    """Declaring `monitor:` is enough: reports no longer need an opt-in block."""
+    state = _build(
+        {
+            "name": "wf",
+            "monitor": {"interval": 1000},  # no report block at all
+            "tasks": [{"name": "a", "script": ["echo a"]}],
+        },
+        tmp_path,
+    )
+    reports = state.monitor_registry.report_spec()["task_reports"]
+    assert [r["name"] for r in reports] == ["a"]
 
 
 def test_task_monitor_default_targets_bound_task_nodes(tmp_path):
@@ -509,6 +570,59 @@ def test_task_monitor_default_targets_bound_task_nodes(tmp_path):
     work = state.workflow.get_task("work")
     assert work.monitor is not None
     assert work.monitor.nodes == ["slurm-node1"]
+
+
+def test_docker_monitor_views_use_physical_gpus_not_container_indices(tmp_path):
+    """Two docker tasks sharing a host must be monitored on disjoint GPUs.
+
+    The docker backend exposes CUDA_VISIBLE_DEVICES=0..N-1 *inside* each
+    container, so deriving monitored GPUs from the task env alone would point
+    every task at GPU 0/1 -- the monitor would then report one task's utilization
+    against another's devices. Views must follow the planner's slice instead.
+    """
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "local_docker",
+                    "type": "docker",
+                    "default": True,
+                    "image": "nvcr.io/example/img:1",
+                    "gpus_per_node": 8,
+                    "nodes": 1,
+                }
+            ],
+            "workflow": {
+                "name": "wf",
+                "monitor": {"interval": 1000, "report": {"enabled": True}},
+                "tasks": [
+                    {
+                        "name": "a",
+                        "script": ["sleep 1"],
+                        "resources": {"gpus": {"count": 2}},
+                    },
+                    {
+                        "name": "b",
+                        "script": ["sleep 1"],
+                        "resources": {"gpus": {"count": 2}},
+                    },
+                ],
+            },
+        }
+    )
+    state = asyncio.run(build_state(config, allocate=False, output_dir=tmp_path))
+
+    tasks = dict(state.workflow.task_graph.dag.nodes)
+    # Both containers really do see the same virtual indices...
+    assert tasks["a"].envs["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert tasks["b"].envs["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+    reports = _task_reports(state)
+    # ...but the monitor targets the disjoint physical devices.
+    assert reports["a"]["gpus"] == [0, 1]
+    assert reports["b"]["gpus"] == [2, 3]
+    assert set(reports["a"]["gpus"]).isdisjoint(reports["b"]["gpus"])
 
 
 def test_monitor_gpu_indices_watch_exactly_those_devices(tmp_path):
@@ -577,3 +691,127 @@ def test_monitor_gpu_indices_expression_is_rejected_with_a_clear_message(tmp_pat
             },
             tmp_path,
         )
+
+
+def test_workflow_monitor_spans_every_backend_not_just_the_default(tmp_path):
+    """`workflow.monitor` is the whole-POOL monitor.
+
+    Resolving it against the default backend alone leaves a second pool
+    unsampled, so tasks running there get a report folder with no data of their
+    own -- which the post-processor's name-mismatch fallback then fills with the
+    other backend's nodes and GPUs.
+    """
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "pool_a", "type": "slurm", "default": True, "nodes": 2,
+                    "gpus_per_node": 8, "partition": "p", "account": "a",
+                    "time": "01:00:00",
+                },
+                {
+                    "name": "pool_b", "type": "slurm", "nodes": 1, "gpus_per_node": 0,
+                    "partition": "p2", "account": "a", "time": "01:00:00",
+                },
+            ],
+            "workflow": {
+                "name": "wf",
+                "monitor": {"report": {"enabled": True}},
+                "tasks": [
+                    {"name": "on_a", "script": ["echo a"]},
+                    {"name": "on_b", "backend": "pool_b", "script": ["echo b"]},
+                ],
+            },
+        }
+    )
+    state = asyncio.run(build_state(config, allocate=False, output_dir=tmp_path))
+    spec = state.monitor_registry.report_spec()
+
+    workflow_nodes = spec["consumers"][0]["nodes"]
+    assert any(n.startswith("pool_b") for n in workflow_nodes), workflow_nodes
+    assert any(n.startswith("pool_a") for n in workflow_nodes), workflow_nodes
+    # The second pool's task gets a report of its OWN hardware.
+    on_b = [r for r in spec["task_reports"] if r["name"] == "on_b"]
+    assert on_b, [r["name"] for r in spec["task_reports"]]
+    assert all(n.startswith("pool_b") for n in on_b[0]["nodes"]), on_b[0]["nodes"]
+
+
+def test_reports_never_mix_in_another_tasks_gpus_on_a_shared_node(tmp_path):
+    """Two tasks on ONE node must report only their own half of its GPUs.
+
+    A collector is a per-node singleton sampling every GPU on that node, so the
+    only thing keeping one task's report free of its neighbour's devices is the
+    plan-time GPU subset. A task that reserved NO GPUs must likewise report none
+    -- an empty subset is not "all of them".
+    """
+    state = _build(
+        {
+            "name": "wf",
+            "monitor": {"report": {"enabled": True}},
+            "tasks": [
+                {
+                    "name": "srv_a", "script": ["x"],
+                    "resources": {"nodes": {"indices": [0]}, "gpus": {"count": 4}},
+                },
+                {
+                    "name": "srv_b", "script": ["x"],
+                    "resources": {"nodes": {"indices": [0]}, "gpus": {"count": 4}},
+                },
+                {
+                    "name": "cpu_only", "script": ["x"],
+                    "resources": {"nodes": {"indices": [1]}},
+                },
+            ],
+        },
+        tmp_path,
+    )
+    reports = {r["name"]: r for r in state.monitor_registry.report_spec()["task_reports"]}
+
+    # Same node, disjoint GPU halves -- neither may contain the other's.
+    assert reports["srv_a"]["nodes"] == reports["srv_b"]["nodes"] == ["slurm-node0"]
+    a, b = set(reports["srv_a"]["gpus"]), set(reports["srv_b"]["gpus"])
+    assert a and b and not (a & b), (a, b)
+    # No GPUs reserved -> report none, NOT every GPU on its node.
+    assert reports["cpu_only"]["gpus"] == [], reports["cpu_only"]["gpus"]
+
+
+
+def test_shared_view_credits_both_the_workflow_and_the_task_monitor(tmp_path):
+    """A folder both monitors ask for must count for BOTH of them.
+
+    Views are deduped by label and the workflow monitor emits first, so the merged
+    view keeps `triggered_by="workflow"`. Counting folders by that alone credits
+    the task monitor with none and the dry-run then reports it as `report=no` --
+    i.e. "this monitor writes nothing", for the monitor that owns the window.
+    """
+    state = _build(
+        {
+            "name": "wf",
+            "monitor": {"interval": 1000},
+            "tasks": [
+                {
+                    "name": "work",
+                    "script": ["echo work"],
+                    "monitor": {
+                        "interval": 1000,
+                        "window": {"start": "GO", "end": "STOP"},
+                    },
+                },
+            ],
+        },
+        tmp_path,
+    )
+    views = {v.label: v for v in state.monitor_registry.task_views}
+    work = views["work"]
+    # One folder, but two monitors put it there.
+    assert work.triggered_by == "workflow"
+    assert work.contributors == ["workflow", "task:work"]
+    # The task monitor's window survived the merge onto the workflow's view.
+    assert work.log_window is not None
+
+    folders_by_owner: dict[str, int] = {}
+    for view in state.monitor_registry.task_views:
+        for owner in view.contributors:
+            folders_by_owner[owner] = folders_by_owner.get(owner, 0) + 1
+    assert folders_by_owner["task:work"] == 1

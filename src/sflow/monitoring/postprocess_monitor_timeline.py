@@ -93,16 +93,17 @@ _OVERVIEW_SPARKLINES = (
 
 _SPARK_TICKS = "▁▂▃▄▅▆▇█"
 
-# Task lifecycle markers drawn on the timeline (color per status change). Order
-# controls legend layout; unknown event types are ignored.
+# Task lifecycle changes drawn on the timeline. Order controls label ordering
+# within a merged transition; unknown event types are ignored. There is no colour
+# per event any more -- see `_ALERT_EVENTS` below for why.
 _EVENT_ORDER = ("submit", "ready", "done", "fail", "cancel")
-_EVENT_STYLE = {
-    "submit": "#1f77b4",  # blue
-    "ready": "#2ca02c",  # green
-    "done": "#7f7f7f",  # gray
-    "fail": "#d62728",  # red
-    "cancel": "#ff7f0e",  # orange
-}
+_KNOWN_EVENTS = frozenset(_EVENT_ORDER)
+# Which band a label goes in, split by what the event MEANS rather than by name:
+# `submit` is the only one that starts something, so it sits above the plot;
+# everything else -- `ready`, `done`, and the `fail`/`cancel` that also end a task
+# -- sits below it. Splitting the two halves how many labels compete for any one
+# strip of x, which is what made neighbouring ones collide.
+_TOP_EVENTS = frozenset({"submit"})
 
 
 def _select_marker_events(
@@ -115,7 +116,7 @@ def _select_marker_events(
     sorted by timestamp (so markers and labels render left-to-right)."""
     selected: list[dict[str, object]] = []
     for ev in events or []:
-        if str(ev.get("event")) not in _EVENT_STYLE:
+        if str(ev.get("event")) not in _KNOWN_EVENTS:
             continue
         try:
             ts = float(ev.get("ts"))  # type: ignore[arg-type]
@@ -127,95 +128,181 @@ def _select_marker_events(
     return selected
 
 
-def _events_present(marker_events: list[dict[str, object]]) -> list[str]:
-    """Event types present among the markers, in canonical legend order."""
-    seen = {str(e["event"]) for e in marker_events}
-    return [e for e in _EVENT_ORDER if e in seen]
+# Transitions are ANNOTATIONS, not a series, so they do not get a categorical
+# colour: routine ones recede to neutral ink and the exceptional ones keep a
+# reserved status colour. Previously colour encoded the event and a dash pattern
+# encoded the task, which cost two legend lookups per line -- and every event
+# colour was also a device series colour (`#1f77b4` meant both "GPU 0" and
+# "submit" on the same canvas).
+_MARKER_INK = "#9aa0a6"
+_MARKER_LABEL_INK = "#5f6772"
+# `fail` -- and ONLY fail -- gets a reserved status colour: a cancel is usually
+# sflow tearing a service down on purpose, so flagging it red would cry wolf on
+# every healthy run. Deliberately darker than the `#d62728` in `_SERIES_COLORS`,
+# so a rule can never be mistaken for a GPU line on the same canvas; it always
+# ships alongside its own text label, never as colour alone.
+_MARKER_FAIL_INK = "#a61b1b"
+_FAIL_EVENTS = frozenset({"fail"})
+# Events closer together than this FRACTION of the plotted span are one
+# transition as far as a reader is concerned; drawing each separately makes a
+# barcode. A fraction, not pixels, so the SVG and the PNG merge identically
+# without either having to know the other's geometry.
+_MARKER_MERGE_FRACTION = 0.02
+# Roughly the width one transition owns before it collides with its neighbour.
+_MARKER_LABEL_CHARS = 30
 
 
-# Distinguishable line styles cycled per task so each task's markers share one
-# style (color still encodes the event type). Each entry is
-# (name, svg_stroke_dasharray, matplotlib_linestyle); "" dasharray = solid.
-_TASK_LINE_STYLES: tuple[tuple[str, str, object], ...] = (
-    ("solid", "", "-"),
-    ("dashed", "6 3", (0, (6, 3))),
-    ("dotted", "1 3", (0, (1, 3))),
-    ("dash-dot", "7 3 1 3", (0, (7, 3, 1, 3))),
-    ("long-dash", "12 4", (0, (12, 4))),
-    ("dash-dot-dot", "7 3 1 3 1 3", (0, (7, 3, 1, 3, 1, 3))),
-)
-
-
-def _assign_task_styles(
+def _merge_marker_events(
     marker_events: list[dict[str, object]],
-) -> dict[str, tuple[str, object]]:
-    """Map each task -> (svg_dasharray, matplotlib_linestyle), cycled stably.
-
-    Tasks are sorted so the mapping is deterministic across SVG/PNG/consumers.
-    With more tasks than styles the styles repeat (best-effort distinctness).
-    """
-    tasks = sorted({str(e["task"]) for e in marker_events})
-    return {
-        task: _TASK_LINE_STYLES[i % len(_TASK_LINE_STYLES)][1:]
-        for i, task in enumerate(tasks)
-    }
-
-
-def _build_legend_svg(
-    present_events: list[str],
-    task_styles: dict[str, tuple[str, object]],
     *,
-    x0: float,
-    max_x: float,
-) -> tuple[list[str], float]:
-    """Build the bottom legend (event colors + task line styles) in local coords.
+    origin: float,
+    max_elapsed: float,
+) -> list[dict[str, object]]:
+    """Collapse near-simultaneous events into one labelled transition.
 
-    Returns the SVG fragments (y measured from 0) and the total legend height, so
-    the caller can size the canvas and translate the group into place.
+    A workflow has a handful of phase edges but emits an event per task per
+    change, so 7 tasks produce ~15 rules that read as noise. Grouping by x
+    position recovers the edges the reader actually cares about.
+    """
+    tolerance = max_elapsed * _MARKER_MERGE_FRACTION
+    groups: list[dict[str, object]] = []
+    for ev in marker_events:
+        rel = float(ev["ts"]) - origin
+        if groups and rel - float(groups[-1]["rel"]) <= tolerance:
+            groups[-1]["pairs"].append((str(ev["event"]), str(ev["task"])))  # type: ignore[union-attr]
+        else:
+            groups.append({"rel": rel, "pairs": [(str(ev["event"]), str(ev["task"]))]})
+    for group in groups:
+        pairs = group["pairs"]  # type: ignore[assignment]
+        group["failed"] = any(e in _FAIL_EVENTS for e, _t in pairs)  # type: ignore[union-attr]
+        # Two labels per transition: what STARTED (top) and what finished or came
+        # up (bottom). Either may be empty, in which case that band skips it.
+        group["label_top"] = _marker_group_label(
+            [p for p in pairs if p[0] in _TOP_EVENTS]  # type: ignore[union-attr]
+        )
+        group["label_bottom"] = _marker_group_label(
+            [p for p in pairs if p[0] not in _TOP_EVENTS]  # type: ignore[union-attr]
+        )
+    return groups
+
+
+def _marker_group_label(pairs: list[tuple[str, str]]) -> str:
+    """One short line naming what changed, e.g. `bench ready` / `3 tasks done`.
+
+    Names the task when exactly one changed (the useful case) and counts them
+    otherwise, so the label stays narrow enough to sit over its own rule.
+    """
+    by_event: dict[str, set[str]] = {}
+    for event, task in pairs:
+        by_event.setdefault(event, set()).add(task)
+    bits = []
+    for event in _EVENT_ORDER:
+        tasks = by_event.get(event)
+        if not tasks:
+            continue
+        who = next(iter(tasks)) if len(tasks) == 1 else f"{len(tasks)} tasks"
+        bits.append(f"{who} {event}")
+    # Drop WHOLE items rather than cutting mid-word: "3 tasks submit +2 more"
+    # still says what happened, "3 tasks submit / decode_serve\u2026" does not.
+    label = ""
+    for i, bit in enumerate(bits):
+        candidate = f"{label} / {bit}" if label else bit
+        if len(candidate) > _MARKER_LABEL_CHARS:
+            return f"{label} +{len(bits) - i} more" if label else bit
+        label = candidate
+    return label
+
+
+def _build_device_legend_svg(
+    labels: list[str], *, x0: float, max_x: float
+) -> tuple[list[str], float]:
+    """Bottom band mapping each series colour to its device.
+
+    Drawn once per image: the colour for a device is the same in every panel, so
+    repeating it in each panel's gutter is noise. Returns fragments in local
+    coords (y from 0) plus the band height so the caller can size the canvas.
     """
     parts: list[str] = []
-    row_h = 16.0
-    y = 8.0
-
-    def _emit_row(heading: str, heading_w: float, items: list[tuple[str, str, str]]) -> None:
-        # items: (label, swatch_color, swatch_dasharray)
-        nonlocal y
+    x, y, row_h = x0, 10.0, 14.0
+    for idx, label in enumerate(labels):
+        entry_w = 26.0 + 6.5 * len(label)
+        if x + entry_w > max_x and x > x0:
+            x, y = x0, y + row_h
+        colour = _SERIES_COLORS[idx % len(_SERIES_COLORS)]
         parts.append(
-            f'<text x="{x0:.0f}" y="{y + 3:.0f}" font-size="9" '
-            f'fill="#222222">{heading}</text>'
+            f'<line x1="{x:.1f}" y1="{y - 3:.1f}" x2="{x + 16:.1f}" '
+            f'y2="{y - 3:.1f}" stroke="{colour}" stroke-width="2"/>'
         )
-        x = x0 + heading_w
-        for label, color, dash in items:
-            label = label if len(label) <= 16 else label[:15] + "\u2026"
-            item_w = 22 + 4 + 6.0 * len(label) + 16
-            if x + item_w > max_x and x > x0 + heading_w:
-                x = x0 + heading_w
-                y += row_h
-            da = f' stroke-dasharray="{dash}"' if dash else ""
-            parts.append(
-                f'<line x1="{x:.0f}" y1="{y:.0f}" x2="{x + 20:.0f}" y2="{y:.0f}" '
-                f'stroke="{color}" stroke-width="2"{da}/>'
-            )
-            parts.append(
-                f'<text x="{x + 24:.0f}" y="{y + 3:.0f}" font-size="9" '
-                f'fill="#444444">{_xml_escape(label)}</text>'
-            )
-            x += item_w
-        y += row_h
+        parts.append(
+            f'<text x="{x + 20:.1f}" y="{y:.1f}" font-size="9" fill="#444444">'
+            f'{_xml_escape(label)}</text>'
+        )
+        x += entry_w
+    return parts, (y + 6.0 if parts else 0.0)
 
-    if present_events:
-        _emit_row(
-            "Events (color):",
-            100,
-            [(e, _EVENT_STYLE[e], "") for e in present_events],
+
+# Height of one label band (two staggered rows plus breathing room).
+_MARKER_BAND_H = 28.0
+
+
+def _build_marker_labels_svg(
+    groups: list[dict[str, object]],
+    *,
+    key: str,
+    above: bool,
+    left: float,
+    plot_w: float,
+    max_elapsed: float,
+    anchor_y: float,
+    width: float,
+) -> list[str]:
+    """Name each transition directly beside its own rule, in one band.
+
+    Direct labels replace the old pair of legends (event colour + task dash):
+    identifying a rule used to mean two lookups, and neither encoding survived
+    being printed in greyscale. Called once per band -- ``submit`` above the plot,
+    ``ready``/``done`` below it -- so the two never compete for the same strip of
+    canvas. Within a band labels still alternate between two rows, and a short
+    leader ties each back to its rule.
+    """
+    parts: list[str] = []
+    drawn = 0
+    for group in groups:
+        text = str(group.get(key) or "")
+        if not text:
+            continue
+        x = left + (float(group["rel"]) / max_elapsed) * plot_w
+        # Stagger by DRAWN count, not group index: a band that skips groups would
+        # otherwise leave a row empty and put two neighbours back on one line.
+        row = drawn % 2
+        drawn += 1
+        if above:
+            y = anchor_y - _MARKER_BAND_H + 12.0 + row * 11.0
+            leader_from, leader_to = y + 3.0, anchor_y
+        else:
+            y = anchor_y + 13.0 + row * 11.0
+            leader_from, leader_to = anchor_y, y - 8.0
+        # A failure only ever lands in the lower band, so the upper one stays
+        # neutral even for a group that also carries one.
+        ink = (
+            _MARKER_FAIL_INK
+            if group.get("failed") and not above
+            else _MARKER_LABEL_INK
         )
-    if task_styles:
-        _emit_row(
-            "Tasks (line style):",
-            118,
-            [(task, "#555555", dash) for task, (dash, _ls) in task_styles.items()],
+        # Keep the text on the canvas even when a transition sits at either edge.
+        tx = min(max(x, 46.0), width - 46.0)
+        parts.append(
+            f'<text x="{tx:.1f}" y="{y:.1f}" text-anchor="middle" font-size="9" '
+            f'fill="{ink}">{_xml_escape(text)}</text>'
         )
-    return parts, y
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{leader_from:.1f}" x2="{x:.1f}" '
+            f'y2="{leader_to:.1f}" stroke="{ink}" stroke-width="0.8" '
+            f'opacity="0.5"/>'
+        )
+    return parts
+
+
 _CSV_FIELDS = [
     "timestamp",
     "timestamp_iso",
@@ -424,12 +511,14 @@ def filter_rows(
         str(row["hostname"]) in node_set for row in rows
     ):
         node_set = None
-    gpu_set = {str(g) for g in gpus} if gpus else None
-    # Best effort (mirrors the node fallback above): if a GPU subset is requested
-    # but matches no sampled GPU id -- e.g. the consumer's logical CUDA indices
-    # differ from nvidia-smi's physical `index`, or no gpu scope was collected --
-    # keep all GPUs rather than emit an empty report.
-    if gpu_set is not None and not any(
+    # `None` means "no GPU subset requested -> all"; an EMPTY list means "this task
+    # reserved no GPUs", which must report none rather than every GPU on its nodes.
+    gpu_set = {str(g) for g in gpus} if gpus is not None else None
+    # Best effort (mirrors the node fallback above): if a NON-EMPTY GPU subset is
+    # requested but matches no sampled GPU id -- e.g. the consumer's logical CUDA
+    # indices differ from nvidia-smi's physical `index`, or no gpu scope was
+    # collected -- keep all GPUs rather than emit an empty report.
+    if gpu_set and not any(
         str(row["resource_type"]) == "gpu" and str(row["resource_id"]) in gpu_set
         for row in rows
     ):
@@ -519,17 +608,49 @@ def _sparkline(values: list[float], width: int = 60) -> str:
     return "".join(out)
 
 
+def _sample_period(samples: list[tuple[float, str]]) -> float:
+    """Collector sampling period, as the median gap between one host's samples.
+
+    Needed because every node samples on its own clock, so timestamps from
+    different nodes essentially never coincide. Grouping them by exact timestamp
+    puts ONE host in each point, and a "cluster average" then sawtooths between a
+    busy node and its idle peers instead of averaging them. Returns 0.0 when
+    there is nothing to infer from (single sample per host).
+    """
+    per_host: dict[str, set[float]] = defaultdict(set)
+    for ts, host in samples:
+        per_host[host].add(ts)
+    gaps: list[float] = []
+    for timestamps in per_host.values():
+        ordered = sorted(timestamps)
+        gaps.extend(b - a for a, b in zip(ordered, ordered[1:]) if b > a)
+    if not gaps:
+        return 0.0
+    gaps.sort()
+    return gaps[len(gaps) // 2]
+
+
 def _metric_timeseries(
     rows: list[dict[str, object]], resource_type: str, metric_name: str
 ) -> list[tuple[float, float]]:
-    """Cluster-averaged ``(timestamp, value)`` series for a metric."""
-    by_ts: dict[float, list[float]] = defaultdict(list)
+    """Cluster-averaged ``(timestamp, value)`` series for a metric.
+
+    Samples are bucketed to the collector period first so that one point averages
+    every node that sampled in that window -- see :func:`_sample_period`.
+    """
+    picked: list[tuple[float, str, float]] = []
     for row in rows:
         if row["resource_type"] != resource_type or row["metric_name"] != metric_name:
             continue
         value = row.get("metric_value")
         if isinstance(value, (int, float)) and not math.isnan(value):
-            by_ts[float(row["timestamp"])].append(float(value))
+            picked.append(
+                (float(row["timestamp"]), str(row.get("hostname", "")), float(value))
+            )
+    period = _sample_period([(ts, host) for ts, host, _v in picked])
+    by_ts: dict[float, list[float]] = defaultdict(list)
+    for ts, _host, value in picked:
+        by_ts[round(ts / period) * period if period else ts].append(value)
     return [(ts, sum(v) / len(v)) for ts, v in sorted(by_ts.items())]
 
 
@@ -538,6 +659,80 @@ def _series_for_metric(
 ) -> list[float]:
     """Cluster-averaged values (one per timestamp) for a metric."""
     return [v for _ts, v in _metric_timeseries(rows, resource_type, metric_name)]
+
+
+# Line colors for per-resource series (one per GPU). Cycled; chosen to stay
+# distinguishable in both the SVG and a greyscale print.
+_SERIES_COLORS = (
+    "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
+    "#8c564b", "#17becf", "#e377c2", "#7f7f7f", "#bcbd22",
+)
+
+
+def gpu_label(gpus: object) -> str:
+    """Render a report's GPU subset for humans.
+
+    `None` means "no subset requested -> all"; an EMPTY list means "this task
+    reserved no GPUs", which :func:`filter_rows` honours by dropping every GPU
+    row. Truthiness collapses the two and advertises `all` for a report that
+    contains no GPU data at all.
+    """
+    if gpus is None:
+        return "all"
+    return ",".join(str(g) for g in gpus) or "none"  # type: ignore[union-attr]
+
+
+def _metric_series_by_resource(
+    rows: list[dict[str, object]], resource_type: str, metric_name: str
+) -> list[tuple[str, list[tuple[float, float]]]]:
+    """One ``(label, [(ts, value)])`` series per physical resource, time-ordered.
+
+    Used for GPU panels so a report shows every device it tracks instead of one
+    averaged line -- an average hides both how many GPUs are in scope and a
+    single hot or idle device among them. Timestamps are bucketed exactly as in
+    :func:`_metric_timeseries` so series from different nodes line up.
+    """
+    picked: list[tuple[float, str, str, float]] = []
+    for row in rows:
+        if row["resource_type"] != resource_type or row["metric_name"] != metric_name:
+            continue
+        value = row.get("metric_value")
+        if isinstance(value, (int, float)) and not math.isnan(value):
+            picked.append(
+                (
+                    float(row["timestamp"]),
+                    str(row.get("hostname", "")),
+                    str(row.get("resource_id", "")),
+                    float(value),
+                )
+            )
+    if not picked:
+        return []
+    period = _sample_period([(ts, host) for ts, host, _rid, _v in picked])
+    by_key: dict[tuple[str, str], dict[float, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for ts, host, rid, value in picked:
+        bucket = round(ts / period) * period if period else ts
+        by_key[(host, rid)][bucket].append(value)
+
+    out: list[tuple[str, list[tuple[float, float]]]] = []
+    for (_host, rid), buckets in sorted(
+        by_key.items(), key=lambda kv: _resource_sort_key(kv[0])
+    ):
+        # Callers always pass single-host rows (`_write_consumer_report` splits a
+        # multi-node report into one image per host), so the id alone is unambiguous.
+        label = f"{resource_type.upper()} {rid}"
+        out.append(
+            (label, [(ts, sum(v) / len(v)) for ts, v in sorted(buckets.items())])
+        )
+    return out
+
+
+def _resource_sort_key(key: tuple[str, str]) -> tuple:
+    """Sort series by host, then resource id numerically (GPU 2 before GPU 10)."""
+    host, rid = key
+    return (host, int(rid)) if rid.isdigit() else (host, float("inf"), rid)
 
 
 def _plottable_families(
@@ -555,9 +750,22 @@ def _plottable_families(
 
 
 def _fmt(value: float) -> str:
-    if abs(value) >= 1000 or (value and abs(value) < 0.01):
-        return f"{value:.3g}"
-    return f"{value:.2f}"
+    """Plain decimal, never scientific: ``2245``, not ``2.24e+03``.
+
+    `%g` switches to an exponent above 1e3 and below 1e-2, which is unreadable on
+    a chart axis and in the summary table -- GPU power and clocks live in exactly
+    that range. Precision follows magnitude instead, mirroring :func:`_fmt_size`.
+    """
+    magnitude = abs(value)
+    if magnitude >= 1000:
+        return f"{value:.0f}"
+    if magnitude >= 1 or value == 0:
+        return f"{value:.2f}"
+    if magnitude >= 0.01:
+        return f"{value:.3f}"
+    # Sub-0.01 still gets real digits rather than an exponent; an underflow to all
+    # zeros collapses to "0" instead of a bare "0." .
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
 
 
 # Absolute byte-size units (NOT rates like "bytes/s"), smallest -> largest.
@@ -711,7 +919,7 @@ def render_overview(
             window = "(full run)"
             if isinstance(start_ts, (int, float)) and isinstance(end_ts, (int, float)):
                 window = f"{end_ts - start_ts:.1f}s"
-            gpu_str = "all" if not gpus else ",".join(str(g) for g in gpus)
+            gpu_str = gpu_label(gpus)
             report = " [report]" if consumer.get("report") else ""
             lines.append(
                 f"- {name} ({owner}){report}: nodes={', '.join(nodes) or 'all'} "
@@ -727,20 +935,29 @@ def render_overview(
             label = str(report.get("label") or report.get("name") or "?")
             nodes = report.get("nodes") or []
             gpus = report.get("gpus")
-            gpu_str = "all" if not gpus else ",".join(str(g) for g in gpus)
+            gpu_str = gpu_label(gpus)
             scopes = report.get("scopes") or []
             tag = " [cross]" if report.get("cross") else ""
+            window_status = report.get("window_status")
+            window_note = f" window={window_status}" if window_status else ""
             node_str = ", ".join(str(n) for n in nodes) or "all"
             scope_str = ",".join(str(s) for s in scopes) or "all"
+            # Prefix with the group so the line doubles as the path to open.
+            group = (
+                WINDOWED_DIRNAME
+                if report.get("log_window") is not None
+                else LIFECYCLE_DIRNAME
+            )
             lines.append(
-                f"- {label}{tag}: nodes={node_str} gpus={gpu_str} scopes={scope_str}"
+                f"- {group}/{label}{tag}: nodes={node_str} gpus={gpu_str} "
+                f"scopes={scope_str}{window_note}"
             )
 
     # Task lifecycle events (the markers overlaid on the SVG/PNG timelines).
     marker_events: list[tuple[float, str, str]] = []
     for e in events or []:
         event = str(e.get("event"))
-        if event not in _EVENT_STYLE:
+        if event not in _KNOWN_EVENTS:
             continue
         try:
             marker_events.append((float(e["ts"]), event, str(e.get("task", ""))))  # type: ignore[arg-type]
@@ -815,27 +1032,43 @@ def _render_svg(
     marker_events = _select_marker_events(
         events, origin=origin, max_elapsed=max_elapsed
     )
-    task_styles = _assign_task_styles(marker_events)
-    present_events = _events_present(marker_events)
-
     width = 900
     left, right, gap, ph = 96, 118, 26, 84
-    top = 50
     n = len(families)
     plot_w = width - left - right
+    marker_groups = _merge_marker_events(
+        marker_events, origin=origin, max_elapsed=max_elapsed
+    )
+    # Headroom above the panels for the transition labels (two staggered rows).
+    has_top = any(g.get("label_top") for g in marker_groups)
+    has_bottom = any(g.get("label_bottom") for g in marker_groups)
+    marker_band_top = _MARKER_BAND_H if has_top else 0.0
+    marker_band_bottom = _MARKER_BAND_H if has_bottom else 0.0
+    top = 50 + marker_band_top
     panels_bottom = top + (n - 1) * (ph + gap) + ph
-    caption_y = panels_bottom + 22
+    caption_y = panels_bottom + 22 + marker_band_bottom
 
-    # A bottom legend band (event colors + task line styles) is laid out first so
-    # the canvas can be sized to fit it.
-    legend_parts: list[str] = []
-    legend_h = 0.0
-    if marker_events:
-        legend_parts, legend_h = _build_legend_svg(
-            present_events, task_styles, x0=8, max_x=width - 8
-        )
-    legend_y0 = caption_y + 6
-    height = int(legend_y0 + legend_h + 8) if marker_events else int(caption_y + 8)
+    # Device colours are shared by every panel, so their legend is built once.
+    # Union across ALL gpu families, not just the first: a device that reports
+    # N/A for one field (MIG mode, a per-field collector error) drops out of that
+    # family only, and keying the colour on each panel's own index would then
+    # shift every line after it against this legend.
+    device_labels: list[str] = []
+    for _lbl, _rtype, _mname in families:
+        if _rtype == "gpu":
+            for lab, _ser in _metric_series_by_resource(rows, _rtype, _mname):
+                if lab not in device_labels:
+                    device_labels.append(lab)
+    device_parts, device_h = (
+        _build_device_legend_svg(device_labels, x0=8, max_x=width - 8)
+        if device_labels
+        else ([], 0.0)
+    )
+
+    # Only ONE legend remains -- the device colours. Transitions are named in
+    # place above their rules, so they need no legend at all.
+    device_y0 = caption_y + 6
+    height = int(device_y0 + device_h + 8)
 
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
@@ -848,14 +1081,42 @@ def _render_svg(
 
     for i, (label, resource_type, metric_name) in enumerate(families):
         panel_top = top + i * (ph + gap)
-        timeseries = _metric_timeseries(rows, resource_type, metric_name)
-        # Auto-scale to display units (e.g. GPU mem MiB -> GiB), matching the
-        # summary table / sparklines, and adapt the panel label + min/max readouts.
-        scaled_vals, disp_label, stat = _scaled_metric_series(
-            metric_name, label, [v for _ts, v in timeseries]
+        # GPU panels draw ONE LINE PER DEVICE: an average hides both how many
+        # GPUs the report covers and a single hot (or idle) device among them.
+        # Node-level scopes have one value per node, so they stay averaged.
+        per_resource = (
+            _metric_series_by_resource(rows, resource_type, metric_name)
+            if resource_type == "gpu"
+            else []
         )
-        series = [(ts - origin, sv) for (ts, _v), sv in zip(timeseries, scaled_vals)]
-        ys = [v for _t, v in series]
+        if per_resource:
+            # One scale across every device so the lines are comparable.
+            flat = [v for _lbl, ser in per_resource for _ts, v in ser]
+            scaled_flat, disp_label, stat = _scaled_metric_series(
+                metric_name, label, flat
+            )
+            multi: list[tuple[str, list[tuple[float, float]]]] = []
+            cursor = 0
+            for lbl, ser in per_resource:
+                chunk = scaled_flat[cursor : cursor + len(ser)]
+                multi.append(
+                    (lbl, [(ts - origin, sv) for (ts, _v), sv in zip(ser, chunk)])
+                )
+                cursor += len(ser)
+            ys = scaled_flat
+        else:
+            timeseries = _metric_timeseries(rows, resource_type, metric_name)
+            # Auto-scale to display units (e.g. GPU mem MiB -> GiB), matching the
+            # summary table / sparklines, and adapt the panel label + readouts.
+            scaled_vals, disp_label, stat = _scaled_metric_series(
+                metric_name, label, [v for _ts, v in timeseries]
+            )
+            multi = [
+                ("", [(ts - origin, sv) for (ts, _v), sv in zip(timeseries, scaled_vals)])
+            ]
+            ys = scaled_vals
+        if not ys:
+            continue
         ymin, ymax = min(ys), max(ys)
         if ymax <= ymin:
             ymax = ymin + 1.0
@@ -876,15 +1137,27 @@ def _render_svg(
                 f'<line x1="{left}" y1="{gy:.1f}" x2="{left + plot_w}" '
                 f'y2="{gy:.1f}" stroke="#eeeeee"/>'
             )
-        points = " ".join(f"{_x(t):.1f},{_y(v):.1f}" for t, v in series)
-        parts.append(
-            f'<polyline points="{points}" fill="none" stroke="#1f77b4" '
-            f'stroke-width="1.5"/>'
-        )
+        for series_label, series in multi:
+            # Look the colour up BY LABEL so it always matches the shared legend.
+            colour = (
+                _SERIES_COLORS[device_labels.index(series_label) % len(_SERIES_COLORS)]
+                if series_label in device_labels
+                else "#1f77b4"
+            )
+            points = " ".join(f"{_x(t):.1f},{_y(v):.1f}" for t, v in series)
+            parts.append(
+                f'<polyline points="{points}" fill="none" stroke="{colour}" '
+                f'stroke-width="1.5"/>'
+            )
         parts.append(
             f'<text x="{left - 8}" y="{panel_top + ph / 2:.0f}" text-anchor="end" '
             f'dominant-baseline="middle">{_xml_escape(disp_label)}</text>'
         )
+        # ONE shared vertical scale per panel, spanning every device drawn on it
+        # (i.e. this node's GPUs). Per-line min/max readouts would suggest each
+        # line has its own axis, which is exactly the confusing part. Device
+        # colours are identical across panels, so that legend is drawn once at the
+        # bottom instead of repeated in every gutter.
         parts.append(
             f'<text x="{left + plot_w + 6}" y="{panel_top + 12}" font-size="10" '
             f'fill="#666666">max {stat(ymax)}</text>'
@@ -894,30 +1167,52 @@ def _render_svg(
             f'fill="#666666">min {stat(ymin)}</text>'
         )
 
-    # Task lifecycle markers: one vertical line per event spanning all panels.
-    # Color encodes the event type; the dash pattern encodes the task (legend
-    # below maps both), so a task's markers are recognizable at a glance.
-    if marker_events:
-        panels_top = top
-        for ev in marker_events:
-            color = _EVENT_STYLE[str(ev["event"])]
-            dash, _ls = task_styles[str(ev["task"])]
-            ex = left + ((float(ev["ts"]) - origin) / max_elapsed) * plot_w
-            da = f' stroke-dasharray="{dash}"' if dash else ""
-            parts.append(
-                f'<line x1="{ex:.1f}" y1="{panels_top}" x2="{ex:.1f}" '
-                f'y2="{panels_bottom}" stroke="{color}" stroke-width="1.2" '
-                f'opacity="0.9"{da}/>'
-            )
+    # Task lifecycle transitions: one rule per MERGED group, spanning all panels.
+    # Routine changes recede to neutral ink so they never compete with the data
+    # lines; only fail/cancel keep a reserved status colour, and they draw solid
+    # and slightly heavier so the one marker worth reacting to stands out.
+    for group in marker_groups:
+        ex = left + (float(group["rel"]) / max_elapsed) * plot_w
+        failed = bool(group.get("failed"))
+        # Started-here vs ended-here, separated on THREE channels at once --
+        # pattern, weight and opacity. Pattern alone (a 1px dotted line beside a
+        # 1px solid one at the same opacity) is too subtle to read at a glance,
+        # which is the whole point of the distinction. A merged group holding both
+        # counts as an end, the stronger event: `label_bottom` is non-empty
+        # exactly when an end event is present, so it doubles as the test.
+        if group.get("label_bottom"):
+            style = f'stroke-width="{1.6 if failed else 1.4}"'
+            opacity = 0.95
+        else:
+            style = 'stroke-width="1" stroke-dasharray="2 4"'
+            opacity = 0.6
+        parts.append(
+            f'<line x1="{ex:.1f}" y1="{top}" x2="{ex:.1f}" y2="{panels_bottom}" '
+            f'stroke="{_MARKER_FAIL_INK if failed else _MARKER_INK}" '
+            f'{style} opacity="{opacity}"/>'
+        )
+    parts.extend(
+        _build_marker_labels_svg(
+            marker_groups, key="label_top", above=True, left=left, plot_w=plot_w,
+            max_elapsed=max_elapsed, anchor_y=top, width=width,
+        )
+    )
+    parts.extend(
+        _build_marker_labels_svg(
+            marker_groups, key="label_bottom", above=False, left=left,
+            plot_w=plot_w, max_elapsed=max_elapsed, anchor_y=panels_bottom,
+            width=width,
+        )
+    )
 
     parts.append(
         f'<text x="{left + plot_w / 2:.0f}" y="{caption_y:.0f}" text-anchor="middle" '
         f'font-size="10" fill="#666666">Elapsed time (s): 0 .. '
         f'{max_elapsed:.0f}</text>'
     )
-    if legend_parts:
-        parts.append(f'<g transform="translate(0,{legend_y0:.0f})">')
-        parts.extend(legend_parts)
+    if device_parts:
+        parts.append(f'<g transform="translate(0,{device_y0:.0f})">')
+        parts.extend(device_parts)
         parts.append("</g>")
     parts.append("</svg>")
     svg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -958,7 +1253,6 @@ def _render_png(
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from matplotlib.lines import Line2D
     except ImportError as exc:  # matplotlib is an optional extra; treat as soft-skip
         raise _MatplotlibUnavailable(str(exc)) from exc
 
@@ -977,58 +1271,100 @@ def _render_png(
     )
     if len(families) == 1:
         axes = [axes]
+    device_legend_drawn = False
     for (label, resource_type, metric_name), axis in zip(families, axes):
         # Match the overview/SVG scaling + auto units so the axis label (e.g.
         # "MiB/s", or GPU mem in "GiB") reflects the plotted values.
-        timeseries = _metric_timeseries(rows, resource_type, metric_name)
-        scaled_vals, disp_label, _stat = _scaled_metric_series(
-            metric_name, label, [v for _ts, v in timeseries]
+        # One line per GPU (see _render_svg); node-level scopes stay averaged.
+        per_resource = (
+            _metric_series_by_resource(rows, resource_type, metric_name)
+            if resource_type == "gpu"
+            else []
         )
-        xs = [ts - origin for ts, _ in timeseries]
-        axis.plot(xs, scaled_vals, linewidth=1.4)
+        if per_resource:
+            flat = [v for _lbl, ser in per_resource for _ts, v in ser]
+            scaled_flat, disp_label, _stat = _scaled_metric_series(
+                metric_name, label, flat
+            )
+            cursor = 0
+            for series_label, ser in per_resource:
+                chunk = scaled_flat[cursor : cursor + len(ser)]
+                axis.plot(
+                    [ts - origin for ts, _v in ser],
+                    chunk,
+                    linewidth=1.4,
+                    label=series_label,
+                )
+                cursor += len(ser)
+            # Once per image, not once per panel: the colour for a device is the
+            # same on every panel, so repeating it three more times is noise.
+            if not device_legend_drawn:
+                axis.legend(
+                    fontsize=6, ncol=max(1, len(per_resource) // 4), loc="upper right"
+                )
+                device_legend_drawn = True
+        else:
+            timeseries = _metric_timeseries(rows, resource_type, metric_name)
+            scaled_vals, disp_label, _stat = _scaled_metric_series(
+                metric_name, label, [v for _ts, v in timeseries]
+            )
+            axis.plot([ts - origin for ts, _ in timeseries], scaled_vals, linewidth=1.4)
         axis.set_ylabel(disp_label)
         axis.grid(alpha=0.25)
 
-    # Task lifecycle markers: a vertical line on every panel, colored by event
-    # type and dashed by task. Two legends explain both encodings.
+    # Task lifecycle transitions: mirrors the SVG exactly -- near-simultaneous
+    # events merged into one dashed neutral rule, `submit` named above the first
+    # panel and `ready`/`done` below the last, instead of decoded through a pair
+    # of legends.
     if marker_events:
-        task_styles = _assign_task_styles(marker_events)
+        marker_groups = _merge_marker_events(
+            marker_events, origin=origin, max_elapsed=max_elapsed
+        )
         for axis in axes:
-            for ev in marker_events:
+            for group in marker_groups:
+                failed = bool(group.get("failed"))
+                # Mirrors the SVG: faint sparse dots for a start, a solid
+                # heavier line for an end.
+                ended = bool(group.get("label_bottom"))
                 axis.axvline(
-                    float(ev["ts"]) - origin,
-                    color=_EVENT_STYLE[str(ev["event"])],
-                    linestyle=task_styles[str(ev["task"])][1],
-                    linewidth=1.2,
-                    alpha=0.8,
+                    float(group["rel"]),
+                    color=_MARKER_FAIL_INK if failed else _MARKER_INK,
+                    linestyle="-" if ended else (0, (2, 4)),
+                    linewidth=(1.6 if failed else 1.4) if ended else 1.0,
+                    alpha=0.95 if ended else 0.6,
                 )
-        top_axis = axes[0]
-        event_handles = [
-            Line2D([0], [0], color=_EVENT_STYLE[e], linewidth=2, label=e)
-            for e in _events_present(marker_events)
-        ]
-        task_handles = [
-            Line2D([0], [0], color="#555555", linestyle=ls, linewidth=1.5, label=task)
-            for task, (_dash, ls) in task_styles.items()
-        ]
-        event_legend = top_axis.legend(
-            handles=event_handles,
-            title="events (color)",
-            loc="upper right",
-            fontsize=8,
-            title_fontsize=8,
-            ncol=len(event_handles),
-        )
-        top_axis.add_artist(event_legend)
-        top_axis.legend(
-            handles=task_handles,
-            title="tasks (line style)",
-            loc="upper left",
-            fontsize=8,
-            title_fontsize=8,
-        )
 
-    axes[-1].set_xlabel("Elapsed time (s)")
+        def _annotate(axis, key: str, *, above: bool) -> None:
+            drawn = 0
+            for group in marker_groups:
+                text = str(group.get(key) or "")
+                if not text:
+                    continue
+                # Stagger by DRAWN count so a skipped group never collapses two
+                # neighbours onto the same row.
+                step = 4 + (drawn % 2) * 9
+                drawn += 1
+                axis.annotate(
+                    text,
+                    xy=(float(group["rel"]), 1.0 if above else 0.0),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(0, step if above else -(step + 22)),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom" if above else "top",
+                    fontsize=6,
+                    color=(
+                        _MARKER_FAIL_INK
+                        if group.get("failed") and not above
+                        else _MARKER_LABEL_INK
+                    ),
+                )
+
+        _annotate(axes[0], "label_top", above=True)
+        _annotate(axes[-1], "label_bottom", above=False)
+
+    # Extra pad so the axis title clears the `ready`/`done` band drawn beneath it.
+    axes[-1].set_xlabel("Elapsed time (s)", labelpad=28)
     figure.suptitle(title, fontsize=14)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(png_path, dpi=140, bbox_inches="tight")
@@ -1040,6 +1376,277 @@ def _render_png(
 # `_resolve_view_window`). A start with no terminal event leaves the window open.
 _WINDOW_START_EVENTS = {"submit", "ready"}
 _WINDOW_END_EVENTS = {"done", "fail", "cancel"}
+
+# Same prefix as utils.parser._SFLOW_LOG_PREFIX_RE, restated here because this
+# module is standard-library-only (it also runs as a materialized standalone
+# script). Milliseconds are required, not optional: every writer emits them
+# (logging.Formatter and all three core.log_offload prefixers).
+_TIMESTAMPED_LOG_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})"
+    r" - \S+ - [A-Z]+ - (?P<message>.*)$"
+)
+_TRANSPORT_PREFIX_RE = re.compile(r"^(?:\d+:\s+|\[pod/[^\]]+\]\s+)")
+_WINDOW_LINE_MAX_CHARS = 4096
+
+# Report folders are grouped by what decides their time range, so a directory
+# listing answers "is this the whole run or the measured phase?" without opening
+# window.json. `lifecycle/` covers the whole-pool aggregate and every task view
+# bounded by submit/ready/done events; `windowed/` holds the marker-clipped ones.
+MONITOR_RAW_HINT = "sflow_monitor/raw/"
+
+LIFECYCLE_DIRNAME = "lifecycle"
+WINDOWED_DIRNAME = "windowed"
+
+
+def _report_dir(out_dir: Path, name: str, *, windowed: bool) -> Path:
+    return out_dir / (WINDOWED_DIRNAME if windowed else LIFECYCLE_DIRNAME) / name
+
+
+def _final_attempt_window(
+    task: str, task_events: "Iterable[dict[str, object]]"
+) -> tuple[float | None, float]:
+    submits: list[float] = []
+    terminals: list[float] = []
+    for event in task_events or []:
+        if str(event.get("task")) != task:
+            continue
+        try:
+            ts = float(event.get("ts"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        kind = str(event.get("event"))
+        if kind == "submit":
+            submits.append(ts)
+        elif kind in _WINDOW_END_EVENTS:
+            terminals.append(ts)
+    if not submits:
+        return None, float("inf")
+    start = max(submits)
+    ends = [ts for ts in terminals if ts >= start]
+    # A long-running service torn down at the end may never emit a terminal
+    # event (same caveat as _resolve_view_window). The marker window's end comes
+    # from the log, so an absent terminal just leaves the search bound open.
+    return start, (max(ends) if ends else float("inf"))
+
+
+def _parse_timestamped_log_line(line: str) -> tuple[float, str, str] | None:
+    match = _TIMESTAMPED_LOG_RE.match(line)
+    if match is None:
+        return None
+    timestamp_text = match.group("timestamp")
+    try:
+        timestamp = datetime.strptime(
+            timestamp_text, "%Y-%m-%d %H:%M:%S,%f"
+        ).timestamp()
+    except ValueError:
+        return None
+    message = match.group("message")
+    transport = _TRANSPORT_PREFIX_RE.match(message)
+    if transport is not None:
+        message = message[transport.end() :]
+    return timestamp, timestamp_text, message
+
+
+def _compile_marker_patterns(patterns: object) -> list[tuple[str, re.Pattern[str]]]:
+    values = [patterns] if isinstance(patterns, str) else list(patterns)  # type: ignore[arg-type]
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    for value in [str(v) for v in values]:
+        source = None
+        for prefix in ("regex:", "re:"):
+            if value.startswith(prefix):
+                source = value[len(prefix) :]
+                break
+        compiled.append(
+            (value, re.compile(source if source is not None else re.escape(value)))
+        )
+    return compiled
+
+
+def _select_log_boundary(
+    candidates: list[dict[str, object]],
+    boundary_spec: dict[str, object],
+) -> dict[str, object] | None:
+    if not candidates:
+        return None
+    ordered = sorted(
+        candidates,
+        key=lambda candidate: (
+            float(candidate["timestamp"]),
+            int(candidate["byte_offset"]),
+        ),
+    )
+    select = str(boundary_spec["select"])
+    selected = dict(ordered[0] if select == "first" else ordered[-1])
+    # `matched_patterns` already records which configured patterns hit this line;
+    # echoing the whole configured list back adds nothing the YAML doesn't have.
+    selected.update({"select": select, "match_count": len(candidates)})
+    return selected
+
+
+def _resolve_log_source(
+    task: str,
+    log_path: Path,
+    log_window: dict[str, object],
+    task_events: "Iterable[dict[str, object]]",
+) -> dict[str, object]:
+    source: dict[str, object] = {
+        "runtime_task": task,
+        "source_log": str(log_path),
+        "status": "unresolved",
+    }
+    attempt_start, attempt_end = _final_attempt_window(task, task_events)
+    if attempt_start is None:
+        source["error"] = "final attempt has no submit event"
+        return source
+    if not log_path.is_file():
+        source["error"] = "source log is missing or unreadable"
+        return source
+
+    # Shape is guaranteed upstream: schema.py validates the patterns (non-empty,
+    # regexes compile) and `select` is a Literal, and monitor_planner always emits
+    # both boundaries with `select` filled in.
+    boundary_specs = {
+        name: dict(log_window[name])  # type: ignore[arg-type]
+        for name in ("start", "end")
+    }
+    matchers = {
+        name: _compile_marker_patterns(spec["pattern"])
+        for name, spec in boundary_specs.items()
+    }
+
+    candidates: dict[str, list[dict[str, object]]] = {"start": [], "end": []}
+    try:
+        with log_path.open("rb") as handle:
+            while True:
+                byte_offset = handle.tell()
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                parsed = _parse_timestamped_log_line(
+                    raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                )
+                if parsed is None:
+                    continue
+                timestamp, timestamp_text, message = parsed
+                # The prefix truncates to milliseconds. Accept the line when that
+                # displayed-time bucket can overlap the final attempt.
+                if timestamp + 0.001 <= attempt_start or timestamp > attempt_end:
+                    continue
+                for name in ("start", "end"):
+                    matched = [
+                        pattern
+                        for pattern, matcher in matchers[name]
+                        if matcher.search(message)
+                    ]
+                    if matched:
+                        candidates[name].append(
+                            {
+                                "timestamp": timestamp,
+                                "timestamp_iso": timestamp_text,
+                                "byte_offset": byte_offset,
+                                "line": message[:_WINDOW_LINE_MAX_CHARS],
+                                "line_truncated": len(message) > _WINDOW_LINE_MAX_CHARS,
+                                "matched_patterns": matched,
+                            }
+                        )
+    except OSError as exc:
+        source["error"] = f"source log is unreadable: {exc}"
+        return source
+
+    start = _select_log_boundary(candidates["start"], boundary_specs["start"])
+    if start is None:
+        source["error"] = "start marker not found in final attempt"
+        return source
+    source["start"] = start
+    # `end` closes *this* window, so only ends strictly after the selected start
+    # qualify -- otherwise `start:last` + `end:first` (the natural "last warmup,
+    # then the run that follows" spelling) picks an earlier cycle's end and the
+    # range comes out reversed.
+    end = _select_log_boundary(
+        [
+            candidate
+            for candidate in candidates["end"]
+            if float(candidate["timestamp"]) > float(start["timestamp"])
+        ],
+        boundary_specs["end"],
+    )
+    if end is None:
+        source["error"] = "end marker not found after the selected start"
+        return source
+    source["end"] = end
+    source["status"] = "matched"
+    return source
+
+
+def _resolve_report_log_window(
+    report: dict[str, object],
+    out_dir: Path,
+    task_events: "Iterable[dict[str, object]]",
+    cache: dict[tuple[str, str], dict[str, object]],
+) -> tuple[float | None, float | None, dict[str, object]]:
+    log_window = dict(report["log_window"])  # type: ignore[arg-type]
+    spec_key = json.dumps(log_window, sort_keys=True)
+    sources: list[dict[str, object]] = []
+    for task in [str(name) for name in (report.get("window_tasks") or [])]:
+        key = (task, spec_key)
+        if key not in cache:
+            # ponytail: mirrors core.outputs.task_log_path's default layout. A
+            # task that overrides SFLOW_TASK_OUTPUT_DIR lands elsewhere and
+            # resolves unresolved -- window.json names the path that was probed.
+            # Carry the real path in the report spec if that override shows up.
+            log_path = out_dir.parent / task / f"{task}.log"
+            cache[key] = _resolve_log_source(task, log_path, log_window, task_events)
+        sources.append(cache[key])
+
+    artifact: dict[str, object] = {
+        "schema_version": "sflow.monitor-window.v1",
+        "status": "unresolved",
+        "sources": sources,
+    }
+    failed = [source for source in sources if source.get("status") != "matched"]
+    if not sources:
+        artifact["error"] = "marker report has no owner runtime task"
+        return None, None, artifact
+    if failed:
+        names = ", ".join(str(source["runtime_task"]) for source in failed)
+        artifact["error"] = f"unresolved owner runtime task(s): {names}"
+        return None, None, artifact
+
+    start = min(
+        (dict(source["start"]) for source in sources),  # type: ignore[arg-type]
+        key=lambda boundary: float(boundary["timestamp"]),
+    )
+    end = max(
+        (dict(source["end"]) for source in sources),  # type: ignore[arg-type]
+        key=lambda boundary: float(boundary["timestamp"]),
+    )
+    # Every source has end > start, so min(start) < max(end) holds by construction.
+    start_ts = float(start["timestamp"])
+    end_ts = float(end["timestamp"])
+    artifact.update(
+        {
+            "status": "matched",
+            "start": start,
+            "end": end,
+            "duration_seconds": end_ts - start_ts,
+        }
+    )
+    return start_ts, end_ts, artifact
+
+
+def _write_window_artifact(
+    out_dir: Path, name: str, artifact: dict[str, object]
+) -> None:
+    report_dir = _report_dir(out_dir, name, windowed=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    # An unresolved window leaves no timeline.csv, so the filename is the fastest
+    # signal for "this folder is empty because the markers did not match".
+    matched = artifact.get("status") == "matched"
+    filename = "window.json" if matched else "window_not_found.json"
+    (report_dir / filename).write_text(
+        json.dumps(artifact, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _resolve_view_window(
@@ -1080,6 +1687,7 @@ def _write_consumer_report(
     matplotlib_ok: bool,
     events: "Iterable[dict[str, object]] | None" = None,
     title: str | None = None,
+    windowed: bool = False,
 ) -> None:
     name = str(consumer.get("name", "consumer"))
     chart_title = str(title or f"{name} hardware timeline")
@@ -1093,43 +1701,194 @@ def _write_consumer_report(
         end_ts=consumer.get("end_ts"),  # type: ignore[arg-type]
     )
     events = list(events or [])
-    consumer_dir = out_dir / name
+    if windowed and not filtered:
+        # The markers matched, so nothing upstream warns -- but the resolved range
+        # holds no samples, so this folder gets empty CSVs and no chart. Most often
+        # a clock/timezone offset between the task's host and this one: marker times
+        # are parsed from the task log as LOCAL time, samples are epoch.
+        print(
+            f"WARN: marker window for '{name}' matched but covers no samples; "
+            "check for a clock/timezone offset between the task host and this host",
+            file=sys.stderr,
+        )
+    consumer_dir = _report_dir(out_dir, name, windowed=windowed)
     # CSV is always written (it is the machine-readable source of truth).
     _write_csv(consumer_dir / "timeline.csv", filtered, _CSV_FIELDS)
     _write_csv(consumer_dir / "summary.csv", summary_rows(filtered), _SUMMARY_FIELDS)
 
-    # SVG: lightweight, pure-stdlib vector timeline (the default visual format).
-    if "svg" in formats and filtered:
-        try:
-            if not _render_svg(
-                filtered,
-                consumer_dir / "timeline.svg",
-                title=chart_title,
-                events=events,
-            ):
-                print(
-                    f"WARN: no plottable metrics for '{name}'; SVG skipped",
-                    file=sys.stderr,
-                )
-        except Exception as exc:  # pragma: no cover - defensive
-            print(f"WARN: SVG rendering failed for '{name}': {exc}", file=sys.stderr)
+    # One image per node once a report spans more than one: a single chart with
+    # every node's devices on it is unreadable, and the per-device legend has
+    # nowhere to put them. Named by the real hostname so a panel maps to a
+    # machine you can go and look at. The CSVs above stay combined.
+    hosts = sorted({str(row["hostname"]) for row in filtered})
+    if len(hosts) > 1:
+        renders = [
+            (
+                f"timeline.{host}",
+                [r for r in filtered if str(r["hostname"]) == host],
+                f"{chart_title} - {host}",
+            )
+            for host in hosts
+        ]
+    else:
+        renders = [("timeline", filtered, chart_title)]
 
-    # PNG: optional raster output via matplotlib. `process` only enables this when
-    # matplotlib is importable, so a failure here is a genuine plotting error.
-    if "png" in formats and matplotlib_ok and filtered:
-        try:
-            if not _render_png(
-                filtered,
-                consumer_dir / "timeline.png",
-                title=chart_title,
-                events=events,
-            ):
-                print(
-                    f"WARN: no plottable metrics for '{name}'; PNG skipped",
-                    file=sys.stderr,
-                )
-        except Exception as exc:  # pragma: no cover - defensive
-            print(f"WARN: PNG rendering failed for '{name}': {exc}", file=sys.stderr)
+    for stem, subset, subtitle in renders:
+        if not subset:
+            continue
+        # SVG: lightweight, pure-stdlib vector timeline (the default format).
+        if "svg" in formats:
+            try:
+                if not _render_svg(
+                    subset, consumer_dir / f"{stem}.svg", title=subtitle, events=events
+                ):
+                    print(
+                        f"WARN: no plottable metrics for '{name}'; SVG skipped",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"WARN: SVG rendering failed for '{name}': {exc}", file=sys.stderr)
+
+        # PNG: optional raster output via matplotlib. `process` only enables this
+        # when matplotlib is importable, so a failure here is a real plot error.
+        if "png" in formats and matplotlib_ok:
+            try:
+                if not _render_png(
+                    subset, consumer_dir / f"{stem}.png", title=subtitle, events=events
+                ):
+                    print(
+                        f"WARN: no plottable metrics for '{name}'; PNG skipped",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"WARN: PNG rendering failed for '{name}': {exc}", file=sys.stderr)
+
+
+# Samples are stamped by the COMPUTE NODE; task events and consumer windows are
+# stamped by the DRIVER. Every report intersects the two, so a node whose clock is
+# off by more than a run's length produces reports whose windows miss their own
+# samples -- empty CSVs and no charts, while the raw logs look perfectly healthy.
+# The offset is measurable from files we already have, with no extra handshake:
+# the driver knows when it started and stopped collecting, and the samples carry
+# the node's own view of that same period.
+#
+# Correcting a gap smaller than this is not worth it -- the estimate below is only
+# accurate to about one sampling interval, so a small "skew" is measurement noise.
+_CLOCK_ALIGN_MIN_SECONDS = 1.0
+
+
+def _clock_bracket(
+    n_first: float, n_last: float, t_start: float, t_stop: float, interval: float
+) -> tuple[float, float] | None:
+    """Bound ``delta = node_clock - driver_clock`` from the collection bracket.
+
+    Let the collector run over driver-clock ``[t_start, t_stop]`` and report
+    samples over node-clock ``[n_first, n_last]``. Three facts bound ``delta``:
+
+    * the last sample cannot be written after the collector is killed
+      -> ``delta >= n_last - t_stop``;
+    * it samples every ``interval``, so the last one is at most one interval
+      before the kill -> ``delta <= n_last - t_stop + interval``;
+    * the first sample cannot precede the launch (startup latency only makes it
+      later) -> ``delta <= n_first - t_start``.
+
+    Every bound is conservative, so the true offset really does lie in the
+    returned range -- it is a bound, not a guess. Returns None when the bounds
+    CONTRADICT each other (``hi < lo``): that proves one of the assumptions above
+    is violated -- most often `release()` stamps `end_ts` before it awaits the
+    collector's teardown, so a healthy node can emit one more sample after
+    `t_stop`. Declining is the only safe answer; clamping the range would turn
+    "my model is wrong" into a zero-width bracket, i.e. maximum confidence.
+    """
+    lo = n_last - t_stop
+    hi = lo + interval if interval > 0 else n_first - t_start
+    if interval > 0:
+        hi = min(hi, n_first - t_start)
+    return (lo, hi) if hi >= lo else None
+
+
+def _estimate_clock_offsets(
+    rows: list[dict[str, object]],
+    consumers: list[dict[str, object]],
+    interval_ms: object,
+) -> dict[str, tuple[float, float, float]]:
+    """Per-host ``(estimate, lo, hi)`` clock offset, or ``{}`` when clocks agree.
+
+    The driver-clock collection bracket comes from the consumers' acquire/release
+    stamps. A bracket that still contains zero means "no measurable skew" -- the
+    healthy case, and the reason a good clock is never "corrected".
+    """
+    interval = max(float(interval_ms or 0) / 1000.0, 0.0)
+    spans: list[tuple[set[str], float, float]] = []
+    for consumer in consumers:
+        start, stop = consumer.get("start_ts"), consumer.get("end_ts")
+        if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
+            continue
+        nodes = {str(n) for n in (consumer.get("nodes") or [])}
+        spans.append((nodes, float(start), float(stop)))
+    if not spans:
+        return {}
+
+    per_host: dict[str, list[float]] = defaultdict(list)
+    for row in rows:
+        per_host[str(row["hostname"])].append(float(row["timestamp"]))
+
+    out: dict[str, tuple[float, float, float]] = {}
+    for host, timestamps in per_host.items():
+        # Consumers naming this host bound its collector; if none do (the planned
+        # node name need not equal the reported hostname -- the same mismatch
+        # `filter_rows` tolerates) fall back to the whole monitor's live period.
+        matched = [(s, e) for nodes, s, e in spans if host in nodes]
+        if not matched:
+            matched = [(s, e) for _nodes, s, e in spans]
+        bracket = _clock_bracket(
+            min(timestamps), max(timestamps),
+            min(s for s, _e in matched), max(e for _s, e in matched),
+            interval,
+        )
+        if bracket is None:
+            continue
+        lo, hi = bracket
+        # Only act when the bracket EXCLUDES zero: a correct clock always yields a
+        # bracket straddling it, so this cannot fire on a healthy node.
+        if lo > _CLOCK_ALIGN_MIN_SECONDS or hi < -_CLOCK_ALIGN_MIN_SECONDS:
+            out[host] = ((lo + hi) / 2.0, lo, hi)
+    return out
+
+
+def _align_sample_clocks(
+    rows: list[dict[str, object]], offsets: dict[str, tuple[float, float, float]]
+) -> None:
+    """Shift samples onto the driver's clock IN MEMORY -- never the raw logs.
+
+    Applied after parsing and before any filtering, so every downstream window,
+    CSV and chart agrees. ``sflow_monitor/raw/`` keeps the node's own timestamps:
+    it is the record of what the node reported, and it is also the evidence the
+    clock is wrong.
+    """
+    if not offsets:
+        return
+    for row in rows:
+        entry = offsets.get(str(row["hostname"]))
+        if entry is None:
+            continue
+        shifted = float(row["timestamp"]) - entry[0]
+        row["timestamp"] = shifted
+        # Keep the human-readable column consistent with the value beside it.
+        row["timestamp_iso"] = datetime.fromtimestamp(shifted).isoformat(
+            sep=" ", timespec="milliseconds"
+        )
+    # Hosts shift by different amounts, so the rows are no longer in time order.
+    rows.sort(key=lambda row: float(row["timestamp"]))
+    for host, (estimate, lo, hi) in sorted(offsets.items()):
+        print(
+            f"WARN: clock on '{host}' is ahead of this host by {lo:.1f}..{hi:.1f}s; "
+            f"monitor samples were shifted by {estimate:+.1f}s for REPORTING only "
+            f"(raw logs under {MONITOR_RAW_HINT} keep the node's own timestamps). "
+            f"Windows are accurate to about the sampling interval until the clocks "
+            f"are synced (NTP/chrony).",
+            file=sys.stderr,
+        )
 
 
 def process(spec: dict[str, object]) -> dict[str, object]:
@@ -1144,6 +1903,9 @@ def process(spec: dict[str, object]) -> dict[str, object]:
     task_events = list(spec.get("task_events") or [])
 
     rows = parse_monitor_logs(raw_dir)
+    # Calibrate the node clock against the driver's BEFORE any window is applied,
+    # otherwise a skewed node filters every report down to nothing.
+    _align_sample_clocks(rows, _estimate_clock_offsets(rows, consumers, interval_ms))
 
     # PNG is the only format that needs a third-party lib (matplotlib, optional).
     # CSV + SVG are pure stdlib. If anything requested PNG but matplotlib is
@@ -1169,16 +1931,41 @@ def process(spec: dict[str, object]) -> dict[str, object]:
 
     # Per-task / per-replica resource reports. Each is filtered to the task's
     # nodes/GPUs and clipped to its (or, for a cross view, the owner's) run window.
+    window_cache: dict[tuple[str, str], dict[str, object]] = {}
     for report in task_reports:
-        start_ts, end_ts = _resolve_view_window(
-            report.get("window_tasks") or [], task_events
-        )
+        if report.get("log_window") is not None:
+            start_ts, end_ts, artifact = _resolve_report_log_window(
+                report, out_dir, task_events, window_cache
+            )
+            name = str(report.get("name", "consumer"))
+            _write_window_artifact(out_dir, name, artifact)
+            report["window_status"] = artifact["status"]
+            if artifact["status"] != "matched":
+                details = "; ".join(
+                    f"{source.get('runtime_task')} ({source.get('source_log')}): "
+                    f"{source.get('error')}"
+                    for source in artifact.get("sources", [])  # type: ignore[union-attr]
+                    if source.get("status") != "matched"
+                )
+                reason = str(artifact.get("error") or "marker window unresolved")
+                if details:
+                    reason = f"{reason}; {details}"
+                print(
+                    f"WARN: marker window unresolved for report '{name}': {reason}",
+                    file=sys.stderr,
+                )
+                continue
+        else:
+            start_ts, end_ts = _resolve_view_window(
+                report.get("window_tasks") or [], task_events
+            )
         entry = dict(report)
         entry["start_ts"] = start_ts
         entry["end_ts"] = end_ts
         _write_consumer_report(
             rows, entry, out_dir, matplotlib_ok=matplotlib_ok,
             events=task_events, title=str(report.get("title") or ""),
+            windowed=report.get("log_window") is not None,
         )
 
     # Always write the terminal overview when any samples exist.

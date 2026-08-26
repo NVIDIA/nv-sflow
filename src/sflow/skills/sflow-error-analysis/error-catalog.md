@@ -216,7 +216,9 @@ is raised only on a **real run** with a local/Slurm/Docker backend. On `--dry-ru
 it also just warns (the path is treated as remote on the cluster/image).
 
 **Fix:** Create the directory/file or fix the URI path before a real run (or use `--dry-run`
-to validate without it).
+to validate without it). If the path is correct but exists only where the task runs (e.g. on
+the Slurm compute nodes, not the submit host), pass `--skip-artifact-check` to `sflow run` /
+`sflow batch` to demote this to a warning.
 
 ---
 

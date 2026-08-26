@@ -514,6 +514,26 @@ class ConfigLoader:
         self.source_files: List[Path] = []
         self.file_contributions: List[Dict[str, Any]] = []
 
+    def _warn_unenforced_timeout(self, config: SflowConfig) -> None:
+        """Say out loud that `timeout:` does nothing.
+
+        The field is accepted and deep-merged but never read, so a recipe that
+        declares one looks bounded and is not -- and a hung workflow then runs
+        until something external kills it. Warning is the honest middle: removing
+        the field would reject every config that sets it (the models forbid extra
+        keys), and enforcing it would start killing runs that have never been
+        held to it.
+        """
+        where = []
+        if config.workflow.timeout is not None:
+            where.append("workflow")
+        where += [t.name for t in config.workflow.tasks if t.timeout is not None]
+        if where:
+            _logger.warning(
+                f"`timeout:` is set on {', '.join(where)} but sflow does not enforce it; "
+                "these run unbounded. Use the backend's own limit (e.g. Slurm --time)."
+            )
+
     def load_config(
         self,
         path: Path,
@@ -572,6 +592,7 @@ class ConfigLoader:
         except ValidationError as e:
             raise ValueError(f"Configuration validation failed:\n{e}")
 
+        self._warn_unenforced_timeout(config)
         self.config = config
         return config
 
@@ -646,6 +667,7 @@ class ConfigLoader:
         except ValidationError as e:
             raise ValueError(f"Merged configuration validation failed:\n{e}")
 
+        self._warn_unenforced_timeout(config)
         self.config = config
         return config
 

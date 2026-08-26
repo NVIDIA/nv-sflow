@@ -78,9 +78,79 @@ class DAG:
                     queue.append(dependent)
 
         if len(result) != len(self.nodes):
-            raise ValueError("Graph contains a cycle")
+            raise ValueError(self._cycle_message(result))
 
         return result
+
+    def find_cycle(self) -> list[str]:
+        """One dependency cycle, as the nodes on it in edge order; ``[]`` if acyclic.
+
+        ``[a, b, c]`` means ``a -> b -> c -> a``: each node is a dependency of the
+        next, and the last is a dependency of the first.
+
+        Depth-first with the classic three colours -- unvisited, on the current path,
+        finished -- so the first node reached twice on one path closes the loop.
+        Iterative rather than recursive: a workflow that fans a task out per replica
+        produces a deep chain, and blowing the stack while reporting a cycle would
+        replace one confusing error with a worse one.
+        """
+        WHITE, GREY, BLACK = 0, 1, 2
+        colour = dict.fromkeys(self.nodes, WHITE)
+
+        for start in self.nodes:
+            if colour[start] != WHITE:
+                continue
+            colour[start] = GREY
+            path = [start]
+            stack = [(start, iter(self.edges.get(start, ())))]
+            while stack:
+                _, dependents = stack[-1]
+                nxt = next(dependents, None)
+                if nxt is None:
+                    colour[path.pop()] = BLACK
+                    stack.pop()
+                    continue
+                if colour.get(nxt) == GREY:  # back edge: it is on the path we walked
+                    return path[path.index(nxt) :]
+                if colour.get(nxt, WHITE) == WHITE:
+                    colour[nxt] = GREY
+                    path.append(nxt)
+                    stack.append((nxt, iter(self.edges.get(nxt, ()))))
+        return []
+
+    def _cycle_message(self, resolved: list[str]) -> str:
+        """Explain a cycle in terms of the ``depends_on`` entries that caused it.
+
+        "Graph contains a cycle" on its own leaves the reader to reconstruct the loop
+        by hand from a merged config -- and a workflow assembled from six files, each
+        contributing a task or two, is exactly where a loop appears without any single
+        file looking wrong. So the loop is named edge by edge, spelled the way the
+        recipe spells it ("X depends on Y"), because the fix is always deleting one of
+        those lines.
+
+        Tasks stuck *behind* the loop are listed separately: they are not the bug, and
+        without that split every task downstream of the loop reads like part of it.
+        """
+        cycle = self.find_cycle()
+        if not cycle:  # pragma: no cover - a short sort always means a cycle
+            stuck = sorted(set(self.nodes) - set(resolved))
+            return f"Graph contains a cycle among: {', '.join(stuck)}"
+
+        loop = cycle + [cycle[0]]
+        lines = [
+            f"Graph contains a cycle: {len(cycle)} task(s) depend on each other in a loop:"
+        ]
+        lines += [
+            f"  {loop[index + 1]} depends on {loop[index]}" for index in range(len(cycle))
+        ]
+        lines.append("Remove one of those 'depends_on' entries to break the loop.")
+
+        blocked = sorted(set(self.nodes) - set(resolved) - set(cycle))
+        if blocked:
+            shown = ", ".join(blocked[:8])
+            more = f", and {len(blocked) - 8} more" if len(blocked) > 8 else ""
+            lines.append(f"Waiting behind it: {shown}{more}")
+        return "\n".join(lines)
 
     def has_cycle(self) -> bool:
         """Check if the DAG contains a cycle."""

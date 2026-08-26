@@ -1,0 +1,95 @@
+# GPU monitoring with a log-marker report window (docker backend).
+#
+# Needs a GPU host with the NVIDIA container runtime (`docker run --gpus all`)
+# and network access to pull the CUDA sample image (~500 MB). No CUDA toolkit or
+# PyTorch on the host -- the workload is the stock `nbody` sample in a container.
+#
+# The task is a deliberate square wave (idle, GPU burst, idle) so two reports
+# built from the SAME samples differ visibly:
+#
+#   sflow_monitor/lifecycle/workflow/  whole run      -> keeps the idle shoulders
+#   sflow_monitor/windowed/gpu_work/   marker-clipped -> burst only, + window.json
+#
+# Compare `summary.csv` between them: the clipped report's average GPU
+# utilization is much higher because the idle shoulders are excluded.
+#
+# See docs/user/monitor.md for the `window` semantics.
+version: "0.1"
+
+variables:
+  # Stock NVIDIA CUDA sample image; `nbody -benchmark` is a pure GPU burn loop.
+  NBODY_IMAGE:
+    value: nvcr.io/nvidia/k8s/cuda-sample:nbody
+  # Bodies and iterations set the burst length. 256k bodies x 40 iterations is
+  # roughly 8s on an RTX 3090; raise iterations on a faster card.
+  NBODY_BODIES:
+    value: 256000
+  NBODY_ITERATIONS:
+    value: 40
+
+backends:
+  - name: local_docker
+    type: docker
+    default: true
+    image: ${{ variables.NBODY_IMAGE }}
+    nodes: 1
+    gpus_per_node: 1
+
+operators:
+  - name: nbody_runtime
+    type: docker_run
+    image: ${{ variables.NBODY_IMAGE }}
+    # No `gpus:` here on purpose -- the task's resources.gpus.count drives it, so
+    # sflow reserves that many physical GPUs and pins the container to exactly
+    # those devices instead of handing it every GPU on the box.
+    extra_args:
+      # This image ships ENTRYPOINT ["/cuda-samples/sample"], which would swallow
+      # the script below and silently run the entrypoint instead. Clearing it
+      # makes sflow's `bash -lc <script>` run normally (same fix as the
+      # examples/gpu_reservation samples).
+      - --entrypoint=
+
+workflow:
+  name: docker_gpu_monitor
+  monitor:
+    # Whole-pool, whole-run baseline. No window, so this report keeps the idle
+    # shoulders and acts as the "before" in the comparison above.
+    interval: 500
+    scopes:
+      gpu: {}
+    report:
+      enabled: true
+
+  tasks:
+    - name: gpu_work
+      operator: nbody_runtime
+      resources:
+        gpus:
+          count: 1
+      script:
+        # Idle shoulder: gives the chart a visible baseline before the window.
+        - echo "idle before measurement"
+        - sleep 4
+
+        # Everything between these two markers is what the task monitor reports.
+        - echo "MEASURE_START"
+        - /cuda-samples/nbody -benchmark -numbodies=${{ variables.NBODY_BODIES }} -i=${{ variables.NBODY_ITERATIONS }}
+        - echo "MEASURE_END"
+
+        # Idle shoulder: the clipped report must NOT include this.
+        - echo "idle after measurement"
+        - sleep 4
+
+      monitor:
+        interval: 500
+        scopes:
+          gpu: {}
+        # Clip this report to the burst. The collector still samples the whole
+        # task -- markers only choose what the report covers. If a marker never
+        # matches, sflow keeps the raw samples, writes
+        # windowed/<report>/window_not_found.json and skips this detailed report.
+        window:
+          start: MEASURE_START
+          end: MEASURE_END
+        report:
+          enabled: true

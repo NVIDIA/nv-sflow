@@ -250,7 +250,11 @@ workflow:
 
 For GPU tasks, install the NVIDIA container toolkit on the Docker host and set
 `gpus_per_node` to the host GPU count. When a task declares `resources.gpus`,
-sflow narrows Docker `--gpus device=...` to the planned GPU slice.
+sflow reserves that many physical GPUs and launches the container with
+`--gpus "device=<uuid,...>"` so it sees exactly those GPUs (as
+`CUDA_VISIBLE_DEVICES=0,1,…` inside). A task that declares **no** GPUs gets
+`NVIDIA_VISIBLE_DEVICES=void` and sees none. See
+[GPU reservation](#gpu-reservation-local-concurrent-runs) below.
 
 Docker backend fields beyond `image`/`nodes`/`gpus_per_node`:
 
@@ -260,6 +264,79 @@ Docker backend fields beyond `image`/`nodes`/`gpus_per_node`:
 | `workdir` | — | Working directory inside every container. |
 | `extra_args` | — | Extra raw `docker run` args for every container. |
 | `offload_task_logs` | `true` | Write each task's `<task>.log` on the container side instead of streaming through the driver (auto-streams on a TTY / `--tui`). |
+| `wait_for_gpus` | — | Wait for free GPUs at reserve time instead of failing fast: `0` = forever, `N` = up to N seconds. Overridden by `--wait-for-gpus`. See [GPU reservation](#gpu-reservation-local-concurrent-runs). |
+
+### GPU reservation (local, concurrent runs)
+
+Tasks on one Docker host reserve **disjoint** physical GPUs, so concurrent tasks
+(across runs or within one run) don't collide. You declare only the per-task count
+(`resources.gpus.count`); `gpus_per_node` is just the planning ceiling.
+
+- **Fail-fast** when not enough are free. To wait instead, set the backend field
+  `wait_for_gpus` (`0` = wait forever, `N` = up to N seconds) or pass
+  [`--wait-for-gpus SECONDS`](cli.md#sflow-run) (CLI/env wins over the field).
+  Both surfaces read `0` the same way — wait forever; fail-fast is what you get
+  by setting neither.
+- Container sees `CUDA_VISIBLE_DEVICES=0,1,…`; UUIDs stay on the host `--gpus` flag.
+  Run reports (hardware monitor, GPU usage chart) still name the **physical**
+  devices, not those container-visible indices.
+- **Local single-node docker only** — remote `hosts:` pools and multi-node fall back
+  to the planner's numeric device slice, as does a host where the driver cannot run
+  `nvidia-smi` and any run with `SFLOW_GPU_RESERVATION=0`. In every one of those
+  cases the container is still pinned to a device slice; only the cross-process
+  reservation is skipped, and a warning names which case you hit. Note that
+  synthetic `nodes: > 1` counts as multi-node even though every container runs on
+  this same daemon — a concurrent run can then pick the same devices.
+- A raw `--gpus` (or `NVIDIA_VISIBLE_DEVICES` / `--device=/dev/nvidia*`) in
+  `extra_args` is passed through untouched, but docker *adds* it to sflow's pin
+  rather than replacing it, so the container ends up with more GPUs than were
+  reserved. sflow warns; use `resources.gpus` instead.
+
+`resources.gpus.release_after: task_ready` hands a task's GPUs back the moment it
+reports READY, so a **later task in the same run** can be packed onto them while the
+server keeps serving. That hand-back is scoped to the run that made it: another
+`sflow run` still sees those GPUs as taken, because the server on them is very much
+alive.
+
+Waiting can deadlock if you ask it to: two runs that each hold part of the pool and
+each wait for the rest will never resolve, since neither can finish and release. An
+unbounded wait (`0`) never times out of that on its own — sflow warns after 10
+minutes, but prefer a bounded `wait_for_gpus: N` when several runs share a host.
+
+A GPU counts as busy — and so is never claimed — when another sflow run holds it or
+a **foreign** workload is on it (any compute process, or more than
+`SFLOW_GPU_BUSY_MEM_MIB` in use). On a workstation with a display attached that
+includes the desktop session, so every GPU reads busy; set
+`SFLOW_GPU_IGNORE_FOREIGN=1` when sflow owns the box. Insufficient-GPU errors name
+which GPUs are busy and why, and list these knobs.
+
+#### Environment variables
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `SFLOW_GPU_RESERVATION` | `1` | `0` turns reservation off entirely. Tasks still get pinned to the planner's device slice, but with no cross-process claim — concurrent runs can collide. |
+| `SFLOW_WAIT_FOR_GPUS` | unset | What `--wait-for-gpus` sets, and it overrides the backend's `wait_for_gpus` field. Empty or `0` = wait forever; `N` = wait up to N seconds. |
+| `SFLOW_GPU_RESERVATION_DIR` | `$TMPDIR/sflow-gpu-reservations` | Where the registry lives. Keep it **machine-local**: on a shared/NFS path, another host's records look like local reservations and its GPUs get counted as taken. |
+| `SFLOW_GPU_BUSY_MEM_MIB` | `512` | A GPU with at least this much memory already in use counts as foreign-busy. |
+| `SFLOW_GPU_IGNORE_FOREIGN` | unset | `1` ignores foreign workloads entirely — for when sflow owns the whole box. |
+
+Two things to know about `SFLOW_WAIT_FOR_GPUS`:
+
+- **Setting it at all turns waiting on.** Every accepted value — including an empty
+  string — means "wait"; there is no value that means "fail fast". To get fail-fast
+  back, `unset` it. Exporting it in a shell profile therefore changes the default for
+  every later run in that shell.
+- A malformed value (`600s`, `-1`) is rejected at parse time when it comes from
+  `--wait-for-gpus`, but when exported directly it is not seen until the run's first
+  GPU task, which then fails.
+
+Reservation requires POSIX file locking and is inert on Windows.
+
+> **Changed behavior.** Container names gained a driver-PID segment
+> (`sflow-<task>-<node>` → `sflow-p<pid>-<task>-<node>`) so concurrent runs on one
+> host never collide; scripts matching the old name must be updated. A task that
+> declares **no** GPUs now gets `NVIDIA_VISIBLE_DEVICES=void` and sees none, unless
+> `extra_args` already grant GPUs (e.g. a raw `--gpus all`), which is left untouched.
 
 ### Multi-node Docker hosts
 

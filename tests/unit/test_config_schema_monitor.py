@@ -95,6 +95,110 @@ def test_report_format_allows_png():
     assert c.workflow.tasks[0].monitor.report.format == ["csv", "png"]
 
 
+def test_task_monitor_log_window_parses_scalar_list_and_regex():
+    c = SflowConfig.model_validate(
+        _cfg(
+            {
+                "name": "wf",
+                "tasks": [
+                    {
+                        "name": "bench",
+                        "script": ["x"],
+                        "monitor": {
+                            "report": {"enabled": True},
+                            "window": {
+                                "start": "WARMUP_FINISHED",
+                                "end": {
+                                    "pattern": [
+                                        "BENCHMARK_FINISHED",
+                                        r"re:^done \d+$",
+                                    ],
+                                    "select": "first",
+                                },
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    window = c.workflow.tasks[0].monitor.window
+    assert window.start.pattern == "WARMUP_FINISHED"
+    assert window.start.select is None
+    assert window.end.pattern == ["BENCHMARK_FINISHED", r"re:^done \d+$"]
+    assert window.end.select == "first"
+
+
+def test_monitor_log_window_rejects_invalid_placement_and_patterns():
+    base_window = {"start": "START", "end": "END"}
+    with pytest.raises(ValueError, match="requires report.enabled"):
+        SflowConfig.model_validate(
+            _cfg(
+                {
+                    "name": "wf",
+                    "tasks": [
+                        {
+                            "name": "bench",
+                            "script": ["x"],
+                            "monitor": {
+                                "report": {"enabled": False},
+                                "window": base_window,
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+
+    with pytest.raises(ValueError, match=re.escape("workflow.monitor.window")):
+        SflowConfig.model_validate(
+            _cfg(
+                {
+                    "name": "wf",
+                    "monitor": {
+                        "report": {"enabled": True},
+                        "window": base_window,
+                    },
+                    "tasks": [{"name": "bench", "script": ["x"]}],
+                }
+            )
+        )
+
+    with pytest.raises(ValueError, match=re.escape("workflow.monitor.window")):
+        SflowConfig.model_validate(
+            _cfg(
+                {
+                    "name": "wf",
+                    "monitor": {"window": base_window},
+                    "tasks": [{"name": "bench", "script": ["x"]}],
+                }
+            )
+        )
+
+    for pattern in ([], ["re:("]):
+        with pytest.raises(ValueError, match="pattern cannot be empty|invalid.*regex"):
+            SflowConfig.model_validate(
+                _cfg(
+                    {
+                        "name": "wf",
+                        "tasks": [
+                            {
+                                "name": "bench",
+                                "script": ["x"],
+                                "monitor": {
+                                    "report": {"enabled": True},
+                                    "window": {
+                                        "start": {"pattern": pattern},
+                                        "end": "END",
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                )
+            )
+
+
 def test_monitor_without_scopes_defaults_to_all():
     c = SflowConfig.model_validate(
         _cfg({"name": "wf", "monitor": {}, "tasks": [{"name": "a", "script": ["x"]}]})

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypeVar, Union
 from urllib.parse import urlparse
@@ -284,14 +285,26 @@ class LogWatchProbeConfig(StrictBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_pattern_exclusivity(cls, data: Any) -> Any:
+        """Reject a probe that names two *different* patterns, or none at all.
+
+        The two fields are one setting under two spellings, so a config that carries
+        both with the same value is not a mistake -- it is what this model produces:
+        :meth:`normalize_pattern` copies ``match_pattern`` into ``regex_pattern``, and
+        anything that dumps a validated config and loads it again (``sflow compose``,
+        and the temp config ``sflow batch`` writes for its dry run when ``--nodes`` or
+        ``--gpus-per-node`` re-plans the backends) hands both of them straight back.
+        Rejecting that round trip made every recipe whose readiness probe is written
+        with ``match_pattern`` fail its dry run with 'Only one of ... not both'.
+        """
         if isinstance(data, dict):
-            has_regex = data.get("regex_pattern") is not None
-            has_match = data.get("match_pattern") is not None
-            if has_regex and has_match:
+            regex = data.get("regex_pattern")
+            match = data.get("match_pattern")
+            if regex is not None and match is not None and regex != match:
                 raise ValueError(
-                    "Only one of 'regex_pattern' or 'match_pattern' may be set, not both"
+                    "Only one of 'regex_pattern' or 'match_pattern' may be set, not both "
+                    f"with different values (got {regex!r} and {match!r})"
                 )
-            if not has_regex and not has_match:
+            if regex is None and match is None:
                 raise ValueError(
                     "Either 'regex_pattern' or 'match_pattern' must be set"
                 )
@@ -299,6 +312,14 @@ class LogWatchProbeConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def normalize_pattern(self) -> "LogWatchProbeConfig":
+        """Give consumers one field to read, whichever spelling was written.
+
+        Both spellings mean the same thing at runtime: the log_watch probe treats the
+        value as a literal unless it carries an ``re:`` / ``regex:`` prefix. Keeping
+        ``match_pattern`` as written rather than clearing it means a dumped config
+        still reads the way its author wrote it -- which is why the check above has to
+        tolerate the pair.
+        """
         if self.regex_pattern is None and self.match_pattern is not None:
             self.regex_pattern = self.match_pattern
         return self
@@ -588,7 +609,18 @@ class NodeResourceConfig(StrictBaseModel):
     indices: Optional[Union[List[Resolvable[int]], str]] = None  # Can be [0, 1], ["${{ ... }}"], or "${{ ... }}" resolving to a list
     count: Optional[Resolvable[int]] = None  # Can be int or expression
     exclude: Optional[Union[List[Resolvable[int]], Resolvable[int]]] = None
-    release_after: ResourceReleaseAfter = ResourceReleaseAfter.WORKFLOW_COMPLETION
+    #: ``None`` means "placement only": the task is put on these nodes but does not
+    #: claim them, so other tasks may share the node. Naming a policy is what turns
+    #: the node into a reservation that blocks others -- see
+    #: :class:`~sflow.app.resource_planner.NodeReservationPlanner`.
+    #:
+    #: The absence of a policy has to be representable *in the data*, not merely as
+    #: "the field was never assigned": a config that is dumped and loaded again --
+    #: which ``sflow compose`` does, and ``sflow batch`` does for its dry run when
+    #: ``--nodes`` / ``--gpus-per-node`` re-plan the backends -- would otherwise come
+    #: back with every default made explicit, turning every node-pinned task into a
+    #: claimant and failing plans that are perfectly valid from source.
+    release_after: Optional[ResourceReleaseAfter] = None
 
     @field_validator("indices")
     @classmethod
@@ -616,7 +648,13 @@ class GpuResourceConfig(StrictBaseModel):
 
     count: Optional[Resolvable[int]] = None  # int or "${{ variables.GPU_COUNT }}"
     indices: Optional[Union[List[Resolvable[int]], str]] = None  # [0, 1] or "${{ ... }}"
-    release_after: ResourceReleaseAfter = ResourceReleaseAfter.WORKFLOW_COMPLETION
+    #: ``None`` means "no policy named": GPUs are always reserved (they cannot be
+    #: shared), so the planner infers the lifetime from the task instead --
+    #: ``workflow_completion`` for a task with readiness probes, which may still be
+    #: running after it reports READY, and ``task_completion`` otherwise. Carried in
+    #: the data rather than in ``model_fields_set`` for the same reason as
+    #: :attr:`NodeResourceConfig.release_after`.
+    release_after: Optional[ResourceReleaseAfter] = None
 
     # mode="before" so bools are still bools here: Pydantic would otherwise
     # coerce them to 0/1 and the check below could never fire.
@@ -791,17 +829,67 @@ class MonitorResourcesConfig(StrictBaseModel):
 
 
 class MonitorReportConfig(StrictBaseModel):
-    """Opt-in detailed post-run report for a monitor consumer.
+    """Detailed post-run report for a monitor consumer. On by default.
 
     Defaults to CSV + SVG, both produced with only the Python standard library
     (no third-party deps). ``png`` is also available but requires matplotlib
     (the optional ``sflow[monitor]`` extra).
+
+    Set ``enabled: false`` to opt OUT. Worth doing on large fan-outs: a report
+    folder is a per-view copy of the samples, so the cost scales with
+    ``samples x views``, not with samples.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     format: List[Literal["csv", "svg", "png"]] = Field(
         default_factory=lambda: list(DEFAULT_MONITOR_REPORT_FORMATS)
     )
+
+
+def _normalize_monitor_log_boundary(value: Any) -> Any:
+    return {"pattern": value} if isinstance(value, str) else value
+
+
+class MonitorLogBoundaryConfig(StrictBaseModel):
+    pattern: Union[str, List[str]]
+    select: Optional[Literal["first", "last"]] = None
+
+    @field_validator("pattern")
+    @classmethod
+    def pattern_must_be_valid(
+        cls, value: Union[str, List[str]]
+    ) -> Union[str, List[str]]:
+        patterns = [value] if isinstance(value, str) else value
+        if not patterns:
+            raise ValueError("monitor.window pattern cannot be empty")
+        for pattern in patterns:
+            body = pattern
+            for prefix in ("regex:", "re:"):
+                if pattern.startswith(prefix):
+                    body = pattern[len(prefix) :]
+                    try:
+                        re.compile(body)
+                    except re.error as exc:
+                        raise ValueError(
+                            f"invalid monitor.window regex {pattern!r}: {exc}"
+                        ) from exc
+                    break
+            # Blank (or blank-bodied "re:") matches every line, which silently
+            # selects an arbitrary boundary instead of failing.
+            if not body.strip():
+                raise ValueError("monitor.window pattern cannot be empty")
+        return value
+
+
+class MonitorWindowConfig(StrictBaseModel):
+    """Task-log markers bounding the reported window."""
+
+    start: Annotated[
+        MonitorLogBoundaryConfig, BeforeValidator(_normalize_monitor_log_boundary)
+    ]
+    end: Annotated[
+        MonitorLogBoundaryConfig, BeforeValidator(_normalize_monitor_log_boundary)
+    ]
 
 
 class MonitorConfig(StrictBaseModel):
@@ -812,7 +900,11 @@ class MonitorConfig(StrictBaseModel):
     # Default sampling interval (ms) for built-in scopes without their own interval.
     # Concrete int only (monitor fields are not expression-resolved).
     interval: int = DEFAULT_MONITOR_INTERVAL_MS
-    report: Optional[MonitorReportConfig] = None
+    # Always present: declaring `monitor:` means you want its report. Opt out
+    # with `report: {enabled: false}` (raw samples + the overview are written
+    # either way).
+    report: MonitorReportConfig = Field(default_factory=MonitorReportConfig)
+    window: Optional[MonitorWindowConfig] = None
 
     @field_validator("interval")
     @classmethod
@@ -826,6 +918,8 @@ class MonitorConfig(StrictBaseModel):
                 "monitor.scopes is set but no scope is active; enable at least one "
                 f"built-in scope ({', '.join(MONITOR_BUILTIN_SCOPES)}) or add scopes.custom"
             )
+        if self.window is not None and not self.report.enabled:
+            raise ValueError("monitor.window requires report.enabled: true")
         return self
 
 
@@ -924,6 +1018,12 @@ class TaskConfig(StrictBaseModel):
     required_by: Optional[List[str]] = None
     replicas: Optional[ReplicaConfig] = None
     retries: Optional[RetryConfig] = None
+    # NOT ENFORCED. Accepted so existing recipes keep loading (this model forbids
+    # extra keys, so removing it would reject every config that sets it) and so
+    # multi-file merge can carry it, but nothing reads it: no code path passes it
+    # to Orchestrator._launch_task_with_timeout, and TaskStatus.TIMEOUT is never
+    # assigned. Bound a task with the backend's own limit (Slurm `--time`) until
+    # this is wired. load_config WARNs when it is set.
     timeout: Optional[Union[int, str]] = None
     variables: Optional[
         Annotated[List[VariableConfig], BeforeValidator(_normalize_to_list)]
@@ -937,6 +1037,8 @@ class WorkflowConfig(StrictBaseModel):
     """Configuration for the workflow execution."""
 
     name: str
+    # NOT ENFORCED -- see TaskConfig.timeout above. A workflow declaring
+    # `timeout: 115m` today runs unbounded.
     timeout: Optional[Union[str, int]] = None
     variables: Optional[
         Annotated[List[VariableConfig], BeforeValidator(_normalize_to_list)]
@@ -948,6 +1050,20 @@ class WorkflowConfig(StrictBaseModel):
     # Workflow-level hardware monitor (covers the whole pool by default; runs for
     # the full workflow lifetime).
     monitor: Optional[MonitorConfig] = None
+
+    @field_validator("monitor", mode="before")
+    @classmethod
+    def monitor_must_not_use_log_window(cls, value: Any) -> Any:
+        window = (
+            value.get("window")
+            if isinstance(value, dict)
+            else getattr(value, "window", None)
+        )
+        if window is not None:
+            raise ValueError(
+                "workflow.monitor.window is not supported; configure it on a task monitor"
+            )
+        return value
 
     @model_validator(mode="before")
     @classmethod

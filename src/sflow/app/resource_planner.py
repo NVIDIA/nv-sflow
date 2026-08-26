@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sflow.config.schema import SflowConfig
@@ -49,6 +49,10 @@ class ResourcePlacement:
     resource_release_after: dict[str, str]
     nodes_inferred_from_gpus: bool = False
     gpu_count: int | None = None
+    # Plan-time transition info: a LATER task in this run is scheduled onto this
+    # task's GPUs. The runtime needs it to know that completing this task must
+    # not publish those devices to other sflow processes yet.
+    gpus_reused_downstream: bool = False
 
 
 class ReservationPolicyPlanner:
@@ -64,8 +68,21 @@ class ReservationPolicyPlanner:
     def release_after_value(value: Any) -> str:
         return str(getattr(value, "value", value))
 
+    @staticmethod
+    def names_a_policy(resource_conf: Any) -> bool:
+        """Whether the config states a release policy, rather than leaving it open.
+
+        Read from the value, not from ``model_fields_set``: pydantic's record of
+        which fields were assigned does not survive ``model_dump()``, so a config
+        that has been dumped and loaded again -- ``sflow compose``, and the temp
+        config ``sflow batch`` writes for its dry run -- came back claiming every
+        default had been asked for. For nodes that flipped every node-pinned task
+        into a reservation holder and broke plans that were fine from source.
+        """
+        return getattr(resource_conf, "release_after", None) is not None
+
     def effective_release_after(self, resource_conf: Any, *, has_readiness: bool) -> str:
-        if "release_after" in getattr(resource_conf, "model_fields_set", set()):
+        if self.names_a_policy(resource_conf):
             return self.release_after_value(resource_conf.release_after)
         return "workflow_completion" if has_readiness else "task_completion"
 
@@ -79,9 +96,7 @@ class ReservationPolicyPlanner:
             resource_conf,
             has_readiness=has_readiness,
         )
-        self._release_explicit[task_name] = "release_after" in getattr(
-            resource_conf, "model_fields_set", set()
-        )
+        self._release_explicit[task_name] = self.names_a_policy(resource_conf)
 
     def set_ancestors(self, ancestors: dict[str, set[str]]) -> None:
         self.ancestors = ancestors
@@ -173,6 +188,42 @@ class GpuReservationPlanner(ReservationPolicyPlanner):
 
     def set_task_stages(self, stages: dict[str, int]) -> None:
         self.task_stages = stages
+
+    def tasks_whose_gpus_are_reused(self) -> set[str]:
+        """Owner tasks whose devices a LATER task in this run is planned to take.
+
+        This is the plan-time transition information the runtime cannot derive on
+        its own. When such a task completes, its GPUs must stay reserved to THIS
+        run: the successor the planner scheduled onto them has not been submitted
+        yet, and publishing them in that gap lets a concurrent `sflow run` take a
+        device this workflow is still counting on -- which fails the successor with
+        "0 free" even though its placement was valid.
+
+        A task ABSENT from this set is the last user of its devices, so completing
+        it genuinely frees them and they can go back to the whole host.
+
+        Computed after every reservation is recorded, by pairing each interval with
+        any overlapping interval whose owner is allowed to reuse it (which already
+        encodes the DAG-ancestry and release_after rules).
+        """
+        reused: set[str] = set()
+        for entries in self.reservations.values():
+            for start, end, owner, release_after in entries:
+                if owner in reused:
+                    continue
+                for other_start, other_end, other, _other_policy in entries:
+                    if other == owner:
+                        continue
+                    if other_start >= end or other_end <= start:
+                        continue  # disjoint device ranges
+                    if self.reservation_is_reusable(
+                        owner_task=owner,
+                        current_task=other,
+                        release_after=release_after,
+                    ):
+                        reused.add(owner)
+                        break
+        return reused
 
     def conflicting_reservations(
         self,
@@ -571,9 +622,14 @@ class ResourcePlacementPlanner:
             resources = t_conf.resources
             nodes_resource_conf = resources.nodes if resources and resources.nodes else None
             gpus_resource_conf = resources.gpus if resources and resources.gpus else None
+            # Reserving a node is opt-in: pinning a task to a node places it there,
+            # it does not claim the node, so CPU-only tasks (nats, etcd, a frontend,
+            # a benchmark client) still share one. Naming a release policy is what
+            # makes the claim -- see ReservationPolicyPlanner.names_a_policy for why
+            # this reads the value rather than model_fields_set.
             nodes_reservation_enabled = (
                 nodes_resource_conf is not None
-                and "release_after" in getattr(nodes_resource_conf, "model_fields_set", set())
+                and ReservationPolicyPlanner.names_a_policy(nodes_resource_conf)
             )
 
             # Pinning device indices only means something where sflow itself
@@ -637,8 +693,8 @@ class ResourcePlacementPlanner:
 
             release_after: dict[str, str] = {}
             has_readiness = self.gpu_planner.has_readiness.get(concrete_node_name, False)
-            if nodes_resource_conf is not None and "release_after" in getattr(
-                nodes_resource_conf, "model_fields_set", set()
+            if nodes_resource_conf is not None and ReservationPolicyPlanner.names_a_policy(
+                nodes_resource_conf
             ):
                 release_after["nodes"] = self.node_planner.effective_release_after(
                     nodes_resource_conf,
@@ -666,7 +722,16 @@ class ResourcePlacementPlanner:
                 nodes_inferred_from_gpus=nodes_inferred_from_gpus,
                 gpu_count=gpu_count,
             )
-        return placements
+        # Only meaningful once EVERY reservation is recorded -- a task's successor
+        # may be placed after it in this loop. ResourcePlacement is frozen, so this
+        # rebuilds rather than mutates.
+        reused = self.gpu_planner.tasks_whose_gpus_are_reused()
+        return {
+            name: replace(
+                placement, gpus_reused_downstream=(name in reused)
+            )
+            for name, placement in placements.items()
+        }
 
     def _build_concrete_dag(self) -> tuple[DAG, dict[str, tuple[Any, int]]]:
         concrete_dag = DAG(name=self.config.workflow.name)
@@ -1491,10 +1556,35 @@ class ResourcePlacementPlanner:
                         f"Task '{task_name}' requests {count} GPUs but assigned nodes have only {total_cap} GPUs total"
                         f"{', ' + backend_gpu_state if backend_gpu_state else ''}"
                     )
-                per_node = min(min(caps), math.ceil(count / len(assigned_nodes)))
-                if per_node <= 0:
+                # `gpus.count` is the TOTAL across the task's nodes, and a GPU run
+                # never straddles a node boundary -- so every assigned node takes
+                # the same per-node slice and the total must divide evenly.
+                #
+                # This used to round up (`ceil`) and reserve that many on EVERY
+                # node, which silently allocated more than was asked for: nodes=2 +
+                # gpus=1 consumed 2 GPUs, nodes=2 + gpus=3 consumed 4. Reject the
+                # unsatisfiable request instead, matching the rules already applied
+                # to `count` + `gpus.indices` and to automatic multi-node expansion.
+                node_count = len(assigned_nodes)
+                if count % node_count != 0:
                     raise ValueError(
-                        f"Task '{task_name}' resources.gpus.count must be > 0, got {count}"
+                        f"Task '{task_name}' requests {count} GPU(s) across "
+                        f"{node_count} nodes, but resources.gpus.count is the total "
+                        f"over all assigned nodes and every node takes the same "
+                        f"slice, so it must be a positive multiple of the node count "
+                        f"({node_count}). Use {math.ceil(count / node_count) * node_count} "
+                        f"for {math.ceil(count / node_count)} GPU(s) per node, or set "
+                        f"resources.nodes.count to a value that divides {count}."
+                    )
+                per_node = count // node_count
+                node_cap = min(caps)
+                if per_node > node_cap:
+                    backend_gpu_state = _backend_gpu_state_summary()
+                    raise ValueError(
+                        f"Task '{task_name}' requests {count} GPU(s) across "
+                        f"{node_count} nodes ({per_node} per node), but the smallest "
+                        f"assigned node has only {node_cap}"
+                        f"{', ' + backend_gpu_state if backend_gpu_state else ''}"
                     )
 
                 starts: list[int | None] = [

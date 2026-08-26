@@ -1,0 +1,550 @@
+version: "0.1"
+
+# All-in-one Slurm sample: one `sflow run` exercises several features at once, so
+# a single job on a real cluster verifies them together instead of one at a time.
+# This is the broadest regression net in examples/ -- if only one recipe gets run
+# on a new cluster, run this one.
+#
+# Mixes four existing samples and adds monitoring:
+#   multi_backend.yaml         -> two Slurm pools, two operators/images
+#   auto_replica.yaml          -> replicas + cross-task `${{ task.x[i]... }}` access
+#   resource_release_after.yaml-> readiness probes + GPU reuse (release_after)
+#   gpu_placement_matrix.yaml  -> GPU placement PROVEN by UUID: container vs bare,
+#                                 slice offset, concurrency, and multi-node
+#   NEW                        -> monitor with a log-marker report window
+#
+# The placement stage runs first and releases its GPUs before the servers start, so
+# it adds assertions without adding nodes. It is the only part here that can catch a
+# task holding the right NUMBER of the WRONG GPUs -- everything below merely echoes
+# CUDA_VISIBLE_DEVICES, which is how a decode server planned for 2,3 passed while
+# sitting in a 2-GPU container numbered 0,1 with no usable device at all.
+# gpu_placement_matrix.yaml keeps the fuller matrix as a standalone 2-node recipe.
+#
+# What to check after a run (<output_dir>/<run_id>/sflow_monitor/):
+#
+#   MARKER-CLIPPED -- sflow_monitor/windowed/ (each with window.json):
+#     prefill_server_0__monitored_by__benchmark/
+#     prefill_server_1__monitored_by__benchmark/
+#     prefill_server__monitored_by__benchmark/      (both replicas combined)
+#     decode_server__monitored_by__benchmark/
+#
+#   LIFECYCLE-WINDOWED baseline -- sflow_monitor/lifecycle/ (no window.json):
+#     workflow/  env_check/  prefill_server*/  decode_server/  benchmark/  client/
+#
+# The cross reports are the point: `used_by_tasks` picks WHOSE resources are
+# charted (the servers'), `window` picks WHICH SLICE of time (the benchmark's
+# measured phase) -- so the startup shoulder is excluded. Compare
+# `windowed/prefill_server__monitored_by__benchmark/summary.csv` against the plain
+# `lifecycle/prefill_server/summary.csv`: the clipped one covers exactly the 60s
+# the benchmark declared measured, the lifecycle one covers the server's whole
+# life -- idle startup included, plus the loaded tail that runs on after the
+# benchmark is done.
+#
+# The load is real, not sleeps. Each server warms a CUDA context, runs a full
+# matmul iteration, and only THEN reports readiness -- so READY means "already
+# saturating". It never stops: these are services with no exit condition, so the
+# load persists until sflow ends the workflow and cancels the whole Slurm job.
+#
+# That ordering is what makes the window trustworthy, and it is load-bearing.
+# sflow starts the benchmark only once every server is READY, so by the time it
+# logs MEASURE_START both prefill AND decode are provably under load. An earlier
+# version had the benchmark signal the servers by creating a file on the shared
+# filesystem: the create took ~40s to become visible on the prefill node and ~73s
+# on the decode nodes, so the 60s window closed before decode had begun and its
+# report showed 0% GPU utilization. Readiness ordering removes the cross-node
+# signal entirely rather than trying to out-wait it.
+#
+#   servers:   |###### saturated from readiness to end of job ######|
+#   benchmark:  READY -> warmup 20s -> MEASURE_START -> 60s -> MEASURE_END
+#   after that:                        cpu_report + client run, servers still loaded
+#
+# Note `benchmark/` itself is a lifecycle report: the benchmark's own monitor
+# uses `used_by_tasks`, so it charts the servers, never itself.
+#
+# Needs a CUDA+PyTorch container (GPU_IMAGE) and a shared filesystem visible to
+# every node -- both normal on a Slurm cluster with pyxis/enroot.
+#
+# Single-partition cluster? Point PARTITION_B at PARTITION_A; it needs >=3 idle nodes.
+
+variables:
+  SLURM_ACCOUNT:
+    description: "SLURM account (shared by both pools)"
+    value: your_slurm_account
+  PARTITION_A:
+    description: "Partition for the gpu_pool resource pool"
+    value: your_partition_a
+  PARTITION_B:
+    description: "Partition for the cpu_pool resource pool"
+    value: your_partition_b
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit (minutes)"
+    value: 30
+  GPUS_PER_NODE:
+    description: "GPUs per node on gpu_pool"
+    value: 4
+  GPU_IMAGE:
+    description: "CUDA + PyTorch container for gpu_pool tasks (any such image works)"
+    value: nvcr.io/nvidia/pytorch:26.07-py3
+  CPU_IMAGE:
+    description: "Container image for cpu_pool tasks"
+    value: python:3.11-slim
+  MATRIX:
+    description: "Square matmul size for the GPU load (raise to saturate a bigger card)"
+    value: 8192
+  PREFILL_SERVER_COUNT:
+    description: "Number of prefill server replicas"
+    value: 2
+  PREFILL_GPUS_PER_SERVER:
+    description: "GPUs per prefill server"
+    value: 2
+  DECODE_GPUS_PER_SERVER:
+    description: "GPUs per decode server"
+    value: 8
+
+# Declared so `sflow run -a LOCAL_MODEL_PATH=...` (the sample-test harness) is
+# accepted, consistent with the other Slurm samples.
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+
+  # Placement proof, mounted at the same path on every node. Kept in a file://
+  # artifact rather than pasted into each task: EXPECT_HOST is the only input, so
+  # one copy serves every case below.
+  - name: ASSERT_PLACEMENT
+    uri: file://assert_placement.sh
+    content: |
+      # Prove by UUID that THIS rank holds the physical GPUs it was planned for.
+      # Reads EXPECT_HOST (planned HOST indices, comma separated) from the env.
+      set -u
+      me=$(basename "$SFLOW_TASK_OUTPUT_DIR")
+      run_dir=$(dirname "$SFLOW_TASK_OUTPUT_DIR")
+      # Per NODE, not per task: every rank of a multi-node task runs this body, and
+      # each node has its own index -> UUID map. Reading node 0's map on node 1
+      # would compare against the wrong hardware and "pass" for the wrong reason.
+      node="${SFLOW_TASK_NODE_NAME:-$(hostname -s)}"
+      map=$(ls "$run_dir"/node_gpu_map*/map."$node".txt 2>/dev/null | head -1)
+
+      echo "SFLOW_GPU_PROBE task=$me node=$node planned_host=$EXPECT_HOST CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+      nvidia-smi -L | sed "s/^/SFLOW_GPU_PROBE $node visible: /"
+
+      if [ -z "$map" ]; then
+        echo "FAIL: no index -> UUID map recorded for node $node" >&2
+        exit 1
+      fi
+      # Are the planned ordinals even addressable in THIS namespace? A carved
+      # container renumbers from 0, so host ordinals can name nothing at all.
+      if ! got=$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=uuid --format=csv,noheader); then
+        echo "FAIL: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES is not addressable on $node" >&2
+        exit 1
+      fi
+      # Per-node filenames: ranks of a multi-node task share one output dir, so a
+      # single gpus.txt would have them overwriting each other's evidence.
+      printf '%s\n' "$got" | sort > "$SFLOW_TASK_OUTPUT_DIR/gpus.$node.txt"
+      # And are they the RIGHT ones? Resolve the planned HOST indices through this
+      # node's bare-metal map; holding the correct count of the wrong devices is
+      # the failure mode a count-only check cannot see.
+      for i in $(echo "$EXPECT_HOST" | tr ',' ' '); do
+        grep "^$i," "$map" | cut -d, -f2
+      done | sort > "$SFLOW_TASK_OUTPUT_DIR/want.$node.txt"
+      if ! diff -q "$SFLOW_TASK_OUTPUT_DIR/want.$node.txt" \
+                   "$SFLOW_TASK_OUTPUT_DIR/gpus.$node.txt" >/dev/null; then
+        echo "FAIL: $node planned host GPU(s) $EXPECT_HOST, but holds different devices" >&2
+        echo "  want: $(tr '\n' ' ' < "$SFLOW_TASK_OUTPUT_DIR/want.$node.txt")" >&2
+        echo "  got : $(tr '\n' ' ' < "$SFLOW_TASK_OUTPUT_DIR/gpus.$node.txt")" >&2
+        exit 1
+      fi
+      echo "OK: $node holds host GPU(s) $EXPECT_HOST, confirmed by UUID"
+
+# Two independent pools: each allocates its own Slurm job and its own nodes.
+backends:
+  - name: gpu_pool
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.PARTITION_A }}
+    nodes: 3
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    time: ${{ variables.SLURM_TIMELIMIT }}
+  - name: cpu_pool
+    type: slurm
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.PARTITION_B }}
+    nodes: 1
+    gpus_per_node: 0
+    time: ${{ variables.SLURM_TIMELIMIT }}
+
+operators:
+  - name: worker_gpu
+    type: srun
+    container_image: ${{ variables.GPU_IMAGE }}
+    ntasks_per_node: 1
+  - name: worker_cpu
+    type: srun
+    container_image: ${{ variables.CPU_IMAGE }}
+    ntasks_per_node: 1
+  # No container, so the placement ground truth is taken on the raw node before any
+  # runtime has renumbered anything. Reuses the host driver's nvidia-smi.
+  - name: worker_bare
+    type: srun
+    ntasks_per_node: 1
+
+workflow:
+  name: monitor_mixed_slurm
+
+  # Whole-pool baseline over the entire run. No window, so this is the "before"
+  # to compare the marker-clipped reports against.
+  monitor:
+    interval: 5000
+    report:
+      enabled: true
+
+  tasks:
+    # ---------------------------------------------------------------------------
+    # -- gpu_placement_matrix: PROVE the planned slice, by UUID, before anything
+    # -- else runs. Counting GPUs is not enough -- a task can hold the right NUMBER
+    # -- of the WRONG devices and look perfectly healthy, which is how a decode
+    # -- server planned for 2,3 ran in a 2-GPU container numbered 0,1 and died on
+    # -- its first CUDA call. The servers below only ECHO their devices, so they
+    # -- cannot catch that; these tasks can.
+    # --
+    # -- This whole stage completes (and releases its GPUs) before env_check, so it
+    # -- costs no extra nodes and cannot collide with the servers' reservations.
+    # ---------------------------------------------------------------------------
+
+    # Ground truth, bare metal, nothing carved. Runs on EVERY node (no
+    # `resources.nodes`), one file each, so the multi-node case below can check the
+    # node it actually landed on.
+    - name: node_gpu_map
+      operator: worker_bare
+      script:
+        - |
+          set -u
+          node="${SFLOW_TASK_NODE_NAME:-$(hostname -s)}"
+          nvidia-smi --query-gpu=index,uuid --format=csv,noheader | tr -d ' ' \
+            > "$SFLOW_TASK_OUTPUT_DIR/map.$node.txt"
+          sed "s/^/SFLOW_GPU_PROBE node_map $node: /" "$SFLOW_TASK_OUTPUT_DIR/map.$node.txt"
+
+    # Bare srun sees the whole node, so a non-zero offset must survive untouched.
+    - name: placement_bare_high
+      operator: worker_bare
+      depends_on: [node_gpu_map]
+      resources:
+        gpus:
+          indices: [2, 3]
+      script:
+        - export EXPECT_HOST="2,3"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # Containerised, low and high offset, CONCURRENTLY on one node. A plan starting
+    # at 0 survives container renumbering by accident, which is why only the
+    # high-offset task ever broke -- both sides are needed to see it.
+    - name: placement_boxed_low
+      operator: worker_gpu
+      depends_on: [placement_bare_high]
+      resources:
+        gpus:
+          indices: [0, 1]
+      script:
+        - export EXPECT_HOST="0,1"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    - name: placement_boxed_high
+      operator: worker_gpu
+      depends_on: [placement_bare_high]
+      resources:
+        gpus:
+          indices: [2, 3]
+      script:
+        - export EXPECT_HOST="2,3"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # MULTI-NODE, containerised, high offset -- every renumbering hazard in play on
+    # more than one node at once. A multi-node plan is ONE node's slice applied
+    # independently per node, so a slice that is right on node 0 and wrong on node 1
+    # is invisible at a single node. Pinned indices repeat on each node.
+    - name: placement_multinode_high
+      operator: worker_gpu
+      depends_on: [placement_boxed_low, placement_boxed_high]
+      resources:
+        nodes:
+          count: 2
+        gpus:
+          indices: [2, 3]
+      script:
+        - export EXPECT_HOST="2,3"
+        - bash ${{ artifacts.ASSERT_PLACEMENT.path }}
+
+    # Collisions are invisible from inside either task: boxed_low and boxed_high
+    # held one node at the same time, so their devices must be disjoint.
+    - name: placement_disjoint
+      operator: worker_bare
+      depends_on: [placement_multinode_high]
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - |
+          set -u
+          run_dir=$(dirname "$SFLOW_TASK_OUTPUT_DIR")
+          low=$(ls "$run_dir"/placement_boxed_low*/gpus.*.txt 2>/dev/null | head -1)
+          high=$(ls "$run_dir"/placement_boxed_high*/gpus.*.txt 2>/dev/null | head -1)
+          if [ -z "$low" ] || [ -z "$high" ]; then
+            echo "FAIL: concurrent tasks left no gpus.*.txt to compare" >&2
+            exit 1
+          fi
+          shared=$(sort "$low" "$high" | uniq -d)
+          if [ -n "$shared" ]; then
+            echo "FAIL: concurrent tasks shared GPU(s): $shared" >&2
+            exit 1
+          fi
+          echo "OK: concurrent tasks held disjoint GPUs"
+
+    # -- resource_release_after: grabs every GPU on a node, then frees them on
+    #    completion (no readiness probe -> sflow infers task_completion), so the
+    #    servers below can reuse them.
+    - name: env_check
+      operator: worker_gpu
+      depends_on: [placement_disjoint]
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_NODE }}
+          indices: [0,2]
+      script:
+        - echo "env_check job=${SFLOW_BACKEND_JOB_ID} nodes=${SFLOW_TASK_ASSIGNED_NODE_NAMES}"
+        - echo "env_check GPUs ${CUDA_VISIBLE_DEVICES}"
+        - nvidia-smi
+        # Visible is not the same as usable -- run a real kernel on every device.
+        - |
+          python3 -c "
+          import os, torch
+          assert torch.cuda.is_available(), 'no CUDA device inside the container'
+          n = torch.cuda.device_count()
+          for i in range(n):
+              x = torch.randn(1024, 1024, device=f'cuda:{i}')
+              (x @ x).sum().item()
+          cvd = os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')
+          names = ', '.join(torch.cuda.get_device_name(i) for i in range(n))
+          print(f'env_check OK: CUDA_VISIBLE_DEVICES={cvd} -> torch sees {n} usable GPU(s) [{names}], torch {torch.__version__}')
+          expected = len([d for d in cvd.split(',') if d.strip()]) if cvd != '<unset>' else None
+          if expected is not None and expected != n:
+              print(f'WARNING: expected {expected} GPU(s) from CUDA_VISIBLE_DEVICES but torch sees {n}')
+          "
+
+    # -- auto_replica + release_after: replicated GPU servers that free their
+    #    reservation once READY, so later tasks can pack onto the same GPUs.
+    - name: prefill_server
+      operator: worker_gpu
+      depends_on: [env_check]
+      replicas:
+        count: ${{ variables.PREFILL_SERVER_COUNT }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.PREFILL_GPUS_PER_SERVER }}
+          release_after: task_ready
+      script:
+        - echo "prefill ${SFLOW_REPLICA_INDEX} nodes=${SFLOW_TASK_ASSIGNED_NODE_NAMES} GPUs=${CUDA_VISIBLE_DEVICES}"
+        - |
+          python3 - <<'PY'
+          import os, torch
+
+          n = ${{ variables.MATRIX }}
+          me = os.environ.get("SFLOW_REPLICA_INDEX", "0")
+          devices = list(range(torch.cuda.device_count()))
+
+          # Allocate and touch EVERY reserved GPU before announcing readiness.
+          # The benchmark opens its measurement window as soon as we report
+          # ready, so anything left until afterwards (torch import, CUDA context
+          # per device, ~n*n*4 bytes x3 per device) lands inside that window and
+          # the report shows an idle server.
+          bufs = []
+          for i in devices:
+              a = torch.randn(n, n, device=f"cuda:{i}")
+              b = torch.randn(n, n, device=f"cuda:{i}")
+              out = torch.empty(n, n, device=f"cuda:{i}")
+              torch.matmul(a, b, out=out)   # force the kernel to load too
+              torch.cuda.synchronize(i)
+              bufs.append((a, b, out))
+          # What the shell was HANDED vs what this process actually got:
+          # on a GRES partition slurmstepd can rewrite CUDA_VISIBLE_DEVICES,
+          # so the two disagreeing is the signal worth seeing in the log.
+          cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+          names = ", ".join(torch.cuda.get_device_name(i) for i in devices) or "none"
+          print(f"prefill {me}: CUDA_VISIBLE_DEVICES={cvd} -> torch sees "
+                f"{len(devices)} GPU(s) [{names}], torch {torch.__version__}", flush=True)
+          expected = len([d for d in cvd.split(",") if d.strip()]) if cvd != "<unset>" else None
+          if expected is not None and expected != len(devices):
+              print(f"WARNING: prefill {me} expected {expected} GPU(s) from "
+                    f"CUDA_VISIBLE_DEVICES but torch sees {len(devices)}", flush=True)
+
+          def burn():
+              for _ in range(10):
+                  for a, b, out in bufs:
+                      torch.matmul(a, b, out=out)
+              # Sync EVERY device. `torch.cuda.synchronize()` waits on the CURRENT
+              # device only, so without this the loop races ahead queueing matmuls
+              # faster than the GPUs retire them, growing an unbounded backlog.
+              for i in devices:
+                  torch.cuda.synchronize(i)
+
+          # Readiness is announced only AFTER a full iteration has really run, so
+          # READY means "already saturating" rather than "about to". sflow starts
+          # the benchmark only once every server is READY -- that ordering is what
+          # keeps its window from opening before the load it means to measure.
+          burn()
+          print("setup_done", flush=True)
+
+          # No exit condition -- this is a service. sflow stops whatever services
+          # are still READY once the last task completes and cancels the Slurm
+          # job, so the load runs from here to the end of the workflow.
+          while True:
+              burn()
+          PY
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "setup_done"
+          interval: 10
+          timeout: 300
+
+    - name: decode_server
+      operator: worker_gpu
+      depends_on: [env_check]
+      resources:
+        gpus:
+          count: ${{ variables.DECODE_GPUS_PER_SERVER }}
+          release_after: task_ready
+      script:
+        - echo "decode nodes=${SFLOW_TASK_ASSIGNED_NODE_NAMES} GPUs=${CUDA_VISIBLE_DEVICES}"
+        - |
+          python3 - <<'PY'
+          import os, torch
+
+          n = ${{ variables.MATRIX }}
+          devices = list(range(torch.cuda.device_count()))
+
+          # Allocate and touch EVERY reserved GPU before announcing readiness.
+          # The benchmark opens its measurement window as soon as we report
+          # ready, so anything left until afterwards (torch import, CUDA context
+          # per device, ~n*n*4 bytes x3 per device) lands inside that window and
+          # the report shows an idle server.
+          bufs = []
+          for i in devices:
+              a = torch.randn(n, n, device=f"cuda:{i}")
+              b = torch.randn(n, n, device=f"cuda:{i}")
+              out = torch.empty(n, n, device=f"cuda:{i}")
+              torch.matmul(a, b, out=out)   # force the kernel to load too
+              torch.cuda.synchronize(i)
+              bufs.append((a, b, out))
+          # What the shell was HANDED vs what this process actually got:
+          # on a GRES partition slurmstepd can rewrite CUDA_VISIBLE_DEVICES,
+          # so the two disagreeing is the signal worth seeing in the log.
+          cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+          names = ", ".join(torch.cuda.get_device_name(i) for i in devices) or "none"
+          print(f"decode: CUDA_VISIBLE_DEVICES={cvd} -> torch sees "
+                f"{len(devices)} GPU(s) [{names}], torch {torch.__version__}", flush=True)
+          expected = len([d for d in cvd.split(",") if d.strip()]) if cvd != "<unset>" else None
+          if expected is not None and expected != len(devices):
+              print(f"WARNING: decode expected {expected} GPU(s) from "
+                    f"CUDA_VISIBLE_DEVICES but torch sees {len(devices)}", flush=True)
+
+          def burn():
+              for _ in range(10):
+                  for a, b, out in bufs:
+                      torch.matmul(a, b, out=out)
+              # Sync EVERY device. `torch.cuda.synchronize()` waits on the CURRENT
+              # device only, so without this the loop races ahead queueing matmuls
+              # faster than the GPUs retire them, growing an unbounded backlog.
+              for i in devices:
+                  torch.cuda.synchronize(i)
+
+          # Readiness is announced only AFTER a full iteration has really run, so
+          # READY means "already saturating" rather than "about to". sflow starts
+          # the benchmark only once every server is READY -- that ordering is what
+          # keeps its window from opening before the load it means to measure.
+          burn()
+          print("setup_done", flush=True)
+
+          # No exit condition -- this is a service. sflow stops whatever services
+          # are still READY once the last task completes and cancels the Slurm
+          # job, so the load runs from here to the end of the workflow.
+          while True:
+              burn()
+          PY
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "setup_done"
+          interval: 10
+          timeout: 300
+
+    # -- THE MONITOR WINDOW CASE. The benchmark drives the servers; its monitor
+    #    charts the SERVERS' GPUs (used_by_tasks) but only over the phase between
+    #    this task's own markers (window). Warmup and teardown are excluded.
+    - name: benchmark
+      operator: 
+        name: worker_cpu
+      resources:
+        nodes:
+          indices: [0]
+      depends_on: [prefill_server, decode_server]
+      script:
+        - echo "benchmark driving prefill=${{ task.prefill_server[0].nodes[0].ip_address }} decode=${{ task.decode_server.nodes[0].ip_address }}"
+        # Both servers are READY, and a server reports READY only once it is
+        # already saturating its GPUs -- so the load is running RIGHT NOW, with no
+        # cross-node signal to wait on. Settle briefly so the window opens on a
+        # steady state rather than on the ramp.
+        - echo "warmup"
+        - sleep 20
+        - echo "MEASURE_START"
+        - sleep 60
+        - echo "MEASURE_END"
+        # The servers keep loading past MEASURE_END until sflow ends the workflow
+        # and cancels the Slurm job. This tail must NOT appear in the clipped
+        # report -- that is what makes the two reports differ.
+        - echo "measured phase over; servers stay under load"
+        - sleep 20
+      monitor:
+        interval: 2000
+        scopes:
+          gpu: {}
+        resources:
+          # Chart the servers' GPUs, not the benchmark's own (it has none).
+          used_by_tasks: [prefill_server, decode_server]
+        # Markers come from THIS task's log (the monitor owner), even though the
+        # sampled resources belong to the servers.
+        window:
+          start: 
+            pattern: MEASURE_START
+            select: last
+          end: 
+            pattern: MEASURE_END
+            select: first
+        report:
+          enabled: true
+
+    # -- multi_backend: pinned to the second, independent pool with its own image.
+    - name: cpu_report
+      backend: cpu_pool
+      operator: worker_cpu
+      depends_on: [benchmark]
+      script:
+        - echo "cpu_report backend=cpu_pool job=${SFLOW_BACKEND_JOB_ID} nodes=${SFLOW_TASK_ASSIGNED_NODE_NAMES}"
+        - python3 -c "import sys; print('cpu_pool python', sys.version.split()[0])"
+
+    # -- auto_replica: cross-task expression access, including per-replica indexing.
+    - name: client
+      operator: worker_cpu
+      depends_on: [benchmark]
+      resources:
+        nodes:
+          indices: [-1]
+      script:
+        - echo "Prefill 0 IP    - ${{ task.prefill_server[0].nodes[0].ip_address }}"
+        - echo "Prefill 1 IP    - ${{ task.prefill_server[1].nodes[0].ip_address }}"
+        - echo "Prefill 0 GPUs  - ${{ task.prefill_server[0].gpus }}"
+        - echo "Prefill 1 GPUs  - ${{ task.prefill_server[1].gpus }}"
+        - echo "Decode GPUs     - ${{ task.decode_server.gpus }}"
+        - echo "Benchmark nodes - ${{ task.benchmark.nodes }}"
+        - echo "Client backend  - ${{ task.client.backend }}"
+        - echo "Client operator - ${{ task.client.operator }}"

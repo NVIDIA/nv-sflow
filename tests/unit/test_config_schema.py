@@ -133,8 +133,12 @@ class TestSflowConfigSchema:
         assert resources.nodes.release_after == "workflow_completion"
         assert resources.gpus.release_after == "task_completion"
 
-    def test_resource_release_after_defaults_to_workflow_completion(self):
-        """Unannotated resources retain the current conservative lifetime."""
+    def test_resource_release_after_is_unset_until_a_policy_is_named(self):
+        """An unannotated resource states no policy, and still states none after a dump.
+
+        The planner reads the *value* to decide whether a task claims what it is placed
+        on, so "no policy" has to be a value, not the absence of an assignment.
+        """
         config = SflowConfig.model_validate({
             "version": "0.1",
             "workflow": {
@@ -152,9 +156,17 @@ class TestSflowConfigSchema:
             },
         })
 
+        # No policy named: carried as None rather than as a materialized default, so
+        # "the recipe did not ask for a reservation" survives a dump and reload. The
+        # planner turns None into the effective lifetime (see ReservationPolicyPlanner).
         resources = config.workflow.tasks[0].resources
-        assert resources.nodes.release_after == "workflow_completion"
-        assert resources.gpus.release_after == "workflow_completion"
+        assert resources.nodes.release_after is None
+        assert resources.gpus.release_after is None
+
+        # and it stays None through a round trip, which is the point
+        again = SflowConfig.model_validate(config.model_dump(mode="json", exclude_none=True))
+        assert again.workflow.tasks[0].resources.nodes.release_after is None
+        assert again.workflow.tasks[0].resources.gpus.release_after is None
 
     def test_resource_release_after_rejects_invalid_policy(self):
         """release_after only accepts documented resource lifetime policies."""
@@ -251,13 +263,18 @@ class TestSflowConfigSchema:
         assert p.log_watch.regex_pattern == "server started"
         assert p.log_watch.match_pattern == "server started"
 
-        # Log Watch Probe: both fields set is rejected
+        # Log Watch Probe: two different patterns is rejected
         with pytest.raises(ValidationError, match="Only one of"):
             LogWatchProbeConfig(regex_pattern="a", match_pattern="b")
 
         # Log Watch Probe: neither field set is rejected
         with pytest.raises(ValidationError, match="Either"):
             LogWatchProbeConfig()
+
+        # Log Watch Probe: the same pattern under both spellings is what this model
+        # itself produces, so it has to load again -- see the round-trip test below.
+        both = LogWatchProbeConfig(regex_pattern="server started", match_pattern="server started")
+        assert both.regex_pattern == "server started"
 
         # Defaults
         assert p.timeout == 1200
@@ -663,6 +680,70 @@ def test_task_ports_rejects_unknown_field():
             script=["echo hi"],
             ports=[{"port": 8000, "protocol": "tcp"}],
         )
+
+
+class TestLogWatchPatternRoundTrip:
+    """A validated config has to survive being dumped and loaded again.
+
+    `sflow compose` writes one, and `sflow batch` writes one for its dry run whenever
+    `--nodes` / `--gpus-per-node` re-plan the backends. `normalize_pattern` fills
+    `regex_pattern` in from `match_pattern`, so both spellings are present in that
+    dump -- which used to be rejected on the way back in, failing every recipe whose
+    readiness probe is written with `match_pattern`.
+    """
+
+    @staticmethod
+    def _dump(probe):
+        return probe.model_dump(mode="json", exclude_none=True)
+
+    def test_match_pattern_survives_a_dump_and_reload(self):
+        probe = LogWatchProbeConfig(match_pattern="Image Loaded", match_count=2)
+        dumped = self._dump(probe)
+        assert dumped["regex_pattern"] == "Image Loaded"
+        assert dumped["match_pattern"] == "Image Loaded"
+
+        reloaded = LogWatchProbeConfig.model_validate(dumped)
+        assert reloaded.regex_pattern == "Image Loaded"
+        assert reloaded.match_count == 2
+        assert self._dump(reloaded) == dumped  # and again, without drifting
+
+    def test_regex_pattern_alone_still_round_trips(self):
+        probe = LogWatchProbeConfig(regex_pattern="Maximum concurrency for")
+        dumped = self._dump(probe)
+        assert "match_pattern" not in dumped
+        assert LogWatchProbeConfig.model_validate(dumped).regex_pattern == "Maximum concurrency for"
+
+    def test_conflicting_patterns_are_still_rejected(self):
+        with pytest.raises(ValidationError, match="Only one of"):
+            LogWatchProbeConfig.model_validate(
+                {"regex_pattern": "Image Loaded", "match_pattern": "Ready"}
+            )
+
+    def test_a_whole_workflow_round_trips(self):
+        config = SflowConfig.model_validate(
+            {
+                "version": "0.1",
+                "workflow": {
+                    "name": "wf",
+                    "tasks": [
+                        {
+                            "name": "load_image",
+                            "script": ["echo hi"],
+                            "probes": {
+                                "readiness": {
+                                    "log_watch": {
+                                        "match_pattern": "Image Loaded",
+                                        "match_count": 2,
+                                    }
+                                }
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        dumped = config.model_dump(mode="json", exclude_none=True)
+        SflowConfig.model_validate(dumped)
 
 
 class TestRequiredBy:

@@ -107,13 +107,15 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         category="artifact",
         pattern=re.compile(r"Artifact path validation failed"),
         description="Artifact fs:// path does not exist",
-        fix="Check the fs:// URI path. Create the directory/file or fix the path.",
+        fix="Check the fs:// URI path. Create the directory/file or fix the path, or "
+            "pass --skip-artifact-check if it only exists where the task runs.",
     ),
     ErrorPattern(
         category="artifact",
         pattern=re.compile(r"Artifact '(.+?)' \(fs://\) path does not exist:\s*(.+)"),
         description="Artifact path missing",
-        fix="Create the path or fix the artifact URI.",
+        fix="Create the path or fix the artifact URI, or pass --skip-artifact-check if "
+            "it only exists where the task runs.",
     ),
     # Merge errors
     ErrorPattern(

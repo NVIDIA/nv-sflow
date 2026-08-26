@@ -25,7 +25,10 @@ from sflow.plugins.operators.docker_run import (
     DockerRunOperator,
     DockerRunOperatorConfig,
 )
+from sflow.utils import gpu_reservation
 from sflow.utils.extra_args import normalize_extra_args
+from sflow.utils.gpu import count_visible_devices
+from sflow.utils.gpu_reservation import validate_config_wait_for_gpus
 from sflow.utils.node_filters import (
     filter_by_node_names,
     normalize_node_list,
@@ -67,6 +70,10 @@ class DockerBackendConfig(BackendConfig):
     # streaming it through the sflow driver. Auto-falls back to streaming on an
     # interactive TTY / --tui session.
     offload_task_logs: bool = True
+    # Wait behavior when not enough GPUs are free at reserve time: None (default)
+    # = fail fast; 0 = wait indefinitely; N > 0 = wait up to N seconds. The
+    # --wait-for-gpus CLI flag / SFLOW_WAIT_FOR_GPUS env override this.
+    wait_for_gpus: Resolvable[int] | None = None
 
     def container_images(self) -> list[str]:
         return [str(self.image)] if self.image else []
@@ -106,6 +113,11 @@ class DockerBackend(Backend):
         # backend): a bundled/whitespace-laden entry can't survive as one
         # unparsable token for `docker run`. Never worse than verbatim passthrough.
         self._extra_args = normalize_extra_args(config.extra_args)
+        # Recipe-level GPU wait behavior (None = fail fast; 0 = forever; N = N s).
+        # The --wait-for-gpus CLI flag / env overrides this at reserve time.
+        self._wait_for_gpus = (
+            int(config.wait_for_gpus) if config.wait_for_gpus is not None else None
+        )
 
     def _filter_hosts(
         self, hosts: list[DockerHostConfig]
@@ -149,7 +161,15 @@ class DockerBackend(Backend):
             )
 
     async def allocate(self) -> Allocation:
+        # GPUs are reserved per task at launch (the docker_run operator's
+        # acquire_resources), not for the whole run here, so a task holds GPUs
+        # only while it runs. gpus_per_node is just the planning capacity.
         return self.placeholder_allocation()
+
+    @property
+    def wait_for_gpus_setting(self) -> int | None:
+        """Recipe-level wait_for_gpus, read by the operator at reserve time."""
+        return self._wait_for_gpus
 
     def placeholder_allocation(self) -> Allocation:
         if self._hosts:
@@ -201,8 +221,39 @@ class DockerBackend(Backend):
             details.append(("extra_args", str(list(self._extra_args))))
         return details
 
+    def resource_env(self, *, cuda_visible_devices: str | None = None) -> dict[str, str]:
+        # The host-side `--gpus device=<uuid>` already isolates the container to
+        # the reserved physical GPUs; inside the container they re-index to
+        # 0..N-1. Expose those simple virtual indices (not the UUIDs) so a user
+        # who asked for N GPUs just sees CUDA_VISIBLE_DEVICES=0,..,N-1 and never
+        # has to deal with physical UUIDs. N is the size of the planned slice.
+        #
+        # Because this env is *virtual*, run reporting must not read it as a
+        # physical device list -- see sflow.utils.gpu.task_gpu_indices.
+        # Must match the operator's GPU claim exactly, so use the shared counter:
+        # it expands the range form ("0-3" -> 4), which a raw token count reads as
+        # a single device -- leaving the container told about 1 GPU while 4 were
+        # reserved for it.
+        n = count_visible_devices(cuda_visible_devices)
+        if not n:
+            return {}
+        return {"CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in range(n))}
+
     async def release(self, allocation: Allocation) -> None:
+        # GPUs are reserved/released per task by the operator, so there is no
+        # run-level allocation to release here.
         return None
+
+    async def release_resources(self) -> None:
+        # The base does the allocation teardown every backend needs (clearing
+        # self.allocation, calling release()); this only ADDS the GPU-registry
+        # backstop on top, so it must delegate rather than replace.
+        await super().release_resources()
+        # Run-end backstop for the machine-local GPU registry. Per-task release is
+        # the normal path; this catches the narrow case where a task was cancelled
+        # at the instant its reservation record was being written, which its own
+        # release could not have seen. Only records owned by THIS pid are touched.
+        gpu_reservation.release_all_for_pid()
 
     def default_operator(
         self,
@@ -317,6 +368,21 @@ class DockerBackend(Backend):
         )
         include_nodes, exclude_nodes = resolve_node_filters(resolver, conf, ctx)
 
+        wait_for_gpus = None
+        if conf.wait_for_gpus is not None:
+            resolved_wait = resolver.resolve(conf.wait_for_gpus, ctx)
+            try:
+                wait_for_gpus = int(resolved_wait)
+            except Exception as e:
+                raise ValueError(
+                    f"Backend '{conf.name}' wait_for_gpus must resolve to int, "
+                    f"got {resolved_wait!r}"
+                ) from e
+            # Same >= 0 rule the reservation layer enforces, stated once there.
+            validate_config_wait_for_gpus(
+                wait_for_gpus, where=f"Backend '{conf.name}'"
+            )
+
         return DockerBackendConfig(
             name=conf.name,
             type="docker",
@@ -331,4 +397,5 @@ class DockerBackend(Backend):
             include_nodes=include_nodes,
             exclude_nodes=exclude_nodes,
             offload_task_logs=bool(getattr(conf, "offload_task_logs", True)),
+            wait_for_gpus=wait_for_gpus,
         )

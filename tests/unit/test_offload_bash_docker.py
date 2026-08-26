@@ -166,3 +166,30 @@ def test_docker_offload_wraps_docker_run(tmp_path, monkeypatch):
     assert f"> {log_path}" in wrapped
     assert wrapped.rstrip().endswith('exit "${PIPESTATUS[0]}"')
     assert op.writes_own_task_log() is True
+
+
+def test_docker_offload_wraps_multi_node_bash_wrapper(tmp_path, monkeypatch):
+    """The multi-node launcher itself is a `bash -lc` wrapper; offload must wrap
+    that whole wrapper (both containers) and redirect to <task>.log."""
+    _clear_env(monkeypatch)
+    _force_non_tty(monkeypatch)
+    op = DockerRunOperator(
+        DockerRunOperatorConfig(name="t", image="busybox", log_to_file=True)
+    )
+    # Two synthetic local nodes (host=None) -> multi-node bash wrapper.
+    op._assigned_nodes = ["localhost", "localhost-1"]
+    op._node_hosts = {"localhost": None, "localhost-1": None}
+    envs = _envs(tmp_path)
+    parts = op.build_command(
+        task_name="t", script=["echo hi"], envs=envs
+    ).as_list()
+
+    assert parts[0] == "bash" and parts[1] == "-c"
+    wrapped = parts[-1]
+    log_path = os.path.join(envs["SFLOW_TASK_OUTPUT_DIR"], "t.log")
+    assert wrapped.startswith("{")
+    # both containers survive inside the offloaded wrapper (names carry the pid)
+    assert f"sflow-p{os.getpid()}-t-localhost" in wrapped
+    assert f"sflow-p{os.getpid()}-t-localhost-1" in wrapped
+    assert f"> {log_path}" in wrapped
+    assert wrapped.rstrip().endswith('exit "${PIPESTATUS[0]}"')

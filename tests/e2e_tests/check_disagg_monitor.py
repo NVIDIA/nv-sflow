@@ -49,6 +49,24 @@ def _find_monitor_dir(out_dir: Path) -> Path | None:
     return matches[0] if matches else None
 
 
+def _find_reports(mon: Path, pattern: str) -> list[Path]:
+    """Report folders matching ``pattern``, in either monitor layout.
+
+    Reports are grouped by what sets their time range
+    (``sflow_monitor/{lifecycle,windowed}/<name>/``). Older runs wrote them flat
+    at ``sflow_monitor/<name>/``, so both are searched -- a run directory on disk
+    outlives the layout that produced it. Grouped wins on a name collision.
+    """
+    found = {d.name: d for d in sorted(mon.glob(pattern)) if d.is_dir()}
+    found.update({d.name: d for d in sorted(mon.glob(f"*/{pattern}")) if d.is_dir()})
+    return sorted(found.values(), key=lambda d: d.name)
+
+
+def _find_report(mon: Path, name: str) -> Path | None:
+    matches = _find_reports(mon, name)
+    return matches[0] if matches else None
+
+
 def _footprint(timeline_csv: Path) -> Footprint:
     """``(row_count, hosts, gpu_pairs)`` sampled in a report's ``timeline.csv``."""
     hosts: set[str] = set()
@@ -70,21 +88,21 @@ def check(out_dir: Path) -> tuple[int, list[str]]:
     mon = _find_monitor_dir(out_dir)
     if mon is None:
         return 2, [f"no sflow_monitor/ under {out_dir} (nothing to check)"]
-    cross_dirs = sorted(d for d in mon.glob(f"*{CROSS_SUFFIX}") if d.is_dir())
+    cross_dirs = _find_reports(mon, f"*{CROSS_SUFFIX}")
     if not cross_dirs:
         return 2, [f"no *{CROSS_SUFFIX} reports under {mon} (not a used_by_tasks run)"]
 
-    bench_tl = mon / BENCH / "timeline.csv"
-    bench_fp = _footprint(bench_tl) if bench_tl.is_file() else None
-
-    # Discover the monitored server(s) from the cross-view folder names, so this
-    # works for any recipe shape (prefill/decode, agg_server, sglang_server, ...).
-    servers = [d.name[: -len(CROSS_SUFFIX)] for d in cross_dirs]
+    bench_dir = _find_report(mon, BENCH)
+    bench_tl = bench_dir / "timeline.csv" if bench_dir else None
+    bench_fp = _footprint(bench_tl) if bench_tl and bench_tl.is_file() else None
 
     msgs: list[str] = []
     errors = 0
-    for server in servers:
-        cross_tl = mon / f"{server}{CROSS_SUFFIX}" / "timeline.csv"
+    # The monitored server(s) are named by the cross-view folders, so this works
+    # for any recipe shape (prefill/decode, agg_server, sglang_server, ...).
+    for cross_dir in cross_dirs:
+        server = cross_dir.name[: -len(CROSS_SUFFIX)]
+        cross_tl = cross_dir / "timeline.csv"
         if not cross_tl.is_file():
             msgs.append(f"FAIL {server}: missing cross report {cross_tl}")
             errors += 1
@@ -95,8 +113,9 @@ def check(out_dir: Path) -> tuple[int, list[str]]:
             errors += 1
             continue
 
-        server_tl = mon / server / "timeline.csv"
-        if server_tl.is_file():
+        server_dir = _find_report(mon, server)
+        server_tl = server_dir / "timeline.csv" if server_dir else None
+        if server_tl and server_tl.is_file():
             _, s_hosts, s_gpus = _footprint(server_tl)
             if (c_hosts, c_gpus) != (s_hosts, s_gpus):
                 msgs.append(

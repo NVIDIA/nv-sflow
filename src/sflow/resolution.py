@@ -891,6 +891,7 @@ def resolve_artifacts(
     output_dir: Any | None = None,
     materialize: bool = False,
     remote_filesystem: bool = False,
+    skip_fs_existence_check: bool = False,
 ) -> SflowState:
     """Resolve artifact URIs and inline content into ``state.artifacts``.
 
@@ -898,6 +899,10 @@ def resolve_artifacts(
     controller host (e.g. Kubernetes). It is forwarded to artifact resolvers that
     accept it (the file/fs resolver) so local ``fs://`` paths are passed through
     instead of being validated/created on the controller.
+
+    ``skip_fs_existence_check`` (``--skip-artifact-check``) passes a missing ``fs://``
+    path through as well, but ONLY that: unlike ``remote_filesystem`` it does not imply
+    a backend that injects ``file://`` inline content, which must still be written here.
     """
     ensure_builtin_artifacts_registered()
 
@@ -962,10 +967,13 @@ def resolve_artifacts(
             output_dir=out_dir,
             materialize=materialize,
         )
-        # Only resolvers that opt in (the file/fs resolver) receive remote_filesystem,
-        # so http/hf/docker resolvers keep their existing behavior unchanged.
-        if "remote_filesystem" in inspect.signature(resolver_obj.resolve).parameters:
+        # Only resolvers that opt in (the file/fs resolver) receive these, so
+        # http/hf/docker resolvers keep their existing behavior unchanged.
+        resolver_params = inspect.signature(resolver_obj.resolve).parameters
+        if "remote_filesystem" in resolver_params:
             resolve_kwargs["remote_filesystem"] = remote_filesystem
+        if "skip_fs_existence_check" in resolver_params:
+            resolve_kwargs["skip_fs_existence_check"] = skip_fs_existence_check
         artifact = resolver_obj.resolve(**resolve_kwargs)
         artifacts[artifact.name] = artifact
 

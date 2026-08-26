@@ -57,8 +57,11 @@ monitor:
     disk:   { enabled, interval }
     network:{ enabled, interval }
     custom: { script: [ "cmd", ... ] }
+  window:                        # task monitors only; optional post-run clipping
+    start: marker                # task-log marker (string or {pattern, select})
+    end:   marker
   report:
-    enabled: false               # default false -> raw CSV + overview only
+    enabled: true                # default true; false -> raw CSV + overview only
     format:  [csv, svg]          # subset of {csv, svg, png}; default [csv, svg]
 ```
 
@@ -135,11 +138,13 @@ only the listed ones (plus `custom`) are active.
 Each built-in scope accepts `enabled` (default `true`) and `interval` (ms,
 overrides `monitor.interval`).
 
-> **`report.enabled` defaults to `false`.** Sampling always happens and the raw CSVs
-> plus the `sflow_monitor.log` overview are always written, but the per-consumer /
-> per-task report folders (charts + summaries) are only produced when you set
-> `report: { enabled: true }` on that monitor. The CLI `--enable-*-monitor` flags turn
-> it on for you.
+> **`report.enabled` defaults to `true`** (it was `false` in earlier releases).
+> Declaring `monitor:` is enough to get the per-task report folders (charts +
+> summaries); raw CSVs and the `sflow_monitor.log` overview are written either way.
+>
+> Opt out with `report: { enabled: false }` on large fan-outs: a report folder is a
+> per-view *copy* of the samples, so disk and post-processing scale with
+> `samples x views`, not with samples. A 50-replica workflow writes 50+ timelines.
 
 > Sampling intervals (both `monitor.interval` and a scope's `interval`) must be
 > **≥ 100 ms** — smaller values are rejected at validation time because they spin
@@ -161,26 +166,100 @@ monitor:
 the named tasks (merged), which is the usual way to attach a benchmark's monitor
 to the inference servers it is driving.
 
+## Clip a report with log markers
+
+A task monitor can restrict its report to a measured phase without changing when
+the collector runs:
+
+```yaml
+monitor:
+  resources:
+    used_by_tasks: [server]
+  window:
+    start: WARMUP_FINISHED
+    end: BENCHMARK_FINISHED
+  report:
+    enabled: true
+```
+
+Plain strings are case-sensitive literal substrings. Prefix a pattern with `re:`
+or `regex:` for regular-expression search. Repeated markers can select `first` or
+`last`, and `pattern` may be a list of alternatives:
+
+```yaml
+start:
+  pattern: [WARMUP_FINISHED, 're:^warmup complete: rank \d+$']
+  select: last
+```
+
+Defaults are `start:first` and `end:last`. `start` is resolved first, then `end`
+is selected only from matches *after* it — so `start:last` + `end:first` means
+"the last warmup, then the run that follows it". Matching uses the task owner's
+final attempt and ignores sflow, srun-rank, and kubectl transport prefixes. With
+`used_by_tasks`, the marker window still comes from the monitor owner while the
+samples come from the referenced tasks' resources. An owner that never reaches a
+terminal state (a service torn down at the end) still resolves.
+
+If either boundary is missing, sflow keeps
+the raw samples, writes `windowed/<report>/window_not_found.json`, and skips that detailed report
+instead of silently falling back to the full task window.
+
 ## Outputs
 
 | Path | Contents |
 |------|----------|
 | `<run>/sflow_monitor.log` | Terminal-friendly overview: a header block (workflow, nodes, scopes, interval, window, sample count), per-metric min/avg/max tables, ASCII sparkline timelines, per-monitor windows, a **GPU Collection Errors** section (de-duplicated `nvidia-smi` failures), the list of per-task reports, and a **Task Events** section (`+elapsed  iso  event  task`). Always written. Sibling to `sflow_summary.log`. |
 | `<run>/sflow_monitor/raw/` | Raw per-node CSV samples (`<scope>_monitor_node_<id>_<host>.log`). |
-| `<run>/sflow_monitor/workflow/` | Whole-pool aggregate for the workflow monitor (all nodes overlaid), when `workflow.monitor.report.enabled`. |
-| `<run>/sflow_monitor/<task>/` | Per-task report scoped to that task's nodes + GPUs and clipped to its run window. |
-| `<run>/sflow_monitor/<task>_<i>/` | Per-replica report for each replica of a replicated task (its own node + GPUs). |
-| `<run>/sflow_monitor/<B>__monitored_by__<A>/` | Cross report: task B's resources sampled over task A's run window (the `used_by_tasks` case, where A's monitor watches B). |
+| `…/<group>/<report>/timeline.svg` | Chart, **one line per GPU** with each device's avg/max. Node-level scopes (cpu/memory/disk/network) stay averaged. |
+| `…/<group>/<report>/timeline.<hostname>.svg` | A report spanning several nodes splits into one image per node, named by the real hostname; the CSVs stay combined. |
+| `<run>/sflow_monitor/lifecycle/` | Reports whose time range comes from task lifecycle events. |
+| `<run>/sflow_monitor/windowed/` | Reports clipped by `monitor.window` log markers (each also carries `window.json`). |
+| `…/lifecycle/workflow/` | Whole-pool aggregate for the workflow monitor (all nodes overlaid), unless `workflow.monitor.report.enabled: false`. |
+| `…/<group>/<task>/` | Per-task report scoped to that task's nodes + GPUs. |
+| `…/<group>/<task>_<i>/` | Per-replica report for each replica of a replicated task (its own node + GPUs). |
+| `…/<group>/<B>__monitored_by__<A>/` | Cross report: task B's resources sampled over task A's window (the `used_by_tasks` case, where A's monitor watches B). |
+
+A resolved marker report folder also contains `window.json` with the selected source
+lines, timestamps, match counts, and resolution status.
 
 Each report folder holds `timeline.csv` + `summary.csv` + `timeline.svg` (and
 `timeline.png` if `png` is requested).
 
-**Task events on the timeline.** The SVG/PNG charts overlay a vertical marker at each
-task lifecycle transition (`submit` / `ready` / `done` / `fail` / `cancel`), color-coded
-by event and line-styled per task, with a legend. This lets you line up a GPU-utilization
-dip or a network spike against exactly when a server became `ready` or a benchmark
-`completed` — no manual timestamp cross-referencing. Byte-size metrics auto-scale in
+**Task events on the timeline.** The SVG/PNG charts overlay a vertical rule at each
+workflow transition, **named in place** — no legend to decode. Events that land at nearly
+the same moment (all the servers becoming `ready`, say) are merged into a single labelled
+rule, so a 7-task workflow shows a handful of phase edges rather than one line per task
+per change; a merged rule reads `3 tasks submit +2 more`. The label bands are split by
+meaning: **`submit` sits above the plot; everything that ends a task — `ready`, `done`,
+`fail`, `cancel` — sits below it**, which halves how many labels compete for any one
+strip of the x axis. Line style separates the two: a **dotted** rule means something
+started, a **solid** one means something ended. Rules are thin grey so they never compete
+with the data lines — except `fail`, which is drawn in red so the one marker worth
+reacting to stands out. `cancel` stays grey: sflow cancels still-running services at the
+end of every healthy workflow, so flagging it would cry wolf. This lets
+you line up a GPU-utilization dip or a network spike against exactly when a server became
+`ready` or a benchmark `completed` — no manual timestamp cross-referencing. Byte-size metrics auto-scale in
 tables and charts (e.g. GPU memory shows `9.9 GiB`, not `10137 MiB`; rates show `MiB/s`).
+
+**Clock calibration.** Samples are timestamped by the *compute node*; task events and
+monitor windows are timestamped by the *driver*. Every report intersects the two, so a node
+whose clock is off by more than a run's length yields empty reports — the raw logs look
+healthy, but no sample falls inside any window. Post-processing therefore measures the
+offset from data it already has: the driver knows when it started and stopped collecting,
+and the samples carry the node's own view of that same period, which bounds the offset to
+about one sampling interval. When that bound clearly excludes zero, samples are shifted onto
+the driver's clock **for reporting only** and a warning is emitted:
+
+```
+WARN: clock on 'node-07' is ahead of this host by 34.6..38.0s; monitor samples were
+shifted by +36.3s for REPORTING only (raw logs under sflow_monitor/raw/ keep the node's
+own timestamps). Windows are accurate to about the sampling interval until the clocks
+are synced (NTP/chrony).
+```
+
+`sflow_monitor/raw/` always keeps the node's original timestamps. A healthy clock always
+produces a bound that straddles zero, so it is never "corrected". The shift keeps reports
+usable, but it is a workaround — fix NTP on the node.
 
 **Per-task reports.** Whatever a monitor covers is broken down into one report
 per task (and per replica), keyed on the resources each task actually used:

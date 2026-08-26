@@ -26,7 +26,6 @@ from typing import Any
 
 from sflow.config.schema import (
     DEFAULT_MONITOR_INTERVAL_MS,
-    DEFAULT_MONITOR_REPORT_FORMATS,
     MONITOR_BUILTIN_SCOPES,
     MonitorConfig,
     SflowConfig,
@@ -43,7 +42,7 @@ from sflow.core.state import SflowState
 from sflow.core.task import Task
 from sflow.logging import get_logger
 from sflow.monitoring import HARDWARE_MONITOR_FILENAME, hardware_monitor_source
-from sflow.utils.gpu import parse_cuda_visible_devices
+from sflow.utils.gpu import task_gpu_indices
 
 _logger = get_logger(__name__)
 
@@ -115,6 +114,22 @@ def _collector_interval_ms(monitor: MonitorConfig) -> int:
             if scope is not None and scope.enabled and scope.interval is not None:
                 intervals.append(_coerce_int(scope.interval, field_name=f"scopes.{name}.interval"))
     return max(1, min(intervals))
+
+
+def _log_window_spec(monitor: MonitorConfig) -> dict[str, Any] | None:
+    if monitor.window is None:
+        return None
+
+    def _boundary(name: str, default_select: str) -> dict[str, Any]:
+        boundary = getattr(monitor.window, name)
+        patterns = (
+            [boundary.pattern]
+            if isinstance(boundary.pattern, str)
+            else list(boundary.pattern)
+        )
+        return {"pattern": patterns, "select": boundary.select or default_select}
+
+    return {"start": _boundary("start", "first"), "end": _boundary("end", "last")}
 
 
 def _backend_node_names(backend: Backend | None) -> list[str]:
@@ -207,8 +222,26 @@ class _MonitorPlanner:
                         continue
                     for node in rt.assigned_nodes:
                         keys.append((backend.name, node))
-                    gpus.update(parse_cuda_visible_devices(rt.envs.get("CUDA_VISIBLE_DEVICES")))
-            return _dedup_keys(keys), (sorted(gpus) if gpus else None)
+                    gpus.update(task_gpu_indices(rt))
+            return _dedup_keys(keys), sorted(gpus)
+
+        # The workflow monitor is the WHOLE-POOL monitor, so it spans every
+        # monitorable backend. Resolving it against the default backend alone
+        # leaves a second pool (e.g. a CPU-only Slurm partition) unsampled, and
+        # the tasks running there then have no samples of their own.
+        # An explicit `resources.nodes` is an index list into ONE backend, so
+        # that case keeps the single-backend resolution below.
+        if owner_task is None and (
+            resources is None or getattr(resources, "nodes", None) is None
+        ):
+            pool = [
+                (backend.name, node)
+                for backend in self.state.backends.values()
+                if self._monitorable(backend)
+                for node in _backend_node_names(backend)
+            ]
+            if pool:
+                return _dedup_keys(pool), self._resolve_gpus(resources)
 
         # Otherwise resolve against a single backend (task's or default).
         if owner_task is not None:
@@ -314,16 +347,8 @@ class _MonitorPlanner:
         # Only the workflow (whole-pool) monitor writes a standalone aggregate
         # folder. Per-task monitors are rendered as resource-scoped task views
         # (see `_build_task_views`), so their consumer skips the duplicate folder.
-        report = (
-            owner == "workflow"
-            and monitor.report is not None
-            and monitor.report.enabled
-        )
-        formats = (
-            monitor.report.format
-            if monitor.report is not None
-            else list(DEFAULT_MONITOR_REPORT_FORMATS)
-        )
+        report = owner == "workflow" and monitor.report.enabled
+        formats = monitor.report.format
 
         # Accumulate per-node collection requirements (scope union, finest interval).
         for key in keys:
@@ -379,19 +404,29 @@ class _MonitorPlanner:
             existing.report_formats = _union_list(
                 existing.report_formats, view.report_formats
             )
+            existing.contributors = _union_list(
+                existing.contributors, view.contributors
+            )
+            # Only a task monitor can carry a window (the schema bars the
+            # workflow one), and labels are unique per monitor, so at most one
+            # contributor to a label ever brings a window.
+            if view.log_window is not None:
+                existing.log_window = view.log_window
+                existing.window_tasks = list(view.window_tasks)
 
         def _emit(monitor, *, triggered_by: str, owner_short: str, owner_window):
-            if monitor.report is None or not monitor.report.enabled:
+            if not monitor.report.enabled:
                 return
             scopes = _effective_builtin_scopes(monitor)
             formats = list(monitor.report.format)
+            log_window = _log_window_spec(monitor)
             used = monitor.resources.used_by_tasks if monitor.resources else None
             if used:
                 for target in used:
                     for view in self._views_for(
                         target, triggered_by=triggered_by, owner_short=owner_short,
                         cross=True, scopes=scopes, formats=formats,
-                        window_names=owner_window,
+                        window_names=owner_window, log_window=log_window,
                     ):
                         _add(view)
             elif triggered_by == "workflow":
@@ -399,13 +434,14 @@ class _MonitorPlanner:
                     for view in self._views_for(
                         task_conf.name, triggered_by=triggered_by,
                         owner_short=owner_short, cross=False, scopes=scopes,
-                        formats=formats, window_names=None,
+                        formats=formats, window_names=None, log_window=log_window,
                     ):
                         _add(view)
             else:
                 for view in self._views_for(
                     owner_short, triggered_by=triggered_by, owner_short=owner_short,
-                    cross=False, scopes=scopes, formats=formats, window_names=None,
+                    cross=False, scopes=scopes, formats=formats,
+                    window_names=None, log_window=log_window,
                 ):
                     _add(view)
 
@@ -425,9 +461,22 @@ class _MonitorPlanner:
             )
         return list(views.values())
 
+    def _has_collector(self, task: Task) -> bool:
+        """True when some monitor actually samples a node this task runs on.
+
+        A task on a backend no monitor covers (e.g. a second Slurm pool) produces
+        no samples of its own. Without this check it still gets a report folder,
+        and the post-processor's name-mismatch fallback then fills that folder
+        with the OTHER backend's nodes and GPUs. Matching is on plan-time node
+        names, so it does not depend on what a collector reports as `hostname`.
+        """
+        nodes = set(task.assigned_nodes or [])
+        return any(node in nodes for _backend, node in self._units)
+
     def _views_for(
         self, resource_task: str, *, triggered_by: str, owner_short: str,
         cross: bool, scopes: list[str], formats: list[str], window_names,
+        log_window: dict[str, Any] | None,
     ) -> list[TaskResourceView]:
         """Combined + per-replica views for one task's resources.
 
@@ -440,9 +489,10 @@ class _MonitorPlanner:
             for rt in self._runtime_tasks_for(resource_task)
             if (
                 rt.assigned_nodes
-                or parse_cuda_visible_devices(rt.envs.get("CUDA_VISIBLE_DEVICES"))
+                or task_gpu_indices(rt)
             )
             and self._monitorable(self._backend_for_task(rt))
+            and self._has_collector(rt)
         ]
         if not rts:
             return []
@@ -453,7 +503,7 @@ class _MonitorPlanner:
         own_names: list[str] = []
         for rt in rts:
             nodes = list(rt.assigned_nodes)
-            gpus = parse_cuda_visible_devices(rt.envs.get("CUDA_VISIBLE_DEVICES"))
+            gpus = task_gpu_indices(rt)
             combined_nodes.extend(nodes)
             combined_gpus.update(gpus)
             own_names.append(rt.name)
@@ -463,7 +513,7 @@ class _MonitorPlanner:
                         label=f"{rt.name}{suffix}", task=resource_task, who=rt.name,
                         triggered_by=triggered_by, owner_short=owner_short,
                         cross=cross, nodes=nodes, gpus=gpus, scopes=scopes,
-                        formats=formats,
+                        formats=formats, log_window=log_window,
                         window_tasks=(window_names if cross else [rt.name]),
                     )
                 )
@@ -474,6 +524,7 @@ class _MonitorPlanner:
                 owner_short=owner_short, cross=cross, nodes=combined_nodes,
                 gpus=sorted(combined_gpus), scopes=scopes, formats=formats,
                 window_tasks=(window_names if cross else own_names),
+                log_window=log_window,
             )
         )
         return out
@@ -626,7 +677,7 @@ def _dedup_str(values: list[str]) -> list[str]:
 def _make_task_view(
     *, label: str, task: str, who: str, triggered_by: str, owner_short: str,
     cross: bool, nodes: list[str], gpus: list[int], scopes: list[str],
-    formats: list[str], window_tasks,
+    formats: list[str], window_tasks, log_window: dict[str, Any] | None,
 ) -> TaskResourceView:
     title = (
         f"{who} hardware timeline (monitored by {owner_short})"
@@ -639,10 +690,15 @@ def _make_task_view(
         triggered_by=triggered_by,
         title=title,
         nodes=_dedup_str(nodes),
-        gpus=(sorted(set(gpus)) if gpus else None),
+        # `[]` (task reserved no GPUs) must stay distinct from `None` (no GPU
+        # subset -> all): collapsing them puts every GPU on the task's nodes into
+        # a report for a task that never touched one.
+        gpus=(sorted(set(gpus)) if gpus is not None else None),
         scopes=list(scopes),
         report_formats=list(formats),
         window_tasks=list(window_tasks or []),
+        log_window=log_window,
+        contributors=[triggered_by],
         cross=cross,
     )
 

@@ -195,6 +195,10 @@ See examples.md Example 5; the replicas doc.
 
 - **Pin placement** with `resources.nodes` (`indices` / `count` / `exclude`; negative indices
   count from the end). **Request GPUs** with `resources.gpus.count`.
+- `gpus.count` is a per-task **total** across the task's nodes, and every node takes the
+  same slice — so when you also pin `resources.nodes`, `count` must be a positive multiple
+  of the node count. `nodes.count: 2` + `gpus.count: 1` is rejected; write `gpus.count: 2`
+  for one GPU on each of two nodes.
 - On `local`/`slurm`/`docker`, sflow slices `CUDA_VISIBLE_DEVICES` per task/replica — set the
   backend's `gpus_per_node` so it can pack.
 - **GPU planning:** `GPUs/worker = TP × DP × PP` (framework-dependent — some use attention-DP

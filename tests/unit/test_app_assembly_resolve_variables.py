@@ -199,3 +199,24 @@ def test_resolve_variables_exposes_domain_metadata_in_expressions():
     out = resolve_global_variables(config, state)
 
     assert out.variables["BATCH_SIZE"].value == 128  # max([128, 512]) // 4
+
+
+def test_build_state_clears_source_files_from_a_previous_call(tmp_path):
+    """`resolver` is a module GLOBAL, so state survives between build_state calls.
+
+    source_files was assigned only when truthy and never cleared, so a call that
+    passes none (visualize() does) inherited the last run's files and pointed its
+    expression-error location hints at the wrong YAML.
+    """
+    import asyncio
+
+    from sflow.app import assembly
+
+    assembly.resolver.source_files = [tmp_path / "stale.yaml"]
+
+    config = _minimal_config(variables=[])
+    asyncio.run(
+        assembly.build_state(config, allocate=False, workspace_dir=str(tmp_path))
+    )
+
+    assert assembly.resolver.source_files == []

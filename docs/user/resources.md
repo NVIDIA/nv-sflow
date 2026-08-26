@@ -177,7 +177,22 @@ A `count`-only request is **index-agnostic**: sflow gives the task any contiguou
 
 If a GPU request cannot fit on one node but is an exact multiple of `backends.<name>.gpus_per_node`, sflow can expand the task across multiple nodes. If the request is not a valid multiple or the selected pool is too small, validation fails before execution.
 
+When you pin the node count yourself with `resources.nodes`, `count` is still the
+**total** over those nodes and every node takes the same slice — so `count` must be a
+positive multiple of the number of assigned nodes, and `count / nodes` must fit on the
+smallest of them. `nodes.count: 2` with `gpus.count: 1` is rejected: one GPU cannot be
+split across two nodes. Write `gpus.count: 2` for one GPU on each of two nodes.
+
 This `CUDA_VISIBLE_DEVICES` packing applies to the **local**, **slurm**, and **docker** backends. Kubernetes assigns GPUs differently — see below.
+
+:::note `gpus_per_task` hands device selection to Slurm
+Setting `gpus_per_task` on an `srun` operator makes the job step request GRES, so Slurm
+carves devices per **rank** and picks which ones. sflow does not re-apply its own slice
+there — `resources.gpus` still sizes the request and drives packing and conflict
+detection, but the physical devices are Slurm's choice, and run reporting falls back to
+showing the planned slice. Leave `gpus_per_task` unset if you want sflow's exact device
+pin (`resources.gpus.indices`) to hold.
+:::
 
 ### Pin specific GPUs with `indices`
 
@@ -238,7 +253,8 @@ sees exactly the GPUs it was granted.
 
 `resources.gpus.count` is a **per-task total** that is split evenly across the task's
 assigned nodes, so it must be a multiple of the node count (each pod gets
-`count / nodes` GPUs). A multi-node task becomes **one pod per reserved node**. See
+`count / nodes` GPUs) — the same rule every backend applies, enforced at plan time.
+A multi-node task becomes **one pod per reserved node**. See
 [Backends: GPU requests](./backends.md#gpu-requests) for details.
 
 ## Resource reuse with `release_after`

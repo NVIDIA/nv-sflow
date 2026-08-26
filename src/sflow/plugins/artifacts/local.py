@@ -26,6 +26,7 @@ class _FileArtifactResolver:
         output_dir: Path,
         materialize: bool,
         remote_filesystem: bool = False,
+        skip_fs_existence_check: bool = False,
     ) -> Artifact:
         path = resolve_file_like_uri_to_path(uri, workspace_dir=workspace_dir)
         is_fs_scheme = str(uri).lower().startswith("fs://")
@@ -33,13 +34,20 @@ class _FileArtifactResolver:
         # For fs:// artifacts that don't exist, create an empty directory with a warning.
         # This allows workflows to reference output directories that will be populated at runtime.
         if is_fs_scheme and materialize and content is None and not path.exists():
-            if remote_filesystem:
-                # The backend executes off the controller host (e.g. Kubernetes),
-                # so an fs:// path refers to a location on the cluster/image, not the
-                # local machine. Don't validate or create it locally -- pass it through.
+            # Two independent reasons to leave the path alone, deliberately NOT folded
+            # into one flag: `remote_filesystem` also decides whether file:// inline
+            # content is written on the controller (below), and `--skip-artifact-check`
+            # must not reach that -- there is no pod to inject it into on slurm/local,
+            # so the content would end up written nowhere at all.
+            if remote_filesystem or skip_fs_existence_check:
+                why = (
+                    "off-host backend"
+                    if remote_filesystem
+                    else "--skip-artifact-check"
+                )
                 _logger.info(
                     f"Artifact '{name}' fs:// path '{path}' is treated as a remote "
-                    "path (backend executes off-host); not created or validated locally."
+                    f"path ({why}); not created or validated locally."
                 )
             else:
                 _logger.warning(

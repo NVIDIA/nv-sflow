@@ -140,7 +140,7 @@ Two consequences that cost real debugging time:
 | `Variable '<key>' ... is not defined`                    | Declare the variable in YAML before `--set`-ing it         |
 | `Undefined variable in expression`                       | Fix spelling; ensure the variable is declared              |
 | `Invalid expression syntax`                              | Fix the `${{ }}` Jinja2 syntax                             |
-| `Artifact path validation failed`                        | Fix the `fs://` path or create it                          |
+| `Artifact path validation failed`                        | Fix the `fs://` path, create it, or `--skip-artifact-check` |
 | `Version conflict`                                       | Every file must use `version: "0.1"`                       |
 | `CSV file must contain a 'sflow_config_file' column`     | Add the required column to the CSV                         |
 

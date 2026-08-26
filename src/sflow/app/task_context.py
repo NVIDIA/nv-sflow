@@ -10,6 +10,7 @@ from sflow.core.backend import Backend
 from sflow.core.compute_node import ComputeNode
 from sflow.core.task import Task, TaskPort
 from sflow.core.task_graph import TaskGraph
+from sflow.utils.gpu import parse_cuda_visible_devices
 
 
 def compute_task_service(
@@ -65,13 +66,12 @@ def build_task_info(
                 }
             )
 
-    gpus: list[int] = []
-    cuda_visible = task.envs.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible:
-        try:
-            gpus = [int(g.strip()) for g in cuda_visible.split(",") if g.strip()]
-        except ValueError:
-            gpus = []
+    # `task.<name>.gpus` is the IN-TASK view, so it reads the execution env rather
+    # than the planner's slice: a containerized task really does see 0..N-1, and a
+    # recipe interpolating this is addressing devices from inside the container.
+    # The shared parser also expands the range form ("0-3" -> 4 devices), which the
+    # hand-rolled int() split used to drop on the floor.
+    gpus = parse_cuda_visible_devices(task.envs.get("CUDA_VISIBLE_DEVICES"))
 
     return {
         "nodes": task_nodes,

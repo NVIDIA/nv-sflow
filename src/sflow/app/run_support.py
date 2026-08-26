@@ -183,9 +183,11 @@ def preflight_validate_artifacts(
 ) -> list[str]:
     """Validate local artifact paths before a run can allocate backend resources.
 
-    ``skip_local_fs_validation`` is set when the workflow targets an off-host backend
-    (e.g. Kubernetes): a missing ``fs://`` path then warns instead of failing, since
-    the path lives on the remote cluster/image rather than the controller.
+    ``skip_local_fs_validation`` demotes a missing ``fs://`` path from an error to a
+    warning. It is set when the workflow targets an off-host backend (e.g. Kubernetes),
+    where the path lives on the remote cluster/image rather than the controller, and by
+    the user via ``--skip-artifact-check`` for the same situation on a backend sflow
+    cannot detect (e.g. a Slurm path that only exists on the compute nodes).
     """
     raw_vars = _raw_variable_values(variable_configs)
 
@@ -217,8 +219,8 @@ def preflight_validate_artifacts(
                 if skip_local_fs_validation and not dry_run:
                     warnings.append(
                         f"Artifact '{artifact_conf.name}' (fs://) path '{resolved}' "
-                        "does not exist locally; assuming it exists on the off-host "
-                        "backend (e.g. the Kubernetes cluster/image)."
+                        "does not exist locally; continuing without local validation "
+                        "(off-host backend such as Kubernetes, or --skip-artifact-check)."
                     )
                 elif dry_run:
                     warnings.append(

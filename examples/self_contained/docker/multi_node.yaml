@@ -22,8 +22,10 @@ workflow:
       resources:
         nodes:
           count: 2
+        # gpus.count is the TOTAL across the task's nodes, and every node takes
+        # the same slice -- so 2 here means 1 GPU on each of the 2 nodes.
         gpus:
-          count: 1
+          count: 2
       script:
         - echo "Running on ${SFLOW_TASK_ASSIGNED_NODE_NAMES}"
         - ./run_worker.sh

@@ -27,12 +27,22 @@ workflow:
       depends_on: [warmup]
       script:
         - echo "doing work"
+        - sleep 1
+        - echo "MEASURE_START"
         # Busy-loop for ~4s to produce some CPU load for the monitor to capture.
         - end=$((SECONDS+4)); while [ "$SECONDS" -lt "$end" ]; do :; done
+        - echo "MEASURE_END"
+        - sleep 1
         - echo "done"
       monitor:
         scopes:
           cpu: {}
           memory: {}
+        # Clip the report to the measured phase; the collector still runs for
+        # the whole task. Unmatched markers keep the raw samples and write
+        # windowed/<report>/window_not_found.json instead of the full window.
+        window:
+          start: MEASURE_START
+          end: MEASURE_END
         report:
           enabled: true

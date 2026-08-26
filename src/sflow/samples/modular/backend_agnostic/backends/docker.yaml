@@ -1,0 +1,75 @@
+# Local Docker backend fragment for the modular samples.
+#
+# Binds the logical operator names the workload fragments use (server / helper /
+# client) to `docker_run` operators, and names the backend `cluster` so workloads
+# can reference `${{ backends.cluster.nodes[0].ip_address }}` uniformly -- which
+# resolves to 127.0.0.1 here, reachable because every container runs with
+# `--network=host`.
+#
+# This is the single-box counterpart to backends/slurm.yaml and backends/k8s.yaml:
+# the same workload YAML that runs on a cluster also runs on one machine with
+# Docker + the NVIDIA Container Toolkit, which makes it the fast loop for trying a
+# recipe before committing it to a queue.
+#
+# Compose with a workload + benchmark, e.g. on a 1-GPU laptop/dev box:
+#   sflow run -f backends/docker.yaml -f workloads/sglang_serve.yaml -f benchmark.yaml \
+#             -s GPUS_PER_NODE=1 -s SERVER_GPUS=1 \
+#             -s MODEL_HOST_PATH=/data/models -s MODEL_PATH=/data/models/Qwen3-0.6B
+#
+# GPUs are reserved per task from a machine-local registry, so several `sflow run`
+# processes can share one box without landing on the same devices -- start a second
+# recipe while this one serves and it takes the next free GPUs (or waits, with
+# `--wait-for-gpus`). See docs/user/backends.md#gpu-reservation-local-concurrent-runs.
+
+version: "0.1"
+
+variables:
+  GPUS_PER_NODE:
+    description: "GPUs on this machine (the planning ceiling, not a reservation)"
+    type: integer
+    value: 8
+  MODEL_HOST_PATH:
+    description: "Host directory holding the model weights; bind-mounted at the same path inside every container so the workload's MODEL_PATH resolves unchanged"
+    value: /models
+  SERVER_SHM_SIZE:
+    description: "Shared memory for the server container (inference runtimes need well above Docker's 64m default)"
+    value: 16g
+
+backends:
+  - name: cluster
+    type: docker
+    default: true
+    # Per-operator `image` below wins; this is the fallback for any task that does
+    # not name an operator (e.g. a plain `script:` task added on top).
+    image: ${{ variables.SERVER_IMAGE }}
+    nodes: 1
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    mounts:
+      # Same path inside and out, so MODEL_PATH from the workload needs no rewrite.
+      - ${{ variables.MODEL_HOST_PATH }}:${{ variables.MODEL_HOST_PATH }}
+
+operators:
+  # Model server. It declares NO `gpus:` here on purpose: the workload's
+  # `resources.gpus.count` drives placement, so sflow reserves that many physical
+  # GPUs for the task and pins the container to exactly those devices. Hard-coding
+  # `gpus: all` instead would take the whole box and collide with any concurrent run.
+  - name: server
+    type: docker_run
+    image: ${{ variables.SERVER_IMAGE }}
+    extra_args:
+      - --network=host          # client reaches the server on 127.0.0.1
+      - --ipc=host              # NCCL / shared-memory transports between workers
+      - --shm-size=${{ variables.SERVER_SHM_SIZE }}
+  # CPU-only infra helpers (nats / etcd / frontend) share the server image. With no
+  # GPU request they get NVIDIA_VISIBLE_DEVICES=void and see no devices at all.
+  - name: helper
+    type: docker_run
+    image: ${{ variables.SERVER_IMAGE }}
+    extra_args:
+      - --network=host
+  # Benchmark client, also CPU-only.
+  - name: client
+    type: docker_run
+    image: ${{ variables.CLIENT_IMAGE }}
+    extra_args:
+      - --network=host

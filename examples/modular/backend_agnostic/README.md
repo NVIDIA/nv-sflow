@@ -2,7 +2,8 @@
 
 These samples compose a **workload** with a **backend** (and the shared
 `benchmark.yaml`) to produce a runnable inference + benchmark workflow. The same
-workload YAML runs on Slurm, plain Kubernetes, or Kubernetes MPI without edits.
+workload YAML runs on Slurm, plain Kubernetes, Kubernetes MPI, or a single machine
+with Docker -- without edits.
 
 Two sflow features make this work:
 
@@ -24,7 +25,8 @@ modular/
 ├── backends/
 │   ├── slurm.yaml            # backend `cluster` + srun operators
 │   ├── k8s.yaml              # backend `cluster` + k8s operators (single-pod)
-│   └── k8s_mpi.yaml          # backend `cluster` + k8s_mpi server, k8s helper/client
+│   ├── k8s_mpi.yaml          # backend `cluster` + k8s_mpi server, k8s helper/client
+│   └── docker.yaml           # backend `cluster` + docker_run operators (one local box)
 └── workloads/
     ├── dynamo_common.yaml           # NATS + etcd + frontend infra (Dynamo only)
     ├── dynamo_trtllm.yaml           # Dynamo TRT-LLM aggregated server
@@ -129,3 +131,26 @@ These samples ship with placeholders — set them with `-s KEY=VALUE` (or a
 `MODEL_PATH` must be visible to the server pod/step: a PVC or hostPath on
 Kubernetes (declare a `volumes:` entry on the backend), or a shared filesystem
 path on Slurm.
+
+## Running on one machine (Docker)
+
+`backends/docker.yaml` is the single-box counterpart to the cluster fragments, so a
+recipe can be proven locally before it goes near a queue:
+
+```bash
+sflow run -f backends/docker.yaml -f workloads/sglang_serve.yaml -f benchmark.yaml \
+          -s GPUS_PER_NODE=1 -s SERVER_GPUS=1 \
+          -s MODEL_HOST_PATH=/data/models -s MODEL_PATH=/data/models/Qwen3-0.6B
+```
+
+Needs Docker and, for GPU workloads, the NVIDIA Container Toolkit. Every container
+runs with `--network=host`, so `${{ backends.cluster.nodes[0].ip_address }}`
+resolves to `127.0.0.1` exactly as the workloads expect, and `MODEL_HOST_PATH` is
+bind-mounted at the same path inside the container so `MODEL_PATH` needs no rewrite.
+
+The server's GPUs come from the workload's `resources.gpus.count`, not from a
+hard-coded `gpus: all`: sflow reserves that many free devices from a machine-local
+registry and pins the container to them. Several `sflow run` processes can
+therefore share one box -- a second recipe takes the next free GPUs, or waits with
+`--wait-for-gpus`. CPU-only helpers and the client request no GPUs and see none.
+See [GPU reservation](../../../docs/user/backends.md#gpu-reservation-local-concurrent-runs).

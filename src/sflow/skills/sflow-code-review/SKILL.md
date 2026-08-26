@@ -2,16 +2,17 @@
 name: sflow-code-review
 description: >-
   Review sflow code changes for functional defects, modular by-purpose structure,
-  duplicated logic that should be consolidated, and adequate unit + e2e CLI test
-  coverage. Use when reviewing an sflow diff, branch, PR, staged changes, or when
-  the user asks for a code review of sflow.
+  duplicated logic that should be consolidated, adequate unit + e2e CLI test
+  coverage, and over-engineering that should simply be deleted (ponytail pass).
+  Use when reviewing an sflow diff, branch, PR, staged changes, or when the user
+  asks for a code review of sflow.
 ---
 
 # sflow Code Review
 
-Structured review of sflow changes against four aspects: functional defects, modular
-structure, duplication, and test coverage. Findings are advisory — report them, do not
-silently rewrite the author's code unless asked.
+Structured review of sflow changes against five aspects: functional defects, modular
+structure, duplication, test coverage, and over-engineering. Findings are advisory —
+report them, do not silently rewrite the author's code unless asked.
 
 ## When to use
 
@@ -29,6 +30,7 @@ Copy this checklist into TodoWrite and work through it in order:
 - [ ] Aspect 2: Modular / by-purpose structure
 - [ ] Aspect 3: Redundant logic that should be consolidated
 - [ ] Aspect 4: Test coverage + test-integrity policy
+- [ ] Aspect 5: Over-engineering (ponytail pass) — what can be deleted
 - [ ] Verify: run focused tests / coverage / dry-run
 - [ ] Report findings grouped by aspect and severity
 ```
@@ -51,7 +53,7 @@ Then, for each non-trivial changed function/class/method, find its callers (the 
 radius) with a quick search — e.g. `grep -rn "changed_symbol" src tests` — so you know
 what an incompatible change would break. Confirm the change set only touches what the
 author intended, and that every direct caller of a changed signature/default was updated.
-Note the area each file belongs to (see `reference.md` layer map) — this drives Aspects 2–4.
+Note the area each file belongs to (see `reference.md` layer map) — this drives Aspects 2–5.
 
 ## Aspect 1 — Functional defects
 
@@ -113,6 +115,9 @@ Full responsibility table for each package: `reference.md`.
 
 ## Aspect 3 — Redundant logic to consolidate
 
+> Sibling of Aspect 5: this one is *the same logic written twice* (unify it);
+> Aspect 5 is *logic that should not exist at all* (delete it).
+
 Look for near-duplicate snippets with the same purpose scattered across files. They
 should become one dedicated module/function called the same way everywhere.
 
@@ -166,6 +171,56 @@ Two-part check:
      an intentional behavior/breaking change with migration notes. Tests must not be bent
      to fit the implementation.
 
+## Aspect 5 — Over-engineering (ponytail pass)
+
+Aspects 1–4 ask "is this correct, well-placed, non-duplicated, tested?" This one asks the
+cheaper question: **should this code exist at all?** Run it last — the ladder shortens the
+solution, never the reading. The best diff is the one that deletes.
+
+Walk the ladder against the change; stop at the first rung that holds:
+
+1. **Does it need to exist?** Speculative need, a flag nobody asked for, config for a
+   value that never changes → cut it, say so in one line. (YAGNI)
+2. **Already in this repo?** A `utils/` helper, an existing plugin/base class, an
+   established convention. Re-implementing what lives a few files over is the most common
+   form of slop here — check the `utils/` table in `reference.md` before accepting a new
+   helper.
+3. **Stdlib does it?** `pathlib`, `dataclasses`, `itertools`, `functools.lru_cache`,
+   `shlex`, `re`, `sorted(key=...)` — before any hand-rolled equivalent.
+4. **Already-installed dependency?** pydantic, typer, rich, jinja2, boto3, parse are
+   already here. Never add a new dependency for what a few lines can do.
+5. **Can it be one line?** Then it should be.
+
+Flag these — one line each, `<file>:<line> — cut X, use Y instead (−N lines)`:
+
+- **Speculative abstraction**: an interface/base class with one implementation, a factory
+  for one product, a registry with one entry, a hook nothing calls.
+- **Dead flexibility**: a parameter every caller passes the same value for, a branch no
+  config can reach, an `Optional[...]` that is never `None`.
+- **Dead on arrival**: a helper the same diff adds and then makes unreachable. The tell is
+  `pytest --cov=src --cov-report=term-missing` — brand-new lines at 0% coverage.
+- **Reinvented stdlib / reinvented sflow**: a hand-rolled merge, sort key, or arg-dedup
+  where `utils/extra_args.py` or a stdlib call already exists.
+- **Boilerplate for later**: scaffolding, placeholder branches, unused config keys.
+- **A second way to do an existing thing**: a new YAML key or CLI flag that overlaps one
+  already in `config/schema.py`. Two spellings of one concept is a support burden forever.
+
+**Never simplify away** (these are not findings): input validation at trust boundaries
+(`config/schema.py` validators), error handling that prevents data loss, the S3 credential
+chain and other security paths, backend/hardware calibration knobs a minimal model cannot
+see, or anything the author was explicitly asked to build.
+
+**Two things that look like findings but are not:**
+
+- *Dense rationale comments.* sflow deliberately comments the non-obvious "why" at length.
+  That is house style. Flag prose only when it defends complexity that should be deleted.
+- *Marked shortcuts.* A `ponytail:` comment names a known ceiling and its upgrade path —
+  that is a tracked decision, not debt to report. An **unmarked** corner-cut with a real
+  ceiling (global lock, O(n²) scan, naive heuristic) IS a finding: ask for the marker.
+
+Report severity by what it costs to carry, not by line count: 🟡 for an abstraction that
+will shape future code (a base class, a new YAML key), 🟢 for a local simplification.
+
 ## Verify
 
 Run the focused checks for the touched areas before concluding (venv active):
@@ -203,13 +258,18 @@ Group findings by aspect, ordered by severity. Use file:line references.
 - 🔴 Critical: existing test <file> weakened without declared breaking change
 - 🟡 Major: new behavior in <file> lacks unit/e2e coverage
 
+### Aspect 5 — Over-engineering
+- 🟡 Major: <file>:<line> — cut <abstraction>, <what replaces it> (−N lines)
+- 🟢 Minor: ...
+
 ### Verification
 - pytest ...: <pass/fail>
 - full_sample_tests.sh -P: <pass/fail/not run + reason>
 ```
 
 Severity: 🔴 Critical (must fix — bug, broken caller, weakened test) · 🟡 Major (should
-fix — missing coverage, misplaced logic) · 🟢 Minor/Nit (optional improvement).
+fix — missing coverage, misplaced logic, abstraction that shapes future code) ·
+🟢 Minor/Nit (optional improvement, local simplification).
 
 ## Additional resources
 

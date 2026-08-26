@@ -16,6 +16,7 @@ import gc
 import logging
 import re
 import time
+from pathlib import Path
 
 import pytest
 
@@ -27,15 +28,37 @@ def _blocking_stall(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _blocking_stall_until_dump(dump: Path, max_seconds: float = 5.0) -> None:
+    """Stall the loop until the watchdog reacts, rather than for a fixed guess.
+
+    The detector is a background thread, so a fixed-length stall turns "a stall is
+    detected" into "that thread got scheduled inside a 300ms window". On an idle box
+    that is a 3x margin; on a loaded CI runner it is a coin flip, and it is how this
+    test failed on 3.10 while its siblings passed. Waiting on the outcome instead of
+    on the clock cannot lose that race.
+
+    The loop is still wedged the whole time -- nothing here awaits, which is the
+    property under test. Only the exit condition changes, so a healthy watchdog also
+    makes these tests *faster* (they stop at detection instead of always ~0.45s).
+    """
+    deadline = time.monotonic() + max_seconds
+    while time.monotonic() < deadline:
+        # The header is written before the stacks, so waiting on it (not on mere
+        # existence) never observes a half-written file.
+        if dump.exists() and "event loop stalled" in dump.read_text():
+            return
+        time.sleep(0.01)
+
+
 def test_stall_dumps_every_thread_stack_to_the_run_dir(tmp_path, caplog):
     dump = tmp_path / "loop_stalls.txt"
     wd = EventLoopWatchdog(dump, stall_seconds=0.15, beat_interval=0.02)
 
     async def drive():
         wd.start()
-        await asyncio.sleep(0.05)      # prove the beat is running first
-        _blocking_stall(0.45)          # now wedge the loop
-        await asyncio.sleep(0.15)      # let the watcher observe recovery
+        await asyncio.sleep(0.05)             # prove the beat is running first
+        _blocking_stall_until_dump(dump)      # now wedge the loop
+        await asyncio.sleep(0.15)             # let the watcher observe recovery
         wd.stop()
 
     with caplog.at_level(logging.WARNING):
@@ -150,7 +173,7 @@ def test_a_stopped_watchdog_can_be_armed_again(tmp_path):
         # Second life: arm again and stall for real.
         wd.start()
         await asyncio.sleep(0.05)
-        _blocking_stall(0.45)
+        _blocking_stall_until_dump(dump)
         await asyncio.sleep(0.15)
         wd.stop()
 

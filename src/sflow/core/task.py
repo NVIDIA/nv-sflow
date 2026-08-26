@@ -206,6 +206,17 @@ class Task:
     # NOT injected into the execution env (e.g. Kubernetes, where the cluster/DRA
     # assigns the physical devices); env injection is gated by Backend.resource_env.
     cuda_visible_devices: str | None = None
+    # Physical GPU indices this task actually acquired at launch, when the backend
+    # reserves specific devices cross-process (docker's per-task reservation).
+    # Unlike `cuda_visible_devices` -- a plan-time provisional slice -- these are
+    # the real devices, so run reporting names what the task truly used. None
+    # whenever no launch-time reservation happened (every other backend).
+    reserved_gpu_indices: list[int] | None = None
+    # Plan-time: a LATER task in this run is scheduled onto this task's GPUs.
+    # Completing this task must therefore keep them reserved to this run rather
+    # than publishing them, or a concurrent sflow run can take a device the
+    # successor was planned onto (see Orchestrator._launch_task_with_timeout).
+    gpus_reused_downstream: bool = False
     # task.ports; feeds task.<name>.service.
     ports: list[TaskPort] = field(default_factory=list)
     # Sweep variable names for this replica (empty if not a sweep replica).

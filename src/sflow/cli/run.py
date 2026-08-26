@@ -29,6 +29,7 @@ from sflow.logging import configure_logging, get_logger
 from sflow.resolution import enrich_error_with_location
 from sflow.runtime_info import log_runtime_info
 from sflow.utils.extra_args import dedup_merge_extra_args, extra_arg_key
+from sflow.utils.gpu_reservation import WAIT_FOR_GPUS_ENV, validate_wait_value
 
 _logger = get_logger(__name__)
 
@@ -182,6 +183,14 @@ def run(
             help="Override artifact URI (format: NAME=URI, can be used multiple times)",
         ),
     ] = None,
+    skip_artifact_check: Annotated[
+        bool,
+        typer.Option(
+            "--skip-artifact-check",
+            help="Do not fail when an fs:// artifact path does not exist locally; warn and continue. Use for paths that only exist where the task runs "
+            "(e.g. on the Slurm compute nodes).",
+        ),
+    ] = False,
     missable_tasks: Annotated[
         Optional[List[str]],
         typer.Option(
@@ -429,6 +438,16 @@ def run(
             "backend's offload_task_logs; no-op for k8s/ssh.",
         ),
     ] = None,
+    wait_for_gpus: Annotated[
+        Optional[str],
+        typer.Option(
+            "--wait-for-gpus",
+            help="When fewer GPUs are free than requested, wait instead of "
+            "failing fast. Pass seconds to bound the wait (e.g. --wait-for-gpus "
+            "600); pass 0 or an empty value to wait indefinitely, matching the "
+            "backend's wait_for_gpus field. Omit the flag to fail fast.",
+        ),
+    ] = None,
 ):
     """
     Run a workflow from one or more sflow YAML files.
@@ -465,6 +484,17 @@ def run(
         # Run a CSV row with additional CLI config files prepended
         sflow run -f common.yaml --bulk-input jobs.csv --row 1
     """
+    # Argument-shape validation, deliberately OUTSIDE the run try/except below so
+    # a bad flag reads as a usage error rather than a workflow failure. A typo
+    # like `--wait-for-gpus 600s` must not survive parsing and dry-run only to
+    # surface at the first GPU task of a long real run.
+    if wait_for_gpus is not None:
+        try:
+            validate_wait_value(wait_for_gpus)
+        except ValueError as e:
+            typer.echo(f"Error: --wait-for-gpus: {e}", err=True)
+            raise typer.Exit(code=2) from None
+
     try:
         if row and bulk_input is None:
             typer.echo("Error: --row requires --bulk-input.", err=True)
@@ -534,6 +564,14 @@ def run(
         # without editing recipes (slurm, local, docker).
         if offload_task_logs is not None:
             os.environ[OFFLOAD_TASK_LOGS_ENV] = "1" if offload_task_logs else "0"
+
+        # Per-invocation GPU wait toggle (already validated above). The docker
+        # operator reads this env when it reserves a task's GPUs (see
+        # sflow.utils.gpu_reservation). Reservation itself is on by default; the
+        # advanced SFLOW_GPU_RESERVATION=0 env escape-hatch (no CLI flag) turns
+        # it off.
+        if wait_for_gpus is not None:
+            os.environ[WAIT_FOR_GPUS_ENV] = wait_for_gpus
 
         # --extra-args is the generic, backend-agnostic flag: fan its values out to
         # every typed channel (salloc / docker run / kubectl global flags) so whichever
@@ -605,6 +643,7 @@ def run(
                 enable_task_monitors=enable_task_monitor,
                 workspace_dir=workspace_dir,
                 output_dir=output_dir,
+                skip_artifact_check=skip_artifact_check,
                 tui=tui_enabled,
                 tui_log_buffer=log_buffer,
                 tui_log_lock=log_lock,

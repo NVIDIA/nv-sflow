@@ -133,6 +133,7 @@ The expression is resolved before the artifact path is validated. This means:
 - **`--dry-run`**: a missing `fs://` path is a **warning** — the dry-run still succeeds.
 - **Real run on a local / Slurm / Docker backend**: a missing `fs://` path **fails** the run before allocation (`Artifact path validation failed`), so create input paths first.
 - **Off-host backends (e.g. Kubernetes)**: `fs://` paths are treated as **remote** paths on the cluster/image, so they are **not validated or created locally** — a missing path just warns. Ensure the path exists inside the pod (baked into the image, or mounted via a PVC/hostPath you configure).
+- **`--skip-artifact-check`**: opts any backend into that same treatment — a missing `fs://` path warns instead of failing, and is left alone rather than created as an empty directory. For paths that exist only where the task runs (e.g. on the Slurm compute nodes, not the login node). For `sflow batch`, pass it there and it is forwarded to the `sflow run` inside the job.
 - **`file://` paths with `content`**: skipped (the file is generated at runtime from the inline content).
 - **URIs with unresolved expressions**: skipped (validated later during full resolution).
 

@@ -495,7 +495,12 @@ def test_build_task_graph_docker_nodes_count_launches_one_container_per_host():
                     name="distributed_job",
                     resources=ResourcesConfig(
                         nodes=NodeResourceConfig(count=2),
-                        gpus=GpuResourceConfig(count=1),
+                        # gpus.count is the TOTAL over the task's nodes, so 2 here
+                        # is 1 GPU on each host. (1 would be unsatisfiable across
+                        # 2 nodes and is now rejected at plan time.) The GPU count
+                        # is incidental to this test -- it asserts the per-host
+                        # container fan-out below.
+                        gpus=GpuResourceConfig(count=2),
                     ),
                     script=["./run_worker.sh"],
                 )

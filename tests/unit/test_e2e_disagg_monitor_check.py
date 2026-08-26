@@ -43,7 +43,9 @@ def _write_timeline(folder: Path, rows: list[tuple[str, str, str]]) -> None:
 
 
 def _mon(tmp_path: Path) -> Path:
-    return tmp_path / "run" / "sflow_monitor"
+    # Reports live under a group naming what sets their time range; the checker
+    # must find them there, not at the pre-grouping flat root.
+    return tmp_path / "run" / "sflow_monitor" / "lifecycle"
 
 
 def test_targeting_pass_when_cross_matches_servers(tmp_path):
