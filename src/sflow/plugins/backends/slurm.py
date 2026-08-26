@@ -402,8 +402,12 @@ class SlurmBackend(Backend):
         if self._exclude_nodes:
             command.add_opt("--exclude", ",".join(self._exclude_nodes))
 
+        # add_arg, not add_opt: extra_args is a verbatim passthrough of already
+        # tokenized argv. add_opt() de-dups by option name, which treats a bare
+        # value ("1" in `-G 1`) as an option and lets a later identical value
+        # ("1" in `-N 1`) delete it. Same as srun/docker's extra_args handling.
         for arg in self._extra_args:
-            command.add_opt(arg)
+            command.add_arg(arg)
 
         parser = ParseLogHandler(
             patterns=[

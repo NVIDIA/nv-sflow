@@ -168,6 +168,51 @@ def test_salloc_tokenizes_extra_args_with_bundled_whitespace(
     assert not any(arg != arg.strip() for arg in salloc_cmd)
 
 
+def test_salloc_extra_args_keep_repeated_values(monkeypatch, slurm_test_logger):
+    # `-e '-G 1 -p polar4 -A acct -N 1'` tokenizes to space-separated flag/value
+    # pairs. Feeding each token through Command.add_opt() treated the bare values
+    # as option names and de-duped them, so the second "1" deleted the first and
+    # salloc received `-G -p polar4 -A acct -N 1` -- a silent, wrong allocation.
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="b",
+            type="slurm",
+            account="acct",
+            partition="batch",
+            nodes=1,
+            time="00:10:00",
+            job_name="job",
+            extra_args=["-G 1 -p polar4 -A general_perflab -N 1"],
+            gpus_per_node=8,
+        )
+    )
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (0, ["salloc: Granted job allocation 1", "salloc: Nodes node001 are ready for job"]),
+            (0, ["node001: 10.0.0.1:123"]),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+    asyncio.run(backend.allocate())
+
+    salloc_cmd = list(fake_launcher.calls[0]["command"])
+    assert salloc_cmd[-8:] == [
+        "-G",
+        "1",
+        "-p",
+        "polar4",
+        "-A",
+        "general_perflab",
+        "-N",
+        "1",
+    ]
+
+
 def test_env_reuse_applies_exclude_filter(monkeypatch, slurm_test_logger):
     # A reused Slurm allocation can't take salloc flags, so exclude filters the
     # resolved node pool instead.
