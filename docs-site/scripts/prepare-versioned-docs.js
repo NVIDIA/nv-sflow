@@ -205,6 +205,33 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+// In-page anchors that were already broken in a published snapshot. A released tag
+// cannot be re-cut, so for frozen versions the only place left to repair them is
+// here, at extraction time. Current docs are deliberately NOT covered: those are
+// fixed at source in docs/.
+//
+// Each entry carries the heading it assumes, and the repair only fires when that
+// heading is actually present. `main` is a branch, not a frozen tag -- once the
+// source fix lands there its snapshot already has the corrected heading, and an
+// unconditional rewrite would break the link a second time in the other direction.
+const FROZEN_ANCHOR_REPAIRS = [
+  {
+    from: "#modular-inference-recipe-inference_x_v2",
+    to: "#inference_x_v2",
+    onlyWhenHeading: /^### inference_x_v2\s*$/m,
+  },
+];
+
+function repairFrozenAnchors(text) {
+  let out = text;
+  for (const repair of FROZEN_ANCHOR_REPAIRS) {
+    if (out.includes(repair.from) && repair.onlyWhenHeading.test(out)) {
+      out = out.replaceAll(repair.from, repair.to);
+    }
+  }
+  return out;
+}
+
 function rewriteVersionedDocsLinks(rootDir, versionLabel) {
   const entries = fs.readdirSync(rootDir, { withFileTypes: true });
   for (const entry of entries) {
@@ -213,7 +240,9 @@ function rewriteVersionedDocsLinks(rootDir, versionLabel) {
       rewriteVersionedDocsLinks(entryPath, versionLabel);
     } else if (entry.isFile() && entry.name.endsWith(".md")) {
       const text = fs.readFileSync(entryPath, "utf8");
-      const rewritten = text.replaceAll("](/docs/", `](/docs/${versionLabel}/`);
+      const rewritten = repairFrozenAnchors(
+        text.replaceAll("](/docs/", `](/docs/${versionLabel}/`),
+      );
       if (rewritten !== text) {
         fs.writeFileSync(entryPath, rewritten);
       }
@@ -284,6 +313,7 @@ if (require.main === module) {
 
 module.exports = {
   buildDocVersionPlan,
+  repairFrozenAnchors,
   currentDocsSource,
   docsPaths,
   isReleaseTag,

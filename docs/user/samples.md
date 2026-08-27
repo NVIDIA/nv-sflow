@@ -1408,7 +1408,7 @@ sflow run -f dynamo_trtllm_disagg.yaml \
 
 Modular samples are folders containing multiple composable YAML files. Instead of one monolithic config, the workflow is split into reusable building blocks.
 
-### inference_x_v2
+### Modular inference recipe (inference_x_v2)
 
 A modular inference benchmark setup supporting multiple frameworks (SGLang, vLLM, TensorRT-LLM) with disaggregated prefill/decode servers.
 
