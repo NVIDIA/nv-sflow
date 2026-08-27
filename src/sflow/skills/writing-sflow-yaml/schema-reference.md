@@ -331,6 +331,7 @@ backends:
     # dra: { gpu_device_class: gpu.nvidia.com, rdma_device_class: rdma.nvidia.com }
     # compute_domain: { channel: auto }   # Multi-Node NVLink (IMEX); top-level, not under dra
     # probe_pod_image: curlimages/curl:latest
+    # collect_node_local_output: true     # default true; false = NO sflow collect machinery in the pod at all
     # collect_max_file_size: 10Mi         # cap for syncing pod output back to driver (0 disables)
     # collect_grace_seconds: 120          # grace window (s) for copying node-local outputs back
     # reservation: { placeholder_image: my-mirror/bash:5 }   # air-gapped placeholder-pod image
@@ -578,6 +579,8 @@ The task then carries only its launch line (no keypair/hostfile/sshd/wait/`-x`):
 | `omp_num_threads`         | int\|null | `8`                  | Per-rank `OMP_NUM_THREADS` (pod env, forwarded to ranks). Caps OpenMP so co-located ranks don't exhaust pthreads at model load; a recipe `export OMP_NUM_THREADS=...` overrides it; `null`/`0` disables |
 | `worker_setup_timeout_seconds` | int/expr | `900` | Per-node setup budget (image apt-install + weight staging) before a worker's readiness probe reaps it (operator route). Rendered as a probe with a fixed 5s poll and `failureThreshold = ceil(timeout/5)`. Raise for a large first-time weight download over slow storage |
 | `launcher_discovery_timeout`   | int/expr | `600` | Seconds to wait for the mpi-operator controller to create the launcher pod after the MPIJob is applied (operator route) |
+| `cpu_bind`                | enum      | `core`               | `core` / `numa` / `none`. Per-rank CPU binding, injected **only when several ranks share a pod**, and never over a binding the recipe already passes. `core` gives each rank an isolated core slice — the tightest cap on the LLVM/OpenMP thread pools `OMP_NUM_THREADS` alone doesn't reach; `numa` binds one rank per NUMA domain (only partitions when the cpuset spans >1 domain); `none` injects nothing |
+| `cpu_bind_cores_per_rank` | int       | `8`                  | Upper bound on the cores bound to each rank under `cpu_bind: core`. Launch-time value is `min(cores-in-cpuset / ranks-per-pod, this)`, so a small cpuset still gets a smaller slice; if the cpuset has fewer cores than ranks the binding is skipped rather than failing the launch. `0` = uncapped |
 
 **Env forwarding.** `mpirun` over SSH gives remote ranks a *bare* environment, so
 env is forwarded with `-x`. sflow forwards a built-in transport/system set (`NCCL_`,

@@ -48,6 +48,9 @@ annotated example.
 | Why did readiness never fire? | probe traces in `sflow_summary.log` | [Probes](./probes.md) |
 | How busy were the GPUs / CPU / network? | `sflow_monitor.log`, `sflow_monitor/` | [Monitor](./monitor.md) |
 | Which GPUs and nodes did each task get? | usage charts in `sflow_summary.log` | [Resources](./resources.md) |
+| Which *physical* GPUs did this task really end up on? | `<task>/sflow_gpus.log`, plus the `GPU Assignment` section of `sflow_summary.log` | [Resources](./resources.md) |
+| Was the cluster control plane slow or flaky, rather than my job? | `External Command Health` in `sflow_summary.log`, `command_trace.jsonl` | [Outputs & logs](./outputs.md#execution-summary) |
+| sflow itself went unresponsive — what was it doing? | `loop_stalls.txt` | [Outputs & logs](./outputs.md#execution-summary) |
 | How do I get all this off the cluster? | storage targets + `uploads:` | [Uploads](./uploads.md) |
 
 ## The output tree at a glance
@@ -58,11 +61,14 @@ annotated example.
 ├── sflow.log              # orchestration + command/status lines (no task stdout)
 ├── *_cmds.log             # launch commands, grouped by family (bash/slurm/docker/ssh/python)
 ├── results.json           # workflow-level metric index      (only with `result:`)
+├── command_trace.jsonl    # slow/failed external commands    (only when some call was notable)
+├── loop_stalls.txt        # all-thread stacks on a driver stall (only when one happened)
 ├── sflow_monitor.log      # resource overview                (only with `monitor:`)
-├── sflow_monitor/         # raw samples + per-task reports   (only with `monitor:`)
+├── sflow_monitor/         # raw samples; per-task reports only when `report.enabled: true`   (only with `monitor:`)
 └── <task>/
     ├── <task>.log         # full per-task stdout/stderr
     ├── result.json        # canonical per-task metrics       (only with `result:`)
+    ├── sflow_gpus.log     # physical GPU placement record    (Slurm steps that pick their own devices)
     └── ...                # anything your scripts write
 ```
 
@@ -100,8 +106,8 @@ downstream tasks and external tooling — see [Results](./results.md).
 
 ## Beyond the local folder
 
-- [Monitor](./monitor.md) — hardware sampling and reports. Raw CSV samples are
-  always written when `monitor:` is set; the per-task charts and summaries need
-  `report: { enabled: true }`.
+- [Monitor](./monitor.md) — hardware sampling and reports. Setting `monitor:` writes
+  raw CSV samples *and* the per-task charts and summaries; reports are on by default
+  (`report: { enabled: false }` opts out).
 - [Uploads](./uploads.md) — declare storage targets and per-task `uploads:` to ship
   files to S3 as each task completes, so partial results survive a cancelled run.

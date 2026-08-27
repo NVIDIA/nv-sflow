@@ -196,6 +196,8 @@ Common options:
 - `--account, -A <name>`: Slurm account (auto-detected if not specified)
 - `--time <limit>`: time limit (e.g., `02:00:00`)
 - `--nodes, -N <count>`: number of nodes. If omitted, single-job and bulk-submit modes derive it from the config's Slurm backend `nodes` field. Bulk-input mode requires either this flag or a CSV node-count column (`SLURM_NODES`, `NUM_SLURM_NODES`, or `NUM_NODES`).
+
+  **When the two node counts disagree.** `--nodes` sizes the *sbatch allocation*; the config's own number sizes the *workflow inside it* — the backend's node count and the `match_count` of readiness probes. The same number in both is the normal way to run, but two different numbers means the job is allocated one size and the recipe plans for another: probes wait on a node that was never allocated, or the job holds nodes nothing will ever use. `--bulk-input` **rejects** the run outright (the CSV states the size per row, so a disagreement is unambiguously a mistake) and names up to five offending rows; the config-driven single-job and `--bulk-submit` paths **warn**. A `--set` of the node variable counts as the row's value, since it overrides the CSV cell.
 - `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation and planning only, not as a Slurm directive. Use `-e '--gpus-per-node=N'` for `sflow batch`, or backend `extra_args` for `sflow run`, if your cluster requires the Slurm allocation flag.
 - `--job-name, -J <name>`: Slurm job name (default: `sflow`)
 - `--set, -s KEY=VALUE`: override variables (repeatable)

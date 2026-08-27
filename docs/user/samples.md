@@ -41,10 +41,14 @@ Two families ship with sflow:
 | docker | `self_contained/docker/hello_world` | Single container task via `docker_run` |
 | docker | `self_contained/docker/multi_node` | Multi-host Docker (`docker_host`/`context`) |
 | docker | `self_contained/docker/sglang_qwen3` | SGLang Qwen3 server + client in containers |
+| docker | `self_contained/docker/gpu_monitor` | GPU monitor with a log-marker report `window:` — runs a stock CUDA `nbody` container as a deliberate idle/burst/idle square wave, so the lifecycle report and the windowed report visibly differ |
 | slurm | `self_contained/slurm/sglang_server_client` | Server + client on Slurm with readiness probes |
 | slurm | `self_contained/slurm/aiperf_template` | AIPerf benchmark template |
 | slurm | `self_contained/slurm/auto_replica` | Replica fan-out sized from a variable sweep |
 | slurm | `self_contained/slurm/resource_release_after` | `release_after` GPU/node lifetimes |
+| slurm | `self_contained/slurm/gpu_indices` | `resources.gpus` — `count` vs `indices` vs both, with the 4-node × 4-GPU planner output annotated |
+| slurm | `self_contained/slurm/gpu_placement_matrix` | GPU-placement regression matrix: container vs bare step, high slice offset, two tasks sharing a node, multi-node — proves placement by UUID rather than by GPU count |
+| slurm | `self_contained/slurm/monitor_mixed` | The broadest single-job regression net: two Slurm pools/operators, replicas with cross-task refs, `release_after` GPU reuse, the placement matrix, and a monitor with a log-marker window. **If you only run one recipe on a new cluster, run this one.** |
 | slurm | `self_contained/slurm/multi_backend` | One workflow spanning multiple backends |
 | slurm | `self_contained/slurm/trtllm_serve_disagg` | TRT-LLM disaggregated serving |
 | slurm | `self_contained/slurm/infmax_v1_ds_r1` | InfMax DeepSeek-R1 benchmark |

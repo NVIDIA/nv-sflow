@@ -172,6 +172,120 @@ workflow_summary_ok() {
     grep -Eq '^Status[[:space:]]*:[[:space:]]*COMPLETED[[:space:]]*$' "$summary"
 }
 
+aiperf_tally_ok() {  # <run_dir> -> 0 every aiperf run benchmarked, 1 one did not, 2 no aiperf here
+    # A benchmark that measured NOTHING is the one failure this suite could not see.
+    # aiperf 0.3.0 exits 0 even when every single request failed, so the task rc is
+    # 0, sflow's own `Status : COMPLETED` is green, and the run is scored PASS while
+    # its CSV holds nothing but `Error Request Count`.
+    #
+    # Not hypothetical: dynamo >= 1.3.0 dropped `ignore_eos` from its (strictly
+    # deserialized) NvExt struct, so one stale `--extra-inputs` 400'd all 1024
+    # requests in six workflows -- and this suite printed "11/11 jobs passed".
+    #
+    # aiperf states the outcome itself, and it is unambiguous:
+    #     Processed 1024 valid requests and 0 errors (1024 total).   <- benchmarked
+    #     Processed 0 valid requests and 1024 errors (1024 total).   <- measured nothing
+    #
+    # Both markers this replaces were wrong. "0 valid" was read as a SUCCESS marker
+    # when it is precisely what a total failure prints -- that alone scored the six
+    # dead runs green -- and unanchored "0 errors" also matches "10 errors" and
+    # "1000 errors", so a mostly-failed run passed too.
+    #
+    # Returns 2, not 0, when no aiperf ran: "no evidence" is a different answer from
+    # "good evidence", and only the caller knows whether this recipe owed any. Same
+    # lesson as workload_placement_ok() -- a checker that passes on an empty
+    # directory scores a workflow that died before it started as a success.
+    local dir="$1" valid errors seen=0 bad=0
+    [ -n "$dir" ] && [ -d "$dir" ] || return 2
+    # grep -o pins the field positions, so the split below cannot drift:
+    #   Processed <valid> valid requests and <errors> errors
+    while read -r _ valid _ _ _ errors _; do
+        seen=$((seen + 1))
+        [ "${valid:-0}" -gt 0 ] && [ "${errors:-1}" -eq 0 ] && continue
+        bad=$((bad + 1))
+        echo "  AIPERF MEASURED NOTHING: ${valid:-?} valid / ${errors:-?} errors under $dir" >&2
+    done < <(find "$dir" -type f -name '*.log' \
+        -exec grep -hoE 'Processed [0-9]+ valid requests and [0-9]+ errors' {} + 2>/dev/null)
+    [ "$seen" -gt 0 ] || return 2
+    [ "$bad" -eq 0 ]
+}
+
+serving_tally_ok() {  # <run_dir> -> 0 every benchmark_serving run completed, 1 one did not, 2 none here
+    # The benchmark_serving.py (InferenceX) half of the same question aiperf_tally_ok
+    # asks. The modular dynamo_benchmark rows drive this instead of aiperf, so
+    # without it they keep the old, far weaker gate.
+    #
+    # What the old markers did: PASS on `grep -l "Successful requests:"` -- the mere
+    # PRESENCE of the string -- and FAIL only on `Successful requests:\s+0\s*$`.
+    # So a run that completed 3 of 512 requests scored a clean PASS, and any
+    # zero-count formatted differently (trailing text, padding) slipped the FAIL too.
+    #
+    # benchmark_serving.py prints its own summary, and the run's own command line is
+    # in the same log, so the two can be cross-checked:
+    #     python3 ... benchmark_serving.py ... --num-prompts 128 ...
+    #     ============ Serving Benchmark Result ============
+    #     Successful requests:                     128
+    #     Output token throughput (tok/s):         4132.77
+    #
+    # A real benchmark therefore owes three things: it succeeded at all (got > 0), it
+    # generated tokens (throughput > 0 -- a run can "succeed" 512 times with empty
+    # responses, which is the same measured-nothing shape ignore_eos produced), and
+    # it completed the work it was ASKED for (got == --num-prompts). Every healthy
+    # run in CI matches exactly: 16/16, 32/32, 48/48, 128/128, 256/256, 512/512.
+    #
+    # want == 0 means no command line was captured in this log; the cross-check is
+    # then skipped rather than guessed at. Returns 2 for "no benchmark_serving here"
+    # for the same reason aiperf_tally_ok does -- no evidence is not good evidence.
+    local dir="$1" f seen=0 bad=0
+    [ -n "$dir" ] && [ -d "$dir" ] || return 2
+    while IFS= read -r f; do
+        seen=$((seen + 1))
+        awk -v src="$f" '
+            match($0, /--num-prompts[= ]+[0-9]+/) {
+                s = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", s); want = s + 0
+            }
+            /Successful requests:/                { got  = $NF + 0 }
+            /Output token throughput \(tok\/s\):/ { thpt = $NF + 0 }
+            END {
+                if (got > 0 && thpt > 0 && (want == 0 || got == want)) exit 0
+                printf "  BENCHMARK INCOMPLETE: %d/%d requests succeeded, %g tok/s -- %s\n", \
+                       got, want, thpt, src > "/dev/stderr"
+                exit 1
+            }
+        ' "$f" || bad=$((bad + 1))
+    done < <(find "$dir" -type f -name '*.log' \
+        -exec grep -l 'Serving Benchmark Result' {} + 2>/dev/null)
+    [ "$seen" -gt 0 ] || return 2
+    [ "$bad" -eq 0 ]
+}
+
+recipe_is_client_only() {  # <run_dir> -> 0 when the recipe starts no server of its own
+    # aiperf_template is a TEMPLATE: ONE CPU-only client task aimed at
+    # ${HEAD_NODE_IP}:8000, an endpoint it deliberately does NOT start -- the reader
+    # is meant to point it at a server they already run. Played standalone in CI
+    # nothing is listening, every request is ConnectionRefused, and aiperf cannot
+    # benchmark. That is the recipe working as designed, not a regression.
+    #
+    # So the claim here is deliberately narrow. Such a run is still expected to
+    # COMPLETE -- sflow `Status : COMPLETED`, benchmark task exit=0 -- it simply
+    # owes no metrics. Every OTHER recipe in the workload half still owes a real
+    # benchmark, which is the whole point of aiperf_tally_ok().
+    #
+    # Structural rather than a name allowlist: a workflow declaring a single task
+    # cannot have started the server it benchmarks. aiperf_template declares 1;
+    # every serving recipe here declares 6-7 (servers + frontend + benchmark), and
+    # the modular compositions more. The recipe is copied into the run directory,
+    # so this reads what actually ran rather than what is on disk now.
+    local dir="$1" total=0 n yml
+    [ -n "$dir" ] && [ -d "$dir" ] || return 1
+    for yml in "$dir"/*.y*ml; do
+        [ -f "$yml" ] || continue
+        n=$(sed -n '/^  tasks:/,$p' "$yml" | grep -cE '^    - name:')
+        total=$((total + n))
+    done
+    [ "$total" -eq 1 ]
+}
+
 gpu_placement_run_ok() {
     # The placement matrix ships no benchmark: its result IS its assertions. Every
     # task resolves its planned HOST indices through a per-node bare-metal
@@ -995,6 +1109,17 @@ run_sanity_recipes_with_sflow_run() {
                 proved="no GPU task, so no placement to prove; sflow reports COMPLETED"
                 unproved="no GPU task to place, and sflow's own verdict is not COMPLETED"
             fi
+            # Say what aiperf actually measured here, without gating on it. This
+            # cluster cannot serve a real model, so demanding a benchmark would fail
+            # these recipes forever -- but a bare PASS next to an aiperf that
+            # measured nothing is how the ptyche half stayed green for six workflows.
+            # Whoever audits these artifacts should not have to open the CSV to find
+            # that out. aiperf_tally_ok() already prints the counts to stderr.
+            aiperf_tally_ok "$run_dir"
+            case $? in
+                0) proved="$proved; aiperf benchmarked" ;;
+                1) proved="$proved; aiperf measured nothing (expected here, not gated)" ;;
+            esac
             if workload_placement_ok "${files[$i]}" "$run_dir"; then
                 PASSED=$((PASSED + 1))
                 echo "  ${names[$i]}: PASS ($proved)"
@@ -1597,23 +1722,42 @@ for jid in "${JOB_IDS[@]}"; do
             ;;
     esac
     # Check for various success indicators across different workflow types
-    #   aiperf benchmark: '0 errors' in benchmark log
-    #   aiperf template:  '0 valid' in benchmark log
-    #   infmax benchmark: 'Successful requests:' with non-zero value
+    #   aiperf:           its own "Processed N valid requests and M errors" tally
+    #   benchmark_serving: its own "Successful requests:" vs the --num-prompts asked for
     #   auto_replica:     'Client Task Nodes' in client task log
-    count_aiperf_errors=$(find "$out_dir" -type f -name 'benchmark*.log' -exec grep -l "0 errors" {} + 2>/dev/null | wc -l)
-    count_aiperf_valid=$(find "$out_dir" -type f -name 'benchmark*.log' -exec grep -l "0 valid" {} + 2>/dev/null | wc -l)
-    count_zero_success=$(find "$out_dir" -type f -name 'benchmark*.log' -exec grep -lP "Successful requests:\s+0\s*$" {} + 2>/dev/null | wc -l)
-    count_any_success=$(find "$out_dir" -type f -name 'benchmark*.log' -exec grep -l "Successful requests:" {} + 2>/dev/null | wc -l)
     count_replica=$(find "$out_dir" -type f -name 'client*.log' -exec grep -l "Client Task Nodes" {} + 2>/dev/null | wc -l)
+    # Both: 0 = benchmarked, 1 = ran and measured nothing, 2 = that tool not used here.
+    aiperf_tally_ok "$out_dir"
+    aiperf_state=$?
+    serving_tally_ok "$out_dir"
+    serving_state=$?
 
-    if [ "$count_zero_success" -gt 0 ]; then
-        if cuda_infra_failure "$out_dir"; then
-            mark_cuda_excused "$jid" "$out_dir" "('Successful requests: 0' with a CUDA init failure)"
+    if [ "$aiperf_state" -eq 1 ] && recipe_is_client_only "$out_dir"; then
+        # The ONE expected-not-to-benchmark shape, claimed explicitly so it reads as
+        # a decision rather than a hole: this recipe starts no server, so aiperf had
+        # nothing to talk to. It still owes a clean completion.
+        if workflow_summary_ok "$out_dir"; then
+            PASSED=$((PASSED + 1))
+            echo "  Job $jid: PASS (client-only recipe: no server to benchmark by design, and it completed; $out_dir)"
         else
-            echo "  Job $jid: FAIL ('Successful requests: 0' found in $out_dir)"
+            echo "  Job $jid: FAIL (client-only recipe is still expected to COMPLETE, and did not; $out_dir)"
         fi
-    elif [ "$count_aiperf_errors" -gt 0 ] || [ "$count_aiperf_valid" -gt 0 ] || [ "$count_any_success" -gt 0 ] || [ "$count_replica" -gt 0 ]; then
+    elif [ "$aiperf_state" -eq 1 ]; then
+        # Checked BEFORE the success indicators: this is the shape where every other
+        # signal in the run says green. A dead aiperf is a failed benchmark even when
+        # a sibling task in the same workflow reported requests of its own.
+        if cuda_infra_failure "$out_dir"; then
+            mark_cuda_excused "$jid" "$out_dir" "(aiperf measured nothing; CUDA init failure on node)"
+        else
+            echo "  Job $jid: FAIL (aiperf ran but measured nothing; see the tally above, $out_dir)"
+        fi
+    elif [ "$serving_state" -eq 1 ]; then
+        if cuda_infra_failure "$out_dir"; then
+            mark_cuda_excused "$jid" "$out_dir" "(benchmark_serving did not complete; CUDA init failure on node)"
+        else
+            echo "  Job $jid: FAIL (benchmark_serving ran but did not complete its requests; see the counts above, $out_dir)"
+        fi
+    elif [ "$aiperf_state" -eq 0 ] || [ "$serving_state" -eq 0 ] || [ "$count_replica" -gt 0 ]; then
         PASSED=$((PASSED + 1))
         echo "  Job $jid: PASS (under $out_dir)"
     elif [ -z "$(find "$out_dir" -type f -name 'benchmark*.log' -print -quit 2>/dev/null)" ] \
