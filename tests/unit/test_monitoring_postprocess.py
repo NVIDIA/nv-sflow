@@ -1141,6 +1141,78 @@ def test_png_gives_all_eight_gpus_a_distinct_palette_colour(tmp_path, monkeypatc
     assert drawn[0][1] == () and drawn[1][1] == (5.0, 3.0), drawn[:2]
 
 
+def test_series_palette_is_the_okabe_ito_set():
+    """The colour SET is Okabe-Ito exactly -- order is our own (see below).
+
+    This palette is picked for a property (it survives all three dichromacies)
+    that cannot be checked by looking at the chart on a normal display, so
+    "nudging" a colour silently forfeits the reason it was chosen.
+    """
+    assert set(pp._SERIES_COLORS) == {
+        "#0072b2", "#e69f00", "#009e73", "#d55e00",
+        "#56b4e9", "#cc79a7", "#f0e442", "#000000",
+    }
+    assert len(pp._SERIES_COLORS) == 8, "8 GPUs per node; the cycle must not wrap"
+    # Yellow carries extra weight, black slightly less -- see _SERIES_WIDTH_SCALE.
+    assert pp._series_width(7, 1.4) > 1.4 > pp._series_width(4, 1.4)
+    assert pp._series_width(0, 1.4) == 1.4
+
+
+# The three near-pairs in Okabe-Ito: two blues, and the warms among themselves.
+# Colour alone does not reliably separate these at 1.5px.
+_NEAR_PAIRS = (
+    ("#0072b2", "#56b4e9"),  # blue / sky blue
+    ("#e69f00", "#d55e00"),  # orange / vermilion
+    ("#e69f00", "#f0e442"),  # orange / yellow
+    ("#d55e00", "#f0e442"),  # vermilion / yellow
+)
+
+
+def test_first_four_slots_hold_no_near_pair():
+    """A 4-GPU task only draws slots 0-3, so those must separate by hue alone.
+
+    The published Okabe-Ito order fails this: it puts orange in slot 1 and
+    vermilion in slot 3, making the palette's worst pairing the common case.
+    """
+    head = pp._SERIES_COLORS[:4]
+    for a, b in _NEAR_PAIRS:
+        assert not (a in head and b in head), f"{a}/{b} both in the first four"
+
+
+def test_near_pairs_do_not_share_a_dash_pattern():
+    """Dash is the fallback for the pairs hue cannot separate -- so it must differ.
+
+    `_SERIES_DASHES` cycles every 4, so slots i and i+4 are identical in dash and
+    would leave such a pair with no redundant encoding at all.
+    """
+    for a, b in _NEAR_PAIRS:
+        i, j = pp._SERIES_COLORS.index(a), pp._SERIES_COLORS.index(b)
+        assert pp._series_dash(i) != pp._series_dash(j), (
+            f"{a} (slot {i}) and {b} (slot {j}) share a dash pattern"
+        )
+
+
+def test_png_greys_its_chrome_so_the_black_series_is_not_mistaken_for_the_frame(
+    tmp_path, monkeypatch
+):
+    """Slot 8 is pure black; matplotlib's default spines/ticks are black too."""
+    plt = pytest.importorskip("matplotlib.pyplot")
+    rows = _gpu_rows([("n1", g, 10.0 * g) for g in range(8)])
+    figs: list = []
+    real = plt.Figure.savefig
+    monkeypatch.setattr(
+        plt.Figure,
+        "savefig",
+        lambda self, *a, **k: (figs.append(self), real(self, *a, **k))[1],
+    )
+    assert pp._render_png(rows, tmp_path / "t.png", title="t")
+
+    (figure,) = figs
+    for ax in figure.axes:
+        for spine in ax.spines.values():
+            assert spine.get_edgecolor()[:3] != (0.0, 0.0, 0.0), "frame still black"
+
+
 def test_png_device_legend_sits_below_the_panels_not_on_the_data(tmp_path, monkeypatch):
     """The legend belongs under the chart, as in the SVG -- not over the lines.
 

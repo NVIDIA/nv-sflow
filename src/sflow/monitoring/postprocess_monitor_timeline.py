@@ -231,8 +231,8 @@ def _build_device_legend_svg(
         colour = _SERIES_COLORS[idx % len(_SERIES_COLORS)]
         parts.append(
             f'<line x1="{x:.1f}" y1="{y - 3:.1f}" x2="{x + 16:.1f}" '
-            f'y2="{y - 3:.1f}" stroke="{colour}" stroke-width="2"'
-            f'{_series_dash(idx)}/>'
+            f'y2="{y - 3:.1f}" stroke="{colour}" '
+            f'stroke-width="{_series_width(idx, 2.0)}"{_series_dash(idx)}/>'
         )
         parts.append(
             f'<text x="{x + 20:.1f}" y="{y:.1f}" font-size="9" fill="#444444">'
@@ -662,20 +662,47 @@ def _series_for_metric(
     return [v for _ts, v in _metric_timeseries(rows, resource_type, metric_name)]
 
 
-# Line colors for per-resource series (one per GPU). The Okabe-Ito qualitative
-# palette: eight hues chosen to stay apart under every common colour-vision
-# deficiency. Exactly eight is enough -- a node carries at most 8 GPUs, so the
-# cycle never wraps in practice and no two devices on one panel share a colour.
-# (Replaces the tab10 subset, which paired blue/cyan, green/olive and grey/brown
-# closely enough to be unreadable at 1.5px stroke width.)
-# One deviation from stock Okabe-Ito: its `#f0e442` yellow is near-invisible as a
-# 1.5px line on white, so slot 8 is darkened to `#b8a000`. Same hue family as the
-# `#e69f00` orange in slot 5, but far enough apart in luminance -- and they never
-# share a dash pattern, since 8 colours over 4 dashes keeps 4 slots between them.
+# Line colors for per-resource series (one per GPU): the Okabe-Ito "Color
+# Universal Design" palette, verbatim and in its published order. Eight is
+# exactly enough -- a node carries at most 8 GPUs, so the cycle never wraps in
+# practice and no two devices on one panel can share a colour.
+#
+# Chosen over a wider hue spread (a true red plus a grey reads as more separated
+# to normal vision) because this palette holds up under all three dichromacies as
+# well, and these charts get pasted into bugs and shared with people we cannot
+# survey. `_SERIES_DASHES` covers the residual: it separates any pair that is not
+# exactly 4 slots apart, with no colour at all.
+# Reordered from the published sequence -- same eight colours, different slots.
+# The palette contains three near-pairs (blue/sky blue, and orange/vermilion/
+# yellow among the warms) and the published order puts BOTH members of two of
+# them inside the first four slots. A 4-GPU task only ever draws slots 0-3, which
+# made orange-vs-vermilion the common case rather than the rare one.
+#
+# Two rules pin this order, and both break if you sort it back:
+#   1. Slots 0-3 take one colour from each family (blue / warm / green / purple),
+#      so the common 4-GPU chart is maximally separated by hue alone.
+#   2. No near-pair sits exactly 4 apart, because `_SERIES_DASHES` cycles every 4
+#      and slots i and i+4 therefore share a dash pattern -- which is precisely
+#      the redundancy those pairs need. Blue/sky blue are 0 and 5; the warms are
+#      1, 6 and 7.
 _SERIES_COLORS = (
-    "#0072b2", "#d55e00", "#009e73", "#cc79a7",
-    "#e69f00", "#56b4e9", "#000000", "#b8a000",
+    "#0072b2",  # blue
+    "#d55e00",  # vermilion
+    "#009e73",  # bluish green
+    "#cc79a7",  # reddish purple
+    "#000000",  # black
+    "#56b4e9",  # sky blue
+    "#e69f00",  # orange
+    "#f0e442",  # yellow
 )
+
+# Per-slot stroke-width multiplier, keyed to the order above. Okabe-Ito's yellow
+# (slot 7) is the one entry that is genuinely faint on white, and the fix is
+# weight rather than a darker hue -- darkening it collapses it toward the
+# `#e69f00` orange, which is the pairing the palette exists to avoid. Black
+# (slot 4) is nudged the other way for the same reason in reverse: at equal width
+# it reads heavier than the rest and draws the eye to whichever GPU lands there.
+_SERIES_WIDTH_SCALE = (1.0, 1.0, 1.0, 1.0, 0.875, 1.0, 1.0, 1.25)
 
 # Dash pattern per device, cycled alongside _SERIES_COLORS and keyed on the same
 # index. Colour alone cannot separate two lines that COINCIDE, and coincidence is
@@ -691,6 +718,11 @@ def _series_dash(idx: int) -> str:
     """SVG dash attribute for series *idx*, or "" for the solid first series."""
     pattern = _SERIES_DASHES[idx % len(_SERIES_DASHES)]
     return f' stroke-dasharray="{pattern}"' if pattern else ""
+
+
+def _series_width(idx: int, base: float) -> float:
+    """Stroke width for series *idx*, scaled per `_SERIES_WIDTH_SCALE`."""
+    return round(base * _SERIES_WIDTH_SCALE[idx % len(_SERIES_WIDTH_SCALE)], 2)
 
 
 def _mpl_dashes(idx: int) -> tuple[float, ...]:
@@ -1193,7 +1225,7 @@ def _render_svg(
             points = " ".join(f"{_x(t):.1f},{_y(v):.1f}" for t, v in series)
             parts.append(
                 f'<polyline points="{points}" fill="none" stroke="{colour}" '
-                f'stroke-width="1.5"{_series_dash(idx)}/>'
+                f'stroke-width="{_series_width(idx, 1.5)}"{_series_dash(idx)}/>'
             )
         parts.append(
             f'<text x="{left - 8}" y="{panel_top + ph / 2:.0f}" text-anchor="end" '
@@ -1317,6 +1349,14 @@ def _render_png(
     )
     if len(families) == 1:
         axes = [axes]
+    # Slot 8 of the palette is pure black, and matplotlib draws its frame and
+    # ticks in black too -- so without this a GPU line reads as chrome. Grey the
+    # chrome, not the data. Tick LABELS stay dark: text is never confusable with
+    # a plotted line, and lightening it only costs legibility.
+    for axis in axes:
+        for spine in axis.spines.values():
+            spine.set_color(_MARKER_INK)
+        axis.tick_params(color=_MARKER_INK)
     device_labels = _device_labels(rows, families)
     for (label, resource_type, metric_name), axis in zip(families, axes):
         # Match the overview/SVG scaling + auto units so the axis label (e.g.
@@ -1348,7 +1388,7 @@ def _render_png(
                 axis.plot(
                     [ts - origin for ts, _v in ser],
                     chunk,
-                    linewidth=1.4,
+                    linewidth=_series_width(idx, 1.4),
                     label=series_label,
                     color=_SERIES_COLORS[idx % len(_SERIES_COLORS)],
                     dashes=_mpl_dashes(idx),
@@ -1428,7 +1468,7 @@ def _render_png(
                 [],
                 color=_SERIES_COLORS[i % len(_SERIES_COLORS)],
                 dashes=_mpl_dashes(i),
-                linewidth=1.4,
+                linewidth=_series_width(i, 1.4),
             )
             for i in range(len(device_labels))
         ]
