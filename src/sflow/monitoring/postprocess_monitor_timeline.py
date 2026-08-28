@@ -231,7 +231,8 @@ def _build_device_legend_svg(
         colour = _SERIES_COLORS[idx % len(_SERIES_COLORS)]
         parts.append(
             f'<line x1="{x:.1f}" y1="{y - 3:.1f}" x2="{x + 16:.1f}" '
-            f'y2="{y - 3:.1f}" stroke="{colour}" stroke-width="2"/>'
+            f'y2="{y - 3:.1f}" stroke="{colour}" stroke-width="2"'
+            f'{_series_dash(idx)}/>'
         )
         parts.append(
             f'<text x="{x + 20:.1f}" y="{y:.1f}" font-size="9" fill="#444444">'
@@ -667,6 +668,21 @@ _SERIES_COLORS = (
     "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
     "#8c564b", "#17becf", "#e377c2", "#7f7f7f", "#bcbd22",
 )
+
+# Dash pattern per device, cycled alongside _SERIES_COLORS and keyed on the same
+# index. Colour alone cannot separate two lines that COINCIDE, and coincidence is
+# the normal case for a tensor-parallel task: every rank allocates the same
+# weights + KV-cache footprint, so `gpu_memory_used_mib` for its GPUs is often
+# identical to the byte. The later line then hides exactly under the earlier one
+# and the panel is indistinguishable from one where the second device was never
+# drawn at all -- which reads as a collection bug rather than as real data.
+_SERIES_DASHES = ("", "5,3", "1.5,2.5", "7,2,1.5,2")
+
+
+def _series_dash(idx: int) -> str:
+    """SVG dash attribute for series *idx*, or "" for the solid first series."""
+    pattern = _SERIES_DASHES[idx % len(_SERIES_DASHES)]
+    return f' stroke-dasharray="{pattern}"' if pattern else ""
 
 
 def gpu_label(gpus: object) -> str:
@@ -1138,16 +1154,19 @@ def _render_svg(
                 f'y2="{gy:.1f}" stroke="#eeeeee"/>'
             )
         for series_label, series in multi:
-            # Look the colour up BY LABEL so it always matches the shared legend.
-            colour = (
-                _SERIES_COLORS[device_labels.index(series_label) % len(_SERIES_COLORS)]
+            # Look the style up BY LABEL so it always matches the shared legend.
+            # Index 0 for a panel with no per-device series (cpu/mem/disk/net):
+            # first colour, no dash, i.e. unchanged from a single solid line.
+            idx = (
+                device_labels.index(series_label)
                 if series_label in device_labels
-                else "#1f77b4"
+                else 0
             )
+            colour = _SERIES_COLORS[idx % len(_SERIES_COLORS)]
             points = " ".join(f"{_x(t):.1f},{_y(v):.1f}" for t, v in series)
             parts.append(
                 f'<polyline points="{points}" fill="none" stroke="{colour}" '
-                f'stroke-width="1.5"/>'
+                f'stroke-width="1.5"{_series_dash(idx)}/>'
             )
         parts.append(
             f'<text x="{left - 8}" y="{panel_top + ph / 2:.0f}" text-anchor="end" '

@@ -1005,6 +1005,54 @@ def test_gpu_panel_draws_one_line_per_device_with_a_legend(tmp_path):
     assert "max 90.00" in svg and "min 0.00" in svg
 
 
+def test_coincident_device_lines_stay_distinguishable(tmp_path):
+    """Two GPUs with IDENTICAL values must not render as one line.
+
+    A tensor-parallel task allocates the same footprint on every rank, so
+    `gpu_memory_used_mib` for its GPUs is often identical to the byte -- the
+    second polyline lands exactly on the first and the panel looks like it only
+    ever had one device, which reads as a collection bug. Colour cannot fix that
+    (nothing of the lower line is visible to be coloured); the dash can.
+    """
+    rows = _gpu_rows([("n1", 0, 50.0), ("n1", 1, 50.0)])
+
+    svg_path = tmp_path / "timeline.svg"
+    assert pp._render_svg(rows, svg_path, title="t")
+    svg = svg_path.read_text()
+
+    lines = re.findall(r"<polyline [^>]*>", svg)
+    assert len(lines) == 2, lines
+    dashes = [
+        re.search(r'stroke-dasharray="([^"]+)"', ln).group(1)
+        if "stroke-dasharray" in ln
+        else ""
+        for ln in lines
+    ]
+    assert dashes[0] != dashes[1], dashes
+    # The legend swatch must carry its line's dash, or the legend stops matching.
+    legend, _h = pp._build_device_legend_svg(["GPU 0", "GPU 1"], x0=8, max_x=800)
+    swatches = [frag for frag in legend if frag.startswith("<line")]
+    assert ("stroke-dasharray" in swatches[0]) is False
+    assert "stroke-dasharray" in swatches[1], swatches[1]
+
+
+def test_single_series_panels_stay_solid(tmp_path):
+    """cpu/mem/disk/net have no per-device split -- dashing them is noise."""
+    rows = _gpu_rows([("n1", 0, 10.0)])
+    for ts in (100.0, 102.0, 104.0):
+        rows.append(
+            {
+                "timestamp": ts, "timestamp_iso": "t", "node_id": "0",
+                "hostname": "n1", "resource_type": "cpu", "resource_id": "cpu",
+                "metric_name": "cpu_utilization_pct", "metric_value": 12.0,
+                "metric_unit": "%", "metric_text": "", "source_log": "x",
+            }
+        )
+    svg_path = tmp_path / "timeline.svg"
+    assert pp._render_svg(rows, svg_path, title="t")
+    assert "stroke-dasharray" not in svg_path.read_text()
+
+
 def test_report_splits_into_one_image_per_node_named_by_hostname(tmp_path):
     """Charts for several nodes on one canvas are unreadable, so split them."""
     rows = _gpu_rows([("nodeA", 0, 10.0), ("nodeB", 0, 20.0)])
