@@ -1115,6 +1115,69 @@ def test_legend_colour_matches_the_line_when_a_device_misses_one_metric(tmp_path
     assert svg.count(">GPU 0<") == 1 and svg.count(">GPU 1<") == 1
 
 
+def test_png_gives_all_eight_gpus_a_distinct_palette_colour(tmp_path, monkeypatch):
+    """The PNG must use `_SERIES_COLORS`, not matplotlib's default tab10 cycle.
+
+    A node carries at most 8 GPUs, so a full node has to be readable without the
+    cycle wrapping or two devices landing on near-identical hues.
+    """
+    plt = pytest.importorskip("matplotlib.pyplot")
+    rows = _gpu_rows([("n1", g, 10.0 * g) for g in range(8)])
+
+    drawn: list[tuple[str, tuple]] = []
+    real_plot = plt.Axes.plot
+
+    def spy(self, *a, **kw):
+        if "color" in kw:
+            drawn.append((kw["color"], kw.get("dashes", ())))
+        return real_plot(self, *a, **kw)
+
+    monkeypatch.setattr(plt.Axes, "plot", spy)
+    assert pp._render_png(rows, tmp_path / "timeline.png", title="t")
+
+    colours = [c for c, _d in drawn]
+    assert colours == list(pp._SERIES_COLORS), colours
+    assert len(set(colours)) == 8, "two GPUs share a colour"
+    assert drawn[0][1] == () and drawn[1][1] == (5.0, 3.0), drawn[:2]
+
+
+def test_png_device_legend_sits_below_the_panels_not_on_the_data(tmp_path, monkeypatch):
+    """The legend belongs under the chart, as in the SVG -- not over the lines.
+
+    In-panel (`loc="upper right"`) it covered the top-right of the first panel,
+    which is exactly where GPU load ramps at the end of a run.
+    """
+    plt = pytest.importorskip("matplotlib.pyplot")
+    rows = _gpu_rows([("n1", g, 10.0 * g) for g in range(4)])
+
+    figs: list = []
+    real_savefig = plt.Figure.savefig
+
+    def spy(self, *a, **kw):
+        figs.append(self)
+        return real_savefig(self, *a, **kw)
+
+    monkeypatch.setattr(plt.Figure, "savefig", spy)
+    assert pp._render_png(rows, tmp_path / "timeline.png", title="t")
+
+    (figure,) = figs
+    assert not any(ax.get_legend() for ax in figure.axes), "legend baked into a panel"
+    (legend,) = figure.legends
+    assert [t.get_text() for t in legend.get_texts()] == [
+        "GPU 0", "GPU 1", "GPU 2", "GPU 3",
+    ]
+    # Below the lowest panel, so it can never overlap plotted data. Both extents
+    # in display pixels (y grows upward): the legend's TOP must clear the bottom
+    # of the lowest axes. Agg canvas because only a real backend has a renderer,
+    # and the drawn box -- not the anchor -- is what can overlap the data.
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    renderer = FigureCanvasAgg(figure).get_renderer()
+    assert legend.get_window_extent(renderer).y1 <= min(
+        ax.get_window_extent(renderer).y0 for ax in figure.axes
+    )
+
+
 def test_empty_gpu_list_reports_no_gpus_rather_than_all(tmp_path, capsys):
     """`[]` (task reserved no GPU) must not read as `None` (no subset -> all).
 
