@@ -58,6 +58,54 @@ ExcludeNodesOption = Annotated[
     ),
 ]
 
+SshOption = Annotated[
+    Optional[str],
+    typer.Option(
+        "--ssh",
+        help="Run this command on an SSH host. The value may include SSH options, "
+        "for example 'user@login -p 22 -i ~/.ssh/id_ed25519'.",
+    ),
+]
+
+SshFollowOption = Annotated[
+    str,
+    typer.Option(
+        "--ssh-follow",
+        help="Remote progress display: auto (default), logs (5-second tail), "
+        "status, or none. auto keeps the remote process as the only writer on "
+        "the terminal when it has a PTY (so --tui renders cleanly) and falls "
+        "back to the log tail when it does not, because a PTY-less remote run "
+        "offloads task logs to files.",
+    ),
+]
+
+SshFetchOption = Annotated[
+    str,
+    typer.Option(
+        "--ssh-fetch",
+        help="Files copied back after completion: logs, all, or none.",
+    ),
+]
+
+SshTtyOption = Annotated[
+    str,
+    typer.Option(
+        "--ssh-tty",
+        help="Remote PTY allocation, which keeps sflow's terminal formatting "
+        "and colors: auto (only when the local terminal is interactive), "
+        "always, or never. Applies to the remote run only; the payload upload "
+        "and output fetch always stay byte-clean.",
+    ),
+]
+
+SshRemoteRootOption = Annotated[
+    Optional[str],
+    typer.Option(
+        "--ssh-remote-root",
+        help="Remote cache/run root. Default: $XDG_CACHE_HOME/sflow/ssh or ~/.cache/sflow/ssh.",
+    ),
+]
+
 
 def parse_key_value_args(values: list[str] | None, *, flag: str) -> dict[str, str]:
     """Parse repeatable ``KEY=VALUE`` CLI options into a dict (later keys win).

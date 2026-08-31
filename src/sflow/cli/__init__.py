@@ -59,8 +59,22 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+class _SflowTyper(typer.Typer):
+    def __call__(self, *args, **kwargs):
+        from sflow.cli._ssh_delegate import predispatch
+
+        try:
+            predispatch()
+        except typer.Exit as exc:
+            raise SystemExit(exc.exit_code) from None
+        except (typer.BadParameter, FileNotFoundError) as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise SystemExit(2) from None
+        return super().__call__(*args, **kwargs)
+
+
 # Create the main CLI app
-app = typer.Typer(
+app = _SflowTyper(
     name="sflow",
     help="SFLOW - Workflow Orchestrator with Pluggable Backends",
     add_completion=False,
@@ -87,13 +101,14 @@ def _register_commands() -> None:
     # Import commands to register them with the app (import side-effects).
     # Keep this in a function to avoid "module level import not at top of file" warnings.
     from . import (
-        run,  # noqa: F401
         batch,  # noqa: F401
-        visualize,  # noqa: F401
-        sample,  # noqa: F401
         compose,  # noqa: F401
+        remote,  # noqa: F401
+        run,  # noqa: F401
+        sample,  # noqa: F401
         skill,  # noqa: F401
         upgrade,  # noqa: F401
+        visualize,  # noqa: F401
     )
 
 

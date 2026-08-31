@@ -18,6 +18,60 @@ Global option:
 
 - `sflow --version` / `sflow -V`: print executable/runtime details, including package version, binary path, Python path, install mode, source label, repo path when known, and git branch/commit when available
 
+## Run through SSH
+
+`run`, `batch`, and `compose` can move the sflow controller to an SSH host:
+
+```bash
+sflow run workflow.yaml --ssh 'user@login -p 20 -i ~/.ssh/id_ed25519'
+sflow batch workflow.yaml --submit --ssh 'user@login -J bastion'
+sflow compose base.yaml tasks.yaml -o composed.yaml --ssh 'user@login'
+```
+
+The remote host needs Python 3.10 or newer, but does not need sflow or rsync. sflow uploads its current source (including local edits), caches a dependency venv remotely, and uploads only explicit YAML/CSV inputs plus relative `file://` or `fs://` artifacts contained by the workspace. Relative artifacts that escape `--workspace-dir` are rejected; absolute artifact paths keep their remote meaning. Undeclared files referenced only inside shell commands are not discovered automatically. Uploaded directories skip `.git`, `.venv`, `.sflow`, `sflow_output`, and `__pycache__`.
+
+Common SSH options:
+
+- `--ssh '<host> [ssh options]'`: connection and ordinary OpenSSH flags
+- `--ssh-follow auto|logs|status|none`: `auto` (the `run`/`batch` default) keeps exactly one writer on your terminal — with a remote PTY the remote process streams everything itself (so `--tui` renders cleanly), and without one it falls back to the 5-second tail of remote controller logs, which is where a PTY-less remote run offloads task logs. `logs`, `status`, and `none` force the tail, a heartbeat only, or raw output only
+- `--ssh-fetch logs|all|none`: `all` copies the complete remote output directory and `none` copies nothing, for every command. What `logs` copies is command-specific: for `run` it is the controller/task logs (`sflow_summary.log`, `sflow.log`, per-task `*.log`, `command_trace.jsonl`, monitor logs) plus the structured result contract (`result.json` per task, workflow-level `results.json`); for `batch` it is the sbatch script plus its `.out`/`.err`/`.json` and the generated `.yaml`/`.yml`/`.csv` config, not task logs; `compose` has no controller log to filter, so it ignores `--ssh-fetch` and always fetches the complete output directory. `logs` is the default for `run`/`batch`
+- `--ssh-remote-root <path>`: remote cache/work root; for `batch`, choose storage visible from compute nodes
+- `--ssh-tty auto|always|never`: allocate a remote PTY so the remote run keeps sflow's terminal formatting and colors. `auto` (default) does so when the local terminal is interactive, except for `compose`, whose stdout is YAML data. Only the remote run gets the PTY; the payload upload and the output fetch stay byte-clean, which is why `-t` inside `--ssh` is rejected
+
+Every SSH execution owns one local folder, `<output-dir>/ssh-<UTC timestamp>-<id>/` (default output dir: `<workspace>/sflow_output`), named exactly like its remote session. Fetched `run`/`batch` logs keep their existing layout inside that folder, and the recovery receipt is `receipt.json` next to them, so remote artifacts never interleave with local runs. An explicit path is still honored literally: `compose -o` is copied to that exact local path.
+
+sflow never deletes the remote run directory it creates under `--ssh-remote-root/runs/<session>/` (only the cached runtime venv is cleaned up on rebuild). Every `--ssh` execution leaves its full work/output tree on the remote host regardless of `--ssh-fetch`; clean up old sessions yourself if remote disk space matters.
+
+Progress is reported in four stages on stderr — connect, stage inputs, prepare the remote runtime, run — each followed by the remote facts it established (remote session/work/output dirs, where each input was staged, the receipt path, and the translated remote command). The first run on a host also reports whether the runtime is being built with `uv` or `pip`.
+
+Reconnect to that receipt after a network interruption or detached batch submission:
+
+```bash
+sflow watch sflow_output/ssh-<timestamp>-<id>/receipt.json
+sflow fetch sflow_output/ssh-<timestamp>-<id>/receipt.json
+sflow fetch sflow_output/ssh-<timestamp>-<id>/receipt.json --all
+```
+
+Ctrl-C on an attached SSH run cancels the remote work: sflow signals the remote controller (SIGINT, escalating to SIGTERM/SIGKILL if it does not stop), `scancel`s any Slurm job that run submitted, records `cancelled` in the receipt, and still fetches the partial logs. If the cancel cannot be confirmed the receipt keeps the state `unknown`. A dropped connection is not a cancel — the remote run keeps going, and the receipt is how you reconnect.
+
+`watch` reads the existing controller-side logs every five seconds until Ctrl-C; stopping it does not cancel the remote work. Interrupting an attached SSH run records its remote state as unknown because portable SSH cannot confirm cancellation. A successful `batch --submit` receipt records `submitted`, not workflow completion. `watch` deliberately does not query Slurm, Kubernetes, Docker, or another backend API. `fetch` can be repeated and copies whatever output exists at that time.
+
+SSH authentication remains OpenSSH's responsibility. Do not put passwords or tokens in the `--ssh` string; the complete connection settings are stored in the mode-`0600` recovery receipt. On MFA clusters, establish an approved multiplexed connection once and reuse it:
+
+```bash
+ssh -MNf -o ControlMaster=yes -o ControlPersist=24h \
+  -o ControlPath=%d/.ssh/sflow-%C user@login
+
+sflow run workflow.yaml \
+  --ssh 'user@login -o ControlMaster=auto -o ControlPersist=24h -o ControlPath=%d/.ssh/sflow-%C'
+```
+
+`ControlPersist=24h` is a client request; cluster policy may end the connection sooner. `batch --submit` keeps its normal detached behavior and returns after `sbatch` accepts the job.
+
+When SSH exits with status 255, sflow prints this ControlMaster guidance after the
+failed attempt. The same status can also indicate a network, DNS, host-key, or SSH
+configuration failure, so the original SSH error remains visible.
+
 ## sflow run
 
 ```bash

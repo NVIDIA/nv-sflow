@@ -28,6 +28,11 @@ from sflow.cli._args import (  # split_list_arg re-exported for back-compat
     EnableWorkflowMonitorOption,
     ExcludeNodesOption,
     IncludeNodesOption,
+    SshFetchOption,
+    SshFollowOption,
+    SshOption,
+    SshRemoteRootOption,
+    SshTtyOption,
     split_list_arg,
 )
 from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
@@ -1691,6 +1696,27 @@ def _derive_row_name(
     return f"{_sanitize_name(base)}_{idx:03d}"
 
 
+# Set by SSH delegation to a session-local file. Every job id submitted through
+# this process is appended to it so an interrupted remote session can scancel
+# exactly the jobs it created (see sflow.cli.remote._cancel).
+SUBMITTED_JOBS_FILE_ENV = "SFLOW_SUBMITTED_JOBS_FILE"
+
+
+def _record_submitted_job(message: str) -> None:
+    import re
+
+    path = os.environ.get(SUBMITTED_JOBS_FILE_ENV)
+    match = re.search(r"Submitted batch job (\d+)", message)
+    if not path or not match:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(f"{match.group(1)}\n")
+    except OSError:
+        # Bookkeeping only: never fail a successful submission over it.
+        pass
+
+
 def _submit_sbatch(script_path: Path) -> str:
     """Submit an sbatch script and return the stdout message (e.g. job id)."""
     import subprocess
@@ -1702,7 +1728,9 @@ def _submit_sbatch(script_path: Path) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"sbatch failed: {result.stderr.strip()}")
-    return result.stdout.strip()
+    message = result.stdout.strip()
+    _record_submitted_job(message)
+    return message
 
 
 def _build_var_map(
@@ -3133,6 +3161,11 @@ def batch(
             "offload_task_logs; no-op for k8s/ssh.",
         ),
     ] = None,
+    ssh: SshOption = None,
+    ssh_follow: SshFollowOption = "auto",
+    ssh_fetch: SshFetchOption = "logs",
+    ssh_remote_root: SshRemoteRootOption = None,
+    ssh_tty: SshTtyOption = "auto",
 ):
     """
     Generate an sbatch script for running sflow in Slurm batch mode.
@@ -3231,6 +3264,33 @@ def batch(
         # Bulk submit: with variable overrides applied to all configs
         sflow batch -B ./examples/ --set SLURM_NODES=2 --partition gpu --submit
     """
+    if ssh is not None:
+        from sflow.cli._ssh_delegate import delegate
+
+        delegate(
+            "batch",
+            connection=ssh,
+            follow=ssh_follow,
+            fetch=ssh_fetch,
+            remote_root=ssh_remote_root,
+            tty=ssh_tty,
+            workspace_dir=workspace_dir,
+            output_dir=output_dir,
+            input_files=[
+                *list(src_files or []),
+                *list(file or []),
+                *list(bulk_submit or []),
+                *([bulk_input] if bulk_input else []),
+                *([sflow_source_path] if sflow_source_path else []),
+            ],
+            artifact_overrides=artifact,
+            bulk_input=bulk_input,
+            batch_sbatch_path=sbatch_path,
+            batch_runtime_explicit=any(
+                (sflow_source_path, sflow_version, sflow_index_url)
+            ),
+        )
+
     configure_logging(level=log_level, console=True)
     log_runtime_info()
 

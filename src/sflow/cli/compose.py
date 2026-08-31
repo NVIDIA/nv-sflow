@@ -14,6 +14,13 @@ import yaml
 
 from sflow.app.monitor_cli import inject_cli_monitors_into_dict
 from sflow.cli import DOCS_URL, app
+from sflow.cli._args import (
+    SshFetchOption,
+    SshFollowOption,
+    SshOption,
+    SshRemoteRootOption,
+    SshTtyOption,
+)
 from sflow.config.loader import (
     ConfigLoader,
     _normalize_script_plain_mappings,
@@ -480,6 +487,11 @@ def compose(
             "and probes with a warning. Only valid with multiple input files or --bulk-input. Repeatable.",
         ),
     ] = None,
+    ssh: SshOption = None,
+    ssh_follow: SshFollowOption = "none",
+    ssh_fetch: SshFetchOption = "logs",
+    ssh_remote_root: SshRemoteRootOption = None,
+    ssh_tty: SshTtyOption = "auto",
 ):
     """
     Compose multiple sflow YAML files into a single valid workflow config.
@@ -512,6 +524,29 @@ def compose(
         # Bulk compose with validation (warns about resource issues)
         sflow compose --bulk-input jobs.csv --validate -o output_dir
     """
+    if ssh is not None:
+        from sflow.cli._ssh_delegate import delegate
+
+        delegate(
+            "compose",
+            connection=ssh,
+            follow=ssh_follow,
+            fetch=ssh_fetch,
+            remote_root=ssh_remote_root,
+            tty=ssh_tty,
+            workspace_dir=None,
+            output_dir=None,
+            input_files=[
+                *list(src_files or []),
+                *list(file or []),
+                *([bulk_input] if bulk_input else []),
+            ],
+            artifact_overrides=artifact,
+            bulk_input=bulk_input,
+            compose_output=output,
+            compose_bulk=bulk_input is not None,
+        )
+
     try:
         configure_logging(
             level=log_level, console=output is not None or bulk_input is not None

@@ -5586,3 +5586,23 @@ def test_bulk_submit_nodes_mismatch_warns(mock_sflow_app, tmp_path):
     assert result.exit_code == 0, result.output
     assert "--nodes=4 does not match" in result.output
     assert "wf.yaml says 6" in result.output
+
+
+def test_submitted_job_ids_are_recorded_for_remote_cancellation(
+    tmp_path, monkeypatch
+) -> None:
+    # SSH delegation points this env var at a session file so an interrupted
+    # remote run can scancel exactly the jobs it submitted.
+    jobs = tmp_path / "submitted-jobs"
+    monkeypatch.setenv(batch_mod.SUBMITTED_JOBS_FILE_ENV, str(jobs))
+
+    batch_mod._record_submitted_job("Submitted batch job 4242")
+    batch_mod._record_submitted_job("Submitted batch job 4243")
+    batch_mod._record_submitted_job("sbatch said nothing useful")
+
+    assert jobs.read_text().split() == ["4242", "4243"]
+
+
+def test_submitted_job_recording_is_off_without_the_env_channel(tmp_path) -> None:
+    # A plain local batch run must not write bookkeeping files anywhere.
+    batch_mod._record_submitted_job("Submitted batch job 1")
