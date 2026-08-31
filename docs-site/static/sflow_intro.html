@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>sflow — Declarative Workflow Descriptor for Massive GPU Clusters</title>
+<title>sflow — Declarative Workflow Descriptor</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-snap-type:y mandatory;scroll-behavior:smooth;height:100%;overflow-x:hidden}
@@ -204,10 +204,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 @media(max-height:600px){.install-panel{font-size:clamp(.46rem,.72vw,.6rem);line-height:1.42}.try-link{padding:clamp(.42rem,.78vw,.6rem)}}
 
 /* === COMPONENTS === */
-/* align-self, because .inner is a flex column: without it the default `stretch`
-   inflates every section pill to the full slide width, so a two-word label reads
-   as a full-bleed bar instead of a tag. */
-.pill{display:inline-block;align-self:flex-start;padding:.2em .8em;border-radius:999px;font-size:var(--b);font-weight:500;border:1px solid}
+.pill{display:inline-block;padding:.2em .8em;border-radius:999px;font-size:var(--b);font-weight:500;border:1px solid}
 .pc{border-color:var(--cy);color:var(--cy)}.pg{border-color:var(--gr);color:var(--gr)}
 
 .fc{background:var(--card);border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.1rem);position:relative;overflow:hidden;transition:transform .4s,border-color .4s,background .4s}
@@ -318,204 +315,14 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .scroll-cue svg{display:block;width:clamp(20px,2.4vw,26px);height:auto;animation:scrollcuebounce 1.8s ease-in-out infinite}
 .scroll-cue:hover span{color:var(--cy)}
 @media(max-height:600px){.scroll-cue{display:none}}
-#s1 .inner{gap:calc(var(--gap) * .75)}
 .doc-btn{display:inline-flex;align-items:center;justify-content:center;margin-top:var(--gap);padding:.6em 1.6em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--b);font-family:var(--font-display);font-weight:600;transition:all .3s;cursor:pointer;z-index:10;position:relative;height:clamp(2.4rem,4vw,3.2rem);line-height:1}
 .doc-btn:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.3)}
-/* Hero CTA hierarchy. Three identically outlined chips gave the title slide no
-   focal point and read as clutter; one filled primary plus two quiet text links
-   says the same thing with a third of the borders. */
-.doc-btn.primary{background:var(--cy);color:#060a10;border-color:var(--cy);box-shadow:0 0 26px rgba(0,212,255,.22)}
-.doc-btn.primary:hover{background:#5ce1ff;border-color:#5ce1ff;box-shadow:0 0 32px rgba(0,212,255,.4)}
-.doc-btn.ghost{border-color:transparent;background:none;box-shadow:none;color:var(--dim);padding-left:.5em;padding-right:.5em}
-.doc-btn.ghost:hover{background:none;box-shadow:none;color:var(--cy)}
-
-/* === HERO (slide 1) ===
-   A centred stack: brand lockup, one descriptor sentence, the slogan, then the CTA.
-   The backend-agnostic claim deliberately is NOT here -- slide 3 is devoted to it,
-   and repeating it on the title slide was what made this read as a wall of text. */
-.hero{display:flex;flex-direction:column;align-items:center;text-align:center;gap:clamp(.5rem,1.5vw,1.15rem);width:100%}
-.hero-brand{display:flex;align-items:center;gap:clamp(.5rem,1.4vw,1rem)}
-.hero-brand img{width:clamp(44px,5vw,76px);height:auto;border-radius:14px;margin:0}
-.hero-brand span{font-family:var(--font-heavy);font-size:clamp(2.3rem,6.2vw,4.8rem);line-height:1;
-  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.hero-desc{font-size:clamp(1rem,1.9vw,1.7rem);color:var(--txt);line-height:1.35}
-.hero-slogan{font-size:var(--b);color:var(--dim)}
-.hero-cta{display:flex;gap:clamp(.3rem,1vw,.7rem);flex-wrap:wrap;align-items:center;justify-content:center;margin-top:calc(var(--gap) * .3)}
-/* Tighter than the stock .doc-btn so all three sit on one row. */
-.hero-cta .doc-btn{margin-top:0;padding:.55em 1.15em;height:clamp(2.2rem,3.5vw,2.9rem)}
-.hero-cta .doc-btn.ghost{padding-left:.2em;padding-right:.2em;font-size:calc(var(--b) * .95)}
-
-/* === HERO ATMOSPHERE (slide 1 only) ===
-   The title slide was inert: a flat 3% grid, two motionless orbs, and one entrance
-   animation that finished inside a second. Everything below adds depth and slow,
-   continuous life WITHOUT changing a word of the content. Scoped to #s1 so the
-   other twelve slides are untouched, and the global prefers-reduced-motion rule
-   further down switches all of it off. */
-
-/* Depth pass 1 -- a GPU-field of dots over the base grid, drifting one cell every
-   46s and masked to an ellipse so it reads as atmosphere, never as a pattern. */
-#s1 .gbg::after{content:"";position:absolute;inset:-12%;
-  background-image:radial-gradient(rgba(0,212,255,.17) 1px,transparent 1.6px);
-  background-size:26px 26px;
-  -webkit-mask-image:radial-gradient(ellipse 64% 56% at 50% 47%,#000 28%,transparent 76%);
-  mask-image:radial-gradient(ellipse 64% 56% at 50% 47%,#000 28%,transparent 76%);
-  animation:fielddrift 46s linear infinite}
-@keyframes fielddrift{to{transform:translate3d(26px,26px,0)}}
-
-/* Depth pass 2 -- the two colour pools drift and breathe on different clocks, so
-   the background never sits still long enough to read as a flat panel. */
-#s1 .orb{animation:orbdrift 26s ease-in-out infinite alternate;will-change:transform}
-#s1 .orb.og{animation-duration:34s;animation-delay:-9s}
-@keyframes orbdrift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(4vw,3vh,0) scale(1.2)}}
-
-/* Depth pass 3 -- a vignette to seat the composition and stop the corners glowing. */
-#s1::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
-  background:radial-gradient(ellipse 72% 62% at 50% 50%,transparent 44%,rgba(2,5,9,.6) 100%)}
-
-/* The wordmark's gradient FLOWS through the letters rather than sitting frozen,
-   and the letters settle in from wide-and-blurred on load -- one high-impact
-   moment instead of scattered fidgets. */
-.hero-brand span{background-size:230% 100%;
-  animation:gradflow 9s ease-in-out infinite alternate,
-            settle 1.1s cubic-bezier(.16,1,.3,1) both}
-@keyframes gradflow{from{background-position:0% 50%}to{background-position:100% 50%}}
-@keyframes settle{from{letter-spacing:.18em;filter:blur(7px);opacity:0}
-                  to{letter-spacing:normal;filter:blur(0);opacity:1}}
-
-/* The logo tile is a flat black square in the asset, which left it sitting on the
-   background rather than in the composition. A hairline ring plus a glow that
-   breathes on the wordmark's clock ties the two halves of the lockup together. */
-#s1 .hero-brand img{box-shadow:0 0 0 1px rgba(0,212,255,.28),0 0 26px rgba(0,212,255,.16);
-  animation:logoglow 9s ease-in-out infinite alternate}
-@keyframes logoglow{from{box-shadow:0 0 0 1px rgba(0,212,255,.28),0 0 22px rgba(0,212,255,.14)}
-                    to{box-shadow:0 0 0 1px rgba(118,255,2,.32),0 0 34px rgba(118,255,2,.20)}}
-
-/* === HERO FLOW BAND (slide 1) ===
-   Its own row, deliberately: the previous version put the fans either side of the
-   headline, which squeezed the centre column and wrapped the slogan onto two lines.
-   As a separate band the slogan keeps the full width and stays on ONE line, and the
-   diagram gets to be read left-to-right on its own terms:
-       frameworks -> [ sflow ] -> platforms
-   The sflow mark is the hub, so the logo appears once, doing work, instead of being
-   duplicated in a lockup above. Direction is carried by colour -- cyan in, green
-   out -- rather than by arrowheads. */
-.hero-desc{white-space:nowrap}
-.flow-band{--rowpx:calc(var(--s) * 1.701);
-  display:grid;grid-template-columns:auto auto auto auto auto;
-  align-items:center;justify-content:center;gap:clamp(.3rem,1.1vw,.85rem);
-  margin-top:calc(var(--gap) * .35)}
-.fan{--row:1.62em;font-size:calc(var(--s) * 1.05);pointer-events:none;display:contents}
-.flow-band svg{display:block;width:auto;overflow:visible}
-.flow-in  svg{height:calc(6 * var(--rowpx))}
-.flow-out svg{height:calc(3 * var(--rowpx))}
-.flow-band path{fill:none;stroke-width:2.2;opacity:.5;stroke-dasharray:220;stroke-dashoffset:220;
-  animation:fandraw 1s cubic-bezier(.16,1,.3,1) forwards}
-.flow-band circle{opacity:0;animation:fannode .45s ease forwards}
-.flow-in path,.flow-in circle{stroke:var(--cy)}  .flow-in circle{fill:var(--cy)}
-.flow-out path,.flow-out circle{stroke:var(--gr)} .flow-out circle{fill:var(--gr)}
-.flow-out path{stroke-width:3.7}
-@keyframes fandraw{to{stroke-dashoffset:0}}
-@keyframes fannode{to{opacity:.85}}
-/* Travelling pulses, so the diagram FLOWS instead of just having been drawn once.
-   pathLength="100" normalises every connector to the same nominal length, so one
-   keyframe set gives identical speed on a long outer curve and the short middle
-   run -- without that, the centre pulse visibly outruns the others.
-   These are separate overlaid paths: the base lines keep their own draw-in
-   animation, which a single element could not do at the same time. */
-.flow-band path.pulse{stroke-dasharray:4 100;stroke-dashoffset:104;stroke-width:5;
-  opacity:0;animation:flowpulse 2.6s linear infinite;stroke-linecap:round}
-@keyframes flowpulse{
-  0%{stroke-dashoffset:104;opacity:0}
-  12%{opacity:.95}
-  88%{opacity:.95}
-  100%{stroke-dashoffset:0;opacity:0}}
-/* Frameworks feed in first, platforms carry on half a cycle later, so a pulse
-   reaching the hub is handed straight out the other side. */
-.flow-in  path.pulse:nth-of-type(7){animation-delay:2.6s}
-.flow-in  path.pulse:nth-of-type(8){animation-delay:3.0s}
-.flow-in  path.pulse:nth-of-type(9){animation-delay:3.4s}
-.flow-in  path.pulse:nth-of-type(10){animation-delay:3.8s}
-.flow-in  path.pulse:nth-of-type(11){animation-delay:4.2s}
-.flow-in  path.pulse:nth-of-type(12){animation-delay:4.6s}
-.flow-out path.pulse:nth-of-type(4){animation-delay:3.9s}
-.flow-out path.pulse:nth-of-type(5){animation-delay:4.3s}
-.flow-out path.pulse:nth-of-type(6){animation-delay:4.7s}
-/* "and more": the label carries the meaning, so its connector just recedes. */
-.flow-labels i.more{opacity:.5;letter-spacing:.16em;font-size:1.15em}
-.flow-in path:nth-of-type(6){opacity:.24}
-.flow-in path.pulse:nth-of-type(12){opacity:0;animation-name:flowpulsefaint}
-@keyframes flowpulsefaint{0%{stroke-dashoffset:104;opacity:0}12%{opacity:.4}88%{opacity:.4}100%{stroke-dashoffset:0;opacity:0}}
-/* Each label box is exactly --row tall and each svg is (rows * --row), so a curve
-   endpoint at n/2rows of the viewBox lands dead centre of its label. */
-.flow-labels{display:flex;flex-direction:column;font-size:calc(var(--s) * 1.05)}
-.flow-labels i{font-style:normal;height:var(--rowpx);display:flex;align-items:center;
-  font-family:var(--font-display);font-weight:700;letter-spacing:.09em;
-  white-space:nowrap;opacity:0;
-  animation:fanlabel .6s cubic-bezier(.16,1,.3,1) forwards}
-.flow-in  .flow-labels i{justify-content:flex-end;color:var(--cy)}
-.flow-out .flow-labels i{color:var(--gr)}
-@keyframes fanlabel{from{opacity:0;transform:translateX(-6px)}to{opacity:.9;transform:none}}
-/* The hub: the mark sits on the axis both fans point at. */
-.flow-hub{display:grid;place-items:center;padding:0 clamp(.15rem,.7vw,.5rem)}
-.flow-hub img{width:clamp(46px,5.2vw,78px);height:auto;border-radius:14px;margin:0;
-  box-shadow:0 0 0 1px rgba(0,212,255,.28),0 0 26px rgba(0,212,255,.16);
-  animation:logoglow 9s ease-in-out infinite alternate}
-/* Narrow: five columns will not hold. Drop the connectors and let the two label
-   groups read as rows above and below the hub -- same order, same colours. */
-@media(max-width:820px){
-  .flow-band{grid-template-columns:1fr;justify-items:center;gap:.45rem}
-  .flow-band svg{display:none}
-  .flow-labels{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:.35em .9em;
-    font-size:calc(var(--s) * .92)}
-  .flow-labels i{height:auto}
-  .flow-in{order:-1}
-  .hero-desc{white-space:normal}
-}
-/* Staggered along the direction of flow: frameworks land, converge on the hub,
-   then fan out to the platforms. */
-.flow-in .flow-labels i:nth-child(1){animation-delay:.55s}
-.flow-in .flow-labels i:nth-child(2){animation-delay:.62s}
-.flow-in .flow-labels i:nth-child(3){animation-delay:.69s}
-.flow-in .flow-labels i:nth-child(4){animation-delay:.76s}
-.flow-in .flow-labels i:nth-child(5){animation-delay:.83s}
-.flow-in .flow-labels i:nth-child(6){animation-delay:.90s}
-.flow-in circle:nth-of-type(1){animation-delay:.60s}
-.flow-in circle:nth-of-type(2){animation-delay:.67s}
-.flow-in circle:nth-of-type(3){animation-delay:.74s}
-.flow-in circle:nth-of-type(4){animation-delay:.81s}
-.flow-in circle:nth-of-type(5){animation-delay:.88s}
-.flow-in circle:nth-of-type(6){animation-delay:.95s}
-.flow-in path{animation-delay:.95s}
-.flow-out path:nth-of-type(1){animation-delay:1.45s}
-.flow-out path:nth-of-type(2){animation-delay:1.53s}
-.flow-out path:nth-of-type(3){animation-delay:1.61s}
-.flow-out circle:nth-of-type(1){animation-delay:2.1s}
-.flow-out circle:nth-of-type(2){animation-delay:2.18s}
-.flow-out circle:nth-of-type(3){animation-delay:2.26s}
-.flow-out .flow-labels i:nth-child(1){animation-delay:2.15s}
-.flow-out .flow-labels i:nth-child(2){animation-delay:2.23s}
-.flow-out .flow-labels i:nth-child(3){animation-delay:2.31s}
-
-/* The primary CTA breathes, and a light sweep crosses it every few seconds so the
-   one call to action on the page reads as live rather than painted on. */
-#s1 .doc-btn.primary{overflow:hidden;animation:ctapulse 3.8s ease-in-out infinite}
-@keyframes ctapulse{0%,100%{box-shadow:0 0 26px rgba(0,212,255,.22)}
-                    50%{box-shadow:0 0 42px rgba(0,212,255,.46)}}
-#s1 .doc-btn.primary::after{content:"";position:absolute;top:0;bottom:0;left:-60%;width:36%;
-  pointer-events:none;transform:skewX(-18deg);
-  background:linear-gradient(100deg,transparent,rgba(255,255,255,.5),transparent);
-  animation:ctashine 5.6s ease-in-out infinite}
-@keyframes ctashine{0%,74%{left:-60%}100%{left:140%}}
 .doc-btn svg{flex-shrink:0}
 .gh-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(.6rem,2vw,1.2rem);z-index:400;padding:.3em .5em;border:1px solid rgba(255,255,255,.2);border-radius:50%;color:rgba(255,255,255,.6);text-decoration:none;background:rgba(6,10,16,.92);transition:all .3s;display:flex;align-items:center;justify-content:center}
 .gh-corner:hover{border-color:#fff;color:#fff;background:rgba(255,255,255,.15);box-shadow:0 0 12px rgba(255,255,255,.15)}
 .corner-links{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(3.2rem,6vw,4.5rem);z-index:400;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
 .doc-corner,.map-corner{padding:.35em .9em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s;box-shadow:0 0 8px rgba(0,212,255,.15)}
 .map-corner{border-color:var(--gr);color:var(--gr);background:rgba(6,10,16,.92);box-shadow:0 0 8px rgba(118,255,2,.15)}
-/* Persistent nav, so it should recede. Neutral hairline instead of a lit brand
-   border keeps these legible over busy slides without reading as two more chips
-   competing with the slide's own content; the colour returns on hover. */
-.doc-corner,.map-corner{border-color:rgba(255,255,255,.14);box-shadow:none}
 .doc-corner:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.35)}
 .map-corner:hover{background:var(--gr);color:#060a10;box-shadow:0 0 20px rgba(118,255,2,.3)}
 .mb{margin-bottom:var(--gap)}.ms{margin-bottom:calc(var(--gap)*.4)}
@@ -523,11 +330,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 @media(max-height:600px){:root{--pad:clamp(.5rem,2vw,1.2rem);--gap:clamp(.25rem,.8vw,.55rem);--t:clamp(1.25rem,4vw,2.2rem);--h:clamp(1.05rem,2.8vw,1.65rem);--b:clamp(.72rem,1.3vw,.95rem)}}
 @media(max-height:500px){:root{--pad:clamp(.4rem,1.6vw,.9rem);--gap:clamp(.2rem,.6vw,.4rem);--t:clamp(1.1rem,3.5vw,1.7rem);--h:clamp(.9rem,2.4vw,1.3rem);--b:clamp(.65rem,1vw,.82rem)}}
 @media(max-height:550px){.dots{display:none}}
-/* animation-delay too, not just duration: collapsing the frames but keeping the
-   stagger meant a reduced-motion visitor still waited out the full choreography
-   (1.75s for the last backend label) in front of a half-drawn slide. Reduced
-   motion should mean "show me the end state now", so the delays go as well. */
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-delay:0s!important;transition-duration:.15s!important}html{scroll-behavior:auto}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.15s!important}html{scroll-behavior:auto}}
 </style>
 </head>
 <body>
@@ -549,21 +352,17 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="orb oc" style="width:450px;height:450px;top:-120px;left:-120px"></div>
 <div class="orb og" style="width:320px;height:320px;bottom:-80px;right:-80px"></div>
 <span class="sn">01 / 13</span>
-<div class="inner"><div class="hero">
-<div class="hero-brand r as d0"><span>NV-SFLOW</span></div>
-<h2 class="hero-desc r au d1">Workflow orchestrator for <span class="accent">large-scale GPU clusters</span> of <span class="green">any kind</span></h2>
-<p class="hero-slogan r au d2">Describe once. Run anywhere.<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
-<div class="flow-band r au d3">
-<span class="fan flow-in"><span class="flow-labels"><i>vLLM</i><i>SGLang</i><i>TensorRT-LLM</i><i>Dynamo</i><i>PyTorch</i><i class="more">&hellip;</i></span><svg viewBox="0 0 104 120" aria-hidden="true"><path pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path pathLength="100" d="M5,110 C50,110 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,110 C50,110 58,60 99,60"/><circle cx="5" cy="10" r="3.2"/><circle cx="5" cy="30" r="3.2"/><circle cx="5" cy="50" r="3.2"/><circle cx="5" cy="70" r="3.2"/><circle cx="5" cy="90" r="3.2"/><circle cx="5" cy="110" r="3.2"/></svg></span>
-<span class="flow-hub"><img src="img/sflow-logo.jpg" alt="sflow" decoding="async" fetchpriority="high"></span>
-<span class="fan flow-out"><svg viewBox="0 0 174 100" aria-hidden="true"><path pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path pathLength="100" d="M8,50 L166,50"/><path pathLength="100" d="M8,50 C78,50 94,84 166,84"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path class="pulse" pathLength="100" d="M8,50 L166,50"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,84 166,84"/><circle cx="166" cy="16" r="5.4"/><circle cx="166" cy="50" r="5.4"/><circle cx="166" cy="84" r="5.4"/></svg><span class="flow-labels"><i>Kubernetes</i><i>Slurm</i><i>Docker</i></span></span>
+<div class="inner" style="align-items:center;text-align:center">
+<img class="logo r as d0" src="img/sflow-logo.jpg" alt="sflow logo" decoding="async" fetchpriority="high">
+<h1 class="r as d1" style="font-family:var(--font-heavy);font-size:clamp(2.5rem,7vw,5.5rem);text-transform:uppercase;letter-spacing:.02em">NV-sflow</h1>
+<h2 class="r au d2" style="font-size:var(--h)">Declarative Workflow Descriptor</h2>
+<p class="r au d3" style="font-size:var(--b);color:var(--dim);margin-top:var(--gap)">Describe once. Run anywhere.<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
+<div class="r au d4" style="display:flex;gap:clamp(.5rem,1.5vw,1rem);flex-wrap:wrap;justify-content:center;margin-top:var(--gap)">
+<a href="docs/user/intro" class="doc-btn" target="_top" onclick="event.stopPropagation()">View Documentation &rarr;</a>
+<a href="feature-map" class="doc-btn" target="_top" onclick="event.stopPropagation()">Explore Feature Map &rarr;</a>
+<a href="https://github.com/NVIDIA/nv-sflow" class="doc-btn gh-btn" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;margin-right:.4em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
 </div>
-<div class="hero-cta r au d3">
-<a href="docs/user/intro" class="doc-btn primary" target="_top" onclick="event.stopPropagation()">View Documentation &rarr;</a>
-<a href="feature-map" class="doc-btn ghost" target="_top" onclick="event.stopPropagation()">Feature Map &rarr;</a>
-<a href="https://github.com/NVIDIA/nv-sflow" class="doc-btn ghost gh-btn" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;margin-right:.4em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
 </div>
-</div></div>
 <a href="#s2" class="scroll-cue" aria-label="Scroll down to explore">
 <span>Scroll</span>
 <svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 8l7 7 7-7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -597,12 +396,12 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="orb og" style="width:350px;height:350px;top:15%;right:-100px"></div>
 <span class="sn">03 / 13</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Backend Agnostic by Design</span>
-<h2 class="r al d1 mb">Keep <span class="accent">what</span>. Swap <span class="green">where</span>. Rewrite nothing.</h2>
+<span class="pill pg r ap d0 ms">Cross-Backend Transplanting</span>
+<h2 class="r al d1 mb">Keep <span class="accent">what</span>. Swap <span class="green">where</span>. Change only a few lines.</h2>
 <div class="fg">
-<div class="fc r au d2"><span class="ic">&#9998;</span><h3>One Semantic</h3><p>A deployment's logic never changes &mdash; only the infrastructure glue does.</p></div>
-<div class="fc r au d3"><span class="ic">&#8644;</span><h3>Swap the Backend Block</h3><p>The same <code>sflow.yaml</code> runs on Docker, Slurm and Kubernetes.</p></div>
-<div class="fc r au d4"><span class="ic">&#9881;</span><h3>Delegate, Don't Reimplement</h3><p>Backends defer to each platform's native ecosystem instead of rebuilding it.</p></div>
+<div class="fc r au d2"><span class="ic">&#9998;</span><h3>Describe Once</h3><p>Portable YAML &mdash; tasks, deps, resources, launch methods</p></div>
+<div class="fc r au d3"><span class="ic">&#8644;</span><h3>Swap the Substrate</h3><p>Change the backend/operator block; keep DAG, scripts, probes, and results.</p></div>
+<div class="fc r au d4"><span class="ic">&#9881;</span><h3>Pluggable Plugins</h3><p>Probes, artifacts, replicas &mdash; no platform coupling.</p></div>
 </div>
 <div class="r as d5" style="width:100%;max-width:700px;margin:0 auto">
 <svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
@@ -683,7 +482,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="orb og" style="width:300px;height:300px;bottom:-90px;right:8%"></div>
 <span class="sn">05 / 13</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Cluster-Level Orchestration at Scale</span>
+<span class="pill pg r ap d0 ms">Resource Planning</span>
 <h2 class="r al d1 ms">Topology-aware GPU Allocation</h2>
 <div class="planner-node r ap d2">sflow topology planner<small>GPU capacity · node affinity · task dependencies</small></div>
 <div class="alloc-arrow r au d2">&#9660; backend-native assignment</div>
@@ -710,7 +509,6 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
     </div>
   </div>
 </div>
-<div class="merge-assumption r au d4">Node and GPU placement, multi-node replicas and sweeps, readiness probes, and batch submission &mdash; so <b style="color:#e3b341">one descriptor drives hundreds of GPUs</b> instead of a pile of hand-written bash.</div>
 </div>
 </section>
 
@@ -756,7 +554,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <span class="pill pc r ap d0 ms">Backend Adapters</span>
 <h2 class="r al d1 ms">One intent becomes four native execution plans</h2>
 <div class="contract-strip r al d2"><b>Portable workflow contract</b> &nbsp; DAG · resources · probes · artifacts · results</div>
-<div class="alloc-arrow r au d2">&#9660; sflow delegates to each platform's native ecosystem</div>
+<div class="alloc-arrow r au d2">&#9660; sflow adapts the execution substrate</div>
 <div class="backend-lanes r as d3">
   <div class="backend-lane" style="--adapter-delay:.45s"><span class="backend-symbol">&gt;_</span><h3>Local</h3><p>bash process<br>synthetic node/GPU map</p></div>
   <div class="backend-lane" style="--adapter-delay:.65s"><span class="backend-symbol">&#9635;</span><h3>Docker</h3><p>docker run<br>container GPU devices</p></div>
@@ -780,9 +578,9 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
   <div class="topology-panel">
     <h3 style="color:#ff7b72">Separate pods · isolated views</h3>
     <div class="pod-pair">
-      <div class="pod-box">worker A<span>GPU 0-1 visible</span></div>
+      <div class="pod-box">worker A<span>GPU 0 visible</span></div>
       <div class="slow-link">IB / TCP<br>&#8596;</div>
-      <div class="pod-box">worker B<span>GPU 2-3 visible</span></div>
+      <div class="pod-box">worker B<span>GPU 1 visible</span></div>
     </div>
   </div>
   <div class="merge-action">sflow merge<br>&#10132;</div>
@@ -938,7 +736,7 @@ NATS/etcd service registry returns internal
 identifiers that the TCP router can't parse.
 
 <span class="yl">Fix:</span> Verify DYN_REQUEST_PLANE and frontend
-networking config match Dynamo disagg routing.</div>
+networking config match SGLang disagg routing.</div>
 </div>
 </div>
 </div>
@@ -953,13 +751,12 @@ networking config match Dynamo disagg routing.</div>
 <table class="mtbl r au d1" style="max-width:800px">
 <thead><tr><th>Command</th><th>Purpose</th><th>Key Flags</th></tr></thead>
 <tbody>
-<tr><td><code>sflow run</code></td><td>Execute a workflow</td><td><code>--dry-run</code> <code>--tui</code> <code>--set</code> <code>-f</code> (multi-file)</td></tr>
-<tr><td><code>sflow batch</code></td><td>Generate sbatch scripts</td><td><code>--submit</code> <code>--bulk-input</code> <code>--row</code></td></tr>
-<tr><td><code>sflow compose</code></td><td>Merge multiple YAMLs</td><td><code>--resolve</code> <code>--missable-tasks</code> <code>-o</code></td></tr>
-<tr><td><code>sflow visualize</code></td><td>Render DAG graph</td><td><code>--format png/svg/mermaid</code></td></tr>
+<tr><td><code>sflow run</code></td><td>Execute a workflow</td><td><code>--dry-run</code> <code>--tui</code> <code>--set</code></td></tr>
+<tr><td><code>sflow batch</code></td><td>Generate sbatch scripts</td><td><code>--submit</code> <code>--bulk-input</code></td></tr>
+<tr><td><code>sflow compose</code></td><td>Merge multiple YAMLs</td><td><code>--resolve</code> <code>--validate</code></td></tr>
+<tr><td><code>sflow visualize</code></td><td>Render DAG image</td><td><code>--format png/svg/mermaid</code></td></tr>
 <tr><td><code>sflow sample</code></td><td>List / copy examples</td><td><code>--list</code> <code>-o</code></td></tr>
-<tr><td><code>sflow skill</code></td><td>Install AI agent skills</td><td><code>--list</code> <code>-o</code></td></tr>
-<tr><td><code>sflow upgrade</code></td><td>Reinstall in place (alias: <code>sflow update</code>)</td><td><code>--branch</code> <code>--dry-run</code> <code>--force</code></td></tr>
+<tr><td><code>sflow skill</code></td><td>Export AI agent skills</td><td><code>--list</code> <code>-o</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -1055,7 +852,6 @@ networking config match Dynamo disagg routing.</div>
 <p class="r au d2" style="max-width:760px">Start locally, validate before allocating hardware, then use the docs and repository as your source of truth.</p>
 <div class="try-layout">
   <div class="term install-panel r al d2"><span class="section"># install from the repository</span>
-<span class="command">$ uv venv --python python3 &amp;&amp; source .venv/bin/activate</span>
 <span class="command">$ uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"</span>
 
 <span class="section"># verify and try a local workflow</span>

@@ -123,8 +123,8 @@ workflow:
 
       # Install dynamo if missing (check for the base dynamo.frontend module which all backends use)
       if ! python3 -c "import dynamo" >/dev/null 2>&1; then
-        echo "dynamo not found, installing ai-dynamo packages (1.3.0)..."
-        pip install --break-system-packages --quiet ai-dynamo-runtime==1.3.0 ai-dynamo==1.3.0
+        echo "dynamo not found, installing ai-dynamo packages (0.8.0)..."
+        pip install --break-system-packages --quiet ai-dynamo-runtime==0.8.0 ai-dynamo==0.8.0
       else
         echo "dynamo already installed."
       fi
@@ -378,7 +378,7 @@ workflow:
     - set -x
     - pip install aiperf==0.3.0
     - export COLUMNS=200
-    - 'aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY} --model Qwen3-8B-FP8 --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }} --endpoint-type chat --endpoint /v1/chat/completions --streaming --url http://${{ variables.HEAD_NODE_IP }}:8000 --synthetic-input-tokens-mean 1024 --synthetic-input-tokens-stddev 0 --output-tokens-mean 1024 --output-tokens-stddev 0 --extra-inputs "max_tokens:1024" --extra-inputs "min_tokens:1024" --extra-inputs "ignore_eos:true" --extra-inputs "repetition_penalty:1.0" --extra-inputs "temperature: 0.0" --concurrency ${CONCURRENCY} --request-count $((8*${CONCURRENCY})) --warmup-request-count ${CONCURRENCY} --num-dataset-entries $((8*${CONCURRENCY})) --random-seed 100 -H ''Authorization: Bearer NOT USED'' -H ''Accept: text/event-stream'' --record-processors 8 --ui simple'
+    - 'aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY} --model Qwen3-8B-FP8 --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }} --endpoint-type chat --endpoint /v1/chat/completions --streaming --url http://${{ variables.HEAD_NODE_IP }}:8000 --synthetic-input-tokens-mean 1024 --synthetic-input-tokens-stddev 0 --output-tokens-mean 1024 --output-tokens-stddev 0 --extra-inputs "max_tokens:1024" --extra-inputs "min_tokens:1024" --extra-inputs "ignore_eos:true" --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}" --extra-inputs "repetition_penalty:1.0" --extra-inputs "temperature: 0.0" --concurrency ${CONCURRENCY} --request-count $((8*${CONCURRENCY})) --warmup-request-count ${CONCURRENCY} --num-dataset-entries $((8*${CONCURRENCY})) --random-seed 100 -H ''Authorization: Bearer NOT USED'' -H ''Accept: text/event-stream'' --record-processors 8 --ui simple'
     - echo "Benchmarking finished"
     resources:
       nodes:

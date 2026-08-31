@@ -748,13 +748,6 @@ def _generate_sbatch_script(
             "dist",
             "*.egg-info",
             "__pycache__",
-            # NOT just size: pip/uv write partial `*.tmp` files under .cache while
-            # other jobs are still bootstrapping, and rsync exits 24 ("some files
-            # vanished") when one disappears mid-transfer -- which the bootstrap
-            # treats as fatal, so the whole Slurm job dies seconds in with no output
-            # directory at all. A shared, concurrently-written cache must never be
-            # part of the copy source.
-            ".cache",
             ".pytest_cache",
             ".ruff_cache",
             ".mypy_cache",

@@ -59,19 +59,9 @@ After a successful run, `sflow run` prints the output folder, summary path, and 
 - task duration timeline and task event timeline
 - probe traces — the last attempt of every readiness/failure probe — when any task defines probes
 - GPU and node usage charts when resource placement data exists
-- **`GPU Assignment`** — per task, the physical GPUs it was planned onto next to the devices it actually saw, read back from the placement record the step wrote. When the backend re-indexes devices inside the container (pyxis/enroot renumbering from 0), the section says so rather than leaving you to reconcile two different numbering schemes.
-- **`Node Topology`** — the CPU / NUMA / GPU probe each backend captured at reservation time, printed as one `[backend <name>]` block per backend.
-- **`External Command Health`** — call counts, failures, timeouts, and mean/max latency for the external commands sflow shells out to (`kubectl`, `srun`, `docker`), plus a list of the slow and failed calls sharing the Timeline's `+elapsed` column. Written even when the run is cancelled or fails, which is when it matters most.
 - command-log paths
 - workflow DAG and dependency list
 - failure hints with task name, attempts, reason, and task log path when a task fails or is cancelled
-
-The task event Timeline also carries an `UNGATED` event for members of a merged Kubernetes pod, marking the moment their in-pod gate opened and the task was allowed to start.
-
-Two companion files are written next to the summary, but only when there is something to say:
-
-- **`command_trace.jsonl`** — one record per *notable* external command (non-zero exit, or slower than 5s). A healthy run, or a run with no notable external-command calls, leaves no file. This is the machine-readable form of the `External Command Health` section; the pre-existing `*_cmds.log` records *what* was issued, this records *how it went*.
-- **`loop_stalls.txt`** — if sflow's own event loop stops being scheduled for 30s, sflow logs a warning and dumps every thread's Python stack here, then logs a recovery line with the worst observed lag. Previously such a freeze produced no diagnostic output at all, because sflow's logging runs on the thread that was stuck. Created only when a stall actually happens.
 
 Example `sflow_summary.log`:
 

@@ -378,6 +378,9 @@ def _get_sample_node_info(sample_path: Path) -> str | None:
             if line_stripped.startswith("SLURM_NODES:"):
                 # Multi-line format, look for value in next lines
                 continue
+            if "value:" in line_stripped and nodes is None:
+                # Check if this is under SLURM_NODES by looking at context
+                pass
             # Direct value extraction for SLURM_NODES
             if "SLURM_NODES:" in line and "value:" in line:
                 # Inline format

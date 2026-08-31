@@ -216,13 +216,12 @@ stateDiagram-v2
 
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
-| **`sflow run`** | Execute a workflow | `--dry-run`, `--tui`, `--bulk-input/--row`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M`, `--skip-artifact-check`, `--wait-for-gpus`, `--extra-args/-e`, `--output-dir`, `--log-level`, `--enable-workflow-monitor`, `--enable-task-monitor`, `--include-nodes/--exclude-nodes`, `--kubeconfig`, `--kube-context`, `--kube-namespace`, `--kube-node-selector`, `--kube-compute-domain-channel`, `--kube-compute-domain-create`, `--extra-kubectl-args`, `--extra-kubectl-apply-args` |
+| **`sflow run`** | Execute a workflow | `--dry-run`, `--tui`, `--bulk-input/--row`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M`, `--skip-artifact-check`, `--extra-args/-e`, `--output-dir`, `--log-level`, `--enable-workflow-monitor`, `--enable-task-monitor`, `--include-nodes/--exclude-nodes`, `--kubeconfig`, `--kube-context`, `--kube-namespace`, `--kube-node-selector`, `--kube-compute-domain-channel`, `--kube-compute-domain-create`, `--extra-kubectl-args` |
 | **`sflow batch`** | Generate Slurm sbatch scripts | `--submit`, `--bulk-input` (CSV sweeps), `--bulk-submit` (YAML folders), `--row`, `--nodes`, `--partition`, `--account`, `--time`, `--resolve`, `--skip-artifact-check`, `--sflow-version`, `--enable-workflow-monitor`, `--enable-task-monitor`, `--include-nodes/--exclude-nodes` |
 | **`sflow compose`** | Merge multiple YAMLs into one | `--resolve`, `--validate`, `--bulk-input`, `--row`, `--missable-tasks/-M`, `-o/--output` |
 | **`sflow visualize`** | Render DAG as image/mermaid | `--format` (png/svg/pdf/mermaid/dot), `--show-variables`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M` |
 | **`sflow sample`** | List/copy example workflows | `--list`, `--force`, `-o/--output` |
 | **`sflow skill`** | Copy agent skills into project (merges into existing directory) | `--list`, `--force` (overwrite existing files), `-o/--output` |
-| **`sflow upgrade`** (alias `sflow update`) | Reinstall sflow in place from git or an index | `--repo`, `--branch`, `--sflow-version`, `--sflow-index-url`, `--sflow-source-path`, `--force`, `--dry-run` |
 
 ### Multi-file Input
 

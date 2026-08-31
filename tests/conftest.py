@@ -7,6 +7,11 @@ import pytest
 
 
 @pytest.fixture
+def mock_config():
+    return {}
+
+
+@pytest.fixture
 def image_warnings():
     """Collect the warnings emitted for unrecognised container image references.
 
