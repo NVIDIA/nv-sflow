@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from sflow.core.loop_watchdog import EventLoopWatchdog
-from sflow.utils.gpu import parse_cuda_visible_devices, task_gpu_indices
+from sflow.utils.gpu import (
+    parse_cuda_visible_devices,
+    task_gpu_indices,
+    task_gpu_record,
+)
 
 from .command_trace import get_command_trace
 from .task import Task, TaskStatus
@@ -670,10 +674,19 @@ class SflowSummaryWriter:
             physical = self._task_gpu_ids(task)
             if not physical:
                 continue
+            # The step's OWN numbering, straight from its placement record. The
+            # planner's env is the HOST slice, so reading it here printed the
+            # physical ids in the in-container column and vice versa: a task
+            # planned for host 2,3 that a container renumbered to 0,1 was reported
+            # as physical 0,1 / in-container 2,3 -- backwards, and impossible.
+            record = task_gpu_record(task)
+            in_step = record.get("cuda_visible_devices", "")
+            if in_step.startswith("<"):  # <env-not-set> / <set-as-empty>
+                in_step = ""
             visible = [
                 str(i)
                 for i in parse_cuda_visible_devices(
-                    task.envs.get("CUDA_VISIBLE_DEVICES")
+                    in_step or task.envs.get("CUDA_VISIBLE_DEVICES")
                 )
             ]
             rows.append((task.name, ",".join(physical), ",".join(visible) or "-"))

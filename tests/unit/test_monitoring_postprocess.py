@@ -1005,6 +1005,54 @@ def test_gpu_panel_draws_one_line_per_device_with_a_legend(tmp_path):
     assert "max 90.00" in svg and "min 0.00" in svg
 
 
+def test_coincident_device_lines_stay_distinguishable(tmp_path):
+    """Two GPUs with IDENTICAL values must not render as one line.
+
+    A tensor-parallel task allocates the same footprint on every rank, so
+    `gpu_memory_used_mib` for its GPUs is often identical to the byte -- the
+    second polyline lands exactly on the first and the panel looks like it only
+    ever had one device, which reads as a collection bug. Colour cannot fix that
+    (nothing of the lower line is visible to be coloured); the dash can.
+    """
+    rows = _gpu_rows([("n1", 0, 50.0), ("n1", 1, 50.0)])
+
+    svg_path = tmp_path / "timeline.svg"
+    assert pp._render_svg(rows, svg_path, title="t")
+    svg = svg_path.read_text()
+
+    lines = re.findall(r"<polyline [^>]*>", svg)
+    assert len(lines) == 2, lines
+    dashes = [
+        re.search(r'stroke-dasharray="([^"]+)"', ln).group(1)
+        if "stroke-dasharray" in ln
+        else ""
+        for ln in lines
+    ]
+    assert dashes[0] != dashes[1], dashes
+    # The legend swatch must carry its line's dash, or the legend stops matching.
+    legend, _h = pp._build_device_legend_svg(["GPU 0", "GPU 1"], x0=8, max_x=800)
+    swatches = [frag for frag in legend if frag.startswith("<line")]
+    assert ("stroke-dasharray" in swatches[0]) is False
+    assert "stroke-dasharray" in swatches[1], swatches[1]
+
+
+def test_single_series_panels_stay_solid(tmp_path):
+    """cpu/mem/disk/net have no per-device split -- dashing them is noise."""
+    rows = _gpu_rows([("n1", 0, 10.0)])
+    for ts in (100.0, 102.0, 104.0):
+        rows.append(
+            {
+                "timestamp": ts, "timestamp_iso": "t", "node_id": "0",
+                "hostname": "n1", "resource_type": "cpu", "resource_id": "cpu",
+                "metric_name": "cpu_utilization_pct", "metric_value": 12.0,
+                "metric_unit": "%", "metric_text": "", "source_log": "x",
+            }
+        )
+    svg_path = tmp_path / "timeline.svg"
+    assert pp._render_svg(rows, svg_path, title="t")
+    assert "stroke-dasharray" not in svg_path.read_text()
+
+
 def test_report_splits_into_one_image_per_node_named_by_hostname(tmp_path):
     """Charts for several nodes on one canvas are unreadable, so split them."""
     rows = _gpu_rows([("nodeA", 0, 10.0), ("nodeB", 0, 20.0)])
@@ -1065,6 +1113,141 @@ def test_legend_colour_matches_the_line_when_a_device_misses_one_metric(tmp_path
     # util panel: GPU 0 then GPU 1; power panel: GPU 1 ONLY -- still GPU 1's colour.
     assert strokes == [gpu0, gpu1, gpu1], strokes
     assert svg.count(">GPU 0<") == 1 and svg.count(">GPU 1<") == 1
+
+
+def test_png_gives_all_eight_gpus_a_distinct_palette_colour(tmp_path, monkeypatch):
+    """The PNG must use `_SERIES_COLORS`, not matplotlib's default tab10 cycle.
+
+    A node carries at most 8 GPUs, so a full node has to be readable without the
+    cycle wrapping or two devices landing on near-identical hues.
+    """
+    plt = pytest.importorskip("matplotlib.pyplot")
+    rows = _gpu_rows([("n1", g, 10.0 * g) for g in range(8)])
+
+    drawn: list[tuple[str, tuple]] = []
+    real_plot = plt.Axes.plot
+
+    def spy(self, *a, **kw):
+        if "color" in kw:
+            drawn.append((kw["color"], kw.get("dashes", ())))
+        return real_plot(self, *a, **kw)
+
+    monkeypatch.setattr(plt.Axes, "plot", spy)
+    assert pp._render_png(rows, tmp_path / "timeline.png", title="t")
+
+    colours = [c for c, _d in drawn]
+    assert colours == list(pp._SERIES_COLORS), colours
+    assert len(set(colours)) == 8, "two GPUs share a colour"
+    assert drawn[0][1] == () and drawn[1][1] == (5.0, 3.0), drawn[:2]
+
+
+def test_series_palette_is_the_okabe_ito_set():
+    """The colour SET is Okabe-Ito exactly -- order is our own (see below).
+
+    This palette is picked for a property (it survives all three dichromacies)
+    that cannot be checked by looking at the chart on a normal display, so
+    "nudging" a colour silently forfeits the reason it was chosen.
+    """
+    assert set(pp._SERIES_COLORS) == {
+        "#0072b2", "#e69f00", "#009e73", "#d55e00",
+        "#56b4e9", "#cc79a7", "#f0e442", "#000000",
+    }
+    assert len(pp._SERIES_COLORS) == 8, "8 GPUs per node; the cycle must not wrap"
+    # Yellow carries extra weight, black slightly less -- see _SERIES_WIDTH_SCALE.
+    assert pp._series_width(7, 1.4) > 1.4 > pp._series_width(4, 1.4)
+    assert pp._series_width(0, 1.4) == 1.4
+
+
+# The three near-pairs in Okabe-Ito: two blues, and the warms among themselves.
+# Colour alone does not reliably separate these at 1.5px.
+_NEAR_PAIRS = (
+    ("#0072b2", "#56b4e9"),  # blue / sky blue
+    ("#e69f00", "#d55e00"),  # orange / vermilion
+    ("#e69f00", "#f0e442"),  # orange / yellow
+    ("#d55e00", "#f0e442"),  # vermilion / yellow
+)
+
+
+def test_first_four_slots_hold_no_near_pair():
+    """A 4-GPU task only draws slots 0-3, so those must separate by hue alone.
+
+    The published Okabe-Ito order fails this: it puts orange in slot 1 and
+    vermilion in slot 3, making the palette's worst pairing the common case.
+    """
+    head = pp._SERIES_COLORS[:4]
+    for a, b in _NEAR_PAIRS:
+        assert not (a in head and b in head), f"{a}/{b} both in the first four"
+
+
+def test_near_pairs_do_not_share_a_dash_pattern():
+    """Dash is the fallback for the pairs hue cannot separate -- so it must differ.
+
+    `_SERIES_DASHES` cycles every 4, so slots i and i+4 are identical in dash and
+    would leave such a pair with no redundant encoding at all.
+    """
+    for a, b in _NEAR_PAIRS:
+        i, j = pp._SERIES_COLORS.index(a), pp._SERIES_COLORS.index(b)
+        assert pp._series_dash(i) != pp._series_dash(j), (
+            f"{a} (slot {i}) and {b} (slot {j}) share a dash pattern"
+        )
+
+
+def test_png_greys_its_chrome_so_the_black_series_is_not_mistaken_for_the_frame(
+    tmp_path, monkeypatch
+):
+    """Slot 8 is pure black; matplotlib's default spines/ticks are black too."""
+    plt = pytest.importorskip("matplotlib.pyplot")
+    rows = _gpu_rows([("n1", g, 10.0 * g) for g in range(8)])
+    figs: list = []
+    real = plt.Figure.savefig
+    monkeypatch.setattr(
+        plt.Figure,
+        "savefig",
+        lambda self, *a, **k: (figs.append(self), real(self, *a, **k))[1],
+    )
+    assert pp._render_png(rows, tmp_path / "t.png", title="t")
+
+    (figure,) = figs
+    for ax in figure.axes:
+        for spine in ax.spines.values():
+            assert spine.get_edgecolor()[:3] != (0.0, 0.0, 0.0), "frame still black"
+
+
+def test_png_device_legend_sits_below_the_panels_not_on_the_data(tmp_path, monkeypatch):
+    """The legend belongs under the chart, as in the SVG -- not over the lines.
+
+    In-panel (`loc="upper right"`) it covered the top-right of the first panel,
+    which is exactly where GPU load ramps at the end of a run.
+    """
+    plt = pytest.importorskip("matplotlib.pyplot")
+    rows = _gpu_rows([("n1", g, 10.0 * g) for g in range(4)])
+
+    figs: list = []
+    real_savefig = plt.Figure.savefig
+
+    def spy(self, *a, **kw):
+        figs.append(self)
+        return real_savefig(self, *a, **kw)
+
+    monkeypatch.setattr(plt.Figure, "savefig", spy)
+    assert pp._render_png(rows, tmp_path / "timeline.png", title="t")
+
+    (figure,) = figs
+    assert not any(ax.get_legend() for ax in figure.axes), "legend baked into a panel"
+    (legend,) = figure.legends
+    assert [t.get_text() for t in legend.get_texts()] == [
+        "GPU 0", "GPU 1", "GPU 2", "GPU 3",
+    ]
+    # Below the lowest panel, so it can never overlap plotted data. Both extents
+    # in display pixels (y grows upward): the legend's TOP must clear the bottom
+    # of the lowest axes. Agg canvas because only a real backend has a renderer,
+    # and the drawn box -- not the anchor -- is what can overlap the data.
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    renderer = FigureCanvasAgg(figure).get_renderer()
+    assert legend.get_window_extent(renderer).y1 <= min(
+        ax.get_window_extent(renderer).y0 for ax in figure.axes
+    )
 
 
 def test_empty_gpu_list_reports_no_gpus_rather_than_all(tmp_path, capsys):

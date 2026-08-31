@@ -1611,7 +1611,7 @@ class TestNormalizeColValue:
 
     def test_container_image_skipped(self):
         assert (
-            _normalize_col_value("nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0") is None
+            _normalize_col_value("nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0") is None
         )
 
     def test_container_image_with_org_skipped(self):
@@ -1626,7 +1626,7 @@ def test_derive_row_name_container_image_skipped():
     rows = [
         {
             "sflow_config_file": "wf.yaml",
-            "IMAGE": "nvcr.io/nvidia/vllm-runtime:0.8.0",
+            "IMAGE": "nvcr.io/nvidia/vllm-runtime:1.3.0",
             "SLURM_NODES": "2",
         },
         {
@@ -5146,6 +5146,11 @@ def test_batch_script_installs_editable_from_source_path(
     # does not recurse into its own destination / sibling jobs' growing copies.
     assert "--exclude='.sflow_venv*'" in script_content
     assert "--exclude='.sflow_src*'" in script_content
+    # Also correctness-critical, and not about size: pip/uv write partial *.tmp
+    # files under .cache while sibling jobs bootstrap, and rsync exits 24 when one
+    # vanishes mid-transfer -- fatal to the bootstrap, so the job dies with no
+    # output dir at all.
+    assert "--exclude=.cache" in script_content
     # The per-job source copy is cleaned up with the venv on exit/signal.
     assert '${SFLOW_SRC_DIR:+"$SFLOW_SRC_DIR"}' in script_content
 

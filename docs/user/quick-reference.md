@@ -319,7 +319,7 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 |-------|----------|------|---------|-------------|
 | `name` | Yes | string | — | Workflow name. |
 | `tasks` | Yes | list | — | List of task definitions (must be non-empty). |
-| `timeout` | | string / int | `null` | Workflow-level timeout (e.g. `1h`, `115m`). |
+| `timeout` | | string / int | `null` | **Not enforced** — accepted and merged, but nothing reads it; a workflow that sets it runs unbounded and `sflow run` warns. Use the backend's own limit (Slurm `--time`). |
 | `variables` | | dict / list | `null` | Workflow-scoped variables (same format as root `variables`). |
 | `upload_all` | | object | `null` | Zip the whole workflow output dir and upload it to a `storage` target (see [Workflow Upload-All](#workflow-upload-all)). |
 | `monitor` | | object | `null` | Workflow-level hardware monitor (see [Monitor](#monitor)). |
@@ -336,7 +336,7 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 | `backend` | | string / dict | `null` | Backend name, or inline backend override. |
 | `depends_on` | | list[string] | `null` | Names of tasks this task depends on. |
 | `required_by` | | list[string] | `null` | Reverse dependency: `A required_by: [B]` is folded into `B depends_on: [A]` at load (lets an optional fragment attach to a hub without editing it). |
-| `timeout` | | int / string | `null` | Task-level timeout. |
+| `timeout` | | int / string | `null` | **Not enforced** — see [Workflow](#workflow). Bound the task with the backend's own limit instead. |
 | `variables` | | dict / list | `null` | Task-scoped variables. |
 | `resources` | | object | `null` | Node / GPU resource requirements. |
 | `replicas` | | object | `null` | Replication configuration. |
@@ -358,8 +358,9 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 | `nodes.indices` | | list[int / expr] | `null` | Specific node indices (e.g. `[0]`). |
 | `nodes.count` | | int / expr | `null` | Number of nodes. |
 | `nodes.exclude` | | int / list[int] / expr | `null` | Node indices to remove from the placement pool before `indices`, `count`, or GPU packing. |
-| `nodes.release_after` | | string | `workflow_completion` | When node reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. sflow reserves nodes **only when this is set explicitly**; omitted, `nodes.indices`/`count` are non-exclusive placement constraints (see note below). |
-| `gpus.count` | If `gpus` is set | int / expr | — | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). |
+| `nodes.release_after` | | string | `null` | When node reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. sflow reserves nodes **only when this is set explicitly**; omitted, `nodes.indices`/`count` are non-exclusive placement constraints (see note below). |
+| `gpus.count` | One of `count` / `indices` | int / expr | `null` | Number of GPUs (sets `CUDA_VISIBLE_DEVICES`). Index-agnostic on its own: the planner packs the task into any contiguous idle GPU run on one node. |
+| `gpus.indices` | One of `count` / `indices` | list[int / expr] | `null` | Pin the task to specific **0-based, non-negative, unique** device ids. Combined with `count`, `count` is the total across nodes and `indices` the per-node slice, so the task fans out over `count / len(indices)` nodes. |
 | `gpus.release_after` | | string | inferred | When GPU reservations can be reused: `workflow_completion`, `task_ready`, or `task_completion`. |
 
 For nodes, `release_after` only creates an exclusive node reservation when explicitly set; omitted `nodes.indices` and `nodes.count` are placement constraints and may overlap with other planned tasks. For GPUs, omitted `release_after` is inferred: tasks without readiness probes release GPUs after task completion for downstream dependents, while tasks with readiness probes keep GPUs until workflow completion unless explicitly set to `task_ready`. `task_ready` releases after readiness succeeds. `task_completion` releases after any terminal task status (`COMPLETED`, `FAILED`, `TIMEOUT`, or `CANCELLED`). Dry-run rehearses these resource lifetimes across the DAG.
@@ -489,7 +490,9 @@ To publish a metric literally named `file`, use `patterns:`; a top-level `file:`
 | `interval` | | int | `5000` | Sampling interval (ms) for built-in scopes without their own. |
 | `scopes` | | object | `null` (all) | Which scopes to collect — `cpu`, `gpu`, `memory`, `disk`, `network`, `custom`; omit ⇒ all built-ins active. |
 | `resources` | | object | `null` | Which hardware to target — `nodes` / `gpus` (like task resources) or `used_by_tasks: [names]`. |
-| `report` | | object | `null` (csv + svg) | Opt-in post-run report `format`: any of `csv`, `svg`, `png` (`png` needs the `sflow[monitor]` extra). |
+| `report` | | object | `{enabled: true}` | Post-run report. `format`: any of `csv`, `svg`, `png` (`png` needs the `sflow[monitor]` extra). |
+| `report.enabled` | | bool | `true` | **On by default** whenever `monitor:` is set. Set `false` to opt out — worth doing on large fan-outs, since report cost scales with samples × views. Raw samples and the overview are still written. |
+| `window` | | object | `null` | `{start, end}` task-log markers bounding the reported window, so the report covers the benchmark rather than the whole task lifecycle. Task monitors only (rejected on `workflow.monitor`) and requires `report.enabled: true`. |
 
 ## Expression Syntax
 

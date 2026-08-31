@@ -11,6 +11,7 @@ const {
   safeVersionDirName,
   currentDocsSource,
   prepareVersionedDocs,
+  repairFrozenAnchors,
 } = require("./prepare-versioned-docs");
 
 function git(cwd, args) {
@@ -163,4 +164,23 @@ test("prepareVersionedDocs materializes current docs, versioned docs, sidebars, 
     fs.readFileSync(path.join(docsSite, "versioned_docs", "version-v1.2.3", "plc", "sflow_srd.md"), "utf8"),
     "See [SPP](/docs/v1.2.3/sflow_spp).\n",
   );
+});
+
+test("repairFrozenAnchors fixes a stale anchor only while the old heading is present", () => {
+  const stale = [
+    "See [Modular inference recipe](#modular-inference-recipe-inference_x_v2).",
+    "",
+    "### inference_x_v2",
+  ].join("\n");
+  assert.match(repairFrozenAnchors(stale), /\(#inference_x_v2\)/);
+
+  // The guard that matters: `main` is a branch, so once the source fix lands its
+  // snapshot already carries the long heading and the link is correct. Rewriting
+  // unconditionally would break it a second time, in the other direction.
+  const fixed = [
+    "See [Modular inference recipe](#modular-inference-recipe-inference_x_v2).",
+    "",
+    "### Modular inference recipe (inference_x_v2)",
+  ].join("\n");
+  assert.equal(repairFrozenAnchors(fixed), fixed);
 });

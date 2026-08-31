@@ -132,3 +132,87 @@ def test_two_docker_tasks_do_not_collide_on_gpu_zero():
     a = _Task(cuda_visible_devices="0,1", envs={"CUDA_VISIBLE_DEVICES": "0,1"})
     b = _Task(cuda_visible_devices="2,3", envs={"CUDA_VISIBLE_DEVICES": "0,1"})
     assert set(task_gpu_indices(a)).isdisjoint(task_gpu_indices(b))
+
+
+def test_a_carved_container_reports_the_physical_card_not_its_own_numbering(tmp_path):
+    """The container's numbering is not a physical id.
+
+    A task planned for host GPUs 2,3 that a runtime carved and renumbered from 0
+    records "0,1" as the devices it used. Reporting that as PHYSICAL put every
+    containerised task on the wrong card in the summary's GPU Assignment table
+    (physical 0,1 / in-container 2,3 -- backwards, and impossible), and made the
+    hardware monitor sample the wrong GPUs.
+
+    The step proves by UUID that it holds exactly the planned cards, and exits 97
+    when it does not, so the planned HOST indices are the physical ones.
+    """
+    from sflow.utils.gpu import GPU_MARKER_FILE, task_gpu_indices, task_gpu_record
+
+    out = tmp_path / "boxed_high"
+    out.mkdir()
+    (out / GPU_MARKER_FILE).write_text(
+        "0,1\n"
+        "node=ptyche0074\n"
+        "action=verified\n"
+        "cuda_visible_devices=0,1\n"
+        "planned_host_indices=2,3\n"
+        "planned_uuids=GPU-74b4,GPU-0989\n"
+        "visible=0 GPU-74b4\n"
+        "visible=1 GPU-0989\n"
+        "selected=0 GPU-74b4\n"
+        "selected=1 GPU-0989\n"
+    )
+
+    class _Task:
+        envs = {"SFLOW_TASK_OUTPUT_DIR": str(out), "CUDA_VISIBLE_DEVICES": "2,3"}
+        assigned_nodes = ["ptyche0074"]
+        cuda_visible_devices = "2,3"
+
+    task = _Task()
+    assert task_gpu_indices(task) == [2, 3], "physical is the planned host slice"
+    # ...and the step's own view is still recoverable for the other column.
+    assert task_gpu_record(task)["cuda_visible_devices"] == "0,1"
+    assert task_gpu_record(task)["action"] == "verified"
+
+
+def test_an_unverified_record_still_reports_what_the_step_selected(tmp_path):
+    """Without UUID proof the record's line 1 is the best answer, as before.
+
+    On that path the step selected host ordinals itself, so line 1 means what it
+    always meant -- notably the GRES case where slurmstepd hands over a partial
+    allocation and plan 0,1 really is physical 3,5.
+    """
+    from sflow.utils.gpu import GPU_MARKER_FILE, task_gpu_indices
+
+    out = tmp_path / "gres_task"
+    out.mkdir()
+    (out / GPU_MARKER_FILE).write_text(
+        "3,5\nnode=n0\naction=fallback\ncuda_visible_devices=3,5\n"
+        "planned_host_indices=0,1\n"
+    )
+
+    class _Task:
+        envs = {"SFLOW_TASK_OUTPUT_DIR": str(out), "CUDA_VISIBLE_DEVICES": "0,1"}
+        assigned_nodes = ["n0"]
+        cuda_visible_devices = "0,1"
+
+    assert task_gpu_indices(_Task()) == [3, 5]
+
+
+def test_task_gpu_record_returns_empty_when_there_is_nothing_to_read(tmp_path):
+    """Three ways to have no record, one answer: {}.
+
+    Callers branch on empty-vs-parsed, so an exception or a half-filled dict here
+    would surface as a confidently wrong device list in the run summary.
+    """
+    from types import SimpleNamespace
+
+    from sflow.utils.gpu import GPU_MARKER_FILE, task_gpu_record
+
+    # No task output dir at all.
+    assert task_gpu_record(SimpleNamespace(envs={})) == {}
+    # Dir known, marker absent (OSError).
+    assert task_gpu_record(SimpleNamespace(envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)})) == {}
+    # Marker present but empty -- there is not even a device line to trust.
+    (tmp_path / GPU_MARKER_FILE).write_text("")
+    assert task_gpu_record(SimpleNamespace(envs={"SFLOW_TASK_OUTPUT_DIR": str(tmp_path)})) == {}

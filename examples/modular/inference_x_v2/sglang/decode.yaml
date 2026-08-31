@@ -1,7 +1,7 @@
 # SGLang decode server task and its configuration.
 # Merge all files for a complete run:
 #   sflow run -f slurm_config.yaml -f common_workflow.yaml -f sglang_prefill.yaml -f sglang_decode.yaml -f benchmark_aiperf.yaml \
-#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0
+#     --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0
 
 version: "0.1"
 

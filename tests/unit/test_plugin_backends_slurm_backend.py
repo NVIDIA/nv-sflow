@@ -3,11 +3,13 @@
 
 import asyncio
 import logging
+import unittest.mock
 
 import pytest
 
 import sflow.plugins.backends.slurm as slurm_mod
 from sflow.core.backend import Allocation
+from sflow.core.compute_node import ComputeNode
 from sflow.plugins.backends.slurm import SlurmBackend, SlurmBackendConfig
 
 
@@ -166,6 +168,51 @@ def test_salloc_tokenizes_extra_args_with_bundled_whitespace(
     assert "--exclude=bad001,bad002" in salloc_cmd
     assert "--gpus-per-node=4" in salloc_cmd
     assert not any(arg != arg.strip() for arg in salloc_cmd)
+
+
+def test_salloc_extra_args_keep_repeated_values(monkeypatch, slurm_test_logger):
+    # `-e '-G 1 -p polar4 -A acct -N 1'` tokenizes to space-separated flag/value
+    # pairs. Feeding each token through Command.add_opt() treated the bare values
+    # as option names and de-duped them, so the second "1" deleted the first and
+    # salloc received `-G -p polar4 -A acct -N 1` -- a silent, wrong allocation.
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="b",
+            type="slurm",
+            account="acct",
+            partition="batch",
+            nodes=1,
+            time="00:10:00",
+            job_name="job",
+            extra_args=["-G 1 -p polar4 -A general_perflab -N 1"],
+            gpus_per_node=8,
+        )
+    )
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (0, ["salloc: Granted job allocation 1", "salloc: Nodes node001 are ready for job"]),
+            (0, ["node001: 10.0.0.1:123"]),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+    asyncio.run(backend.allocate())
+
+    salloc_cmd = list(fake_launcher.calls[0]["command"])
+    assert salloc_cmd[-8:] == [
+        "-G",
+        "1",
+        "-p",
+        "polar4",
+        "-A",
+        "general_perflab",
+        "-N",
+        "1",
+    ]
 
 
 def test_env_reuse_applies_exclude_filter(monkeypatch, slurm_test_logger):
@@ -1406,8 +1453,12 @@ def test_slurm_backend_resource_env_preserves_controller_slurm_envs(monkeypatch)
     env = backend.resource_env(cuda_visible_devices="0,1")
 
     assert env["CUDA_VISIBLE_DEVICES"] == "0,1"
-    # NVIDIA_VISIBLE_DEVICES mirrors the same slice (some stacks honor only that one).
-    assert env["NVIDIA_VISIBLE_DEVICES"] == "0,1"
+    # INTENTIONAL CHANGE: NVIDIA_VISIBLE_DEVICES is no longer handed to an srun
+    # step. It used to mirror the slice, but the container runtime reads it at
+    # container CREATION and carves + RENUMBERS those devices from 0 -- leaving
+    # the CUDA_VISIBLE_DEVICES we exported beside it, in host numbering,
+    # addressing nothing. See SlurmBackend.resource_env.
+    assert "NVIDIA_VISIBLE_DEVICES" not in env
     assert env["SLURM_JOB_ID"] == "2222222"
     assert env["SLURM_JOB_NODELIST"] == "node[001-002]"
     assert env["SLURM_NNODES"] == "2"
@@ -1416,3 +1467,174 @@ def test_slurm_backend_resource_env_preserves_controller_slurm_envs(monkeypatch)
     assert env["SFLOW_BACKEND_JOB_ID"] == "2222222"
     assert env["SFLOW_BACKEND_NODELIST"] == "node[001-002]"
     assert env["SFLOW_BACKEND_NUM_NODES"] == "2"
+
+
+def test_srun_steps_are_not_handed_nvidia_visible_devices():
+    """The variable that carves the container must not name a subset.
+
+    pyxis/enroot reads NVIDIA_VISIBLE_DEVICES when it CREATES the container: a
+    subset there makes it expose only those devices and renumber them from 0, so
+    the CUDA_VISIBLE_DEVICES exported alongside -- in host numbering -- then
+    addresses nothing. A worker planned for host 2,3 landed in a 2-GPU container
+    numbered 0,1 and died with "No CUDA GPUs are available"; one planned for 0,1
+    survived only by coincidence.
+
+    Not exporting it lets the container see the node's GPUs with host numbering
+    intact, so the planned slice is directly addressable and CUDA_VISIBLE_DEVICES
+    -- the variable CUDA actually reads -- is the only thing sflow sets.
+
+    Docker is unaffected: it overrides resource_env and isolates with
+    `--gpus device=<uuid>`.
+    """
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="s",
+            type="slurm",
+            account="acct",
+            partition="batch",
+            nodes=1,
+            time="00:10:00",
+            gpus_per_node=8,
+        )
+    )
+    env = backend.resource_env(cuda_visible_devices="2,3")
+    assert env["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert "NVIDIA_VISIBLE_DEVICES" not in env
+
+    # A task with no GPU slice gets neither.
+    assert "NVIDIA_VISIBLE_DEVICES" not in backend.resource_env(cuda_visible_devices=None)
+
+
+def _discovery_backend(script):
+    """A backend whose only subprocess call is the GPU topology probe."""
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="b", type="slurm", account="acct", partition="batch",
+            nodes=1, time="00:10:00", job_name="job", gpus_per_node=4,
+        )
+    )
+    backend._subprocess_launcher = _FakeSubprocessLauncher(script=script)
+    return backend
+
+
+def test_gpu_topology_probe_records_each_nodes_index_to_uuid_map():
+    """The probe's output is the ground truth every later check rests on.
+
+    A step can only ask "am I on the cards I was planned for?" by UUID, and this
+    bare srun is where those UUIDs come from. Parsing it wrong does not fail
+    loudly -- it leaves the maps empty and silently drops every task in the run to
+    index arithmetic, so the parse needs a test of its own.
+    """
+    nodes = [ComputeNode(name="n0", ip_address="10.0.0.1", index=0),
+             ComputeNode(name="n1", ip_address="10.0.0.2", index=1)]
+    backend = _discovery_backend([(0, [
+        "n0 0,GPU-aaa", "n0 1,GPU-bbb",
+        "n1 0,GPU-ccc", "n1 1,GPU-ddd",
+    ])])
+
+    asyncio.run(backend._discover_gpu_uuids(nodes=nodes))
+
+    # Ordered by HOST index, per node: the same planned slot is a different
+    # physical card on n1 than on n0, which is why this is not one flat list.
+    assert nodes[0].gpu_uuids == ["GPU-aaa", "GPU-bbb"]
+    assert nodes[1].gpu_uuids == ["GPU-ccc", "GPU-ddd"]
+
+    cmd = backend._subprocess_launcher.calls[0]["command"]
+    # --overlap: shares the allocation instead of queueing behind a real step.
+    assert "--overlap" in cmd and "--nodelist" in cmd
+    assert cmd[cmd.index("--nodelist") + 1] == "n0,n1"
+
+
+def test_gpu_topology_probe_rejects_a_partial_reading():
+    """A gap means indices are missing, and a partial map resolves to the WRONG card.
+
+    With 0 and 2 reported, index 1 is unaccounted for; treating the two as a
+    0,1 run would map planned slot 1 onto the physical card at slot 2. Better to
+    say nothing and let the step fall back.
+    """
+    nodes = [ComputeNode(name="n0", ip_address="10.0.0.1", index=0)]
+    backend = _discovery_backend([(0, ["n0 0,GPU-aaa", "n0 2,GPU-ccc"])])
+
+    asyncio.run(backend._discover_gpu_uuids(nodes=nodes))
+
+    assert nodes[0].gpu_uuids is None
+
+
+def test_gpu_topology_probe_ignores_noise_and_survives_failure():
+    """Never the reason a workflow cannot start."""
+    nodes = [ComputeNode(name="n0", ip_address="10.0.0.1", index=0)]
+    # Slurm prologue chatter, a malformed pair, and a non-UUID value.
+    backend = _discovery_backend([(0, [
+        "srun: job 42 queued and waiting for resources",
+        "n0 notanindex,GPU-zzz",
+        "n0 0,NOT-A-UUID",
+        "n0 0,GPU-aaa",
+    ])])
+    asyncio.run(backend._discover_gpu_uuids(nodes=nodes))
+    assert nodes[0].gpu_uuids == ["GPU-aaa"]
+
+    # A failed probe leaves the map untouched rather than raising.
+    other = [ComputeNode(name="n0", ip_address="10.0.0.1", index=0)]
+    asyncio.run(_discovery_backend([(1, ["srun: error"])])._discover_gpu_uuids(nodes=other))
+    assert other[0].gpu_uuids is None
+
+
+def test_resource_env_hands_the_step_its_planned_uuids():
+    """The seam the whole feature hangs on: driver map -> step env.
+
+    _planned_gpu_uuids and gpu_placement.sh were each covered in isolation, but
+    nothing asserted resource_env actually JOINS them. Drop this line and every
+    other test still passes while every step silently falls back to index
+    arithmetic -- the failure mode is invisible.
+    """
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="b", type="slurm", account="acct", partition="batch",
+            nodes=1, time="00:10:00", job_name="job", gpus_per_node=4,
+        )
+    )
+    backend.allocation = Allocation(
+        allocation_id="1",
+        nodes=[ComputeNode(name="n0", ip_address="10.0.0.1", index=0,
+                           gpu_uuids=["GPU-a", "GPU-b", "GPU-c", "GPU-d"])],
+        owned=False,
+    )
+    env = backend.resource_env(cuda_visible_devices="2,3")
+    assert env["SFLOW_PLANNED_GPU_UUIDS"] == "n0=GPU-c,GPU-d"
+
+    # Nothing trustworthy to say -> say nothing. Absent means "fall back", and an
+    # empty string would read as "this task was planned for no GPUs".
+    backend.allocation.nodes[0].gpu_uuids = None
+    assert "SFLOW_PLANNED_GPU_UUIDS" not in backend.resource_env(cuda_visible_devices="2,3")
+
+
+def test_planned_uuids_warns_when_a_slot_is_past_the_nodes_device_count():
+    """The warning IS the deliverable here.
+
+    Returning "" already drops the task to index arithmetic; the log line is the
+    only thing that tells the user their gpus_per_node is bigger than the node.
+    Silence would leave them with weaker checking and no idea why.
+    """
+    alloc = Allocation(
+        allocation_id="1",
+        nodes=[ComputeNode(name="n0", ip_address="10.0.0.1", index=0,
+                           gpu_uuids=["GPU-a", "GPU-b"])],
+        owned=False,
+    )
+    with unittest.mock.patch.object(slurm_mod._logger, "warning") as warn:
+        assert slurm_mod._planned_gpu_uuids("0,9", alloc) == ""
+    assert warn.called
+    assert "gpus_per_node" in warn.call_args.args[0]
+
+
+def test_allocation_probes_the_gpu_topology():
+    """Both allocate() paths must actually call the probe.
+
+    It is best-effort and never raises, so a missing call site is silent: the
+    maps stay None and every task drops to index arithmetic while the suite
+    stays green.
+    """
+    import inspect
+
+    # Once for the pre-existing (unowned) allocation, once for the salloc path.
+    assert inspect.getsource(SlurmBackend).count("await self._discover_gpu_uuids(") == 2

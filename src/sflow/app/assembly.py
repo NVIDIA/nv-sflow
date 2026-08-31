@@ -1662,12 +1662,19 @@ async def build_state(
     """
     Build runtime state from configuration (composition root).
 
-    This is intentionally kept out of core to avoid core importing plugins.
+    Kept out of core because this is the PLAN-TIME side of the split: it turns a
+    validated config into runtime objects, while core owns what happens once
+    they exist. Not because core may not import plugins -- it already does, in
+    the four registry self-population calls (core/backend_registry.py:56 and
+    its siblings), so defending that invariant here would be defending one
+    that is already false.
     """
     from pathlib import Path
 
-    if source_files:
-        resolver.source_files = [Path(f) for f in source_files]
+    # Assigned unconditionally: `resolver` is module-global, so a conditional
+    # assignment leaves the PREVIOUS run's files in place and visualize() (which
+    # passes none) then points its error hints at the wrong YAML.
+    resolver.source_files = [Path(f) for f in source_files] if source_files else []
 
     # Seed an empty workflow/state; we will populate task graph after resolution/allocation.
     wf = Workflow(name=config.workflow.name, task_graph=TaskGraph())

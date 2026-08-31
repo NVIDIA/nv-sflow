@@ -1018,6 +1018,12 @@ class TaskConfig(StrictBaseModel):
     required_by: Optional[List[str]] = None
     replicas: Optional[ReplicaConfig] = None
     retries: Optional[RetryConfig] = None
+    # NOT ENFORCED. Accepted so existing recipes keep loading (this model forbids
+    # extra keys, so removing it would reject every config that sets it) and so
+    # multi-file merge can carry it, but nothing reads it: no code path passes it
+    # to Orchestrator._launch_task_with_timeout, and TaskStatus.TIMEOUT is never
+    # assigned. Bound a task with the backend's own limit (Slurm `--time`) until
+    # this is wired. load_config WARNs when it is set.
     timeout: Optional[Union[int, str]] = None
     variables: Optional[
         Annotated[List[VariableConfig], BeforeValidator(_normalize_to_list)]
@@ -1031,6 +1037,8 @@ class WorkflowConfig(StrictBaseModel):
     """Configuration for the workflow execution."""
 
     name: str
+    # NOT ENFORCED -- see TaskConfig.timeout above. A workflow declaring
+    # `timeout: 115m` today runs unbounded.
     timeout: Optional[Union[str, int]] = None
     variables: Optional[
         Annotated[List[VariableConfig], BeforeValidator(_normalize_to_list)]

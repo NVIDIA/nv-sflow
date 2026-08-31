@@ -124,7 +124,3 @@ workflow:
             match_pattern: "Traceback (most recent call last)"
             match_count: 5
           interval: 30
-      retries:
-        count: 3
-        interval: 30
-        backoff: 2

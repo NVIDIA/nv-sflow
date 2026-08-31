@@ -174,6 +174,40 @@ sflow batch -f workflow.yaml -e "--gpus-per-node=8" -e "--segment=2"
 This is useful for quick adjustments or when testing different cluster configurations.
 :::
 
+### GPU placement inside the step
+
+On a GRES partition `slurmstepd` overwrites the `CUDA_VISIBLE_DEVICES` sflow exports, so
+every step sees the whole allocation and every rank picks device 0 — several tasks that
+were planned onto different GPUs all pile onto the same one. sflow therefore no longer
+trusts the inherited value. A prelude sourced inside each Slurm step probes the devices
+the step can actually see, looks up the physical UUIDs the driver resolved this task's
+plan to (`SFLOW_PLANNED_GPU_UUIDS`), and re-exports the indices those same cards have
+*here*. Matching by UUID rather than by index is also what fixes pyxis/enroot containers,
+which renumber devices from 0.
+
+This is **on by default** for any Slurm task with a `resources.gpus` slice. The one thing
+that opts out is srun `gpus_per_task`, because Slurm already carves GPUs per rank there.
+
+- **Audit record.** Each task writes `<task>/sflow_gpus.log` (`sflow_gpus.<node>.log` per
+  node on multi-node tasks): planned indices and UUIDs, the inherited environment, the
+  visible index→UUID map, and the final selection. It is deliberately not dot-prefixed so
+  artifact browsers show it. The `GPU Assignment` section of `sflow_summary.log` is built
+  from it.
+- **Hard failure `exit 97`.** If a planned card is not visible at all, the step holds fewer
+  GPUs than planned, or a planned slot is out of range, the step aborts with exit code 97
+  rather than silently running on the wrong device. When Slurm — not sflow — chose the
+  devices, sflow degrades to index arithmetic instead of failing.
+- **Graceful skips.** If `CUDA_VISIBLE_DEVICES` is not a plain comma-separated list of
+  non-negative integers (for example a workflow variable of that name shadowing it), or the
+  placement script cannot be staged, sflow warns and falls back to the previous behavior.
+
+:::note
+`NVIDIA_VISIBLE_DEVICES` is no longer exported to srun steps. Containers therefore see all
+of the node's GPUs — NVML consumers such as `nvidia-smi` and DCGM lose device isolation —
+in exchange for the planned host-numbered slice being addressable at all. The Docker
+backend is unaffected: it keeps isolation via `--gpus device=<uuid>`.
+:::
+
 ## Selecting or excluding nodes (all backends)
 
 Restrict which cluster nodes a run may use with two backend-agnostic controls that
@@ -331,11 +365,6 @@ Two things to know about `SFLOW_WAIT_FOR_GPUS`:
   GPU task, which then fails.
 
 Reservation requires POSIX file locking and is inert on Windows.
-
-To see it work on a real GPU host, `examples/gpu_reservation/` ships a runnable demo
-(`demo.yaml`) plus two harnesses: `prove.sh` asserts the four guarantees above
-(exact pinning, disjoint concurrent tasks, fail-fast, `--wait-for-gpus`) and exits
-non-zero if any fails, and `stress.sh` fires many concurrent runs at one GPU pool.
 
 > **Changed behavior.** Container names gained a driver-PID segment
 > (`sflow-<task>-<node>` → `sflow-p<pid>-<task>-<node>`) so concurrent runs on one

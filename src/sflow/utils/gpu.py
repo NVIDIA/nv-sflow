@@ -8,7 +8,10 @@ from typing import Any
 
 # Written by a job step that picks its own devices (slurm), read back by run
 # reporting. Lives here, next to its only reader, so the producer imports it.
-GPU_MARKER_FILE = ".sflow_gpus"
+# Deliberately NOT dot-prefixed: this is the placement record a human reads when
+# a run looks mis-placed, and GitLab's artifact browser hides dot-files entirely
+# (they ship in the zip but cannot be clicked).
+GPU_MARKER_FILE = "sflow_gpus.log"
 
 
 def count_device_tokens(cuda_visible: str | None) -> int:
@@ -38,6 +41,33 @@ def count_visible_devices(cuda_visible: str | None) -> int:
     return len(parse_cuda_visible_devices(cuda_visible)) or count_device_tokens(
         cuda_visible
     )
+
+
+def task_gpu_record(task: Any) -> dict[str, str]:
+    """Parse the placement record a Slurm step leaves in :data:`GPU_MARKER_FILE`.
+
+    Line 1 is the device list the step ended up using; the rest is ``key=value``
+    (node, the branch taken, planned host indices, planned UUIDs) plus repeated
+    ``visible=``/``selected=`` lines. Returns {} when there is no record.
+    """
+    envs = getattr(task, "envs", None) or {}
+    out_dir = envs.get("SFLOW_TASK_OUTPUT_DIR")
+    if not out_dir:
+        return {}
+    try:
+        text = (Path(out_dir) / GPU_MARKER_FILE).read_text()
+    except OSError:
+        return {}
+    lines = text.splitlines()
+    if not lines:
+        return {}
+    record: dict[str, str] = {"devices": lines[0].strip()}
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        # visible=/selected= repeat; the scalars are what callers need.
+        if sep and key not in ("visible", "selected"):
+            record[key] = value.strip()
+    return record
 
 
 def task_gpu_indices(task: Any) -> list[int]:
@@ -81,13 +111,25 @@ def task_gpu_indices(task: Any) -> list[int]:
     # node 0's devices for every node would be a confident wrong answer -- the plan,
     # which is uniform across nodes by construction, is the honest one there.
     if out_dir and len(getattr(task, "assigned_nodes", None) or []) <= 1:
-        try:
-            reported = (Path(out_dir) / GPU_MARKER_FILE).read_text()
-        except OSError:
-            reported = ""
+        record = task_gpu_record(task)
+        if record.get("action") == "verified":
+            # The step PROVED, by UUID, that it holds exactly the planned cards --
+            # it exits 97 otherwise -- so the planned HOST indices are the physical
+            # ones, whatever the step's own numbering happened to be.
+            #
+            # Line 1 must not be used here: inside a carved container it is the
+            # container's numbering (a task planned for host 2,3 records 0,1), and
+            # reporting that as physical put every containerised task on the wrong
+            # card in the summary and made the monitor sample the wrong GPUs.
+            indices = parse_cuda_visible_devices(record.get("planned_host_indices", ""))
+            if indices:
+                return indices
+        # No verified record (older marker, or the driver could not probe the
+        # topology): line 1 is the best available answer, and under that path the
+        # step selected host ordinals, so it means what it used to mean.
         # An unparseable marker (e.g. CUDA UUID form) must fall through, not drop the
         # task out of run reporting entirely.
-        indices = parse_cuda_visible_devices(reported.strip())
+        indices = parse_cuda_visible_devices(record.get("devices", ""))
         if indices:
             return indices
     return planned_gpu_indices(task)

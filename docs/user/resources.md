@@ -185,6 +185,15 @@ split across two nodes. Write `gpus.count: 2` for one GPU on each of two nodes.
 
 This `CUDA_VISIBLE_DEVICES` packing applies to the **local**, **slurm**, and **docker** backends. Kubernetes assigns GPUs differently — see below.
 
+:::note `gpus_per_task` hands device selection to Slurm
+Setting `gpus_per_task` on an `srun` operator makes the job step request GRES, so Slurm
+carves devices per **rank** and picks which ones. sflow does not re-apply its own slice
+there — `resources.gpus` still sizes the request and drives packing and conflict
+detection, but the physical devices are Slurm's choice, and run reporting falls back to
+showing the planned slice. Leave `gpus_per_task` unset if you want sflow's exact device
+pin (`resources.gpus.indices`) to hold.
+:::
+
 ### Pin specific GPUs with `indices`
 
 Use `resources.gpus.indices` when a task must land on particular device IDs — NUMA/NVLink affinity, reproducing a vendor benchmark topology, or steering around a known-bad device.

@@ -304,6 +304,16 @@ workflow:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
         - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        # Port derived from the first visible device, so two workers sharing a
+        # node never collide. This works because sflow does NOT hand
+        # NVIDIA_VISIBLE_DEVICES to an srun step: the container therefore sees the
+        # node's GPUs with HOST numbering intact, and the first entry of
+        # CUDA_VISIBLE_DEVICES is a real host index -- unique per worker.
+        #
+        # Keep it this way deliberately. When NVIDIA_VISIBLE_DEVICES was exported,
+        # the runtime carved and renumbered every worker's devices from 0, so both
+        # prefill and decode computed 5557 and the second to bind died with
+        # "Address already in use". This line is the canary that found it.
         - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
         - export NODE_RANK=${SLURM_NODEID}
         - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
@@ -381,6 +391,16 @@ workflow:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
         - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        # Port derived from the first visible device, so two workers sharing a
+        # node never collide. This works because sflow does NOT hand
+        # NVIDIA_VISIBLE_DEVICES to an srun step: the container therefore sees the
+        # node's GPUs with HOST numbering intact, and the first entry of
+        # CUDA_VISIBLE_DEVICES is a real host index -- unique per worker.
+        #
+        # Keep it this way deliberately. When NVIDIA_VISIBLE_DEVICES was exported,
+        # the runtime carved and renumbered every worker's devices from 0, so both
+        # prefill and decode computed 5557 and the second to bind died with
+        # "Address already in use". This line is the canary that found it.
         - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${FIRST_CUDA_DEVICE}))
         - export NODE_RANK=${SLURM_NODEID}
         - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
@@ -469,7 +489,6 @@ workflow:
           --extra-inputs "max_tokens:${{ variables.OSL }}"
           --extra-inputs "min_tokens:${{ variables.OSL }}"
           --extra-inputs "ignore_eos:true"
-          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
           --extra-inputs "repetition_penalty:1.0"
           --extra-inputs "temperature: 0.0"
           --concurrency ${CONCURRENCY}

@@ -170,7 +170,7 @@ variables:
     value: python:3.12-slim
   DYNAMO_IMAGE:
     description: "Dynamo TRTLLM container image"
-    value: nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0
+    value: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0
 
   # Network device information, change per your cluster or comment out if not needed
   # NCCL_SOCKET_IFNAME:
@@ -424,7 +424,6 @@ workflow:
           --extra-inputs "max_tokens:${{ variables.OSL }}"
           --extra-inputs "min_tokens:${{ variables.OSL }}"
           --extra-inputs "ignore_eos:true"
-          --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
           --extra-inputs "repetition_penalty:1.0"
           --extra-inputs "temperature: 0.0"
           --concurrency ${CONCURRENCY}

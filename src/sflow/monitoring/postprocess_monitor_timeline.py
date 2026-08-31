@@ -138,7 +138,7 @@ _MARKER_INK = "#9aa0a6"
 _MARKER_LABEL_INK = "#5f6772"
 # `fail` -- and ONLY fail -- gets a reserved status colour: a cancel is usually
 # sflow tearing a service down on purpose, so flagging it red would cry wolf on
-# every healthy run. Deliberately darker than the `#d62728` in `_SERIES_COLORS`,
+# every healthy run. Deliberately darker than the `#d55e00` in `_SERIES_COLORS`,
 # so a rule can never be mistaken for a GPU line on the same canvas; it always
 # ships alongside its own text label, never as colour alone.
 _MARKER_FAIL_INK = "#a61b1b"
@@ -231,7 +231,8 @@ def _build_device_legend_svg(
         colour = _SERIES_COLORS[idx % len(_SERIES_COLORS)]
         parts.append(
             f'<line x1="{x:.1f}" y1="{y - 3:.1f}" x2="{x + 16:.1f}" '
-            f'y2="{y - 3:.1f}" stroke="{colour}" stroke-width="2"/>'
+            f'y2="{y - 3:.1f}" stroke="{colour}" '
+            f'stroke-width="{_series_width(idx, 2.0)}"{_series_dash(idx)}/>'
         )
         parts.append(
             f'<text x="{x + 20:.1f}" y="{y:.1f}" font-size="9" fill="#444444">'
@@ -661,12 +662,95 @@ def _series_for_metric(
     return [v for _ts, v in _metric_timeseries(rows, resource_type, metric_name)]
 
 
-# Line colors for per-resource series (one per GPU). Cycled; chosen to stay
-# distinguishable in both the SVG and a greyscale print.
+# Line colors for per-resource series (one per GPU): the Okabe-Ito "Color
+# Universal Design" palette, verbatim and in its published order. Eight is
+# exactly enough -- a node carries at most 8 GPUs, so the cycle never wraps in
+# practice and no two devices on one panel can share a colour.
+#
+# Chosen over a wider hue spread (a true red plus a grey reads as more separated
+# to normal vision) because this palette holds up under all three dichromacies as
+# well, and these charts get pasted into bugs and shared with people we cannot
+# survey. `_SERIES_DASHES` covers the residual: it separates any pair that is not
+# exactly 4 slots apart, with no colour at all.
+# Reordered from the published sequence -- same eight colours, different slots.
+# The palette contains three near-pairs (blue/sky blue, and orange/vermilion/
+# yellow among the warms) and the published order puts BOTH members of two of
+# them inside the first four slots. A 4-GPU task only ever draws slots 0-3, which
+# made orange-vs-vermilion the common case rather than the rare one.
+#
+# Two rules pin this order, and both break if you sort it back:
+#   1. Slots 0-3 take one colour from each family (blue / warm / green / purple),
+#      so the common 4-GPU chart is maximally separated by hue alone.
+#   2. No near-pair sits exactly 4 apart, because `_SERIES_DASHES` cycles every 4
+#      and slots i and i+4 therefore share a dash pattern -- which is precisely
+#      the redundancy those pairs need. Blue/sky blue are 0 and 5; the warms are
+#      1, 6 and 7.
 _SERIES_COLORS = (
-    "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
-    "#8c564b", "#17becf", "#e377c2", "#7f7f7f", "#bcbd22",
+    "#0072b2",  # blue
+    "#d55e00",  # vermilion
+    "#009e73",  # bluish green
+    "#cc79a7",  # reddish purple
+    "#000000",  # black
+    "#56b4e9",  # sky blue
+    "#e69f00",  # orange
+    "#f0e442",  # yellow
 )
+
+# Per-slot stroke-width multiplier, keyed to the order above. Okabe-Ito's yellow
+# (slot 7) is the one entry that is genuinely faint on white, and the fix is
+# weight rather than a darker hue -- darkening it collapses it toward the
+# `#e69f00` orange, which is the pairing the palette exists to avoid. Black
+# (slot 4) is nudged the other way for the same reason in reverse: at equal width
+# it reads heavier than the rest and draws the eye to whichever GPU lands there.
+_SERIES_WIDTH_SCALE = (1.0, 1.0, 1.0, 1.0, 0.875, 1.0, 1.0, 1.25)
+
+# Dash pattern per device, cycled alongside _SERIES_COLORS and keyed on the same
+# index. Colour alone cannot separate two lines that COINCIDE, and coincidence is
+# the normal case for a tensor-parallel task: every rank allocates the same
+# weights + KV-cache footprint, so `gpu_memory_used_mib` for its GPUs is often
+# identical to the byte. The later line then hides exactly under the earlier one
+# and the panel is indistinguishable from one where the second device was never
+# drawn at all -- which reads as a collection bug rather than as real data.
+_SERIES_DASHES = ("", "5,3", "1.5,2.5", "7,2,1.5,2")
+
+
+def _series_dash(idx: int) -> str:
+    """SVG dash attribute for series *idx*, or "" for the solid first series."""
+    pattern = _SERIES_DASHES[idx % len(_SERIES_DASHES)]
+    return f' stroke-dasharray="{pattern}"' if pattern else ""
+
+
+def _series_width(idx: int, base: float) -> float:
+    """Stroke width for series *idx*, scaled per `_SERIES_WIDTH_SCALE`."""
+    return round(base * _SERIES_WIDTH_SCALE[idx % len(_SERIES_WIDTH_SCALE)], 2)
+
+
+def _mpl_dashes(idx: int) -> tuple[float, ...]:
+    """`_series_dash` as matplotlib's `dashes=`; empty tuple means solid."""
+    pattern = _SERIES_DASHES[idx % len(_SERIES_DASHES)]
+    return tuple(float(x) for x in pattern.split(",")) if pattern else ()
+
+
+def _device_labels(
+    rows: list[dict[str, object]], families: "list[tuple[str, str, str]]"
+) -> list[str]:
+    """Every GPU drawn anywhere in this image, in stable colour-assignment order.
+
+    The union across ALL gpu families, not just the first: a device that reports
+    N/A for one field (MIG mode, a per-field collector error) drops out of that
+    family only. Both renderers key a line's colour on this list's index rather
+    than on the device's position within its own panel -- otherwise the survivor
+    of a drop-out inherits the colour of the device that vanished, and the shared
+    legend below the chart then names the wrong GPU.
+    """
+    labels: list[str] = []
+    for _label, resource_type, metric_name in families:
+        if resource_type != "gpu":
+            continue
+        for lab, _ser in _metric_series_by_resource(rows, resource_type, metric_name):
+            if lab not in labels:
+                labels.append(lab)
+    return labels
 
 
 def gpu_label(gpus: object) -> str:
@@ -1049,16 +1133,7 @@ def _render_svg(
     caption_y = panels_bottom + 22 + marker_band_bottom
 
     # Device colours are shared by every panel, so their legend is built once.
-    # Union across ALL gpu families, not just the first: a device that reports
-    # N/A for one field (MIG mode, a per-field collector error) drops out of that
-    # family only, and keying the colour on each panel's own index would then
-    # shift every line after it against this legend.
-    device_labels: list[str] = []
-    for _lbl, _rtype, _mname in families:
-        if _rtype == "gpu":
-            for lab, _ser in _metric_series_by_resource(rows, _rtype, _mname):
-                if lab not in device_labels:
-                    device_labels.append(lab)
+    device_labels = _device_labels(rows, families)
     device_parts, device_h = (
         _build_device_legend_svg(device_labels, x0=8, max_x=width - 8)
         if device_labels
@@ -1138,16 +1213,19 @@ def _render_svg(
                 f'y2="{gy:.1f}" stroke="#eeeeee"/>'
             )
         for series_label, series in multi:
-            # Look the colour up BY LABEL so it always matches the shared legend.
-            colour = (
-                _SERIES_COLORS[device_labels.index(series_label) % len(_SERIES_COLORS)]
+            # Look the style up BY LABEL so it always matches the shared legend.
+            # Index 0 for a panel with no per-device series (cpu/mem/disk/net):
+            # first colour, no dash, i.e. unchanged from a single solid line.
+            idx = (
+                device_labels.index(series_label)
                 if series_label in device_labels
-                else "#1f77b4"
+                else 0
             )
+            colour = _SERIES_COLORS[idx % len(_SERIES_COLORS)]
             points = " ".join(f"{_x(t):.1f},{_y(v):.1f}" for t, v in series)
             parts.append(
                 f'<polyline points="{points}" fill="none" stroke="{colour}" '
-                f'stroke-width="1.5"/>'
+                f'stroke-width="{_series_width(idx, 1.5)}"{_series_dash(idx)}/>'
             )
         parts.append(
             f'<text x="{left - 8}" y="{panel_top + ph / 2:.0f}" text-anchor="end" '
@@ -1271,7 +1349,15 @@ def _render_png(
     )
     if len(families) == 1:
         axes = [axes]
-    device_legend_drawn = False
+    # Slot 8 of the palette is pure black, and matplotlib draws its frame and
+    # ticks in black too -- so without this a GPU line reads as chrome. Grey the
+    # chrome, not the data. Tick LABELS stay dark: text is never confusable with
+    # a plotted line, and lightening it only costs legibility.
+    for axis in axes:
+        for spine in axis.spines.values():
+            spine.set_color(_MARKER_INK)
+        axis.tick_params(color=_MARKER_INK)
+    device_labels = _device_labels(rows, families)
     for (label, resource_type, metric_name), axis in zip(families, axes):
         # Match the overview/SVG scaling + auto units so the axis label (e.g.
         # "MiB/s", or GPU mem in "GiB") reflects the plotted values.
@@ -1289,20 +1375,25 @@ def _render_png(
             cursor = 0
             for series_label, ser in per_resource:
                 chunk = scaled_flat[cursor : cursor + len(ser)]
+                # Same colour/dash for a device as the SVG, looked up BY LABEL
+                # (see _device_labels): matplotlib restarts its own cycle on every
+                # axes, so relying on the default would repaint each panel from
+                # scratch -- and that default is tab10, whose adjacent hues are
+                # the thing being fixed.
+                idx = (
+                    device_labels.index(series_label)
+                    if series_label in device_labels
+                    else 0
+                )
                 axis.plot(
                     [ts - origin for ts, _v in ser],
                     chunk,
-                    linewidth=1.4,
+                    linewidth=_series_width(idx, 1.4),
                     label=series_label,
+                    color=_SERIES_COLORS[idx % len(_SERIES_COLORS)],
+                    dashes=_mpl_dashes(idx),
                 )
                 cursor += len(ser)
-            # Once per image, not once per panel: the colour for a device is the
-            # same on every panel, so repeating it three more times is noise.
-            if not device_legend_drawn:
-                axis.legend(
-                    fontsize=6, ncol=max(1, len(per_resource) // 4), loc="upper right"
-                )
-                device_legend_drawn = True
         else:
             timeseries = _metric_timeseries(rows, resource_type, metric_name)
             scaled_vals, disp_label, _stat = _scaled_metric_series(
@@ -1366,6 +1457,30 @@ def _render_png(
     # Extra pad so the axis title clears the `ready`/`done` band drawn beneath it.
     axes[-1].set_xlabel("Elapsed time (s)", labelpad=28)
     figure.suptitle(title, fontsize=14)
+    # Device legend UNDER the panels, matching the SVG. In-panel it sat on top of
+    # the data it was explaining -- and the busiest corner at that, since GPU load
+    # ramps toward the end of a run. Once per figure, not once per panel: a
+    # device keeps its colour on every panel, so repeating it is pure noise.
+    if device_labels:
+        handles = [
+            plt.Line2D(
+                [],
+                [],
+                color=_SERIES_COLORS[i % len(_SERIES_COLORS)],
+                dashes=_mpl_dashes(i),
+                linewidth=_series_width(i, 1.4),
+            )
+            for i in range(len(device_labels))
+        ]
+        figure.legend(
+            handles,
+            device_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.0),
+            ncol=min(len(device_labels), 8),
+            fontsize=8,
+            frameon=False,
+        )
     png_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(png_path, dpi=140, bbox_inches="tight")
     plt.close(figure)

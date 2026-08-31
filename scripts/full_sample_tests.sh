@@ -10,13 +10,15 @@ CLI_MODEL_PATH=""
 CLI_PARTITION=""
 CLI_ACCOUNT=""
 usage() {
-    echo "Usage: $0 [-a|-s|-m|-inf|--smoke|--min] [-S] [-P] [-j N] [-M model_path] [-p partition] [-A account]"
+    echo "Usage: $0 [-a|-s|-m|-inf|--smoke|--min|--one] [-S] [-P] [-j N] [-M model_path] [-p partition] [-A account]"
     echo "  -a  all tests (default)"
     echo "  -s  self-contained examples only"
     echo "  -m  modular examples only"
     echo "  -inf  infmax batch suites only"
     echo "  --smoke  curated Slurm smoke subset with broad coverage"
     echo "  --min  minimal Slurm submit set (one representative per validation type)"
+    echo "  --one  submit EXACTLY ONE Slurm job and skip the preflight sweep."
+    echo "         Plumbing smoke for a new CI path / cluster, not coverage."
     echo "  -S  submit jobs to Slurm"
     echo "  -P  preflight checks only (skip job submission even if -S is set)"
     echo "  -j  max parallel jobs (default: 16, 0 for unlimited)"
@@ -33,6 +35,7 @@ while [ $# -gt 0 ]; do
         -inf) TEST_TYPE="inf" ;;
         --smoke) TEST_TYPE="smoke" ;;
         --min) TEST_TYPE="min" ;;
+        --one) TEST_TYPE="one" ;;
         -S) SUBMIT="--submit" ;;
         -P) PREFLIGHT_ONLY="1" ;;
         -j) [ $# -ge 2 ] || { usage; exit 1; }; shift; MAX_JOBS="$1" ;;
@@ -275,7 +278,85 @@ run_check() {
 # =========================================================================
 # Preflight: CLI smoke tests (no jobs submitted)
 # =========================================================================
-if true; then
+# The colon-in-task-script fixture. Written OUTSIDE the preflight gate on
+# purpose: sample_test.sh submits a focused Slurm e2e for it whenever
+# SFLOW_COLON_SCRIPT_FIXTURE points at a real file, so leaving it inside the
+# sweep would silently drop that real job from --min/--smoke whenever the
+# sweep is skipped. Writing a small YAML costs nothing; the run_check probes
+# that USE it stay in the sweep below.
+COLON_SCRIPT_DIR="$PREFLIGHT_DIR/colon_in_task_script"
+COLON_SCRIPT_FIXTURE="$COLON_SCRIPT_DIR/colon_in_task_script.yaml"
+COLON_SCRIPT_DRYRUN_LOG="$COLON_SCRIPT_DIR/dry_run.log"
+COLON_SCRIPT_COMPOSED="$COLON_SCRIPT_DIR/colon_in_task_script_composed.yaml"
+COLON_SCRIPT_BATCH="$COLON_SCRIPT_DIR/colon_in_task_script_batch.sh"
+COLON_SCRIPT_BATCH_CONFIG="$COLON_SCRIPT_DIR/colon_in_task_script_batch.yaml"
+mkdir -p "$COLON_SCRIPT_DIR"
+cat > "$COLON_SCRIPT_FIXTURE" <<'EOF'
+version: "0.1"
+
+variables:
+  SLURM_ACCOUNT:
+    value: dummy_acct
+  SLURM_PARTITION:
+    value: dummy_part
+  SLURM_TIMELIMIT:
+    value: "00:10:00"
+  SLURM_NODES:
+    value: 1
+  GPUS_PER_NODE:
+    value: 4
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: srun_no_container
+    type: srun
+    ntasks_per_node: 1
+    mpi: pmix
+
+workflow:
+  name: colon_in_task_script
+  tasks:
+    - name: worker
+      operator: srun_no_container
+      resources:
+        gpus:
+          count: 1
+      script:
+        - echo "My GPUs: $CUDA_VISIBLE_DEVICES"
+        - echo "COLON_SCRIPT_E2E_PASS"
+EOF
+
+# Whether to run the preflight sweep at all.
+#   -t one                     -> never: the single-job smoke exists to prove the
+#                                 Slurm path, and the sweep is the slowest part of
+#                                 a run while proving nothing about it.
+#   SFLOW_E2E_SKIP_PREFLIGHT=1 -> caller states the sweep already ran elsewhere.
+#                                 sflow's CI runs exactly this (`-P`) in its own
+#                                 container job every pipeline, so repeating all
+#                                 182 checks on a SHARED login node costs ~3.5min
+#                                 of the e2e and someone else's CPU for no new
+#                                 signal. Default off, so a manual/local run still
+#                                 gets the safety net.
+RUN_PREFLIGHT="1"
+if [ "$TEST_TYPE" = "one" ] || [ "${SFLOW_E2E_SKIP_PREFLIGHT:-}" = "1" ]; then
+    RUN_PREFLIGHT=""
+fi
+# ...unless -P was asked for explicitly. -P IS the sweep, so a skip switch that
+# silences it turns the only job that runs these checks into a vacuous exit 0.
+if [ -n "$PREFLIGHT_ONLY" ]; then
+    RUN_PREFLIGHT="1"
+fi
+
+if [ -n "$RUN_PREFLIGHT" ]; then
     echo ""
     echo "===== Preflight: CLI smoke tests (no Slurm submission) ====="
     echo "===== Running tests in parallel (max_jobs=${MAX_JOBS:-unlimited}) ====="
@@ -400,44 +481,53 @@ if true; then
             grep -F -- 'operator: docker_run' \"$DOCKER_MULTI_DRYRUN_LOG\" && \
             grep -F -- 'CUDA_VISIBLE_DEVICES: 0' \"$DOCKER_MULTI_DRYRUN_LOG\" && \
             grep -E -- 'gpus: device=0[^0-9,]' \"$DOCKER_MULTI_DRYRUN_LOG\""
-    run_check "dry-run gpu_reservation demo pins the planned device slice" \
-        bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/demo.yaml\" --dry-run --verbose > \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\" 2>&1 && \
-            grep -F -- 'operator: docker_run' \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\" && \
-            grep -E -- 'gpus: device=0,1[^0-9,]' \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\" && \
-            grep -F -- 'Dry-run complete: gpu_reservation_demo' \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\""
-    run_check "dry-run gpu_reservation hog workload plans its GPU claim" \
-        bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/hog.yaml\" --dry-run --verbose > \"$DOCKER_GPU_HOG_DRYRUN_LOG\" 2>&1 && \
-            grep -F -- 'operator: docker_run' \"$DOCKER_GPU_HOG_DRYRUN_LOG\" && \
-            grep -F -- 'Dry-run complete: gpu_hog' \"$DOCKER_GPU_HOG_DRYRUN_LOG\""
-    # The pipeline sample fills a 4-GPU board exactly: pinned_service holds device 0
-    # for the whole run, server_a holds 1-2 and server_b holds 3 (both released at
-    # READY), and merged_consumer then takes server_a's PAIR back -- so device=1,2
-    # appears twice while device=3 is left over for whoever wants it next. That exact
-    # layout is the assertion: it is what makes the leftover deterministic, which the
-    # e2e suite then relies on to prove a concurrent run picks up device 3 and not
-    # some other one. Drop either `release_after: task_ready` and this fails with
-    # "merged_consumer needs GPU N, but it is blocked by server_a/server_b".
-    run_check "dry-run gpu_reservation pipeline reuses one server's GPUs and frees the other's" \
-        bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/pipeline.yaml\" --dry-run --verbose > \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\" 2>&1 && \
-            grep -F -- 'server_a: releases GPUs after task readiness' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\" && \
-            grep -F -- 'server_b: releases GPUs after task completion' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\" && \
-            [ \"\$(grep -c -E -- 'gpus: device=0[^0-9,]' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\")\" -eq 1 ] && \
-            [ \"\$(grep -c -E -- 'gpus: device=1,2[^0-9,]' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\")\" -eq 2 ] && \
-            [ \"\$(grep -c -E -- 'gpus: device=3[^0-9,]' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\")\" -eq 1 ] && \
-            grep -F -- 'Dry-run complete: gpu_reservation_pipeline' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\""
-    # The scheduling smoke drains and refills a full 8-GPU board in four waves. Wave
-    # 1 splits it into four pairs and wave 2 reuses each pair, so every pair spec
-    # appears TWICE -- that count is the assertion, and a scheduler that double-books
-    # or scatters a task off its predecessor's devices breaks it. The later waves are
-    # forced by the DAG once the pairs hold, so they need no counts of their own.
-    run_check "dry-run gpu_reservation scheduling smoke refills a full board in waves" \
-        bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/scheduling_smoke.yaml\" --dry-run --verbose > \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\" 2>&1 && \
-            [ \"\$(grep -c -E -- 'gpus: device=0,1[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
-            [ \"\$(grep -c -E -- 'gpus: device=2,3[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
-            [ \"\$(grep -c -E -- 'gpus: device=4,5[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
-            [ \"\$(grep -c -E -- 'gpus: device=6,7[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
-            [ \"\$(grep -c -F -- 'releases GPUs after task completion' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 11 ] && \
-            grep -F -- 'Dry-run complete: docker_gpu_scheduling_smoke' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\""
+    # The gpu_reservation samples are internal-only: they are excluded from the
+    # public sync, and sample_test.sh refuses to package them. Guard rather than
+    # assume, so a checkout without them SKIPs here instead of failing four checks
+    # on a missing file, which says nothing about sflow.
+    if [ -d "$EXAMPLES_DIR/gpu_reservation" ]; then
+        run_check "dry-run gpu_reservation demo pins the planned device slice" \
+            bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/demo.yaml\" --dry-run --verbose > \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\" 2>&1 && \
+                grep -F -- 'operator: docker_run' \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\" && \
+                grep -E -- 'gpus: device=0,1[^0-9,]' \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\" && \
+                grep -F -- 'Dry-run complete: gpu_reservation_demo' \"$DOCKER_GPU_RESERVATION_DRYRUN_LOG\""
+        run_check "dry-run gpu_reservation hog workload plans its GPU claim" \
+            bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/hog.yaml\" --dry-run --verbose > \"$DOCKER_GPU_HOG_DRYRUN_LOG\" 2>&1 && \
+                grep -F -- 'operator: docker_run' \"$DOCKER_GPU_HOG_DRYRUN_LOG\" && \
+                grep -F -- 'Dry-run complete: gpu_hog' \"$DOCKER_GPU_HOG_DRYRUN_LOG\""
+        # The pipeline sample fills a 4-GPU board exactly: pinned_service holds device 0
+        # for the whole run, server_a holds 1-2 and server_b holds 3 (both released at
+        # READY), and merged_consumer then takes server_a's PAIR back -- so device=1,2
+        # appears twice while device=3 is left over for whoever wants it next. That exact
+        # layout is the assertion: it is what makes the leftover deterministic, which the
+        # e2e suite then relies on to prove a concurrent run picks up device 3 and not
+        # some other one. Drop either `release_after: task_ready` and this fails with
+        # "merged_consumer needs GPU N, but it is blocked by server_a/server_b".
+        run_check "dry-run gpu_reservation pipeline reuses one server's GPUs and frees the other's" \
+            bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/pipeline.yaml\" --dry-run --verbose > \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\" 2>&1 && \
+                grep -F -- 'server_a: releases GPUs after task readiness' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\" && \
+                grep -F -- 'server_b: releases GPUs after task completion' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\" && \
+                [ \"\$(grep -c -E -- 'gpus: device=0[^0-9,]' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\")\" -eq 1 ] && \
+                [ \"\$(grep -c -E -- 'gpus: device=1,2[^0-9,]' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\")\" -eq 2 ] && \
+                [ \"\$(grep -c -E -- 'gpus: device=3[^0-9,]' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\")\" -eq 1 ] && \
+                grep -F -- 'Dry-run complete: gpu_reservation_pipeline' \"$DOCKER_GPU_PIPELINE_DRYRUN_LOG\""
+        # The scheduling smoke drains and refills a full 8-GPU board in four waves. Wave
+        # 1 splits it into four pairs and wave 2 reuses each pair, so every pair spec
+        # appears TWICE -- that count is the assertion, and a scheduler that double-books
+        # or scatters a task off its predecessor's devices breaks it. The later waves are
+        # forced by the DAG once the pairs hold, so they need no counts of their own.
+        run_check "dry-run gpu_reservation scheduling smoke refills a full board in waves" \
+            bash -c "sflow run \"$EXAMPLES_DIR/gpu_reservation/scheduling_smoke.yaml\" --dry-run --verbose > \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\" 2>&1 && \
+                [ \"\$(grep -c -E -- 'gpus: device=0,1[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
+                [ \"\$(grep -c -E -- 'gpus: device=2,3[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
+                [ \"\$(grep -c -E -- 'gpus: device=4,5[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
+                [ \"\$(grep -c -E -- 'gpus: device=6,7[^0-9,]' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 2 ] && \
+                [ \"\$(grep -c -F -- 'releases GPUs after task completion' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\")\" -eq 11 ] && \
+                grep -F -- 'Dry-run complete: docker_gpu_scheduling_smoke' \"$DOCKER_GPU_SCHEDULING_DRYRUN_LOG\""
+    else
+        record_preflight_skip "gpu_reservation dry-run checks skipped: examples/gpu_reservation is not present"
+        echo "  SKIP: examples/gpu_reservation not present; skipping its dry-run checks."
+    fi
     run_check "dry-run kubernetes_hello_world uses k8s operator" \
         bash -c "sflow run \"$EXAMPLES_DIR/self_contained/kubernetes/hello_world.yaml\" --dry-run --verbose > \"$KUBERNETES_HELLO_DRYRUN_LOG\" 2>&1 && \
             grep -F -- 'id=kubernetes' \"$KUBERNETES_HELLO_DRYRUN_LOG\" && \
@@ -1027,56 +1117,6 @@ EOF
         bash "$OFFLOAD_TUI_CHECK" "$OFFLOAD_TUI_FIXTURE" "$OFFLOAD_TUI_DIR"
 
     # -- sflow run/batch: plain script commands containing ':' must stay strings --
-    COLON_SCRIPT_DIR="$PREFLIGHT_DIR/colon_in_task_script"
-    COLON_SCRIPT_FIXTURE="$COLON_SCRIPT_DIR/colon_in_task_script.yaml"
-    COLON_SCRIPT_DRYRUN_LOG="$COLON_SCRIPT_DIR/dry_run.log"
-    COLON_SCRIPT_COMPOSED="$COLON_SCRIPT_DIR/colon_in_task_script_composed.yaml"
-    COLON_SCRIPT_BATCH="$COLON_SCRIPT_DIR/colon_in_task_script_batch.sh"
-    COLON_SCRIPT_BATCH_CONFIG="$COLON_SCRIPT_DIR/colon_in_task_script_batch.yaml"
-    mkdir -p "$COLON_SCRIPT_DIR"
-    cat > "$COLON_SCRIPT_FIXTURE" <<'EOF'
-version: "0.1"
-
-variables:
-  SLURM_ACCOUNT:
-    value: dummy_acct
-  SLURM_PARTITION:
-    value: dummy_part
-  SLURM_TIMELIMIT:
-    value: "00:10:00"
-  SLURM_NODES:
-    value: 1
-  GPUS_PER_NODE:
-    value: 4
-
-backends:
-  - name: slurm_cluster
-    type: slurm
-    default: true
-    account: ${{ variables.SLURM_ACCOUNT }}
-    partition: ${{ variables.SLURM_PARTITION }}
-    time: ${{ variables.SLURM_TIMELIMIT }}
-    nodes: ${{ variables.SLURM_NODES }}
-    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
-
-operators:
-  - name: srun_no_container
-    type: srun
-    ntasks_per_node: 1
-    mpi: pmix
-
-workflow:
-  name: colon_in_task_script
-  tasks:
-    - name: worker
-      operator: srun_no_container
-      resources:
-        gpus:
-          count: 1
-      script:
-        - echo "My GPUs: $CUDA_VISIBLE_DEVICES"
-        - echo "COLON_SCRIPT_E2E_PASS"
-EOF
     run_check "run colon in task script (dry-run)" \
         bash -c "sflow run \"$COLON_SCRIPT_FIXTURE\" --dry-run > \"$COLON_SCRIPT_DRYRUN_LOG\" 2>&1"
     run_check "compose colon in task script" \
@@ -1812,7 +1852,7 @@ EOF
     COMMON="$EXAMPLES_DIR/modular/inference_x_v2/common_workflow.yaml"
     BENCH_INFMAX="$EXAMPLES_DIR/modular/inference_x_v2/benchmark_infmax.yaml"
     BENCH_AIPERF="$EXAMPLES_DIR/modular/inference_x_v2/benchmark_aiperf.yaml"
-    DYNAMO_IMAGE="${DYNAMO_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0}"
+    DYNAMO_IMAGE="${DYNAMO_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0}"
     MODULAR_MISSABLE=(-M agg_server -M prefill_server -M decode_server -M benchmark_infmax -M benchmark_aiperf)
     MODULAR_OVERRIDES=(-a "LOCAL_MODEL_PATH=fs://$MODEL_PATH" -s "DYNAMO_IMAGE=$DYNAMO_IMAGE")
     for framework in trtllm sglang vllm; do
@@ -2993,7 +3033,11 @@ fi
 # =========================================================================
 if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
     echo ""
-    echo "===== All preflight checks passed — proceeding to job submission ====="
+    if [ -z "$RUN_PREFLIGHT" ]; then
+        echo "===== Preflight sweep skipped — proceeding straight to job submission ====="
+    else
+        echo "===== All preflight checks passed — proceeding to job submission ====="
+    fi
     echo ""
     set -x
     cd "$SCRIPT_DIR/../tests/e2e_tests"
@@ -3001,12 +3045,12 @@ if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
     E2E_ACCOUNT="${CLI_ACCOUNT:-user}"
     E2E_SBATCH_OUTPUT="$REPO_DIR/sflow_output/%j-sflow-submit.out"
     E2E_SBATCH_ERROR="$REPO_DIR/sflow_output/%j-sflow-submit.err"
-    # Known-broken/flaky Slurm nodes to keep every e2e submission off of. CI pins
-    # the live list via the $SLURM_E2E_EXCLUDE_NODES job variable (forwarded to the
-    # remote by run_slurm_e2e_over_ssh.py); the default here is the fallback for
-    # local/manual runs. Add a node here (or to the CI variable) to drain it from
-    # e2e without touching any recipe.
-    E2E_EXCLUDE_NODES="${SLURM_E2E_EXCLUDE_NODES:-gb-nvl-137-compute02,gb-nvl-137-compute14}"
+    # Nodes to drain from e2e, via $SLURM_E2E_EXCLUDE_NODES. Default EMPTY on
+    # purpose: node names are cluster-specific and sbatch rejects the WHOLE
+    # submission with "Invalid node name specified" if one is unknown, so a
+    # hardcoded list is a landmine the moment the e2e moves cluster (stale
+    # gb-nvl-137-* names failed every job on ptyche exactly this way).
+    E2E_EXCLUDE_NODES="${SLURM_E2E_EXCLUDE_NODES:-}"
     E2E_BATCH_EXTRA_ARGS=(
         "--sbatch-output" "$E2E_SBATCH_OUTPUT"
         "--sbatch-error" "$E2E_SBATCH_ERROR"
@@ -3016,6 +3060,29 @@ if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
         # regardless of the workflow's own pass/fail.
         "--enable-workflow-monitor"
     )
+    # Some clusters (GB200: ptyche/poly/lyris) require --segment on every
+    # submission, sized to the job's OWN node count -- and this suite submits
+    # recipes spanning 1..N nodes in a single bulk submit, so a fixed number cannot
+    # be right for all of them. "auto" expands to sflow's expression, which sflow
+    # resolves per workflow (verified: 1-node recipe -> --segment=1, 3-node ->
+    # --segment=3, same submit).
+    #
+    # It is a KEYWORD rather than the expression itself in the CI config on
+    # purpose: a literal expression there would have to survive CI variable
+    # expansion upstream, expansion AGAIN when the trigger job forwards it to the
+    # downstream pipeline, then python and shell quoting -- four chances to be
+    # silently mangled into something sbatch rejects. "auto" has no "$" to mangle.
+    # Any other value is passed through verbatim (e.g. a fixed node count).
+    # Empty default, so clusters without segment support are unaffected.
+    E2E_SEGMENT="${SLURM_E2E_SEGMENT:-}"
+    if [ "$E2E_SEGMENT" = "auto" ]; then
+        # Single quotes: this must reach sflow as a literal expression, and bash
+        # would fail on "${{...}}" as a bad substitution if it tried to expand it.
+        E2E_SEGMENT='${{SLURM_NODES}}'
+    fi
+    if [ -n "$E2E_SEGMENT" ]; then
+        E2E_BATCH_EXTRA_ARGS+=("-e" "--segment=$E2E_SEGMENT")
+    fi
     # Flag and value MUST be separate argv tokens ("-e" "--exclude=..."); a glued
     # single token folds a leading space into the value and the secondary-backend
     # salloc drops the exclude silently.
@@ -3029,8 +3096,13 @@ if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
     else
         ./sample_test.sh -p "$E2E_PARTITION" -A "$E2E_ACCOUNT" -m "$MODEL_PATH" -t "$TEST_TYPE" --submit -- "${E2E_BATCH_EXTRA_ARGS[@]}" # 09 has some GPU issues
     fi
+    e2e_rc=$?
 
     set +x
+    # `set +x` is a command and it always succeeds, so without this the script's
+    # exit status is ITS status, not the suite's -- the "green despite exit 1"
+    # family. Nothing runs after this branch, so exiting here is safe.
+    exit "$e2e_rc"
 elif [ -z "$SUBMIT" ]; then
     echo "Preflight only (no -S flag). To submit jobs, re-run with -S."
 else

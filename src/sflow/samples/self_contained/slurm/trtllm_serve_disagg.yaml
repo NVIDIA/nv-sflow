@@ -328,6 +328,15 @@ workflow:
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
+        # GPU placement probe. sflow plans a per-task slice and re-applies it
+        # inside the step; this prints what the container ACTUALLY has next to
+        # what was planned, which is the only way to tell the two failure modes
+        # apart: if the planned ordinals are absent from `nvidia-smi -L`, the
+        # slice never reached the container (carved and renumbered by the
+        # runtime); if they are present, placement worked and the launcher chose
+        # the wrong device. Cheap, and it makes every future triage one grep.
+        - echo "SFLOW_GPU_PROBE task=${SLURM_JOB_NAME:-?} procid=${SLURM_PROCID:-?} localid=${SLURM_LOCALID:-?} planned_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+        - nvidia-smi -L 2>&1 | sed "s/^/SFLOW_GPU_PROBE visible: /" || true
         - export TLLM_LOG_LEVEL=INFO
         - export TRTLLM_SERVER_DISABLE_GC=1
         - export TRTLLM_WORKER_DISABLE_GC=1
@@ -374,6 +383,15 @@ workflow:
       script:
         - set -x
         - echo ${CUDA_VISIBLE_DEVICES}
+        # GPU placement probe. sflow plans a per-task slice and re-applies it
+        # inside the step; this prints what the container ACTUALLY has next to
+        # what was planned, which is the only way to tell the two failure modes
+        # apart: if the planned ordinals are absent from `nvidia-smi -L`, the
+        # slice never reached the container (carved and renumbered by the
+        # runtime); if they are present, placement worked and the launcher chose
+        # the wrong device. Cheap, and it makes every future triage one grep.
+        - echo "SFLOW_GPU_PROBE task=${SLURM_JOB_NAME:-?} procid=${SLURM_PROCID:-?} localid=${SLURM_LOCALID:-?} planned_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+        - nvidia-smi -L 2>&1 | sed "s/^/SFLOW_GPU_PROBE visible: /" || true
         - export TLLM_LOG_LEVEL=INFO
         - export TRTLLM_SERVER_DISABLE_GC=1
         - export TRTLLM_WORKER_DISABLE_GC=1
