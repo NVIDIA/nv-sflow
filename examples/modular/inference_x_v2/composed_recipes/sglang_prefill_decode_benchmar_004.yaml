@@ -49,7 +49,7 @@ operators:
   container_writable: true
   mpi: pmix
   extra_args:
-  - --container-image=nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0
+  - --container-image=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0
 
 - name: nginx
   type: srun
@@ -102,8 +102,8 @@ workflow:
 
       # Install dynamo if missing (check for the base dynamo.frontend module which all backends use)
       if ! python3 -c "import dynamo" >/dev/null 2>&1; then
-        echo "dynamo not found, installing ai-dynamo packages (1.3.0)..."
-        pip install --break-system-packages --quiet ai-dynamo-runtime==1.3.0 ai-dynamo==1.3.0
+        echo "dynamo not found, installing ai-dynamo packages (0.8.0)..."
+        pip install --break-system-packages --quiet ai-dynamo-runtime==0.8.0 ai-dynamo==0.8.0
       else
         echo "dynamo already installed."
       fi

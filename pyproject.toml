@@ -57,7 +57,6 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=7.0.0",
     "pytest-subprocess>=1.5.3",
-    "pytest-xdist>=3.8.0",
 ]
 s3 = [
     "boto3>=1.34.0",
@@ -79,9 +78,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "sflow.samples" = ["**/*.yaml", "**/*.csv", "**/*.md"]
-# gpu_placement.sh is sourced by every Slurm GPU step; without it the operator
-# skips GPU placement entirely, so it must ship in the wheel.
-"sflow.plugins.operators" = ["*.sh"]
 "sflow.skills" = ["*.md", "**/*.md", "**/*.py"]
 "sflow.monitoring" = ["*.py"]
 
@@ -94,7 +90,6 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=7.0.0",
     "pytest-subprocess>=1.5.3",
-    "pytest-xdist>=3.8.0",
 ]
 
 

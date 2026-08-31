@@ -106,6 +106,39 @@ class SubprocessLauncher:
         """
         return f"[{task_name}] " if task_name else ""
 
+    async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
+        """
+        Best-effort terminate a running subprocess.
+        """
+        try:
+            if process.returncode is not None:
+                return
+            process.terminate()
+        except ProcessLookupError:
+            return
+        except Exception:
+            # Fall back to kill below.
+            pass
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+            return
+        except Exception:
+            pass
+
+        try:
+            if process.returncode is None:
+                process.kill()
+        except ProcessLookupError:
+            return
+        except Exception:
+            return
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except Exception:
+            return
+
     async def run_async(
         self,
         command: Command | str | list[str],
@@ -393,3 +426,161 @@ class SubprocessLauncher:
                 os.close(master_fd)
             except OSError:
                 pass
+
+    # async def run_pipe_async(
+    #     self,
+    #     commands: list[Command | str | list[str]],
+    #     shell: bool = False,
+    #     output_logger: Optional[logging.Logger] = None,
+    #     env: Mapping[str, str] | None = None,
+    #     task_name: str | None = None,
+    # ) -> int:
+    #     """Execute multiple commands connected by pipes asynchronously.
+
+    #     Args:
+    #         commands: List of commands to pipe together
+    #         shell: Whether to use shell for individual commands
+    #         output_logger: Optional logger to use for output logging
+
+    #     Returns:
+    #         int: Exit code of the final command
+    #     """
+    #     pfx = self._console_prefix(task_name)
+    #     _logger.info(f"{pfx}========== Commands ==========")
+    #     _logger.info(f"{pfx}{' | '.join([format_command(cmd) for cmd in commands])}")
+    #     _logger.info(f"{pfx}=============================")
+
+    #     if not commands:
+    #         raise ValueError("At least one command required")
+
+    #     processes = []
+    #     pipes = []
+    #     proc_env = None
+    #     if env is not None:
+    #         proc_env = os.environ.copy()
+    #         proc_env.update({str(k): str(v) for k, v in env.items()})
+
+    #     try:
+    #         for i, cmd in enumerate(commands):
+    #             if isinstance(cmd, Command):
+    #                 cmd = cmd.as_list()
+
+    #             stdin = None
+    #             if i > 0:
+    #                 stdin = pipes[-1][0]  # Read end of previous pipe
+
+    #             if i < len(commands) - 1:
+    #                 r, w = os.pipe()
+    #                 pipes.append((r, w))
+    #                 stdout = w
+    #             else:
+    #                 stdout = asyncio.subprocess.PIPE
+
+    #             # Intermediate processes: inherit stderr (goes to console)
+    #             # Last process: merge stderr to stdout (captured in output)
+    #             stderr = asyncio.subprocess.STDOUT if i == len(commands) - 1 else None
+
+    #             create_subprocess = (
+    #                 asyncio.create_subprocess_shell
+    #                 if shell
+    #                 else asyncio.create_subprocess_exec
+    #             )
+
+    #             args = []
+    #             if shell:
+    #                 if isinstance(cmd, list):
+    #                     args = [shlex.join(cmd)]
+    #                 else:
+    #                     args = [cmd]
+    #             else:
+    #                 if isinstance(cmd, str):
+    #                     args = shlex.split(cmd)
+    #                 else:
+    #                     args = cmd
+
+    #             proc = await create_subprocess(
+    #                 *args,
+    #                 stdin=stdin,
+    #                 stdout=stdout,
+    #                 stderr=stderr,
+    #                 env=proc_env,
+    #             )
+
+    #             processes.append(proc)
+
+    #             # Close parent's copy of the write pipe end immediately
+    #             if i < len(commands) - 1:
+    #                 os.close(stdout)
+
+    #             # Close parent's copy of the read pipe end used as stdin
+    #             if i > 0:
+    #                 os.close(stdin)
+
+    #         # Read output from last process
+    #         last_proc = processes[-1]
+    #         try:
+    #             # Read output in chunks to handle progress bars and special characters
+    #             # that use \r without \n (which would cause readline() to hang)
+    #             buffer = b""
+    #             while True:
+    #                 try:
+    #                     # Read available data in chunks (non-blocking when data is available)
+    #                     chunk = await last_proc.stdout.read(4096)
+    #                     if not chunk:
+    #                         # Process any remaining data in buffer
+    #                         if buffer:
+    #                             line_str = _strip_ansi(buffer.decode("utf-8", errors="replace")).rstrip()
+    #                             if line_str:
+    #                                 _logger.info(f"{pfx}{line_str}")
+    #                                 if output_logger:
+    #                                     output_logger.info(line_str)
+    #                         break
+
+    #                     buffer += chunk
+
+    #                     # Split on both \n and \r to handle progress bars
+    #                     # Replace \r\n with \n first to avoid double processing
+    #                     text = buffer.decode("utf-8", errors="replace")
+    #                     text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    #                     # Split into lines, keeping incomplete line in buffer
+    #                     lines = text.split("\n")
+    #                     buffer = lines[-1].encode("utf-8")  # Keep incomplete line
+
+    #                     for line_str in lines[:-1]:
+    #                         # Strip ANSI escape sequences for cleaner logs
+    #                         line_str = _strip_ansi(line_str).rstrip()
+    #                         if line_str:  # Skip empty lines from progress bar overwrites
+    #                             _logger.info(f"{pfx}{line_str}")
+    #                             if output_logger:
+    #                                 output_logger.info(line_str)
+    #                 except Exception as e:
+    #                     _logger.warning(f"{pfx}Error reading output: {e}")
+    #                     break
+
+    #             # Wait for all processes
+    #             exit_codes = await asyncio.gather(*[p.wait() for p in processes])
+    #             last_exit_code = exit_codes[-1]
+
+    #             return last_exit_code
+    #         except asyncio.CancelledError:
+    #             # Terminate the whole pipeline on cancellation.
+    #             for p in processes:
+    #                 try:
+    #                     await self._terminate_process(p)
+    #                 except Exception:
+    #                     pass
+    #             raise
+
+    #     except Exception:
+    #         # Cleanup pipes if error
+    #         for r, w in pipes:
+    #             try:
+    #                 os.close(r)
+    #             except OSError:
+    #                 pass
+    #             try:
+    #                 os.close(w)
+    #             except OSError:
+    #                 pass
+    #         raise

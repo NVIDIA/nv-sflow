@@ -15,48 +15,55 @@ resolve_under_dev_sflow_ref() {
     fi
 }
 
-assert_sflow_installed_from() {
-    # The suite exists to validate THIS checkout, so prove the sflow on PATH came
-    # from it. Not by grepping `sflow --version` for "source : local editable
-    # dev" -- that made the runtime-info format load-bearing and rejected install
-    # shapes that were the right code (a wheel built from the checkout, a
-    # direct-URL install). direct_url.json records the path pip installed FROM
-    # whatever the shape, so compare that and do not require "editable".
-    #
-    # Worth keeping now that the CI workspace and its venv are reused across
-    # runs: without it a stale install silently passes as this branch.
+assert_under_dev_sflow_editable_install() {
     local repo_dir="$1"
 
-    # PYTHONPATH deliberately cleared: setup_under_dev_sflow puts $repo_dir/src on
-    # it, and importlib.metadata would then discover src/sflow.egg-info -- which
-    # has no direct_url.json -- ahead of the real dist-info in site-packages. The
-    # question here is what is INSTALLED, not what is importable, so the source
-    # tree must not be on the path. (Otherwise this rejects every checkout that
-    # ever ran a plain `pip install -e .` and left an egg-info behind.)
-    PYTHONPATH= "$SFLOW_TEST_PYTHON" - "$repo_dir" <<'SFLOW_INSTALL_CHECK'
-import json, sys
-from importlib import metadata
+    "$SFLOW_TEST_PYTHON" - "$repo_dir" <<'PY'
+import json
+import sys
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 repo_dir = Path(sys.argv[1]).resolve()
-try:
-    dist = metadata.distribution("sflow")
-except metadata.PackageNotFoundError:
-    sys.exit(f"ERROR: sflow is not installed in {sys.executable}.")
 
-url = json.loads(dist.read_text("direct_url.json") or "{}").get("url") or ""
-parsed = urlparse(url)
-src = Path(unquote(parsed.path)).resolve() if parsed.scheme == "file" else None
-if src != repo_dir:
-    sys.exit(
-        "ERROR: the sflow on PATH was not installed from this checkout.\n"
-        f"       Selected Python : {sys.executable}\n"
-        f"       Expected repo   : {repo_dir}\n"
-        f"       Installed from  : {src or url or 'a package index'}\n"
-        f"       Fix with        : {sys.executable} -m pip install -e {repo_dir}"
+try:
+    dist = importlib_metadata.distribution("sflow")
+except importlib_metadata.PackageNotFoundError:
+    print(
+        "ERROR: sflow is not installed in the selected Python environment.",
+        file=sys.stderr,
     )
-SFLOW_INSTALL_CHECK
+    print(
+        f"       Install this checkout editable first: {sys.executable} -m pip install -e {repo_dir}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+direct_url_text = dist.read_text("direct_url.json")
+try:
+    direct_url = json.loads(direct_url_text or "{}")
+except json.JSONDecodeError:
+    direct_url = {}
+
+parsed = urlparse(direct_url.get("url") or "")
+install_path = Path(unquote(parsed.path)).resolve() if parsed.scheme == "file" else None
+is_editable = bool(direct_url.get("dir_info", {}).get("editable"))
+
+if not is_editable or install_path != repo_dir:
+    print(
+        "ERROR: full sample tests must run against this checkout installed editable.",
+        file=sys.stderr,
+    )
+    print(f"       Selected Python : {sys.executable}", file=sys.stderr)
+    print(f"       Expected repo   : {repo_dir}", file=sys.stderr)
+    print(f"       Installed path  : {install_path or 'not a local editable install'}", file=sys.stderr)
+    print(
+        f"       Fix with        : {sys.executable} -m pip install -e {repo_dir}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
 }
 
 setup_under_dev_sflow() {
@@ -79,6 +86,8 @@ setup_under_dev_sflow() {
         echo "ERROR: unable to find a Python interpreter for under-dev sflow" >&2
         return 1
     fi
+
+    assert_under_dev_sflow_editable_install "$repo_dir"
 
     if [ -z "${SFLOW_UNDER_DEV_REF:-}" ]; then
         SFLOW_UNDER_DEV_REF="$(resolve_under_dev_sflow_ref "$repo_dir" || true)"
@@ -126,8 +135,14 @@ EOF
 
     echo "Using under-dev sflow from $SFLOW_UNDER_DEV_REPO (ref: $SFLOW_UNDER_DEV_REF)"
     echo "Submitted Slurm jobs install this checkout editable (--sflow-source-path), so uncommitted working-tree changes are included."
-    sflow --version
-    assert_sflow_installed_from "$repo_dir"
+    local sflow_runtime_info
+    sflow_runtime_info="$(sflow --version)"
+    printf '%s\n' "$sflow_runtime_info"
+    if ! printf '%s\n' "$sflow_runtime_info" | grep -q "source  : local editable dev"; then
+        echo "ERROR: sflow runtime source is not local editable dev." >&2
+        echo "       full_sample_tests.sh is intended to validate local editable sflow changes." >&2
+        return 1
+    fi
 }
 
 cleanup_under_dev_sflow() {

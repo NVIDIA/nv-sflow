@@ -54,7 +54,7 @@ variables:
   # Dependencies versions
   DYNAMO_VERSION:
     description: "Dynamo version to install when missing from the container image"
-    value: 1.3.0
+    value: 0.8.0
   NATS_VERSION:
     description: "NATS server version to install when missing"
     value: v2.10.28

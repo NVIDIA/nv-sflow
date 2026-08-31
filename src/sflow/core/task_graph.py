@@ -66,3 +66,34 @@ class TaskGraph:
 
         return to_submit
 
+    def update_task_status(
+        self,
+        task_name: str,
+        status: TaskStatus | str,
+    ) -> None:
+        """Update the status of a task.
+
+        Args:
+            task_name: Name of the task to update
+            status: New status (can be TaskStatus enum or string)
+        """
+        task = self.dag.nodes[task_name]
+
+        if isinstance(status, str):
+            status = TaskStatus(status)
+
+        task.status = status
+
+        _logger.debug(f"Task '{task_name}' status updated to {status}")
+
+    def mark_all_cancelled(self) -> None:
+        """Mark all non-terminal tasks as cancelled."""
+        for task in self.get_tasks():
+            if task.status not in [
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.TIMEOUT,
+                TaskStatus.CANCELLED,
+            ]:
+                task.status = TaskStatus.CANCELLED
+                _logger.debug(f"Task '{task.name}' marked as CANCELLED")

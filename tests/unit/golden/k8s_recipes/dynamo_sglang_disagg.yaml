@@ -763,10 +763,11 @@ items:
       Qwen3-8B-FP8 --tokenizer /models/Qwen3-8B-FP8 --endpoint-type chat --endpoint /v1/chat/completions
       --streaming --url http://0.0.0.1:8000 --synthetic-input-tokens-mean 1024 --synthetic-input-tokens-stddev
       0 --output-tokens-mean 1024 --output-tokens-stddev 0 --extra-inputs "max_tokens:1024" --extra-inputs
-      "min_tokens:1024" --extra-inputs "ignore_eos:true" --extra-inputs "repetition_penalty:1.0" --extra-inputs
-      "temperature: 0.0" --concurrency ${CONCURRENCY} --request-count $((8*${CONCURRENCY})) --warmup-request-count
-      ${CONCURRENCY} --num-dataset-entries $((8*${CONCURRENCY})) --random-seed 100 -H ''Authorization:
-      Bearer NOT USED'' -H ''Accept: text/event-stream'' --record-processors 8 --ui simple
+      "min_tokens:1024" --extra-inputs "ignore_eos:true" --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}"
+      --extra-inputs "repetition_penalty:1.0" --extra-inputs "temperature: 0.0" --concurrency ${CONCURRENCY}
+      --request-count $((8*${CONCURRENCY})) --warmup-request-count ${CONCURRENCY} --num-dataset-entries
+      $((8*${CONCURRENCY})) --random-seed 100 -H ''Authorization: Bearer NOT USED'' -H ''Accept: text/event-stream''
+      --record-processors 8 --ui simple
 
       echo "Benchmarking finished"'
   kind: ConfigMap

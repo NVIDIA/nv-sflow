@@ -60,71 +60,6 @@ class SlurmBackendConfig(BackendConfig):
         return self.nodes
 
 
-def _planned_gpu_uuids(
-    cuda_visible_devices: str | None, allocation: "Allocation | None"
-) -> str:
-    """Encode "which physical GPUs was this task planned for, on each node".
-
-    Format: ``node=uuid,uuid;node=uuid,uuid`` -- one entry per node whose topology
-    is known. The task step looks up its OWN node and compares against what it can
-    actually see.
-
-    The plan is a flat list of HOST indices applied identically on every node the
-    task spans, so the same slot resolves to a DIFFERENT physical card per node --
-    which is exactly why this is emitted per node rather than as one list.
-
-    Returns "" when there is nothing trustworthy to say (no plan, no allocation,
-    no probe, or a planned index beyond a node's device count). Silence means
-    "fall back", never "no GPUs".
-    """
-    if not cuda_visible_devices or allocation is None:
-        return ""
-    slots: list[int] = []
-    for token in cuda_visible_devices.split(","):
-        token = token.strip()
-        if not token.isdigit():
-            # UUID-form or anything non-ordinal: nothing to resolve against.
-            return ""
-        slots.append(int(token))
-    if not slots:
-        return ""
-
-    entries: list[str] = []
-    for node in allocation.nodes:
-        uuids = node.gpu_uuids
-        if not uuids:
-            continue
-        over = [slot for slot in slots if slot >= len(uuids)]
-        if over:
-            # A partial answer is worse than none: it would let a step "verify"
-            # against a map that cannot contain the card it was planned for. But
-            # say so -- this is the one case where the truth is in hand and the
-            # config is simply wrong (gpus_per_node larger than the node really
-            # has), and staying quiet just drops the task to weaker checking.
-            _logger.warning(
-                "Node %s reports %d GPU(s) but this task was planned for device %s; "
-                "check the backend's gpus_per_node. Placement for this task falls "
-                "back to device-index arithmetic instead of UUID verification.",
-                node.name,
-                len(uuids),
-                ",".join(str(slot) for slot in over),
-            )
-            continue
-        entries.append(f"{node.name}=" + ",".join(uuids[slot] for slot in slots))
-    return ";".join(entries)
-
-
-class _OutputCapture(logging.Handler):
-    """Collect a subprocess's log lines into *sink*, for the srun/salloc probes."""
-
-    def __init__(self, sink: list[str]) -> None:
-        super().__init__()
-        self._sink = sink
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self._sink.append(record.getMessage())
-
-
 @register_backend("slurm", SlurmBackendConfig)
 class SlurmBackend(Backend):
     """
@@ -208,52 +143,8 @@ class SlurmBackend(Backend):
             details.append(("extra_args", str(list(self._extra_args))))
         return details
 
-    @property
-    def node_topology_report(self) -> str | None:
-        """The allocation's GPU topology, for the summary's Node Topology section.
-
-        This is the bare-metal index -> UUID map taken before any task carved
-        anything. Recorded so a run can be judged AFTER the fact: each GPU task
-        also writes what it actually saw inside its step, and comparing the two
-        is what distinguishes "sflow placed this wrong" from "the recipe used the
-        wrong device" -- neither of which a bare index list can settle.
-        """
-        allocation = self.allocation
-        if allocation is None:
-            return None
-        blocks: list[str] = []
-        for node in allocation.nodes:
-            if not node.gpu_uuids:
-                continue
-            blocks.append(f"{node.name}: {len(node.gpu_uuids)} GPU(s)")
-            blocks.extend(
-                f"  [{index}] {uuid}" for index, uuid in enumerate(node.gpu_uuids)
-            )
-        return "\n".join(blocks) if blocks else None
-
     def resource_env(self, *, cuda_visible_devices: str | None = None) -> dict[str, str]:
         env = super().resource_env(cuda_visible_devices=cuda_visible_devices)
-        # Do NOT hand NVIDIA_VISIBLE_DEVICES to an srun step. It is read by the
-        # container runtime (pyxis/enroot) at container CREATION, and naming a
-        # subset there makes the runtime carve the container and RENUMBER those
-        # devices from 0 -- after which the CUDA_VISIBLE_DEVICES we exported
-        # alongside it, in HOST numbering, addresses nothing. That is the whole
-        # origin of the placement problem: a worker planned for host 2,3 landed in
-        # a 2-GPU container numbered 0,1 and died with "No CUDA GPUs are
-        # available", while a worker planned for 0,1 survived by coincidence.
-        #
-        # Without it the container sees every GPU on the node with host numbering
-        # intact, so the slice we planned is directly addressable and
-        # CUDA_VISIBLE_DEVICES alone -- the variable CUDA actually reads -- decides
-        # what the task uses. Where something still carves the step (a GRES
-        # partition with ConstrainDevices), the in-step placement script detects it
-        # by UUID and re-selects.
-        #
-        # The trade is deliberate: this drops device-level isolation (an NVML
-        # consumer such as nvidia-smi or DCGM can now SEE the node's other GPUs)
-        # in exchange for the slice being addressable at all. Docker keeps its own
-        # isolation via `--gpus device=<uuid>` and overrides this method entirely.
-        env.pop("NVIDIA_VISIBLE_DEVICES", None)
         env.update(
             {
                 key: value
@@ -261,17 +152,6 @@ class SlurmBackend(Backend):
                 if key.startswith("SLURM_") or key.startswith("SLURMD_")
             }
         )
-
-        # Resolve the planned HOST indices to physical UUIDs, per node, so the step
-        # can check whether it already holds them instead of rewriting
-        # CUDA_VISIBLE_DEVICES unconditionally. Built from THIS backend's own
-        # allocation: with several Slurm backends the node sets and gpus_per_node
-        # differ, and a UUID is the only identifier that survives a container
-        # renumbering devices from 0. Absent when the probe found nothing, which
-        # the step reads as "fall back to index arithmetic".
-        planned = _planned_gpu_uuids(cuda_visible_devices, self.allocation)
-        if planned:
-            env["SFLOW_PLANNED_GPU_UUIDS"] = planned
 
         allocation = self.allocation
         job_id: str | None = env.get("SLURM_JOB_ID") or env.get("SLURM_JOBID")
@@ -345,90 +225,6 @@ class SlurmBackend(Backend):
             )
         return nodes
 
-    async def _discover_gpu_uuids(
-        self, *, nodes: list[ComputeNode], job_id: str | None = None
-    ) -> None:
-        """Record each node's HOST GPU index -> UUID map, in place.
-
-        One bare srun across the allocation, before any task carves anything, so
-        what nvidia-smi reports here really is the host numbering. That map is the
-        only thing that can answer "does this step already hold the GPUs it was
-        planned for?" -- device indices cannot, because a container renumbers them
-        from 0 and an index says nothing about which physical card it names.
-
-        Per node on purpose. Nodes in one allocation can differ, and two Slurm
-        backends can have different gpus_per_node, so a single per-backend count
-        is not a substitute.
-
-        Best effort: on any failure the maps stay None and the step falls back to
-        the index arithmetic it used before. A placement probe must never be the
-        reason a workflow cannot start.
-        """
-        if not nodes:
-            return
-        nodelist = ",".join(node.name for node in nodes)
-        cmd: list[str] = ["srun", "--nodelist", nodelist, "--ntasks-per-node=1"]
-        if job_id:
-            cmd.extend(["--jobid", job_id])
-        # --overlap: this shares the allocation with the real job steps rather
-        # than waiting for one, and it must not hold resources of its own.
-        cmd.append("--overlap")
-        cmd.extend(
-            [
-                "bash",
-                "-c",
-                "timeout 10 nvidia-smi --query-gpu=index,uuid --format=csv,noheader "
-                '| tr -d " " | sed "s|^|${SLURMD_NODENAME:-$(hostname -s)} |"',
-            ]
-        )
-        _logger.debug(f"Discovering GPU topology via srun: {' '.join(cmd)}")
-
-        output_lines: list[str] = []
-
-        capture_logger = isolated_logger("slurm.gpu_discovery")
-        try:
-            with temporary_handler(capture_logger, _OutputCapture(output_lines)):
-                exit_code = await self._subprocess_launcher.run_async(
-                    cmd, output_logger=capture_logger
-                )
-        except Exception as exc:  # pragma: no cover - defensive
-            _logger.debug(f"GPU topology discovery failed ({exc}); placement will "
-                          "fall back to device-index arithmetic.")
-            return
-        if exit_code != 0:
-            _logger.debug(
-                f"GPU topology discovery exited {exit_code}; placement will fall "
-                f"back to device-index arithmetic. Output: {output_lines}"
-            )
-            return
-
-        by_node: dict[str, dict[int, str]] = {}
-        for line in output_lines:
-            parts = line.split()
-            if len(parts) < 2 or "," not in parts[-1]:
-                continue
-            node_name = parts[-2]
-            index_text, _, uuid = parts[-1].partition(",")
-            if not index_text.isdigit() or not uuid.startswith("GPU-"):
-                continue
-            by_node.setdefault(node_name, {})[int(index_text)] = uuid
-
-        for node in nodes:
-            found = by_node.get(node.name)
-            if not found:
-                continue
-            # Ordered by host index, and only a contiguous 0..N-1 run is usable:
-            # a gap means the reading is partial, and a partial map would resolve
-            # planned indices to the wrong cards.
-            if set(found) == set(range(len(found))):
-                node.gpu_uuids = [found[i] for i in range(len(found))]
-        _logger.debug(
-            "GPU topology: "
-            + ", ".join(
-                f"{n.name}={len(n.gpu_uuids or [])}" for n in nodes
-            )
-        )
-
     async def _resolve_nodes_via_srun(
         self, *, nodelist: str, job_id: str | None = None
     ) -> list[ComputeNode]:
@@ -455,7 +251,11 @@ class SlurmBackend(Backend):
         # Capture output
         output_lines: list[str] = []
 
-        capture_handler = _OutputCapture(output_lines)
+        class OutputCaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord):
+                output_lines.append(record.getMessage())
+
+        capture_handler = OutputCaptureHandler()
         # Use a per-call isolated logger so concurrent backend allocations don't
         # capture each other's output (see isolated_logger docstring).
         capture_logger = isolated_logger("slurm.srun_resolve")
@@ -583,8 +383,6 @@ class SlurmBackend(Backend):
                 )
 
             # Important: we do NOT own this allocation; do not scancel on exit.
-            if self._gpu_per_node:
-                await self._discover_gpu_uuids(nodes=nodes, job_id=job_id)
             return Allocation(allocation_id=str(job_id), nodes=nodes, owned=False)
 
         command = (
@@ -604,12 +402,8 @@ class SlurmBackend(Backend):
         if self._exclude_nodes:
             command.add_opt("--exclude", ",".join(self._exclude_nodes))
 
-        # add_arg, not add_opt: extra_args is a verbatim passthrough of already
-        # tokenized argv. add_opt() de-dups by option name, which treats a bare
-        # value ("1" in `-G 1`) as an option and lets a later identical value
-        # ("1" in `-N 1`) delete it. Same as srun/docker's extra_args handling.
         for arg in self._extra_args:
-            command.add_arg(arg)
+            command.add_opt(arg)
 
         parser = ParseLogHandler(
             patterns=[
@@ -620,7 +414,11 @@ class SlurmBackend(Backend):
         # Capture all output lines for error reporting
         output_lines: list[str] = []
 
-        capture_handler = _OutputCapture(output_lines)
+        class OutputCaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord):
+                output_lines.append(record.getMessage())
+
+        capture_handler = OutputCaptureHandler()
         # Use a per-call isolated logger so concurrent backend allocations don't
         # capture each other's salloc output. Routing through the shared module
         # logger caused parsers from sibling allocations to see each other's
@@ -681,8 +479,6 @@ class SlurmBackend(Backend):
                 )
             raise
 
-        if self._gpu_per_node:
-            await self._discover_gpu_uuids(nodes=nodes, job_id=allocation_id)
         return Allocation(
             allocation_id=allocation_id,
             nodes=nodes,
