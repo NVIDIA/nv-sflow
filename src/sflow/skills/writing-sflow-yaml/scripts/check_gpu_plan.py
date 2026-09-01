@@ -17,7 +17,11 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
+
+# Parse exactly as the runtime does: sflow's loader keeps `10:00:00` a string
+# instead of letting YAML 1.1 read it as the base-60 integer 36000. A validator
+# that disagrees with the runtime is worse than one that requires sflow.
+from sflow.config.loader import safe_load
 
 EXPRESSION_PATTERN = re.compile(r"\$\{\{(.+?)\}\}", re.DOTALL)
 
@@ -31,7 +35,7 @@ def _load_and_merge(filepaths: list[str]) -> dict:
             print(f"Warning: file not found: {fp}", file=sys.stderr)
             continue
         with open(fp) as f:
-            config = yaml.safe_load(f.read())
+            config = safe_load(f.read())
         if not isinstance(config, dict):
             continue
         if not merged:

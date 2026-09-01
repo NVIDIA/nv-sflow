@@ -210,6 +210,22 @@ aiperf_tally_ok() {  # <run_dir> -> 0 every aiperf run benchmarked, 1 one did no
     [ "$bad" -eq 0 ]
 }
 
+# The one question both scoring paths ask: did a benchmark client actually
+# measure something? Wraps the two clients so callers never have to remember that
+# there are two -- the submitted-job loop checks both, and the sanity/`sflow run`
+# path used to check only aiperf, silently passing every benchmark_serving recipe.
+#   0 = a client benchmarked
+#   1 = a client ran and measured nothing
+#   2 = no benchmark client in this run
+benchmark_tally_state() {  # <out_dir>
+    local dir="$1" a s
+    aiperf_tally_ok "$dir";  a=$?
+    serving_tally_ok "$dir"; s=$?
+    [ "$a" -eq 0 ] || [ "$s" -eq 0 ] && return 0
+    [ "$a" -eq 1 ] || [ "$s" -eq 1 ] && return 1
+    return 2
+}
+
 serving_tally_ok() {  # <run_dir> -> 0 every benchmark_serving run completed, 1 one did not, 2 none here
     # The benchmark_serving.py (InferenceX) half of the same question aiperf_tally_ok
     # asks. The modular dynamo_benchmark rows drive this instead of aiperf, so
@@ -818,6 +834,24 @@ E2E_PARTITION_B="${SLURM_E2E_PARTITION_B:-$PARTITION}"
 # verify_disjoint compares two tasks' device lists) still need the OUTPUT DIR on
 # storage the compute nodes share. Point -o/E2E_OUTPUT_DIR at shared scratch;
 # only the driver moved, the task steps still run out on the nodes.
+# Emit `--set <VAR>=<path>` for a PRE-IMPORTED squashfs image, when it is there.
+# pyxis takes a .sqsh straight from disk, so there is no registry import and no
+# enroot cache write -- it cannot hit the shared-cache race that aborts two
+# concurrent imports of the same image (see container_infra_failure).
+#
+# A missing file falls back to the recipe's own registry image: that keeps the run
+# working, where a stale path would fail the recipe outright -- strictly worse than
+# the race it avoids. The warning goes to STDERR because callers capture this
+# function's stdout AS the argument list; an echo there becomes a bogus --set.
+emit_sqsh_override() {  # <var-name> <sqsh-path>
+    [ -n "$2" ] || return 0
+    if [ -f "$2" ]; then
+        printf '%s\n' "--set" "$1=$2"
+    else
+        echo "⚠ WARNING: $2 does not exist on this host; keeping the recipe's registry image for $1. The enroot image-cache race can recur -- run 'enroot import -o $2 docker://<image>' to create it." >&2
+    fi
+}
+
 sanity_recipe_set_args() {
     # `--set` of a variable a config does not declare is a hard error, and so is
     # `--artifact` of an artifact it does not declare -- which is why these are
@@ -858,6 +892,18 @@ sanity_recipe_set_args() {
                            "--set" "PARTITION_B=${E2E_PARTITION_B:-$PARTITION}" \
                            "--set" "SLURM_ACCOUNT=$ACCOUNT" \
                            "--set" "GPUS_PER_NODE=$GPUS_PER_NODE"
+            # Its gpu_pool tasks pull the same pytorch image concurrently, which is
+            # the other half of the enroot cache race. Same contract as above.
+            emit_sqsh_override GPU_IMAGE "${SFLOW_E2E_MONITOR_GPU_IMAGE:-}"
+            ;;
+        gpu_placement_matrix.yaml)
+            printf '%s\n' "--set" "SLURM_PARTITION=$PARTITION" \
+                           "--set" "SLURM_ACCOUNT=$ACCOUNT" \
+                           "--set" "GPUS_PER_NODE=$GPUS_PER_NODE"
+            # Overridden here rather than in the recipe: the path is cluster-
+            # specific, and the recipe's docker:// default is what every other user
+            # and cluster needs. Unset = leave it alone.
+            emit_sqsh_override PLACEMENT_IMAGE "${SFLOW_E2E_PLACEMENT_IMAGE:-}"
             ;;
         *)
             printf '%s\n' "--set" "SLURM_PARTITION=$PARTITION" \
@@ -865,6 +911,32 @@ sanity_recipe_set_args() {
                            "--set" "GPUS_PER_NODE=$GPUS_PER_NODE"
             ;;
     esac
+
+    # Right-size parallelism for the small stand-in model. The workload recipes
+    # carry LARGE-model sizing -- infmax_v1_ds_r1 is a DeepSeek-R1 recipe (GEN
+    # TP=8 + attention DP), dynamo_sglang_agg runs TP=4 -- which a 0.6B dense
+    # stand-in cannot satisfy:
+    #   * TRT-LLM asserts "lm_head and vocab embedding should use the same TP
+    #     size" when a tiny vocab is sharded 8 ways with attention DP on.
+    #   * sglang's torch.compile dies with FailOnRecompileLimitHit and SIGKILLs
+    #     its own process tree (exit 137).
+    # Both are model-vs-parallelism mismatches, not GPU or sflow problems -- the
+    # other 7 workload recipes serve real traffic on this cluster.
+    #
+    # Opt-in: unset leaves every recipe's own sizing alone, so a hand-run against
+    # a real checkpoint is never silently down-scaled.
+    if [ "${SFLOW_E2E_SMALL_MODEL_PARALLELISM:-0}" = "1" ]; then
+        case "$(basename "$1")" in
+            dynamo_sglang_agg.yaml)
+                printf '%s\n' "--set" "AGG_TP_SIZE=1"
+                ;;
+            infmax_v1_ds_r1.yaml)
+                printf '%s\n' "--set" "CTX_TP_SIZE=1" \
+                               "--set" "GEN_TP_SIZE=1" \
+                               "--set" "GEN_ENABLE_ATTENTION_DP=false"
+                ;;
+        esac
+    fi
 }
 
 gpu_placement_verified() {  # <out_dir> -> 0 when every GPU task PROVED its placement
@@ -1076,12 +1148,26 @@ run_sanity_recipes_with_sflow_run() {
         files+=("$f")
         if is_workload_recipe "$f"; then kinds+=("workload"); else kinds+=("sanity"); fi
     done
-    wait
-
     echo ""
-    echo "===== Scoring ${#names[@]} sflow run(s) ====="
-    local i rc
-    for i in "${!names[@]}"; do
+    echo "===== Scoring ${#names[@]} sflow run(s) -- each is scored the moment it finishes ====="
+    # Score in COMPLETION order, not launch order: with recipes running in
+    # parallel and wildly different runtimes, a single `wait` for all of them
+    # meant a whole suite's worth of verdicts appeared only at the very end, and
+    # a hung recipe hid the results of every one that had already passed.
+    #
+    # `.rc` is written by each subshell after its `sflow run` returns, so its
+    # presence is the completion signal. -s, not -e: the file is created and
+    # written in two steps, and an empty read would score a finished run as rc="".
+    local i rc pending=("${!names[@]}") still=() progressed
+    while [ ${#pending[@]} -gt 0 ]; do
+        progressed=0
+        still=()
+        for i in "${pending[@]}"; do
+            if [ ! -s "${roots[$i]}/.rc" ]; then
+                still+=("$i")
+                continue
+            fi
+            progressed=1
         # Missing .rc means the subshell never got to write one -- treat as failure.
         rc=$(cat "${roots[$i]}/.rc" 2>/dev/null || echo 1)
         # No job id to look a run up by later, so find where it landed; the
@@ -1103,7 +1189,12 @@ run_sanity_recipes_with_sflow_run() {
             # EVIDENCE THAT DOES NOT EXIST: aiperf_template holds no GPU, wrote no
             # record, and still reported "placement proven by UUID" -- the exact
             # kind of line that misleads whoever audits these artifacts later.
-            local proved="placement proven by UUID; app rc=$rc ignored on this cluster"
+            local proved="placement proven by UUID"
+            # Only the lenient mode disclaims the app's exit status; under strict
+            # scoring the rc is part of the verdict, so saying it was ignored would
+            # be a lie in the CI log.
+            [ "${SFLOW_E2E_STRICT_WORKLOAD:-0}" = "1" ] \
+                || proved="$proved; app rc=$rc ignored on this cluster"
             local unproved="GPU placement not proven"
             if ! recipe_requests_gpus "${files[$i]}"; then
                 proved="no GPU task, so no placement to prove; sflow reports COMPLETED"
@@ -1114,13 +1205,53 @@ run_sanity_recipes_with_sflow_run() {
             # these recipes forever -- but a bare PASS next to an aiperf that
             # measured nothing is how the ptyche half stayed green for six workflows.
             # Whoever audits these artifacts should not have to open the CSV to find
-            # that out. aiperf_tally_ok() already prints the counts to stderr.
-            aiperf_tally_ok "$run_dir"
-            case $? in
-                0) proved="$proved; aiperf benchmarked" ;;
-                1) proved="$proved; aiperf measured nothing (expected here, not gated)" ;;
+            # that out. The tally helpers already print their counts to stderr.
+            benchmark_tally_state "$run_dir"
+            local tally=$?
+            # The ONE expected-not-to-benchmark shape, excused exactly as the ptyche
+            # half does it (see recipe_is_client_only): aiperf_template starts no
+            # server, so its client has nothing to talk to and can never produce a
+            # metric. Every OTHER workload recipe still owes a real benchmark.
+            # It does still owe a clean COMPLETE -- the workload_placement_ok elif
+            # below already demands exactly that, because a recipe with no GPU task
+            # falls back to workflow_summary_ok.
+            local client_only=1
+            [ "$tally" -eq 1 ] && recipe_is_client_only "$run_dir" && client_only=0
+            case "$tally" in
+                0) proved="$proved; benchmarked" ;;
+                1) if [ "$client_only" -eq 0 ]; then
+                       proved="$proved; client-only recipe: no server to benchmark by design"
+                   else
+                       proved="$proved; benchmark client measured nothing"
+                   fi ;;
             esac
-            if workload_placement_ok "${files[$i]}" "$run_dir"; then
+            if [ "${SFLOW_E2E_STRICT_WORKLOAD:-0}" = "1" ]; then
+                # STRICT: the cluster can serve, so the app's own verdict counts.
+                # A workload recipe must exit 0, prove its placement, AND have
+                # actually benchmarked -- placement alone is not a working stack.
+                # Infra failures are still excused (a broken node or an enroot
+                # cache race is not a regression), exactly as the sanity half does.
+                if [ "$rc" -ne 0 ]; then
+                    if cuda_infra_failure "${roots[$i]}"; then
+                        mark_cuda_excused "${names[$i]}" "${logs[$i]}" "(sflow run rc=$rc with a CUDA init failure)"
+                    elif container_infra_failure "${roots[$i]}"; then
+                        mark_container_excused "${names[$i]}" "${logs[$i]}" "(enroot image-cache race on its node)"
+                    else
+                        echo "  ${names[$i]}: FAIL (sflow run exited $rc; see ${logs[$i]})"
+                    fi
+                elif ! workload_placement_ok "${files[$i]}" "$run_dir"; then
+                    echo "  ${names[$i]}: FAIL ($unproved; see ${run_dir:-${logs[$i]}})"
+                elif [ "$tally" -eq 1 ] && [ "$client_only" -ne 0 ]; then
+                    # tally 2 = this recipe runs no benchmark client at all, which
+                    # is not a failure; 1 = one ran and measured nothing, which is
+                    # -- unless it is the client-only recipe, which by design has
+                    # no server to measure.
+                    echo "  ${names[$i]}: FAIL (benchmark client ran but measured nothing; see $run_dir)"
+                else
+                    PASSED=$((PASSED + 1))
+                    echo "  ${names[$i]}: PASS ($proved)"
+                fi
+            elif workload_placement_ok "${files[$i]}" "$run_dir"; then
                 PASSED=$((PASSED + 1))
                 echo "  ${names[$i]}: PASS ($proved)"
             else
@@ -1129,6 +1260,8 @@ run_sanity_recipes_with_sflow_run() {
         elif [ "$rc" -ne 0 ]; then
             if cuda_infra_failure "${roots[$i]}"; then
                 mark_cuda_excused "${names[$i]}" "${logs[$i]}" "(sflow run rc=$rc with a CUDA init failure)"
+            elif container_infra_failure "${roots[$i]}"; then
+                mark_container_excused "${names[$i]}" "${logs[$i]}" "(enroot image-cache race on its node)"
             else
                 echo "  ${names[$i]}: FAIL (sflow run exited $rc; see ${logs[$i]})"
             fi
@@ -1138,12 +1271,21 @@ run_sanity_recipes_with_sflow_run() {
             echo "  ${names[$i]}: PASS (rc=0 and its own output proves it, under $run_dir)"
         elif cuda_infra_failure "${roots[$i]}"; then
             mark_cuda_excused "${names[$i]}" "${run_dir:-${logs[$i]}}" "(exited 0 but proved nothing; CUDA init failure on node)"
+        elif container_infra_failure "${roots[$i]}"; then
+            mark_container_excused "${names[$i]}" "${run_dir:-${logs[$i]}}" "(enroot image-cache race on its node)"
         else
             # The nastiest shape: green process, unproven run. Exactly what a
             # silently-degraded placement or a collapsed two-backend run looks like.
             echo "  ${names[$i]}: FAIL (sflow run exited 0 but its output does not prove the run: ${run_dir:-no run dir found})"
         fi
+        done
+        pending=("${still[@]+"${still[@]}"}")
+        # Only sleep when nothing finished this pass, so a burst of completions
+        # prints back-to-back instead of one every poll interval.
+        [ ${#pending[@]} -eq 0 ] || [ "$progressed" -eq 1 ] || sleep 5
     done
+    # Reap the subshells; every one has already written its .rc by now.
+    wait
 }
 
 run_monitor_mixed_real() {
@@ -1662,6 +1804,25 @@ cuda_infra_failure() {  # <out_dir> -> 0 (true) if the job failed due to CUDA in
         "$out_dir"
 }
 
+container_infra_failure() {  # <out_dir> -> 0 (true) if the job failed due to container-runtime infra
+    local out_dir="$1"
+    [ -n "$out_dir" ] && [ -d "$out_dir" ] || return 1
+    # Enroot populates its shared image cache with `mv --no-clobber`. When two
+    # concurrent srun steps import the same image (a cold cache -- e.g. the first
+    # run on a new cluster), the loser's mv refuses to replace the winner's file
+    # and pyxis aborts the step. Only that race produces this line.
+    #
+    # Deliberately NOT matched here, per the same rule as cuda_infra_failure above
+    # (a pattern that also fits healthy//buggy runs turns real regressions green):
+    # 'failed to import docker image' and 'couldn't start container' are also what
+    # a recipe naming a nonexistent image, or a broken registry credential, emits.
+    # Those are recipe/config bugs and must stay real failures. The mv collision
+    # cannot be produced by a bad recipe.
+    grep -rIqs --include='*.log' --include='*.out' \
+        -e 'mv: not replacing .*enroot' \
+        "$out_dir"
+}
+
 # Reclassify a would-be FAIL as a CUDA-infra excuse: bump the excused counter and
 # print a prominent warning. Excused jobs are NOT counted as failures by the CI
 # threshold, but they did NOT succeed -- the node should be investigated/drained.
@@ -1671,12 +1832,21 @@ mark_cuda_excused() {  # <jid> <out_dir> <detail>
     echo "  ⚠ WARNING: Job $1 failed due to a CUDA/GPU infrastructure error on its node (e.g. 'CUDA initialization: Unexpected error from cudaGetDeviceCount()' / 'Error 802: system not yet initialized'). Excused from the pass/fail threshold, but this is NOT a successful run -- investigate/drain the node. See $2"
 }
 
+# Same contract as mark_cuda_excused, for a container-runtime (enroot/pyxis) infra
+# failure: excused from the threshold, but loudly reported -- it did NOT succeed.
+mark_container_excused() {  # <jid> <out_dir> <detail>
+    CONTAINER_INFRA=$((CONTAINER_INFRA + 1))
+    echo "  Job $1: CONTAINER-INFRA EXCUSED (enroot image-cache race; NOT a real pass) $3"
+    echo "  ⚠ WARNING: Job $1 failed because two concurrent steps imported the same image into the shared enroot cache ('mv: not replacing ...enroot.../cache/...'), so pyxis could not start the container. Excused from the pass/fail threshold, but this is NOT a successful run -- re-run once the cache is warm, or pre-warm it on this cluster. See $2"
+}
+
 # Check results in output folders
 echo ""
 echo "===== Results ====="
 TOTAL=0
 PASSED=0
 CUDA_INFRA=0
+CONTAINER_INFRA=0
 if [ "$RECIPE_CLASS" = "sanity" ]; then
     run_sanity_recipes_with_sflow_run
 fi
@@ -1715,6 +1885,8 @@ for jid in "${JOB_IDS[@]}"; do
                 echo "  Job $jid: PASS (GPU placement proven by UUID on 2+ nodes under $out_dir)"
             elif cuda_infra_failure "$out_dir"; then
                 mark_cuda_excused "$jid" "$out_dir" "(placement assertions unproven; CUDA init failure on node)"
+            elif container_infra_failure "$out_dir"; then
+                mark_container_excused "$jid" "$out_dir" "(enroot image-cache race on its node)"
             else
                 echo "  Job $jid: FAIL (GPU placement not proven under $out_dir; read SFLOW_GPU_PROBE / FAIL: in the task logs)"
             fi
@@ -1748,12 +1920,16 @@ for jid in "${JOB_IDS[@]}"; do
         # a sibling task in the same workflow reported requests of its own.
         if cuda_infra_failure "$out_dir"; then
             mark_cuda_excused "$jid" "$out_dir" "(aiperf measured nothing; CUDA init failure on node)"
+        elif container_infra_failure "$out_dir"; then
+            mark_container_excused "$jid" "$out_dir" "(enroot image-cache race on its node)"
         else
             echo "  Job $jid: FAIL (aiperf ran but measured nothing; see the tally above, $out_dir)"
         fi
     elif [ "$serving_state" -eq 1 ]; then
         if cuda_infra_failure "$out_dir"; then
             mark_cuda_excused "$jid" "$out_dir" "(benchmark_serving did not complete; CUDA init failure on node)"
+        elif container_infra_failure "$out_dir"; then
+            mark_container_excused "$jid" "$out_dir" "(enroot image-cache race on its node)"
         else
             echo "  Job $jid: FAIL (benchmark_serving ran but did not complete its requests; see the counts above, $out_dir)"
         fi
@@ -1766,6 +1942,8 @@ for jid in "${JOB_IDS[@]}"; do
         echo "  Job $jid: PASS (no benchmark log; sflow reports Status: COMPLETED under $out_dir)"
     elif cuda_infra_failure "$out_dir"; then
         mark_cuda_excused "$jid" "$out_dir" "(no success indicator; CUDA init failure on node)"
+    elif container_infra_failure "$out_dir"; then
+        mark_container_excused "$jid" "$out_dir" "(enroot image-cache race on its node)"
     else
         echo "  Job $jid: FAIL (no success indicator found in $out_dir)"
     fi
@@ -1785,12 +1963,72 @@ if [ -n "${MONITOR_MIXED_LAUNCH_FAILED:-}" ]; then
     echo "  monitor_mixed run: FAIL (no Slurm job submitted)"
 fi
 
+# Print the benchmark client's own summary numbers from every benchmark task, so
+# the CI log carries REAL perf. A green verdict only says the workflow exited 0
+# and placement was proven; these lines are what show the server actually served
+# -- throughput and latency a human can sanity-check, and a non-zero request count.
+#
+# Both clients in this suite are covered, because the recipes are split between
+# them (see aiperf_tally_ok / serving_tally_ok):
+#   * aiperf              -- a boxed "NVIDIA AIPerf | LLM Metrics" table.
+#   * benchmark_serving   -- sa-bench / InferenceX "Serving Benchmark Result".
+#
+# Matched on metric names, never on the bare words "Successful"/"Request": the
+# benchmark task pip-installs its client first, and "Successfully installed ..."
+# is in the same log.
+print_benchmark_metrics() {
+    local root="${E2E_OUTPUT_DIR:-sflow_output}" found=0 log rows label client
+
+    while IFS= read -r log; do
+        # Strip sflow's per-task log prefix ("... - INFO - 0: ") so both summaries
+        # line up in the CI log.
+        local body
+        body=$(sed 's/.*INFO - [0-9]*: //' "$log" 2>/dev/null) || continue
+
+        # The ┃ line is aiperf's column header (avg/min/max/p99/p90/p50/std) --
+        # without it the numbers below are unlabelled.
+        rows=$(printf '%s\n' "$body" | grep -E \
+            '^┃ *Metric|^│ *(Time to First Token|Inter Token Latency|Output Token Throughput|Request Throughput|Request Count)' || true)
+        client="aiperf"
+        if [ -z "$rows" ]; then
+            # sa-bench / benchmark_serving.py prints a flat "label: value" block.
+            rows=$(printf '%s\n' "$body" | grep -E \
+                '^(Successful requests|Benchmark duration|Total input tokens|Total generated tokens|Request throughput|Output token throughput|Total token throughput|Mean TTFT|Median TTFT|P99 TTFT|Mean TPOT|Median TPOT|Mean ITL|Median ITL) *\(?[^)]*\)? *:' || true)
+            client="benchmark_serving"
+        fi
+        [ -n "$rows" ] || continue
+
+        if [ "$found" -eq 0 ]; then
+            echo ""
+            echo "===== Benchmark metrics ====="
+            found=1
+        fi
+        # <recipe>/<task>, e.g. dynamo_trtllm_agg/benchmark_128
+        label="$(basename "$(dirname "$(dirname "$(dirname "$log")")")")/$(basename "$log" .log)"
+        echo ""
+        echo "  $label  [$client]"
+        printf '%s\n' "$rows" | sed 's/^/    /'
+    done < <(find "$root" -type f -name 'benchmark*.log' 2>/dev/null | sort)
+
+    if [ "$found" -eq 0 ]; then
+        echo ""
+        echo "===== Benchmark metrics ====="
+        echo "  (none found -- no benchmark task produced an aiperf or benchmark_serving summary)"
+    fi
+}
+
+print_benchmark_metrics
+
 echo ""
 echo "===== Summary ====="
 echo "$PASSED/$TOTAL jobs passed"
 if [ "${CUDA_INFRA:-0}" -gt 0 ]; then
     echo "$CUDA_INFRA/$TOTAL jobs excused due to CUDA/GPU infrastructure failures (not counted as failures)"
     echo "⚠ WARNING: $CUDA_INFRA job(s) failed because of CUDA/GPU infrastructure errors on their nodes (driver/fabric not ready). They are EXCUSED from the pass/fail threshold but did NOT succeed -- investigate/drain the affected nodes."
+fi
+if [ "${CONTAINER_INFRA:-0}" -gt 0 ]; then
+    echo "$CONTAINER_INFRA/$TOTAL jobs excused due to container-runtime infrastructure failures (not counted as failures)"
+    echo "⚠ WARNING: $CONTAINER_INFRA job(s) failed because of an enroot image-cache race on their nodes (concurrent imports of the same image). They are EXCUSED from the pass/fail threshold but did NOT succeed -- re-run with a warm cache, or pre-warm the images on this cluster."
 fi
 
 # =============================================================================
@@ -1921,6 +2159,6 @@ fi
 # summarize_validation() does with the same numbers -- but an ALL-excused run
 # proved nothing, so it is not a pass either.
 [ "$PASSED" -gt 0 ] \
-    && [ $((PASSED + CUDA_INFRA)) -eq "$TOTAL" ] \
+    && [ $((PASSED + CUDA_INFRA + CONTAINER_INFRA)) -eq "$TOTAL" ] \
     && [ "$MONITOR_PRESENT" -eq "$MONITOR_TOTAL" ] \
     && [ "$TARGETING_OK" -eq "$TARGETING_TOTAL" ]

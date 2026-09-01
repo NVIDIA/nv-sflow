@@ -3,21 +3,25 @@ title: Introduction
 sidebar_position: 1
 ---
 
-`sflow` is a **declarative workflow descriptor** that separates _what to deploy_ from _where to deploy it_.
+## What is sflow
+
+A **declarative workflow descriptor for massive GPU clusters** that separates _what to deploy_ from _where to deploy it_.
 
 :::tip Find the right feature
 Not sure where to start? Open the [Feature Map](/feature-map) to choose a goal, see which sflow features apply, and jump to the relevant docs. Building with an AI coding agent? See [Agent Skills](/docs/agents/intro).
 :::
 
-An application's deployment steps are usually logically the same regardless of the underlying infrastructure. Take [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) as an example: you start etcd and NATS, launch a frontend server, spin up workers that register to the frontend, and the service is up. That logical flow never changes — but making it actually run on Slurm, Docker Compose, or Kubernetes requires a different set of infrastructure-specific scripts, resource management, and networking tweaks each time, and the effort must be repeated for every new platform.
+**One semantic across every platform — backend agnostic by design.** A deployment's logic never changes: start etcd and NATS, launch a frontend, spin up workers, run the benchmark. Only the infrastructure glue does — and today that glue is rewritten from scratch for every platform. `sflow` consolidates it into a single portable YAML: tasks, dependencies, resources, and launch methods. The **same `sflow.yaml` runs on Docker, Slurm, and Kubernetes** — swap the backend fragment, rewrite nothing. Backends delegate to each platform's native ecosystem (`srun`/MPI, `docker run`, pods and MPI jobs) rather than reimplementing it.
 
-`sflow` is trying to eliminate this duplication. You describe the workflow once in a portable YAML format — tasks, dependencies, resources, and launch methods — and `sflow` delegates execution to the target infrastructure through swappable backends, leveraging each platform's native ecosystem rather than reimplementing it (e.g. Kubernetes, Helm charts, Argo Workflows).
+**Cluster-level orchestration at scale.** Topology-aware node and GPU placement, multi-node replicas and sweeps, readiness/failure probes, and batch submission — so one descriptor drives hundreds of GPUs instead of a pile of hand-written bash.
 
-Pluggable extensions such as probes and artifacts integrate naturally without coupling your workflow to any specific platform. Write one `sflow.yaml` and run it across environments with minimal changes.
-
-The current focus is **Slurm**, which — unlike Kubernetes or Docker — lacks a built-in workflow orchestration layer, making multi-step deployments especially cumbersome. As of the v0.3.0 release, the Docker and Kubernetes backends ship as well, alongside `local` and `slurm`. Kubernetes support is new in v0.3.0 and has known limitations (interactive `sflow run` only, `monitor:` not yet supported, tested on bare-metal Kubernetes and GKE) — see [Backends](./backends.md#kubernetes-backend).
+All four backends ship today: `local`, `docker`, `slurm`, and `kubernetes` (`k8s` / `k8s_mpi`). It is light enough to write and debug a recipe on your laptop and submit that same file to the cluster.
 
 ![sflow TUI](/img/sflow_tui.gif)
+
+Define _what to run_ in a `sflow.yaml` — tasks, dependencies, how to launch each task, and required resources. `sflow` executes the DAG in order, collects logs, and organizes outputs into a consistent directory structure. Example of a dynamo PD disaggregation LLM inference service workflow:
+
+![Workflow DAG Example](/img/workflow-dag.png)
 
 ## Docs versions
 

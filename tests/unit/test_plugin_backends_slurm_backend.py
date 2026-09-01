@@ -1638,3 +1638,60 @@ def test_allocation_probes_the_gpu_topology():
 
     # Once for the pre-existing (unowned) allocation, once for the salloc path.
     assert inspect.getsource(SlurmBackend).count("await self._discover_gpu_uuids(") == 2
+
+
+def test_unquoted_walltime_from_yaml_reaches_the_slurm_time_flag(tmp_path, monkeypatch):
+    """`time: 10:00:00` must render as `--time 10:00:00`, not `--time 36000`.
+
+    PyYAML resolves an unquoted `10:00:00` to the base-60 integer 36000, which
+    Slurm reads as 36000 *minutes*. Covers the whole path: YAML -> ConfigLoader
+    -> SlurmBackendConfig -> the rendered flag value.
+    """
+    from sflow.config.loader import ConfigLoader
+
+    path = tmp_path / "sflow.yaml"
+    path.write_text(
+        """
+version: "0.1"
+backends:
+  - name: slurm
+    type: slurm
+    default: true
+    partition: debug
+    account: test
+    nodes: 1
+    gpus_per_node: 1
+    time: 10:00:00
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(ConfigLoader().load_config(path).backends[0])
+    backend._subprocess_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 2222222",
+                    "salloc: Nodes node001 are ready for job",
+                ],
+            ),
+            (0, ["node001: 10.0.0.1:123"]),
+        ]
+    )
+
+    asyncio.run(backend.allocate())
+
+    salloc_cmd = list(backend._subprocess_launcher.calls[0]["command"])
+    assert "--time" in salloc_cmd
+    assert salloc_cmd[salloc_cmd.index("--time") + 1] == "10:00:00"

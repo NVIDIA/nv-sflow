@@ -23,11 +23,14 @@ Looking for a quick lookup of all config fields? See the [Quick Reference](./qui
 
 ## version
 
-Currently supported:
+Optional. Omit it and sflow uses `"0.1"`, the only value that has ever existed:
 
 ```yaml
-version: "0.1"
+version: "0.1"   # optional
 ```
+
+If you do declare it, it must be `"0.1"` — any other value is rejected. When
+several files are merged, they must not declare conflicting versions.
 
 ## variables
 

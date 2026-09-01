@@ -119,7 +119,14 @@ also accepts:
 | `job_name` | workflow name | `salloc --job-name`. Falls back to the backend name, then is set to the workflow name at resolve time. |
 | `offload_task_logs` | `true` | Have `srun` write each task's `<task>.log` on the compute side (via `--output`) instead of streaming every line through the driver. Auto-falls back to streaming on an interactive TTY / `--tui`. Also toggled by `--offload-task-logs` / `--no-offload-task-logs` or `SFLOW_OFFLOAD_TASK_LOGS`. |
 
-> `time` accepts either an `"HH:MM:SS"` string or an integer number of minutes.
+> `time` accepts either an `HH:MM:SS` walltime or an integer number of minutes.
+> Quoting is optional: `time: 10:00:00` and `time: "10:00:00"` are equivalent.
+> A bare integer (`time: 5400`) means **minutes**, matching `sbatch --time`.
+>
+> Earlier sflow versions required the quotes. Unquoted, YAML 1.1 read `10:00:00`
+> as the base-60 integer `36000`, which Slurm then interpreted as 36000 *minutes*
+> — a 10-hour request silently became 25 days. sflow now parses config scalars
+> with YAML 1.2 rules, so the unquoted form means what it looks like.
 
 ### Cluster-specific flags (`extra_args`)
 

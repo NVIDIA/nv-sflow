@@ -3,21 +3,90 @@ version: "0.1"
 # Multi-node distributed training on Kubernetes via sflow's default device-plugin
 # GPU scheduling (scheduling: device_plugin -> nvidia.com/gpu limits).
 #
-# The reservation reserves 4 GPU nodes; the single task is split into 4 pods (one
-# per reserved node, leader = index 0) each requesting 8 GPUs via the device-plugin
-# limit. sflow injects SFLOW_TASK_NODE_INDEX and SFLOW_LEADER_ADDRESS
-# per pod (plus the shared SFLOW_TASK_ASSIGNED_NODE_IPS) so torchrun can rendezvous.
+# The reservation reserves NUM_NODES GPU nodes; the single task is split into one
+# pod per reserved node (leader = index 0), each requesting GPUS_PER_NODE GPUs via
+# the device-plugin limit. sflow injects SFLOW_TASK_NODE_INDEX and
+# SFLOW_LEADER_ADDRESS per pod so torchrun can rendezvous.
+#
+# The topology lives in variables and NOTHING restates it. torchrun's --nnodes must
+# equal the pod count or the c10d rendezvous blocks forever waiting for ranks that
+# will never join -- a silent hang, not an error. Deriving both from one variable is
+# why that cannot drift.
 #
 # `scheduling: device_plugin` is sflow's default; swap to `scheduling: dra` (a work in
 # progress) on a cluster with nvidia-dra-driver-gpu to request GPUs via DRA ResourceClaims.
+
+variables:
+  NUM_NODES:
+    description: "Nodes to reserve == the number of pods == torchrun --nnodes."
+    type: integer
+    value: 2
+  GPUS_PER_NODE:
+    description: "GPUs per node == torchrun --nproc_per_node."
+    type: integer
+    value: 2
+  TOTAL_GPUS:
+    description: "GPUs across the whole task; sflow divides it per pod."
+    type: integer
+    value: ${{ variables.NUM_NODES * variables.GPUS_PER_NODE }}
+
+artifacts:
+  # The recipe used to invoke a bare `train.py` that existed nowhere -- the run only
+  # ever got that far after the rendezvous, so the missing file was masked by the
+  # hang. Ship the smallest thing that PROVES the point of the example: every rank
+  # joined and NCCL actually carried a collective between the nodes.
+  - name: TRAIN_SCRIPT
+    uri: file://train.py
+    content: |
+      import os
+      import socket
+      import torch
+      import torch.distributed as dist
+
+      host = socket.gethostname()
+      node = os.environ.get("SFLOW_TASK_NODE_INDEX", "?")
+      local_rank = int(os.environ["LOCAL_RANK"])
+
+      def log(msg):
+          # Rank-tagged and flushed: torchrun interleaves every rank onto one stream,
+          # and an unflushed print is lost entirely if a peer dies mid-collective.
+          print(f"[node {node} | rank {os.environ.get('RANK', '?')} | {host}] {msg}", flush=True)
+
+      log(f"starting: local_rank={local_rank} master={os.environ.get('MASTER_ADDR')}:"
+          f"{os.environ.get('MASTER_PORT')} world_size={os.environ.get('WORLD_SIZE')}")
+
+      # Everything before this line is local. If the run hangs HERE, the rendezvous
+      # never completed -- which is exactly the --nnodes mismatch this recipe hit.
+      log("entering rendezvous (init_process_group)...")
+      dist.init_process_group("nccl")
+      rank, world = dist.get_rank(), dist.get_world_size()
+      torch.cuda.set_device(local_rank)
+      log(f"rendezvous OK: rank {rank}/{world} on {torch.cuda.get_device_name(local_rank)}")
+
+      # Sum of all ranks -- wrong if any rank is missing or NCCL silently no-ops.
+      t = torch.full((1,), float(rank), device="cuda")
+      dist.all_reduce(t)
+      expected = world * (world - 1) / 2
+      log(f"all_reduce -> {t.item():.0f} (expected {expected:.0f})")
+      assert t.item() == expected, f"all_reduce={t.item()} expected={expected}"
+
+      dist.barrier()
+      if rank == 0:
+          hosts = [None] * world
+          dist.all_gather_object(hosts, host)
+          log(f"OK: {world} ranks across {len(set(hosts))} host(s) agreed: {sorted(set(hosts))}")
+      else:
+          dist.all_gather_object([None] * world, host)
+      dist.destroy_process_group()
+      log("done")
 
 backends:
   - name: k8s
     type: kubernetes
     default: true
     namespace: default
-    nodes: 4
-    gpus_per_node: 8
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
     host_network: true
     scheduling: device_plugin
 
@@ -33,17 +102,18 @@ workflow:
       operator: trainer
       resources:
         nodes:
-          count: 4
+          count: ${{ variables.NUM_NODES }}
         gpus:
-          count: 32   # 8 GPUs per pod across 4 nodes
+          count: ${{ variables.TOTAL_GPUS }}
       script:
         # SFLOW_LEADER_ADDRESS is the leader (node 0) IP; SFLOW_TASK_NODE_INDEX is
-        # 0 on the leader and 1..N-1 on workers. Keep NNODES in sync with nodes.count.
+        # 0 on the leader and 1..N-1 on workers.
         - export MASTER_ADDR="$SFLOW_LEADER_ADDRESS"
         - export MASTER_PORT=12345
-        - export NNODES=4
-        - export NPROC_PER_NODE=8
+        - export NNODES=${{ variables.NUM_NODES }}
+        - export NPROC_PER_NODE=${{ variables.GPUS_PER_NODE }}
         - export NODE_RANK="$SFLOW_TASK_NODE_INDEX"
+        - nvidia-smi
         - >
           torchrun
           --nnodes=$NNODES
@@ -51,4 +121,4 @@ workflow:
           --node_rank=$NODE_RANK
           --master_addr=$MASTER_ADDR
           --master_port=$MASTER_PORT
-          train.py
+          ${{ artifacts.TRAIN_SCRIPT.path }}

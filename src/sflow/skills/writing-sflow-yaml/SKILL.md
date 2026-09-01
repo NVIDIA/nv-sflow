@@ -29,7 +29,7 @@ Every recipe has the same top-level shape. You design `workflow.tasks` first; th
 optional scaffolding you add only when a step calls for it.
 
 ```yaml
-version: "0.1"        # schema version (NOT the sflow release) — required in EVERY file
+version: "0.1"        # optional — schema version (NOT the sflow release); omit ⇒ "0.1"
 variables: { ... }    # optional — ${{ variables.X }} in YAML, ${X} in scripts
 artifacts: [ ... ]    # optional — named paths/URIs, auto-mounted at the same path
 backends:  [ ... ]    # optional — omit ⇒ a default `local` backend

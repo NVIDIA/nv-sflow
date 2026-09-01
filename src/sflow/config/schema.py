@@ -1194,7 +1194,9 @@ class SflowConfig(StrictBaseModel):
     Main configuration model for Sflow.
     """
 
-    version: str
+    # Optional. Only "0.1" has ever existed, so requiring it bought nothing but a
+    # line of boilerplate at the top of every recipe. Omitting it means "0.1".
+    version: str = "0.1"
     variables: Optional[
         Annotated[List[VariableConfig], BeforeValidator(_normalize_to_list)]
     ] = None

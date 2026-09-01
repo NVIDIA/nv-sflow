@@ -1,9 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
+import re
 
-from sflow.config.loader import ConfigLoader
+import pytest
+import yaml
+
+from sflow.config.loader import (
+    _FLOAT_WITHOUT_SEXAGESIMAL,
+    _INT_WITHOUT_SEXAGESIMAL,
+    ConfigLoader,
+    safe_load,
+)
 
 
 def _vars_to_map(config) -> dict[str, object]:
@@ -319,3 +327,170 @@ workflow:
         ConfigLoader().load_config(p)
 
     assert "does not enforce it" not in "\n".join(r.message for r in caplog.records)
+
+
+def test_unquoted_slurm_walltime_is_not_read_as_base_60(tmp_path):
+    """`time: 10:00:00` must reach the backend as a string, not YAML 1.1 base-60.
+
+    PyYAML resolves `10:00:00` to the integer 36000, which Slurm reads as 36000
+    *minutes*. Guards the ConfigLoader wiring, not just the loader helper.
+    """
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+version: "0.1"
+backends:
+  - name: slurm
+    type: slurm
+    default: true
+    partition: debug
+    account: test
+    nodes: 1
+    gpus_per_node: 1
+    time: 10:00:00
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    config = ConfigLoader().load_config(p)
+
+    assert config.backends[0].time == "10:00:00"
+
+
+def test_integer_walltime_still_means_minutes(tmp_path):
+    """A genuine integer must keep working — Slurm reads it as minutes."""
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+version: "0.1"
+backends:
+  - name: slurm
+    type: slurm
+    default: true
+    partition: debug
+    account: test
+    nodes: 1
+    gpus_per_node: 1
+    time: 5400
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    config = ConfigLoader().load_config(p)
+
+    assert config.backends[0].time == 5400
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "10:00:00",  # the reported case: 10 hours, not 36000
+        "9:00:00",
+        "1:30:00",
+        "10:00",
+        "01:00:00",  # leading zero already survived under YAML 1.1
+        "00:10:00",
+        "1-00:00:00",  # Slurm day-hour form
+        "10:00:00.5",  # sexagesimal *float* — used to fail validation outright
+    ],
+)
+def test_walltime_stays_a_string(text: str) -> None:
+    assert safe_load(f"time: {text}") == {"time": text}
+
+
+def test_only_sexagesimal_scalars_differ_from_pyyaml() -> None:
+    """Dropping base-60 must not disturb any other scalar type.
+
+    `017` is YAML 1.1 octal (15); `1e10` stays a string because PyYAML requires a
+    signed exponent. Both quirks are deliberately preserved.
+    """
+    document = (
+        "a: 7\nb: -7\nc: 0\nd: 0x1f\ne: 017\nf: 1.5\ng: -0.25\n"
+        "h: true\ni: null\nj: slurm\nk: [1, 2]\nl: {x: 1}\nm: 1e10\n"
+    )
+    assert safe_load(document) == yaml.safe_load(document)
+
+
+def test_loader_does_not_mutate_pyyaml_global_state() -> None:
+    """Also pins the upstream behavior this loader exists to neutralize."""
+    safe_load("time: 10:00:00")
+    assert yaml.safe_load("time: 10:00:00") == {"time": 36000}
+
+
+def _without_sexagesimal(pattern: str) -> str:
+    """Delete the base-60 alternative from a PyYAML resolver pattern."""
+    collapsed = re.sub(r"\s+", "", pattern)
+    return re.sub(r"\|[^|]*?\(\?::\[0-5\]\?\[0-9\]\)\+[^|)]*", "", collapsed)
+
+
+@pytest.mark.parametrize(
+    ("tag", "ours"),
+    [
+        ("tag:yaml.org,2002:int", _INT_WITHOUT_SEXAGESIMAL),
+        ("tag:yaml.org,2002:float", _FLOAT_WITHOUT_SEXAGESIMAL),
+    ],
+)
+def test_patterns_stay_in_sync_with_pyyaml(tag: str, ours) -> None:
+    """Fail loudly if PyYAML edits the patterns we copied.
+
+    Our resolvers are PyYAML's own, minus the base-60 branch. That copy would
+    otherwise rot silently on a PyYAML upgrade, so pin the relationship rather
+    than the literal text: re-derive ours from upstream and compare.
+    """
+    upstream = next(
+        pattern
+        for resolvers in yaml.SafeLoader.yaml_implicit_resolvers.values()
+        for resolver_tag, pattern in resolvers
+        if resolver_tag == tag
+    )
+    assert "(?::[0-5]?[0-9])+" in upstream.pattern, (
+        f"PyYAML no longer resolves {tag} as base-60; this workaround may be obsolete"
+    )
+    assert _without_sexagesimal(upstream.pattern) == re.sub(r"\s+", "", ours.pattern)
+
+
+def test_config_without_version_defaults_to_0_1(tmp_path):
+    """`version` is optional; omitting it means "0.1"."""
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    config = ConfigLoader().load_config(p)
+
+    assert config.version == "0.1"
+
+
+def test_explicit_unsupported_version_still_rejected(tmp_path):
+    """Optional does not mean unvalidated: a declared bad version still fails."""
+    p = tmp_path / "sflow.yaml"
+    p.write_text(
+        """
+version: "9.9"
+workflow:
+  name: wf
+  tasks:
+    - name: t1
+      script:
+        - echo hi
+""".lstrip()
+    )
+
+    with pytest.raises(Exception, match="9.9"):
+        ConfigLoader().load_config(p)
