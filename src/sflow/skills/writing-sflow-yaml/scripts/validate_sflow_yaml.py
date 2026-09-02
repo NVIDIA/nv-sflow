@@ -5,7 +5,7 @@ Usage:
     python validate_sflow_yaml.py <yaml_file> [<yaml_file> ...]
 
 Checks performed:
-    - version field is present and set to "0.1"
+    - version field, if declared, is "0.1" (the field is optional)
     - Top-level keys are from the allowed set
     - Variable references (${{ }}) have valid syntax
     - depends_on references exist as task names
@@ -24,6 +24,11 @@ import sys
 from pathlib import Path
 
 import yaml
+
+# Parse exactly as the runtime does: sflow's loader keeps `10:00:00` a string
+# instead of letting YAML 1.1 read it as the base-60 integer 36000. A validator
+# that disagrees with the runtime is worse than one that requires sflow.
+from sflow.config.loader import safe_load
 
 ALLOWED_TOP_LEVEL_KEYS = {
     "version",
@@ -158,8 +163,9 @@ def _resolve_variable_value(variables: dict, name: str) -> int | float | str | N
 
 
 def check_version(config: dict, result: ValidationResult) -> None:
+    # `version` is optional and defaults to "0.1". Only that value has ever
+    # existed, so omitting it is fine; declaring anything else is not.
     if "version" not in config:
-        result.error("Missing required field: 'version'")
         return
     if str(config["version"]) != "0.1":
         result.error(f"Invalid version: '{config['version']}' (must be '0.1')")
@@ -647,7 +653,7 @@ def validate_file(filepath: str) -> ValidationResult:
         return result
 
     try:
-        config = yaml.safe_load(content)
+        config = safe_load(content)
     except yaml.YAMLError as e:
         result.error(f"YAML syntax error: {e}")
         return result

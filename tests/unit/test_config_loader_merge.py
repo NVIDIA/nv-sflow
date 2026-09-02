@@ -125,11 +125,21 @@ class TestMergeConfigDicts:
         with pytest.raises(ValueError, match="No 'workflow' section"):
             merge_config_dicts([a, b])
 
-    def test_missing_version_raises(self):
+    def test_missing_version_is_allowed(self):
+        """`version` is optional; the schema defaults it to "0.1".
+
+        Behavior change: this previously raised "No 'version' field found in any
+        input file". Only "0.1" has ever existed, so requiring it bought nothing.
+        A conflict between files is still an error -- see
+        ``test_version_must_be_consistent``.
+        """
         a = {"workflow": {"name": "wf", "tasks": [{"name": "t", "script": ["echo"]}]}}
         b = {"variables": {"X": {"value": 1}}}
-        with pytest.raises(ValueError, match="No 'version' field"):
-            merge_config_dicts([a, b])
+
+        merged = merge_config_dicts([a, b])
+
+        assert "version" not in merged
+        assert merged["workflow"]["name"] == "wf"
 
     def test_missing_tasks_raises(self):
         a = {"version": "0.1", "workflow": {"name": "wf"}}

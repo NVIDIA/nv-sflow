@@ -22,6 +22,7 @@ import typer
 import yaml as _yaml
 
 from sflow.app.sflow import SflowApp
+from sflow.config.loader import safe_load
 from sflow.cli import DOCS_URL, app
 from sflow.cli._args import (  # split_list_arg re-exported for back-compat
     EnableTaskMonitorOption,
@@ -279,10 +280,9 @@ def _resolve_sbatch_extra_args(
     domain_map: dict[str, list[Any]] = {}
     for cfg_path in config_files:
         try:
-            import yaml as _yaml
 
             with open(cfg_path) as fh:
-                data = _yaml.safe_load(fh)
+                data = safe_load(fh)
             if data:
                 var_map.update(_build_var_map(data))
                 domain_map.update(extract_domains_from_raw_config(data))
@@ -1803,7 +1803,6 @@ def _derive_backend_int(
     runs when the regex returns None, so currently-resolving configs are unchanged and
     partial fragments (which the pipeline can't validate) keep their regex result.
     """
-    import yaml as _yaml
 
     merged_var_map: dict[str, Any] = {}
     all_data: list[dict] = []
@@ -1811,7 +1810,7 @@ def _derive_backend_int(
     for f in config_files:
         try:
             with open(f) as fh:
-                raw = _yaml.safe_load(fh)
+                raw = safe_load(fh)
             if isinstance(raw, dict):
                 all_data.append(raw)
                 merged_var_map.update(_build_var_map(raw))
@@ -2108,7 +2107,6 @@ def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
     """
     import glob as _glob
 
-    import yaml as _yaml
 
     candidates: list[Path] = []
     for p in paths:
@@ -2132,8 +2130,8 @@ def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
     for f in candidates:
         try:
             with open(f) as fh:
-                data = _yaml.safe_load(fh)
-            if isinstance(data, dict) and "version" in data:
+                data = safe_load(fh)
+            if isinstance(data, dict) and "workflow" in data:
                 valid.append(f.resolve())
         except Exception:
             continue
@@ -2216,10 +2214,9 @@ def _run_bulk_submit(
         # Warn about CLI variable overrides
         if cli_var_keys:
             try:
-                import yaml as _yaml
 
                 with open(yaml_file) as fh:
-                    data = _yaml.safe_load(fh)
+                    data = safe_load(fh)
                 config_var_names: set[str] = set()
                 raw_vars = data.get("variables") or []
                 if isinstance(raw_vars, dict):
@@ -2326,10 +2323,9 @@ def _run_bulk_submit(
                 # (loading the YAML) when the backend has no resolvable ``nodes`` field.
                 row_nodes = _derive_nodes([yaml_file], cli_overrides=cli_set_var)
                 if row_nodes is None:
-                    import yaml as _yaml
 
                     with open(yaml_file) as fh:
-                        data = _yaml.safe_load(fh)
+                        data = safe_load(fh)
                     row_nodes = _first_node_column_int(
                         _build_var_map(data, cli_overrides=cli_set_var)
                     )

@@ -11,7 +11,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 
 | Field | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
-| `version` | Yes | string | — | Schema version. Must be `"0.1"`. |
+| `version` | No | string | `"0.1"` | Schema version. If declared, must be `"0.1"`. |
 | `variables` | | dict / list | — | Global variables available to expressions and task env. |
 | `artifacts` | | dict / list | — | Named resources referenced by URI. |
 | `backends` | | dict / list | — | Compute backends (`local`, `slurm`, `docker`, `kubernetes`). |

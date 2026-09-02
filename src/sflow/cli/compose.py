@@ -18,6 +18,7 @@ from sflow.config.loader import (
     ConfigLoader,
     _normalize_script_plain_mappings,
     merge_config_dicts,
+    safe_load,
 )
 from sflow.logging import configure_logging, get_logger
 from sflow.resolution import ExpressionResolver, resolve_variables_inline
@@ -85,7 +86,7 @@ def _compose_files(
     config_dicts: List[Dict[str, Any]] = []
     for path in files:
         with open(path, "r") as f:
-            data = yaml.safe_load(f)
+            data = safe_load(f)
         if data is None:
             raise ValueError(f"Configuration file is empty: {path}")
         _normalize_script_plain_mappings(data)
