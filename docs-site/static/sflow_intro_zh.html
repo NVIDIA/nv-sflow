@@ -1,16 +1,16 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>sflow — Declarative Workflow Descriptor for Massive GPU Clusters</title>
+<title>sflow — 面向大规模 GPU 集群的声明式工作流描述器</title>
 <!-- Relative, so the pair stays linked under any deploy baseUrl (site root, /nv-sflow/, ...). -->
 <link rel="alternate" hreflang="en" href="sflow_intro.html">
 <link rel="alternate" hreflang="zh-Hans" href="sflow_intro_zh.html">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-snap-type:y mandatory;scroll-behavior:smooth;height:100%;overflow-x:hidden}
-body{font-family:'Consolas',monospace;background:#060a10;color:#dce3ed;height:100%}
+body{font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;background:#060a10;color:#dce3ed;height:100%}
 :root{
   --cy:#00d4ff;--gr:#76ff02;--bg:#060a10;--card:#0d1420;--card-h:#141e2e;
   --txt:#dce3ed;--dim:#6b7d95;--bdr:rgba(0,212,255,0.12);
@@ -18,17 +18,17 @@ body{font-family:'Consolas',monospace;background:#060a10;color:#dce3ed;height:10
   --t:clamp(2rem,5.5vw,4.5rem);--h:clamp(1.6rem,3.8vw,3.0rem);
   --b:clamp(1.2rem,2vw,1.5rem);--s:clamp(.72rem,1.1vw,.95rem);
   --pad:clamp(1rem,4vw,4rem);--gap:clamp(.5rem,1.8vw,1.6rem);
-  --font-display:'Syne','Bahnschrift','Segoe UI',sans-serif;
-  --font-heavy:'Archivo Black','Arial Black','Segoe UI Black','Bahnschrift',sans-serif;
+  --font-display:'Syne','Bahnschrift','Segoe UI','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',sans-serif;
+  --font-heavy:'Archivo Black','Arial Black','Segoe UI Black','Bahnschrift','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',sans-serif;
 }
 .sec{width:100vw;min-height:100vh;height:100dvh;overflow:hidden;scroll-snap-align:start;position:relative;display:flex;align-items:center;justify-content:center;content-visibility:auto;contain-intrinsic-size:100vh;contain:layout paint style}
 .legacy-hidden{display:none!important}
 .inner{position:relative;z-index:2;width:100%;max-width:1200px;padding:var(--pad);display:flex;flex-direction:column;gap:var(--gap)}
 h1{font-family:var(--font-display);font-weight:800;font-size:var(--t);letter-spacing:-.03em;line-height:1.1;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-h2{font-family:'Consolas',monospace;font-weight:700;font-size:var(--h);color:var(--txt);line-height:1.2}
-h3{font-family:'Consolas',monospace;font-weight:600;font-size:clamp(.95rem,1.4vw,1.15rem);color:var(--txt);margin-bottom:.15rem}
+h2{font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-weight:700;font-size:var(--h);color:var(--txt);line-height:1.2}
+h3{font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-weight:600;font-size:clamp(.95rem,1.4vw,1.15rem);color:var(--txt);margin-bottom:.15rem}
 p,li{font-size:var(--b);color:var(--dim);line-height:1.6}
-code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
+code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:.95em}
 .accent{color:var(--cy)}.green{color:var(--gr)}
 
 /* === ANIMATIONS (only run on visible slides) === */
@@ -108,10 +108,10 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .problem-source b{color:var(--cy)}
 .dup-matrix{display:grid;grid-template-columns:minmax(6.8rem,.8fr) repeat(3,minmax(0,1fr));gap:clamp(.22rem,.55vw,.4rem);width:100%;max-width:1040px;align-self:center}
 .dup-head{padding:clamp(.25rem,.5vw,.4rem);border-bottom:1px solid rgba(255,123,114,.35);color:#ff7b72;text-align:center;font-family:var(--font-display);font-size:clamp(.62rem,1vw,.82rem)}
-.dup-corner{color:var(--dim);text-align:left;font-family:'Consolas',monospace;font-size:clamp(.48rem,.72vw,.6rem)}
+.dup-corner{color:var(--dim);text-align:left;font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.48rem,.72vw,.6rem)}
 .dup-label{display:flex;align-items:center;padding:clamp(.28rem,.55vw,.42rem);border-left:2px solid rgba(255,123,114,.45);color:var(--txt);font-size:clamp(.54rem,.82vw,.68rem);font-weight:700}
 .dup-cell{position:relative;min-width:0;padding:clamp(.28rem,.58vw,.44rem) clamp(.35rem,.7vw,.55rem);border:1px solid rgba(255,123,114,.58);border-radius:5px;background:rgba(255,123,114,.07);color:#ff7b72;opacity:.68;overflow:hidden}
-.dup-cell::after{content:"COPY";position:absolute;right:clamp(.18rem,.4vw,.3rem);top:clamp(.12rem,.3vw,.22rem);color:rgba(255,123,114,.42);font-size:clamp(.38rem,.56vw,.46rem);font-weight:700}
+.dup-cell::after{content:"重复";position:absolute;right:clamp(.18rem,.4vw,.3rem);top:clamp(.12rem,.3vw,.22rem);color:rgba(255,123,114,.42);font-size:clamp(.38rem,.56vw,.46rem);font-weight:700}
 .dup-cell code{display:block;padding-right:clamp(1.6rem,3vw,2.4rem);color:#a99296;font-size:clamp(.46rem,.68vw,.56rem);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dup-total{align-self:center;width:min(90vw,820px);display:flex;justify-content:center;gap:clamp(.4rem,1vw,.8rem);padding:clamp(.42rem,.85vw,.65rem);border:1px solid rgba(255,123,114,.55);border-radius:8px;background:rgba(255,123,114,.035);color:var(--dim);font-size:clamp(.56rem,.86vw,.7rem)}
 .dup-total b{color:#ff7b72}
@@ -144,7 +144,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 @keyframes flowhop{from{opacity:.12;transform:translateX(calc(-1 * clamp(.3rem,.8vw,.6rem)));color:var(--dim)}to{opacity:1;transform:translateX(0);color:var(--gr)}}
 .recipe-tree{display:grid;grid-template-columns:minmax(7.5rem,.65fr) minmax(0,2.35fr);gap:clamp(.9rem,2.2vw,1.7rem);width:100%;max-width:1040px;align-self:center;align-items:center}
 .tree-root{position:relative;padding:clamp(.8rem,1.5vw,1.1rem);border:1px solid var(--cy);border-radius:9px;background:var(--card);text-align:center;color:var(--cy);font-family:var(--font-heavy);font-size:clamp(1rem,2vw,1.5rem);box-shadow:0 0 14px rgba(0,212,255,.12)}
-.tree-root small{display:block;margin-top:clamp(.18rem,.4vw,.3rem);color:var(--dim);font-family:'Consolas',monospace;font-size:clamp(.46rem,.68vw,.56rem);font-weight:400}
+.tree-root small{display:block;margin-top:clamp(.18rem,.4vw,.3rem);color:var(--dim);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.46rem,.68vw,.56rem);font-weight:400}
 .tree-root::after{content:"";position:absolute;left:100%;top:50%;width:clamp(.9rem,2.2vw,1.7rem);height:1px;background:var(--cy);opacity:.45}
 .tree-branches{display:grid;gap:clamp(.28rem,.65vw,.48rem);padding-left:clamp(.75rem,1.8vw,1.35rem);border-left:1px solid rgba(0,212,255,.45)}
 .tree-branch{position:relative;display:grid;grid-template-columns:minmax(7.5rem,.8fr) minmax(0,2fr);gap:clamp(.4rem,.9vw,.7rem);align-items:center;opacity:.68}
@@ -212,9 +212,9 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
    existing treebranch/flowhop keyframes so the motion vocabulary matches the
    recipe-tree and developer-loop slides rather than introducing a new one. */
 .evo-grid{display:grid;gap:clamp(.5rem,1.15vw,.9rem);width:100%;max-width:1120px;align-self:center}
-.evo-row{display:grid;grid-template-columns:minmax(5rem,.46fr) minmax(0,.82fr) auto minmax(0,1.9fr);gap:clamp(.38rem,.9vw,.7rem);align-items:stretch}
+.evo-row{display:grid;grid-template-columns:minmax(5rem,.4fr) minmax(0,.82fr) auto minmax(0,1.9fr);gap:clamp(.38rem,.9vw,.7rem);align-items:stretch}
 .evo-axis{display:flex;flex-direction:column;justify-content:center;padding-left:clamp(.35rem,.75vw,.55rem);border-left:2px solid rgba(0,212,255,.5);color:var(--txt);font-family:var(--font-display);font-size:clamp(.6rem,.92vw,.78rem);font-weight:700}
-.evo-axis small{margin-top:.25em;color:var(--dim);font-family:'Consolas',monospace;font-size:clamp(.44rem,.66vw,.55rem);font-weight:400}
+.evo-axis small{margin-top:.25em;color:var(--dim);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.44rem,.66vw,.55rem);font-weight:400}
 .evo-panel{position:relative;display:flex;flex-direction:column;justify-content:center;gap:clamp(.3rem,.62vw,.48rem);padding:clamp(.55rem,1.05vw,.8rem);border:1px solid #3d444d;border-radius:8px;background:#0d1117;opacity:.12}
 .evo-cap{position:absolute;top:calc(-1 * clamp(.42rem,.85vw,.62rem));left:clamp(.5rem,1vw,.75rem);padding:0 clamp(.28rem,.55vw,.45rem);background:var(--bg);color:var(--dim);font-size:clamp(.44rem,.66vw,.55rem);font-weight:700;letter-spacing:.1em}
 .evo-now{border-color:rgba(118,255,2,.5)}.evo-now .evo-cap{color:var(--gr)}
@@ -225,7 +225,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .evo-link{color:var(--gr);font-size:clamp(.5rem,.8vw,.66rem);opacity:.45}
 .evo-note{color:var(--dim);font-size:clamp(.46rem,.7vw,.58rem);line-height:1.4}
 /* Filled bars, not outlined squares: an empty bordered box at text size sitting
-   inline beside copy is indistinguishable from a missing-glyph tofu box. */
+   inline beside CJK copy is indistinguishable from a missing-glyph tofu box. */
 .evo-mini{display:flex;align-items:flex-end;gap:clamp(.1rem,.24vw,.19rem);color:#4a5364}
 .evo-now .evo-mini{color:var(--gr)}
 .evo-mini i{width:clamp(.19rem,.4vw,.28rem);height:clamp(.5rem,1.05vw,.76rem);background:currentColor;border-radius:1px;opacity:.85;box-shadow:0 0 5px currentColor}
@@ -247,15 +247,14 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .persp-side span{color:var(--dim);font-size:clamp(.46rem,.7vw,.58rem);line-height:1.4}
 .persp-side.now{border-color:rgba(118,255,2,.5)}.persp-side.now b{color:var(--gr)}
 .persp-arrow{align-self:center;color:var(--gr);font-size:clamp(.95rem,1.8vw,1.4rem)}
-.stack{--stackcols:minmax(6.4rem,.92fr) minmax(0,2.1fr) minmax(6.2rem,1.08fr);
+
+.stack{--stackcols:minmax(6.4rem,.92fr) minmax(0,2.1fr) minmax(6.2rem,1.02fr);
   display:grid;grid-template-columns:auto minmax(0,1fr);gap:clamp(.4rem,.9vw,.7rem);
   width:100%;max-width:1120px;align-self:center}
 .stack-axis{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:clamp(.2rem,.45vw,.35rem);padding:0 clamp(.3rem,.65vw,.5rem)}
 .stack-axis::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:2px;transform:translateX(-50%);background:linear-gradient(to top,var(--cy),var(--gr));opacity:.5}
 .stack-axis span{position:relative;z-index:1;background:var(--bg);padding:clamp(.2rem,.45vw,.35rem) 0;color:var(--gr);font-size:clamp(.6rem,.95vw,.8rem)}
-/* Rotated 180deg on top of vertical-rl so the label reads bottom-to-top, matching
-   the arrow above it -- the usual treatment for a chart's y-axis caption. */
-.stack-axis em{position:relative;z-index:1;writing-mode:vertical-rl;transform:rotate(180deg);font-style:normal;background:var(--bg);padding:clamp(.25rem,.55vw,.4rem) 0;color:var(--dim);font-family:var(--font-display);font-size:clamp(.5rem,.78vw,.64rem);letter-spacing:.18em}
+.stack-axis em{position:relative;z-index:1;writing-mode:vertical-rl;font-style:normal;background:var(--bg);padding:clamp(.25rem,.55vw,.4rem) 0;color:var(--dim);font-family:var(--font-display);font-size:clamp(.5rem,.78vw,.64rem);letter-spacing:.22em}
 .stack-layers{display:grid;gap:clamp(.22rem,.5vw,.36rem)}
 .stack-head,.layer{display:grid;grid-template-columns:var(--stackcols);gap:clamp(.35rem,.8vw,.6rem);align-items:center}
 .stack-head .head-nodes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(.25rem,.55vw,.42rem)}
@@ -269,36 +268,37 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .layer-align b{color:var(--gr);font-weight:700}
 .sec.on .layer{animation:dagready .45s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--layer-delay)}
 .sec.on .layer-align{animation:flowhop .4s ease forwards;animation-delay:var(--align-delay)}
-@media(max-width:820px){.stack{grid-template-columns:1fr}.stack-axis{flex-direction:row}.stack-axis em{writing-mode:horizontal-tb;transform:none}.stack-head,.layer{grid-template-columns:1fr}.layer-align{text-align:left}}
+@media(max-width:820px){.stack{grid-template-columns:1fr}.stack-axis{flex-direction:row}.stack-axis em{writing-mode:horizontal-tb}.stack-head,.layer{grid-template-columns:1fr}.layer-align{text-align:left}}
 
 /* === PLATFORM FRAGMENTATION (slide 4) ===
-   Three platform "dialect" cards, each showing the native syntax you actually have
+   Four platform "dialect" cards, each showing the native syntax you actually have
    to write, plus a learning-curve meter. Below them a two-lane mini-gantt: the app
    lane stalls on a wait block exactly as long as the platform lane's compat work,
-   which is the whole point of the slide. The label column is a fixed width so the
-   two tracks start at the same x -- that alignment IS the argument. Idle gantt
-   cells are borderless on purpose; an empty bordered cell reads as a broken glyph. */
+   which is the whole point of the slide. Idle gantt cells are borderless on
+   purpose -- an empty bordered cell reads as a missing glyph. */
 .dialect-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(.4rem,.95vw,.75rem);width:100%;max-width:1120px;align-self:center}
 .dialect{display:flex;flex-direction:column;gap:clamp(.28rem,.6vw,.45rem);padding:clamp(.5rem,1vw,.75rem);border:1px solid var(--bdr);border-radius:8px;background:var(--card);opacity:.12}
 .dialect h3{color:currentColor;font-family:var(--font-display);font-size:clamp(.62rem,.98vw,.8rem);margin:0}
-.dialect-code{padding:clamp(.32rem,.65vw,.5rem);border:1px solid #2b3544;border-left:2px solid currentColor;border-radius:4px;background:#0d1117;color:var(--dim);font-family:'Consolas',monospace;font-size:clamp(.4rem,.62vw,.52rem);line-height:1.5;white-space:pre;overflow:hidden;text-overflow:ellipsis}
+.dialect-code{padding:clamp(.32rem,.65vw,.5rem);border:1px solid #2b3544;border-left:2px solid currentColor;border-radius:4px;background:#0d1117;color:var(--dim);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.4rem,.62vw,.52rem);line-height:1.5;white-space:pre;overflow:hidden;text-overflow:ellipsis}
 .dialect-learn{color:var(--dim);font-size:clamp(.4rem,.62vw,.52rem);line-height:1.4}
 .dialect-meter{display:flex;align-items:center;gap:clamp(.18rem,.4vw,.3rem);margin-top:auto}
 .dialect-meter em{font-style:normal;color:var(--dim);font-size:clamp(.38rem,.58vw,.48rem);letter-spacing:.06em}
 .dialect-meter i{flex:1;height:clamp(.24rem,.48vw,.34rem);border-radius:2px;background:#2b3544}
 .dialect-meter i.lit{background:currentColor;box-shadow:0 0 5px currentColor}
+
 .drag-band{display:grid;gap:clamp(.28rem,.6vw,.45rem);width:100%;max-width:1120px;align-self:center;padding:clamp(.5rem,1vw,.75rem);border:1px solid rgba(255,123,114,.4);border-radius:8px;background:rgba(255,123,114,.03)}
-.drag-row{display:grid;grid-template-columns:clamp(5rem,8.5vw,7.5rem) minmax(0,1fr);gap:clamp(.35rem,.8vw,.6rem);align-items:center}
+.drag-row{display:grid;grid-template-columns:minmax(4.6rem,auto) minmax(0,1fr);gap:clamp(.35rem,.8vw,.6rem);align-items:center}
 .drag-label{color:var(--txt);font-family:var(--font-display);font-size:clamp(.5rem,.78vw,.64rem);font-weight:700}
 .drag-track{display:flex;gap:clamp(.14rem,.3vw,.24rem);align-items:center}
-.drag-track i{display:flex;align-items:center;justify-content:center;height:clamp(.95rem,1.9vw,1.35rem);border-radius:3px;font-style:normal;font-size:clamp(.4rem,.6vw,.5rem);white-space:nowrap;overflow:hidden;opacity:.12}
+.drag-track i{display:flex;align-items:center;justify-content:center;height:clamp(.95rem,1.9vw,1.35rem);border-radius:3px;font-style:normal;font-size:clamp(.4rem,.6vw,.5rem);white-space:nowrap;overflow:hidden}
 .blk.go{background:rgba(118,255,2,.18);border:1px solid rgba(118,255,2,.55);color:var(--gr)}
 .blk.wait{background:repeating-linear-gradient(135deg,rgba(255,123,114,.16) 0 6px,transparent 6px 12px);border:1px dashed rgba(255,123,114,.6);color:#ff7b72}
 .blk.work{background:rgba(227,179,65,.16);border:1px solid rgba(227,179,65,.6);color:#e3b341}
-.blk.idle{background:none;border:0;opacity:1!important;animation:none!important}
+.blk.idle{background:none;border:0}
 .sec.on .dialect{animation:adapterin .5s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--dia-delay)}
 .sec.on .drag-track i{animation:copycell .4s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--blk-delay)}
-@media(max-width:820px){.dialect-grid{grid-template-columns:1fr}.drag-row{grid-template-columns:1fr}}
+.drag-track i{opacity:.12}.blk.idle{opacity:1!important;animation:none!important}
+@media(max-width:820px){.dialect-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.drag-row{grid-template-columns:1fr}}
 
 /* === DAG SLIDE LAYOUT (slide 7) ===
    The graph is a tall narrow column on a 16:9 stage, so the takeaway cards sit
@@ -331,7 +331,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .fc p{font-size:var(--s);margin:0;line-height:1.35}
 
 /* === TERMINAL BLOCK === */
-.term{background:#0d1117;border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.2rem);font-family:'Consolas',monospace;font-size:clamp(.6rem,1vw,.88rem);line-height:1.55;color:#8b949e;position:relative;overflow:hidden;white-space:pre;overflow-x:auto}
+.term{background:#0d1117;border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.2rem);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.6rem,1vw,.88rem);line-height:1.55;color:#8b949e;position:relative;overflow:hidden;white-space:pre;overflow-x:auto}
 .term .hi{color:var(--txt)}.term .cy{color:var(--cy)}.term .gr{color:var(--gr)}
 .term .rd{color:#ff7b72}.term .yl{color:#e3b341}.term .wh{color:#c9d1d9}
 .livebar{display:inline-block;width:30ch;position:relative;color:transparent;vertical-align:bottom}
@@ -367,7 +367,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 @media(max-height:600px){.obs-chart-card{min-height:clamp(3.6rem,9vh,4.7rem);padding:clamp(.32rem,.65vw,.5rem)}.obs-line-chart{height:clamp(1.2rem,3.8vh,1.9rem)}}
 
 /* === DAG FLOWCHART === */
-.dag{display:flex;flex-direction:column;align-items:center;gap:clamp(.3rem,.6vw,.5rem);font-family:'Consolas',monospace;font-size:clamp(.6rem,1vw,.85rem)}
+.dag{display:flex;flex-direction:column;align-items:center;gap:clamp(.3rem,.6vw,.5rem);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.6rem,1vw,.85rem)}
 .dag-row{display:flex;gap:clamp(.3rem,.8vw,.6rem);justify-content:center;flex-wrap:wrap}
 .dag-node{border:1px solid #3d444d;border-radius:4px;padding:.25em .7em;color:#c9d1d9;background:#161b22;white-space:nowrap;transition:border-color .3s,box-shadow .3s}
 .dag-node:hover{border-color:var(--cy);box-shadow:0 0 10px rgba(0,212,255,.15)}
@@ -655,17 +655,17 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
 </a>
 <div class="corner-links">
-<a href="docs/user/intro" class="doc-corner" target="_top" onclick="event.stopPropagation()">Docs &rarr;</a>
-<a href="feature-map" class="map-corner" target="_top" onclick="event.stopPropagation()">Feature Map &rarr;</a>
+<a href="docs/user/intro" class="doc-corner" target="_top" onclick="event.stopPropagation()">文档 &rarr;</a>
+<a href="feature-map" class="map-corner" target="_top" onclick="event.stopPropagation()">功能地图 &rarr;</a>
 <!-- No target: the deck is also iframed as the site homepage, and swapping in place
      keeps the reader where they are instead of punting them to a bare file URL. -->
-<a href="sflow_intro_zh.html" class="lang-corner" id="langToggle" hreflang="zh-Hans" lang="zh-Hans" title="切换到中文" onclick="event.stopPropagation()">
-<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>中文</a>
+<a href="sflow_intro.html" class="lang-corner" id="langToggle" hreflang="en" lang="en" title="Switch to English" onclick="event.stopPropagation()">
+<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>English</a>
 </div>
 <div class="prog" id="prog"></div>
 <div class="tmr" id="tmr"></div>
 <nav class="dots" id="dots"></nav>
-<div class="badge" id="badge">press P to enable auto-scroll</div>
+<div class="badge" id="badge">按 P 开启自动播放</div>
 
 <!-- 1: Title -->
 <section class="sec" id="s1">
@@ -675,21 +675,21 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <span class="sn">01 / 18</span>
 <div class="inner"><div class="hero">
 <div class="hero-brand r as d0"><span>NV-SFLOW</span></div>
-<h2 class="hero-desc r au d1">Workflow orchestrator for <span class="accent">large-scale GPU clusters</span> of <span class="green">any kind</span></h2>
-<p class="hero-slogan r au d2">Describe once. Run anywhere.<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
+<h2 class="hero-desc r au d1">面向<span class="accent">大规模 GPU 集群</span>的<span class="green">通用</span>工作流编排引擎</h2>
+<p class="hero-slogan r au d2">一次描述，随处运行。<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
 <div class="flow-band r au d3">
 <span class="fan flow-in"><span class="flow-labels"><i>vLLM</i><i>SGLang</i><i>TensorRT-LLM</i><i>Dynamo</i><i>PyTorch</i><i class="more">&hellip;</i></span><svg viewBox="0 0 104 120" aria-hidden="true"><path pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path pathLength="100" d="M5,110 C50,110 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,110 C50,110 58,60 99,60"/><circle cx="5" cy="10" r="3.2"/><circle cx="5" cy="30" r="3.2"/><circle cx="5" cy="50" r="3.2"/><circle cx="5" cy="70" r="3.2"/><circle cx="5" cy="90" r="3.2"/><circle cx="5" cy="110" r="3.2"/></svg></span>
 <span class="flow-hub"><img src="img/sflow-logo.jpg" alt="sflow" decoding="async" fetchpriority="high"></span>
 <span class="fan flow-out"><svg viewBox="0 0 174 100" aria-hidden="true"><path pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path pathLength="100" d="M8,50 L166,50"/><path pathLength="100" d="M8,50 C78,50 94,84 166,84"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path class="pulse" pathLength="100" d="M8,50 L166,50"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,84 166,84"/><circle cx="166" cy="16" r="5.4"/><circle cx="166" cy="50" r="5.4"/><circle cx="166" cy="84" r="5.4"/></svg><span class="flow-labels"><i>Kubernetes</i><i>Slurm</i><i>Docker</i></span></span>
 </div>
 <div class="hero-cta r au d3">
-<a href="docs/user/intro" class="doc-btn primary" target="_top" onclick="event.stopPropagation()">View Documentation &rarr;</a>
-<a href="feature-map" class="doc-btn ghost" target="_top" onclick="event.stopPropagation()">Feature Map &rarr;</a>
+<a href="https://nvidia.github.io/nv-sflow/docs/user/intro" class="doc-btn primary" target="_blank" rel="noopener" onclick="event.stopPropagation()">查看文档 &rarr;</a>
+<a href="https://nvidia.github.io/nv-sflow/feature-map" class="doc-btn ghost" target="_blank" rel="noopener" onclick="event.stopPropagation()">功能地图 &rarr;</a>
 <a href="https://github.com/NVIDIA/nv-sflow" class="doc-btn ghost gh-btn" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;margin-right:.4em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
 </div>
 </div></div>
-<a href="#s2" class="scroll-cue" aria-label="Scroll down to explore">
-<span>Scroll</span>
+<a href="#s2" class="scroll-cue" aria-label="向下滚动继续浏览">
+<span>滚动</span>
 <svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 8l7 7 7-7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
 </a>
 </section>
@@ -700,39 +700,39 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="orb og" style="width:300px;height:300px;top:-70px;right:10%"></div>
 <span class="sn">02 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">Workload Evolution</span>
-<h2 class="r al d1 ms">From local host container, to cluster level multi-stage service</h2>
+<span class="pill pc r ap d0 ms">工作负载演进</span>
+<h2 class="r al d1 ms">从本地单机容器，到集群级多阶段服务</h2>
 <div class="evo-grid r as d2">
   <div class="evo-row">
-    <div class="evo-axis">Deployment scale<small>where it runs</small></div>
+    <div class="evo-axis">部署规模<small>跑在哪里</small></div>
     <div class="evo-panel" style="--evo-delay:.3s">
-      <span class="evo-cap">BEFORE</span>
-      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:.45s">Single local host</span><span class="evo-mini"><i></i></span></div>
-      <div class="evo-note">1 node &middot; 1-8 GPUs &middot; nothing to coordinate across machines</div>
+      <span class="evo-cap">过去</span>
+      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:.45s">本地单机</span><span class="evo-mini"><i></i></span></div>
+      <div class="evo-note">1 个节点 · 1-8 张 GPU · 无跨节点依赖</div>
     </div>
     <div class="evo-arrow" style="--evo-delay:.6s">&#10132;</div>
     <div class="evo-panel evo-now" style="--evo-delay:.75s">
-      <span class="evo-cap">NOW</span>
-      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:.9s">Multi-node cluster service</span><span class="evo-mini"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></div>
-      <div class="evo-note">Tens to hundreds of nodes &middot; cross-node traffic and topology &middot; schedulers, quotas and lifecycle</div>
+      <span class="evo-cap">现在</span>
+      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:.9s">多节点集群级服务</span><span class="evo-mini"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></div>
+      <div class="evo-note">数十至数百个节点 · 跨节点通信与拓扑 · 调度器、配额与生命周期</div>
     </div>
   </div>
   <div class="evo-row">
-    <div class="evo-axis">Serving architecture<small>how it is served</small></div>
+    <div class="evo-axis">服务架构<small>怎么被服务</small></div>
     <div class="evo-panel" style="--evo-delay:1.05s">
-      <span class="evo-cap">BEFORE</span>
+      <span class="evo-cap">过去</span>
       <div class="evo-chain"><span class="evo-chip" style="--evo-delay:1.2s">Agg Server</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:1.3s">Client</span></div>
-      <div class="evo-note">One stage &middot; one command brings the service up</div>
+      <div class="evo-note">单阶段 · 一条命令拉起服务</div>
     </div>
     <div class="evo-arrow" style="--evo-delay:1.45s">&#10132;</div>
     <div class="evo-panel evo-now" style="--evo-delay:1.6s">
-      <span class="evo-cap">NOW</span>
-      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:1.75s">Router</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:1.9s">PD Disagg</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:2.05s">KV Transfer</span><span class="evo-link">&rarr;</span><span class="evo-chip hetero" style="--evo-delay:2.2s">Heterogeneous Compute</span></div>
-      <div class="evo-note">Many stages &middot; many components &middot; each with its own resources and readiness</div>
+      <span class="evo-cap">现在</span>
+      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:1.75s">Router</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:1.9s">PD 分离</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:2.05s">KV Transfer</span><span class="evo-link">&rarr;</span><span class="evo-chip hetero" style="--evo-delay:2.2s">异构计算</span></div>
+      <div class="evo-note">多阶段 · 多组件协同 · 每个阶段各自的资源与就绪条件</div>
     </div>
   </div>
 </div>
-<div class="merge-assumption r au d4"><b style="color:#e3b341">The complexity moved:</b> it is the same model &mdash; but getting it running went from <b style="color:var(--gr)">starting one process</b> to orchestrating a whole distributed system.</div>
+<div class="merge-assumption r au d4"><b style="color:#e3b341">复杂度就此转移：</b>模型还是那个模型，但把它跑起来，已经从「起一个进程」变成「编排一整套分布式系统」。</div>
 </div>
 </section>
 
@@ -742,45 +742,45 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="orb oc" style="width:280px;height:280px;bottom:-70px;left:8%"></div>
 <span class="sn">03 / 18</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Perspective Shift</span>
-<h2 class="r al d1 ms">A wider orchestration lens: from one machine to one cluster</h2>
+<span class="pill pg r ap d0 ms">视角转变</span>
+<h2 class="r al d1 ms">更宏观的编排视角：从一台机器，到一个集群</h2>
 <div class="persp-strip r as d2">
-  <div class="persp-side"><b>Single-host view</b><span>All five layers sit on the same machine, so they line up by default &mdash; install it, run it, done.</span></div>
+  <div class="persp-side"><b>单机视角</b><span>五层都挤在同一台机器里，天然就是一致的 &mdash; 装好、跑起来，就结束了。</span></div>
   <div class="persp-arrow">&#10132;</div>
-  <div class="persp-side now"><b>Cluster view</b><span>The same five layers exist on every node, and they all have to agree &mdash; one layer out of step and the whole workflow fails.</span></div>
+  <div class="persp-side now"><b>集群视角</b><span>同样五层要在每个节点上各来一份，还必须彼此对齐 &mdash; 任何一层错位，整个工作流都跑不起来。</span></div>
 </div>
 <div class="stack r as d3">
-  <div class="stack-axis"><span>&#8593;</span><em>BOTTOM-UP</em></div>
+  <div class="stack-axis"><span>&#8593;</span><em>自下而上</em></div>
   <div class="stack-layers">
     <div class="stack-head"><span></span><div class="head-nodes"><i>node-0</i><i>node-1</i><i>node-2</i><i>node-3</i></div><span></span></div>
     <div class="layer" style="--layer-delay:1.15s;--align-delay:1.95s;color:var(--gr)">
-      <div class="layer-name"><b>App workflow</b><small>DAG &middot; task deps &middot; probes</small></div>
+      <div class="layer-name"><b>应用工作流</b><small>DAG · 任务依赖 · 探针</small></div>
       <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
-      <div class="layer-align">Across nodes: <b>dependencies and readiness</b></div>
+      <div class="layer-align">跨节点<b>依赖与就绪对齐</b></div>
     </div>
     <div class="layer" style="--layer-delay:1s;--align-delay:1.8s;color:#a4e83a">
-      <div class="layer-name"><b>Software</b><small>vLLM &middot; SGLang &middot; TensorRT-LLM &middot; images</small></div>
+      <div class="layer-name"><b>软件</b><small>vLLM · SGLang · TensorRT-LLM · 镜像</small></div>
       <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
-      <div class="layer-align">Across nodes: <b>matching versions and images</b></div>
+      <div class="layer-align">跨节点<b>版本与镜像一致</b></div>
     </div>
     <div class="layer" style="--layer-delay:.85s;--align-delay:1.65s;color:#e3b341">
-      <div class="layer-name"><b>Infra platform</b><small>Slurm &middot; Kubernetes &middot; Docker</small></div>
+      <div class="layer-name"><b>基础设施平台</b><small>Slurm · Kubernetes · Docker</small></div>
       <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
-      <div class="layer-align">Across nodes: <b>scheduling, quota, network</b></div>
+      <div class="layer-align">跨节点<b>调度、配额与网络</b></div>
     </div>
     <div class="layer" style="--layer-delay:.7s;--align-delay:1.5s;color:#4fc3e8">
-      <div class="layer-name"><b>Driver</b><small>CUDA &middot; NCCL &middot; NIC drivers</small></div>
+      <div class="layer-name"><b>驱动</b><small>CUDA · NCCL · 网卡驱动</small></div>
       <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
-      <div class="layer-align">Across nodes: <b>driver and firmware parity</b></div>
+      <div class="layer-align">跨节点<b>驱动与固件对齐</b></div>
     </div>
     <div class="layer" style="--layer-delay:.55s;--align-delay:1.35s;color:var(--cy)">
-      <div class="layer-name"><b>Hardware</b><small>GPU &middot; NVLink &middot; IB &middot; topology</small></div>
+      <div class="layer-name"><b>硬件</b><small>GPU · NVLink · IB · 拓扑</small></div>
       <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
-      <div class="layer-align">Across nodes: <b>same topology and visibility</b></div>
+      <div class="layer-align">跨节点<b>拓扑与可见性一致</b></div>
     </div>
   </div>
 </div>
-<div class="merge-assumption r au d5"><b style="color:#e3b341">So the thing being orchestrated changed:</b> not &ldquo;start one process&rdquo;, but <b style="color:var(--gr)">compose all five layers as a whole</b> and keep every node <b style="color:var(--gr)">sharing the same information and the same conventions</b>.</div>
+<div class="merge-assumption r au d5"><b style="color:#e3b341">于是编排的对象变了：</b>不再是「把一个进程跑起来」，而是把五层<b style="color:var(--gr)">当成一个整体来组合</b>，并让节点之间<b style="color:var(--gr)">共享同一份信息、保持同一套约定</b>。</div>
 </div>
 </section>
 
@@ -790,51 +790,51 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="orb og" style="width:270px;height:270px;top:-60px;right:14%"></div>
 <span class="sn">04 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">Platform Fragmentation</span>
-<h2 class="r al d1 ms">Every platform speaks its own dialect</h2>
+<span class="pill pc r ap d0 ms">基础设施差异</span>
+<h2 class="r al d1 ms">每个平台一套语义，编排流程重复构建</h2>
 <div class="dialect-grid r as d2">
   <div class="dialect" style="--dia-delay:.3s;color:#e3b341">
     <h3>Slurm</h3>
     <div class="dialect-code">#SBATCH --gres=gpu:8
 srun --ntasks=16 ...</div>
-    <div class="dialect-learn">Partitions, accounts and QoS &middot; sbatch syntax &middot; hostlist expansion</div>
-    <div class="dialect-meter"><em>LEARNING CURVE</em><i class="lit"></i><i class="lit"></i><i class="lit"></i><i></i></div>
+    <div class="dialect-learn">分区、账户与 QoS · sbatch 语法 · hostlist 展开规则</div>
+    <div class="dialect-meter"><em>学习曲线</em><i class="lit"></i><i class="lit"></i><i class="lit"></i><i></i></div>
   </div>
   <div class="dialect" style="--dia-delay:.45s;color:var(--cy)">
     <h3>Kubernetes</h3>
     <div class="dialect-code">resources.limits:
   nvidia.com/gpu: 8</div>
-    <div class="dialect-learn">Manifests and CRDs &middot; labels and affinity &middot; RBAC and namespaces</div>
-    <div class="dialect-meter"><em>LEARNING CURVE</em><i class="lit"></i><i class="lit"></i><i class="lit"></i><i class="lit"></i></div>
+    <div class="dialect-learn">manifest 与 CRD · label 与 affinity · RBAC 与 namespace</div>
+    <div class="dialect-meter"><em>学习曲线</em><i class="lit"></i><i class="lit"></i><i class="lit"></i><i class="lit"></i></div>
   </div>
   <div class="dialect" style="--dia-delay:.6s;color:var(--gr)">
     <h3>Docker</h3>
     <div class="dialect-code">docker run --gpus all
   --network host ...</div>
-    <div class="dialect-learn">Images and mounts &middot; device mapping &middot; compose syntax</div>
-    <div class="dialect-meter"><em>LEARNING CURVE</em><i class="lit"></i><i class="lit"></i><i></i><i></i></div>
+    <div class="dialect-learn">镜像与挂载 · 设备映射 · compose 语法</div>
+    <div class="dialect-meter"><em>学习曲线</em><i class="lit"></i><i class="lit"></i><i></i><i></i></div>
   </div>
 </div>
 <div class="drag-band r as d3">
   <div class="drag-row">
-    <span class="drag-label">App iteration</span>
+    <span class="drag-label">应用迭代</span>
     <div class="drag-track">
-      <i class="blk go" style="flex:1;--blk-delay:1s">edit</i>
-      <i class="blk go" style="flex:1;--blk-delay:1.1s">run</i>
-      <i class="blk wait" style="flex:5;--blk-delay:1.25s">blocked &mdash; waiting on platform work</i>
-      <i class="blk go" style="flex:1;--blk-delay:1.9s">edit</i>
+      <i class="blk go" style="flex:1;--blk-delay:1s">改一版</i>
+      <i class="blk go" style="flex:1;--blk-delay:1.1s">跑一次</i>
+      <i class="blk wait" style="flex:5;--blk-delay:1.25s">卡住 &mdash; 等平台适配做完</i>
+      <i class="blk go" style="flex:1;--blk-delay:1.9s">改一版</i>
     </div>
   </div>
   <div class="drag-row">
-    <span class="drag-label">Platform work</span>
+    <span class="drag-label">平台适配</span>
     <div class="drag-track">
       <i class="blk idle" style="flex:2"></i>
-      <i class="blk work" style="flex:5;--blk-delay:1.45s">learn the syntax &middot; match the schema &middot; fix permissions &middot; patch compatibility</i>
+      <i class="blk work" style="flex:5;--blk-delay:1.45s">学语法 · 对 schema · 调权限 · 补兼容</i>
       <i class="blk idle" style="flex:1"></i>
     </div>
   </div>
 </div>
-<div class="merge-assumption r au d4"><b style="color:#e3b341">The app is what actually gets slowed down:</b> the model and the parameters changed by one line, but the time all goes into making it run on this platform &mdash; swap the infrastructure platform and you <b style="color:#ff7b72">rewrite the whole workflow orchestration</b>.</div>
+<div class="merge-assumption r au d4"><b style="color:#e3b341">真正被拖慢的是应用：</b>模型和参数只改了一行，时间却全花在「让它能在这个平台上跑起来」&mdash; 换一个基础设施平台，就要<b style="color:#ff7b72">重写整个工作流编排</b>。</div>
 </div>
 </section>
 
@@ -844,18 +844,18 @@ srun --ntasks=16 ...</div>
 <div class="orb oc" style="width:280px;height:280px;top:60%;right:-60px"></div>
 <span class="sn">05 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">The Problem</span>
-<h2 class="r al d1 ms">The workload stays the same. The platform adaptation multiplies.</h2>
-<div class="problem-source r as d2"><b>Stable workflow:</b> etcd → NATS → frontend → GPU workers → benchmark</div>
+<span class="pill pc r ap d0 ms">问题</span>
+<h2 class="r al d1 ms">工作负载始终不变，平台适配成本却成倍增长。</h2>
+<div class="problem-source r as d2"><b>稳定的工作流：</b> etcd → NATS → 前端 → GPU 工作节点 → 基准测试</div>
 <div class="dup-matrix r as d3">
-  <div class="dup-head dup-corner">repeated concern</div><div class="dup-head">Slurm</div><div class="dup-head">Docker</div><div class="dup-head">Kubernetes</div>
-  <div class="dup-label">Launch</div><div class="dup-cell" style="--copy-delay:.35s"><code>sbatch + srun</code></div><div class="dup-cell" style="--copy-delay:.45s"><code>docker run</code></div><div class="dup-cell" style="--copy-delay:.55s"><code>Pod / Job</code></div>
-  <div class="dup-label">GPU placement</div><div class="dup-cell" style="--copy-delay:.5s"><code>GPU flags</code></div><div class="dup-cell" style="--copy-delay:.6s"><code>device mapping</code></div><div class="dup-cell" style="--copy-delay:.7s"><code>claims + affinity</code></div>
-  <div class="dup-label">Networking</div><div class="dup-cell" style="--copy-delay:.65s"><code>hostlists + ports</code></div><div class="dup-cell" style="--copy-delay:.75s"><code>host network</code></div><div class="dup-cell" style="--copy-delay:.85s"><code>Service + DNS</code></div>
-  <div class="dup-label">Readiness</div><div class="dup-cell" style="--copy-delay:.8s"><code>shell polling</code></div><div class="dup-cell" style="--copy-delay:.9s"><code>healthcheck</code></div><div class="dup-cell" style="--copy-delay:1s"><code>probes</code></div>
-  <div class="dup-label">Logs + cleanup</div><div class="dup-cell" style="--copy-delay:.95s"><code>sacct + files</code></div><div class="dup-cell" style="--copy-delay:1.05s"><code>docker logs</code></div><div class="dup-cell" style="--copy-delay:1.15s"><code>relay + lifecycle</code></div>
+  <div class="dup-head dup-corner">重复的关注点</div><div class="dup-head">Slurm</div><div class="dup-head">Docker</div><div class="dup-head">Kubernetes</div>
+  <div class="dup-label">启动</div><div class="dup-cell" style="--copy-delay:.35s"><code>sbatch + srun</code></div><div class="dup-cell" style="--copy-delay:.45s"><code>docker run</code></div><div class="dup-cell" style="--copy-delay:.55s"><code>Pod / Job</code></div>
+  <div class="dup-label">GPU 放置</div><div class="dup-cell" style="--copy-delay:.5s"><code>GPU 参数</code></div><div class="dup-cell" style="--copy-delay:.6s"><code>设备映射</code></div><div class="dup-cell" style="--copy-delay:.7s"><code>claims + Affinity</code></div>
+  <div class="dup-label">网络</div><div class="dup-cell" style="--copy-delay:.65s"><code>hostlist + 端口</code></div><div class="dup-cell" style="--copy-delay:.75s"><code>host 网络</code></div><div class="dup-cell" style="--copy-delay:.85s"><code>Service + DNS</code></div>
+  <div class="dup-label">就绪检测</div><div class="dup-cell" style="--copy-delay:.8s"><code>shell 轮询</code></div><div class="dup-cell" style="--copy-delay:.9s"><code>healthcheck</code></div><div class="dup-cell" style="--copy-delay:1s"><code>probes</code></div>
+  <div class="dup-label">日志与清理</div><div class="dup-cell" style="--copy-delay:.95s"><code>sacct + 文件</code></div><div class="dup-cell" style="--copy-delay:1.05s"><code>docker logs</code></div><div class="dup-cell" style="--copy-delay:1.15s"><code>日志转发 + 生命周期</code></div>
 </div>
-<div class="dup-total r au d4"><b>5 concerns × 3 platforms</b><span>the same orchestration work, repeated around one stable workflow</span></div>
+<div class="dup-total r au d4"><b>5 类关注点 × 3 个平台</b><span>围绕同一个稳定的工作流，重复着同样的编排工作</span></div>
 </div>
 </section>
 
@@ -865,12 +865,12 @@ srun --ntasks=16 ...</div>
 <div class="orb og" style="width:350px;height:350px;top:15%;right:-100px"></div>
 <span class="sn">06 / 18</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Backend Agnostic by Design</span>
-<h2 class="r al d1 mb">Keep <span class="accent">what</span>. Swap <span class="green">where</span>. Rewrite nothing.</h2>
+<span class="pill pg r ap d0 ms">后端无关的设计</span>
+<h2 class="r al d1 mb">保留<span class="accent">做什么</span>，替换<span class="green">在哪跑</span>，无需重写。</h2>
 <div class="fg">
-<div class="fc r au d2"><span class="ic">&#9998;</span><h3>One Semantic</h3><p>A deployment's logic never changes &mdash; only the infrastructure adaptation does.</p></div>
-<div class="fc r au d3"><span class="ic">&#8644;</span><h3>Swap the Backend Block</h3><p>The same <code>sflow.yaml</code> runs on Docker, Slurm and Kubernetes.</p></div>
-<div class="fc r au d4"><span class="ic">&#9881;</span><h3>Delegate, Don't Reimplement</h3><p>Backends defer to each platform's native ecosystem instead of rebuilding it.</p></div>
+<div class="fc r au d2"><span class="ic">&#9998;</span><h3>统一语义</h3><p>部署逻辑始终不变 &mdash; 变的只是基础设施适配。</p></div>
+<div class="fc r au d3"><span class="ic">&#8644;</span><h3>只换后端配置块</h3><p>同一份 <code>sflow.yaml</code> 可运行在 Docker、Slurm 与 Kubernetes 上。</p></div>
+<div class="fc r au d4"><span class="ic">&#9881;</span><h3>委托，而非重造</h3><p>后端交由各平台的原生生态处理，而不是重新实现一遍。</p></div>
 </div>
 <div class="r as d5" style="width:100%;max-width:700px;margin:0 auto">
 <svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
@@ -880,9 +880,9 @@ srun --ntasks=16 ...</div>
 </defs>
 <!-- One stable recipe source -->
 <rect x="20" y="62" width="180" height="96" rx="8" fill="#0d1420" stroke="#00d4ff" stroke-width="1.8"/>
-<text x="110" y="91" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="15" font-weight="700">sflow.yaml</text>
-<text x="110" y="116" text-anchor="middle" fill="#dce3ed" font-family="Consolas,monospace" font-size="9">DAG · scripts · probes</text>
-<text x="110" y="134" text-anchor="middle" fill="#6b7d95" font-family="Consolas,monospace" font-size="9">resources · results · artifacts</text>
+<text x="110" y="91" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="15" font-weight="700">sflow.yaml</text>
+<text x="110" y="116" text-anchor="middle" fill="#dce3ed" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="9">DAG · 脚本 · 探针</text>
+<text x="110" y="134" text-anchor="middle" fill="#6b7d95" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="9">资源 · 结果 · 产物</text>
 
 <!-- Recipe enters the sflow adapter -->
 <path id="recipeIn" d="M200,110 C245,110 268,110 288,110" fill="none" stroke="url(#wg)" stroke-width="3"/>
@@ -891,7 +891,7 @@ srun --ntasks=16 ...</div>
 
 <!-- sflow adapter -->
 <circle cx="335" cy="110" r="42" fill="#060a10" stroke="url(#wg)" stroke-width="2.5" filter="url(#gl)"/>
-<text x="335" y="116" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, sans-serif" font-size="16" font-weight="800">sflow</text>
+<text x="335" y="116" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, 'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC', sans-serif" font-size="16" font-weight="800">sflow</text>
 
 <!-- Backend-native fan-out -->
 <path id="toLocal" d="M377,100 C420,85 454,25 500,25" fill="none" stroke="#00d4ff" stroke-width="2.2" opacity=".8"/>
@@ -905,13 +905,13 @@ srun --ntasks=16 ...</div>
 
 <!-- Supported execution backends -->
 <rect x="500" y="5" width="180" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
-<text x="590" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="12" font-weight="600">Local · bash</text>
+<text x="590" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Local · bash</text>
 <rect x="500" y="55" width="180" height="40" rx="6" fill="#0d1420" stroke="#76ff03" stroke-width="1.5"/>
-<text x="590" y="80" text-anchor="middle" fill="#76ff03" font-family="Consolas,monospace" font-size="12" font-weight="600">Docker · docker_run</text>
+<text x="590" y="80" text-anchor="middle" fill="#76ff03" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Docker · docker_run</text>
 <rect x="500" y="105" width="180" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
-<text x="590" y="130" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="12" font-weight="600">Slurm · srun</text>
+<text x="590" y="130" text-anchor="middle" fill="#e3b341" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Slurm · srun</text>
 <rect x="500" y="155" width="180" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
-<text x="590" y="180" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="12" font-weight="600">Kubernetes · k8s</text>
+<text x="590" y="180" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Kubernetes · k8s</text>
 <polygon points="495,20 505,25 495,30" fill="#00d4ff"/>
 <polygon points="495,70 505,75 495,80" fill="#76ff03"/>
 <polygon points="495,120 505,125 495,130" fill="#e3b341"/>
@@ -927,11 +927,11 @@ srun --ntasks=16 ...</div>
 <div class="orb oc" style="width:240px;height:240px;top:8%;left:-70px"></div>
 <span class="sn">07 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">DAG Orchestration</span>
-<h2 class="r al d1 ms">You define tasks and dependencies</h2>
+<span class="pill pc r ap d0 ms">DAG 编排</span>
+<h2 class="r al d1 ms">任务与依赖，全部由你定义</h2>
 <div class="dag-layout r as d2">
 <div class="dag-main">
-<div class="contract-strip"><b>Directed Acyclic Graph</b> &nbsp; each stage fires as soon as its dependencies are ready</div>
+<div class="contract-strip"><b>有向无环图(DAG)</b> &nbsp; 每个阶段在依赖就绪时自动启动</div>
 <div class="dag">
 <div class="dag-row dag-stage" style="--dag-delay:.2s"><div class="dag-node" style="border-color:var(--cy)">load_image</div></div>
 <div class="dag-arrow dag-link" style="--dag-delay:.5s">&#9660;</div>
@@ -947,9 +947,9 @@ srun --ntasks=16 ...</div>
 </div>
 </div>
 <div class="dag-aside">
-<div class="fc r au" style="animation-delay:2.7s"><span class="ic">&#9998;</span><h3>Tasks = any command</h3><p>bash, python, or a container entrypoint.</p></div>
-<div class="fc r au" style="animation-delay:2.82s"><span class="ic">&#8644;</span><h3>Dependencies = any DAG</h3><p>Serial, parallel, fan-in and fan-out. No cap on stages.</p></div>
-<div class="fc r au" style="animation-delay:2.94s"><span class="ic">&#8734;</span><h3>Not tied to a domain</h3><p>Inference, training, evaluation, data processing.</p></div>
+<div class="fc r au" style="animation-delay:2.7s"><span class="ic">&#9998;</span><h3>任务 = 任意命令</h3><p>bash、python、容器入口都可以。</p></div>
+<div class="fc r au" style="animation-delay:2.82s"><span class="ic">&#8644;</span><h3>依赖 = 任意 DAG</h3><p>串行、并行、分支与汇聚，阶段数不设上限。</p></div>
+<div class="fc r au" style="animation-delay:2.94s"><span class="ic">&#8734;</span><h3>不限定领域</h3><p>推理、训练、评测、数据处理均可自由编排。</p></div>
 </div>
 </div>
 </div>
@@ -961,13 +961,13 @@ srun --ntasks=16 ...</div>
 <div class="orb og" style="width:300px;height:300px;bottom:-90px;right:8%"></div>
 <span class="sn">08 / 18</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Cluster-Level Orchestration at Scale</span>
-<h2 class="r al d1 ms">Topology-aware GPU Allocation</h2>
-<div class="planner-node r ap d2">sflow topology planner<small>GPU capacity · node affinity · task dependencies</small></div>
-<div class="alloc-arrow r au d2">&#9660; backend-native assignment</div>
+<span class="pill pg r ap d0 ms">大规模集群级编排</span>
+<h2 class="r al d1 ms">拓扑感知的 GPU 分配</h2>
+<div class="planner-node r ap d2">sflow 拓扑规划器<small>GPU 容量 · 节点亲和性 · 任务依赖</small></div>
+<div class="alloc-arrow r au d2">&#9660; 以后端原生方式下发</div>
 <div class="alloc-board r as d3">
   <div class="compute-node">
-    <div class="node-head"><strong>node-0</strong><span>NVLink domain A · 4 GPUs</span></div>
+    <div class="node-head"><strong>node-0</strong><span>NVLink 域 A · 4 张 GPU</span></div>
     <div class="gpu-grid">
       <div class="gpu-slot" style="--assign-delay:.65s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 0</b><span>prefill_0</span></span></div>
       <div class="gpu-slot" style="--assign-delay:.85s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 1</b><span>prefill_1</span></span></div>
@@ -976,9 +976,9 @@ srun --ntasks=16 ...</div>
     </div>
   </div>
   <div class="compute-node">
-    <div class="node-head"><strong>node-1</strong><span>NVLink domain B · 4 GPUs</span></div>
+    <div class="node-head"><strong>node-1</strong><span>NVLink 域 B · 4 张 GPU</span></div>
     <div class="task-allocation decode-allocation">
-      <span class="task-allocation-label">decode_0 · 4-GPU task</span>
+      <span class="task-allocation-label">decode_0 · 4 GPU 任务</span>
       <div class="gpu-grid">
         <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 0</b><span>decode_0</span></span></div>
         <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 1</b><span>decode_0</span></span></div>
@@ -988,7 +988,7 @@ srun --ntasks=16 ...</div>
     </div>
   </div>
 </div>
-<div class="merge-assumption r au d4">Node and GPU placement, multi-node replicas and sweeps, readiness probes, and batch submission &mdash; so <b style="color:#e3b341">one descriptor drives hundreds of GPUs</b> instead of a pile of hand-written bash.</div>
+<div class="merge-assumption r au d4">节点与 GPU 放置、多节点副本与参数扫描、就绪探针、批量提交 &mdash; 于是<b style="color:#e3b341">一份描述文件即可驱动数百张 GPU</b>，而不是一堆手写的 bash 脚本。</div>
 </div>
 </section>
 
@@ -998,28 +998,28 @@ srun --ntasks=16 ...</div>
 <div class="orb oc" style="width:200px;height:200px;top:-40px;right:28%"></div>
 <span class="sn">09 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">Workflow Lifecycle</span>
-<h2 class="r al d1 ms">Define. Execute. Understand.</h2>
+<span class="pill pc r ap d0 ms">工作流生命周期</span>
+<h2 class="r al d1 ms">定义。执行。洞察。</h2>
 <div class="lifecycle-flow r as d2">
   <div class="phase define" data-step="01" style="--phase-delay:.25s">
-    <h3>Define</h3>
-    <div class="phase-item"><span class="phase-icon">DAG</span><span><b>Tasks + dependencies</b><br>One declarative workflow</span></div>
-    <div class="phase-item"><span class="phase-icon">{ }</span><span><b>Variables + artifacts</b><br>Portable inputs and expressions</span></div>
-    <div class="phase-item"><span class="phase-icon">✓</span><span><b>Probes</b><br>Readiness and failure gates</span></div>
+    <h3>定义</h3>
+    <div class="phase-item"><span class="phase-icon">DAG</span><span><b>任务与依赖</b><br>一份声明式工作流</span></div>
+    <div class="phase-item"><span class="phase-icon">{ }</span><span><b>变量与产物</b><br>可移植的输入与表达式</span></div>
+    <div class="phase-item"><span class="phase-icon">✓</span><span><b>探针</b><br>就绪与失败判定</span></div>
   </div>
   <div class="flow-arrow" style="--phase-delay:.75s">&#10132;</div>
   <div class="phase execute" data-step="02" style="--phase-delay:.95s">
-    <h3>Execute</h3>
-    <div class="phase-item"><span class="phase-icon">GPU</span><span><b>Resource planning</b><br>Nodes, GPUs, topology</span></div>
-    <div class="phase-item"><span class="phase-icon">N×</span><span><b>Replicas + sweeps</b><br>Parallel or sequential</span></div>
-    <div class="phase-item"><span class="phase-icon">→</span><span><b>Backend adapters</b><br>Local, Docker, Slurm, K8S</span></div>
+    <h3>执行</h3>
+    <div class="phase-item"><span class="phase-icon">GPU</span><span><b>资源规划</b><br>节点、GPU、拓扑</span></div>
+    <div class="phase-item"><span class="phase-icon">N×</span><span><b>副本与参数扫描</b><br>并行或串行</span></div>
+    <div class="phase-item"><span class="phase-icon">→</span><span><b>后端适配器</b><br>Local、Docker、Slurm、K8S</span></div>
   </div>
   <div class="flow-arrow" style="--phase-delay:1.45s">&#10132;</div>
   <div class="phase understand" data-step="03" style="--phase-delay:1.65s">
-    <h3>Understand</h3>
-    <div class="phase-item"><span class="phase-icon">TUI</span><span><b>Live status</b><br>Tasks, logs, readiness</span></div>
-    <div class="phase-item"><span class="phase-icon">∿</span><span><b>Summary + monitor</b><br>Timelines and hardware charts</span></div>
-    <div class="phase-item"><span class="phase-icon">⇧</span><span><b>Results + uploads</b><br>JSON metrics and S3</span></div>
+    <h3>洞察</h3>
+    <div class="phase-item"><span class="phase-icon">TUI</span><span><b>实时状态</b><br>任务、日志、就绪</span></div>
+    <div class="phase-item"><span class="phase-icon">∿</span><span><b>汇总与监控</b><br>时间线与硬件图表</span></div>
+    <div class="phase-item"><span class="phase-icon">⇧</span><span><b>结果与上传</b><br>JSON 指标与 S3</span></div>
   </div>
 </div>
 </div>
@@ -1031,18 +1031,18 @@ srun --ntasks=16 ...</div>
 <div class="orb oc" style="width:260px;height:260px;top:-70px;right:16%"></div>
 <span class="sn">10 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">Backend Adapters</span>
-<h2 class="r al d1 ms">One intent becomes four native execution plans</h2>
-<div class="contract-strip r al d2"><b>Portable workflow contract</b> &nbsp; DAG · resources · probes · artifacts · results</div>
-<div class="alloc-arrow r au d2">&#9660; sflow delegates to each platform's native ecosystem</div>
+<span class="pill pc r ap d0 ms">后端适配器</span>
+<h2 class="r al d1 ms">同一份意图，落地为四套原生执行方案</h2>
+<div class="contract-strip r al d2"><b>可移植的工作流契约</b> &nbsp; DAG · 资源 · 探针 · 产物 · 结果</div>
+<div class="alloc-arrow r au d2">&#9660; sflow 委托给各平台的原生生态</div>
 <div class="backend-lanes r as d3">
-  <div class="backend-lane" style="--adapter-delay:.45s"><span class="backend-symbol">&gt;_</span><h3>Local</h3><p>bash process<br>synthetic node/GPU map</p></div>
-  <div class="backend-lane" style="--adapter-delay:.65s"><span class="backend-symbol">&#9635;</span><h3>Docker</h3><p>docker run<br>container GPU devices</p></div>
-  <div class="backend-lane" style="--adapter-delay:.85s"><span class="backend-symbol">#</span><h3>Slurm</h3><p>salloc + srun<br>scheduler allocations</p></div>
-  <div class="backend-lane" style="--adapter-delay:1.05s"><span class="backend-symbol">&#9096;</span><h3>Kubernetes</h3><p>pods + claims<br>pinning and lifecycle</p></div>
+  <div class="backend-lane" style="--adapter-delay:.45s"><span class="backend-symbol">&gt;_</span><h3>Local</h3><p>bash 进程<br>模拟的节点 / GPU 映射</p></div>
+  <div class="backend-lane" style="--adapter-delay:.65s"><span class="backend-symbol">&#9635;</span><h3>Docker</h3><p>docker run<br>容器 GPU 设备</p></div>
+  <div class="backend-lane" style="--adapter-delay:.85s"><span class="backend-symbol">#</span><h3>Slurm</h3><p>salloc + srun<br>调度器分配</p></div>
+  <div class="backend-lane" style="--adapter-delay:1.05s"><span class="backend-symbol">&#9096;</span><h3>Kubernetes</h3><p>pods + claims<br>绑定与生命周期</p></div>
 </div>
 <div class="alloc-arrow r au d4">&#9660;</div>
-<div class="output-strip r ar d4">Consistent outputs &nbsp; task.log · result.json · summary · artifacts</div>
+<div class="output-strip r ar d4">一致的输出 &nbsp; task.log · result.json · summary · 产物</div>
 </div>
 </section>
 
@@ -1053,25 +1053,25 @@ srun --ntasks=16 ...</div>
 <span class="sn">11 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">Merge Pod</span>
-<h2 class="r al d1 ms">Co-located GPU tasks, one fast intra-node fabric</h2>
+<h2 class="r al d1 ms">GPU 任务同机部署，共享高速的节点内互联</h2>
 <div class="merge-topology r as d2">
   <div class="topology-panel">
-    <h3 style="color:#ff7b72">Separate pods · isolated views</h3>
+    <h3 style="color:#ff7b72">独立 Pod · 视图相互隔离</h3>
     <div class="pod-pair">
-      <div class="pod-box">worker A<span>GPU 0-1 visible</span></div>
+      <div class="pod-box">worker A<span>仅可见 GPU 0-1</span></div>
       <div class="slow-link">IB / TCP<br>&#8596;</div>
-      <div class="pod-box">worker B<span>GPU 2-3 visible</span></div>
+      <div class="pod-box">worker B<span>仅可见 GPU 2-3</span></div>
     </div>
   </div>
   <div class="merge-action">sflow merge<br>&#10132;</div>
   <div class="topology-panel merged-topology">
-    <h3 style="color:var(--gr)">One pod · combined GPU view</h3>
+    <h3 style="color:var(--gr)">单个 Pod · 合并的 GPU 视图</h3>
     <div class="worker-row"><span class="worker-tag">worker A</span><span class="worker-tag">worker B</span></div>
     <div class="shared-gpus"><span class="shared-gpu">GPU 0</span><span class="shared-gpu">GPU 1</span><span class="shared-gpu">GPU 2</span><span class="shared-gpu">GPU 3</span></div>
     <div class="nvlink-bus">CUDA IPC · NVLink · NVSwitch</div>
   </div>
 </div>
-<div class="merge-assumption r au d4"><b style="color:#e3b341">Safe boundary:</b> same workflow + backend + node + image. Example: PD KV transfer. Also fits current per-node IMEX constraints.</div>
+<div class="merge-assumption r au d4"><b style="color:#e3b341">安全边界：</b>同一工作流 + 同一后端 + 同一节点 + 同一镜像。典型场景：PD 分离的 KV 传输。同时契合当前每节点 IMEX 的约束。</div>
 </div>
 </section>
 
@@ -1081,8 +1081,8 @@ srun --ntasks=16 ...</div>
 <div class="orb oc" style="width:220px;height:220px;top:-50px;left:20%"></div>
 <span class="sn">12 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">Observability</span>
-<h2 class="r al d1 ms">Runs explain themselves</h2>
+<span class="pill pc r ap d0 ms">可观测性</span>
+<h2 class="r al d1 ms">完备的自动运行时信息收集以供事后审查</h2>
 <div class="two">
 <div class="term r al d2" style="font-size:clamp(.45rem,.72vw,.62rem)"><span class="cy">sflow_summary.log</span>
 Task Duration Chart
@@ -1108,18 +1108,18 @@ Timelines (cluster avg)
 <span class="runline">GPU mem used GiB  <span class="spark" data-spark="▁▃▄▆▇█████">▁▃▄▆▇█████</span></span>
 <span class="runline">Net RX MiB/s      <span class="spark cy" data-spark="▁▁▂▅▇▆▃▂▁">▁▁▂▅▇▆▃▂▁</span></span></div>
 </div>
-<div class="obs-chart-grid r au d4" aria-label="Hardware utilization chart samples">
+<div class="obs-chart-grid r au d4" aria-label="硬件利用率图表示例">
   <div class="obs-chart-card">
-    <div class="obs-chart-head"><span class="obs-chart-label">GPU Util</span><span class="obs-chart-value">87%</span></div>
-    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU utilization line chart"><path d="M5 64 C35 58 42 34 70 36 S108 10 137 16 S180 48 235 20" stroke="#00d4ff"/></svg>
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU 利用率</span><span class="obs-chart-value">87%</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU 利用率折线图"><path d="M5 64 C35 58 42 34 70 36 S108 10 137 16 S180 48 235 20" stroke="#00d4ff"/></svg>
   </div>
   <div class="obs-chart-card">
-    <div class="obs-chart-head"><span class="obs-chart-label">GPU Memory</span><span class="obs-chart-value">61 GiB</span></div>
-    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU memory line chart"><path d="M5 68 C35 66 58 54 80 48 S120 28 155 24 S200 22 235 18" stroke="#76ff03"/></svg>
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU 显存</span><span class="obs-chart-value">61 GiB</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU 显存折线图"><path d="M5 68 C35 66 58 54 80 48 S120 28 155 24 S200 22 235 18" stroke="#76ff03"/></svg>
   </div>
   <div class="obs-chart-card">
-    <div class="obs-chart-head"><span class="obs-chart-label">GPU Power</span><span class="obs-chart-value">642 W</span></div>
-    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU power line chart"><path d="M5 58 C28 20 55 74 82 35 S135 14 160 42 S205 60 235 28" stroke="#e3b341"/></svg>
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU 功耗</span><span class="obs-chart-value">642 W</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU 功耗折线图"><path d="M5 58 C28 20 55 74 82 35 S135 14 160 42 S205 60 235 28" stroke="#e3b341"/></svg>
   </div>
 </div>
 </div>
@@ -1131,10 +1131,10 @@ Timelines (cluster avg)
 <div class="orb og" style="width:260px;height:260px;top:-60px;left:20%"></div>
 <span class="sn">13 / 18</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Modular Composition</span>
-<h2 class="r al d1 ms">Swap a leaf. Reuse the tree.</h2>
+<span class="pill pg r ap d0 ms">模块化组合</span>
+<h2 class="r al d1 ms">公共路径无需重复修改, 模块替换自由组合</h2>
 <div class="recipe-tree r as d2">
-  <div class="tree-root">recipe/<small>composition root</small></div>
+  <div class="tree-root">recipe/<small>组合根目录</small></div>
   <div class="tree-branches">
     <div class="tree-branch" style="--branch-delay:.3s">
       <div class="branch-label"><code>backend/</code></div>
@@ -1142,7 +1142,7 @@ Timelines (cluster avg)
     </div>
     <div class="tree-branch" style="--branch-delay:.45s">
       <div class="branch-label"><code>common/</code></div>
-      <div class="tree-leaves"><span class="tree-leaf fixed">common_workflow.yaml · shared DAG</span></div>
+      <div class="tree-leaves"><span class="tree-leaf fixed">common_workflow.yaml · 共享 DAG</span></div>
     </div>
     <div class="tree-branch" style="--branch-delay:.6s">
       <div class="branch-label"><code>workload/</code></div>
@@ -1154,9 +1154,9 @@ Timelines (cluster avg)
     </div>
   </div>
 </div>
-<div class="tree-selection r au d3">&#9660; selected leaves compose</div>
-<div class="compose-result r ap d4"><b>composed.yaml</b> &nbsp; k8s + shared workflow + vLLM + AIPerf</div>
-<div class="output-strip r au d5">Swap one highlighted leaf; shared branches remain unchanged.</div>
+<div class="tree-selection r au d3">&#9660; 选中的叶子完成组合</div>
+<div class="compose-result r ap d4"><b>composed.yaml</b> &nbsp; k8s + 共享工作流 + vLLM + AIPerf</div>
+<div class="output-strip r au d5">替换叶子节点以部分切换工作流，共享分支保持不变。</div>
 </div>
 </section>
 
@@ -1166,8 +1166,8 @@ Timelines (cluster avg)
 <div class="orb oc" style="width:220px;height:220px;bottom:-50px;left:15%"></div>
 <span class="sn">14 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">Real-world Debugging</span>
-<h2 class="r al d1 ms">Structured Error Analysis</h2>
+<span class="pill pc r ap d0 ms">真实场景调试</span>
+<h2 class="r al d1 ms">结构化的错误分析</h2>
 <div class="two">
 <div>
 <div class="term r al d2" style="font-size:clamp(.42rem,.68vw,.58rem);margin-bottom:var(--gap)"><span class="hi">Workflow:</span> <span class="cy">b200-fp8-low-latency-tep8-1p-1d</span>
@@ -1196,27 +1196,27 @@ Model: DeepSeek R1 FP8 | 2 nodes &times; 8 GPUs | ISL=8192, OSL=1024
 <span class="wh">Invalid TCP address 'dynamo_backend.generate-58b49ce145f5660b'</span></div>
 </div>
 <div>
-<p class="r ar d3 ms" style="font-size:var(--s);color:var(--txt)">Diagnosis &mdash; sflow orchestration vs application error</p>
+<p class="r ar d3 ms" style="font-size:var(--s);color:var(--txt)">诊断 &mdash; sflow 编排层 vs 应用层错误</p>
 <table class="mtbl r ar d3">
-<thead><tr><th>Layer</th><th>Status</th><th>Detail</th></tr></thead>
+<thead><tr><th>层级</th><th>状态</th><th>细节</th></tr></thead>
 <tbody>
-<tr><td><span class="green">sflow</span></td><td style="color:var(--gr)">&#10003; OK</td><td>DAG executed, all tasks launched, probes passed</td></tr>
-<tr><td><span class="green">GPU alloc</span></td><td style="color:var(--gr)">&#10003; OK</td><td>8 GPUs/node, no overlap, TP=8 per server</td></tr>
-<tr><td><span class="green">Infra</span></td><td style="color:var(--gr)">&#10003; OK</td><td>etcd, NATS, frontend all READY</td></tr>
-<tr><td><span style="color:#ff7b72">Routing</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>Frontend gets service names, not host:port</td></tr>
-<tr><td><span style="color:#ff7b72">Benchmark</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>0/800 requests succeed (all HTTP 500)</td></tr>
+<tr><td><span class="green">sflow</span></td><td style="color:var(--gr)">&#10003; OK</td><td>DAG 已执行，全部任务已拉起，探针通过</td></tr>
+<tr><td><span class="green">GPU 分配</span></td><td style="color:var(--gr)">&#10003; OK</td><td>每节点 8 张 GPU，无重叠，每个 server TP=8</td></tr>
+<tr><td><span class="green">基础设施</span></td><td style="color:var(--gr)">&#10003; OK</td><td>etcd、NATS、frontend 均已 READY</td></tr>
+<tr><td><span style="color:#ff7b72">路由</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>frontend 拿到的是服务名，而不是 host:port</td></tr>
+<tr><td><span style="color:#ff7b72">基准测试</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>0/800 请求成功（全部 HTTP 500）</td></tr>
 </tbody>
 </table>
-<div class="term r ar d5" style="font-size:clamp(.42rem,.65vw,.55rem);margin-top:var(--gap)"><span class="hi">Root Cause</span>
-Frontend receives <span class="rd">discovery service names</span>
-(e.g. dynamo_prefill.generate-58b49...)
-instead of <span class="gr">host:port</span> addresses.
+<div class="term r ar d5" style="font-size:clamp(.42rem,.65vw,.55rem);margin-top:var(--gap)"><span class="hi">根因</span>
+frontend 收到的是<span class="rd">服务发现的服务名</span>
+（例如 dynamo_prefill.generate-58b49...）
+而不是 <span class="gr">host:port</span> 地址。
 
-NATS/etcd service registry returns internal
-identifiers that the TCP router can't parse.
+NATS/etcd 服务注册表返回的内部标识符
+TCP 路由无法解析。
 
-<span class="yl">Fix:</span> Verify DYN_REQUEST_PLANE and frontend
-networking config match Dynamo disagg routing.</div>
+<span class="yl">修复：</span>检查 DYN_REQUEST_PLANE 与 frontend
+网络配置是否匹配 Dynamo 分离式路由。</div>
 </div>
 </div>
 </div>
@@ -1227,17 +1227,17 @@ networking config match Dynamo disagg routing.</div>
 <div class="gbg"></div>
 <span class="sn">15 / 18</span>
 <div class="inner">
-<h2 class="r au d0 mb">CLI at a Glance</h2>
+<h2 class="r au d0 mb">CLI 速览</h2>
 <table class="mtbl r au d1" style="max-width:800px">
-<thead><tr><th>Command</th><th>Purpose</th><th>Key Flags</th></tr></thead>
+<thead><tr><th>命令</th><th>用途</th><th>关键参数</th></tr></thead>
 <tbody>
-<tr><td><code>sflow run</code></td><td>Execute a workflow</td><td><code>--dry-run</code> <code>--tui</code> <code>--set</code> <code>-f</code> (multi-file)</td></tr>
-<tr><td><code>sflow batch</code></td><td>Generate sbatch scripts</td><td><code>--submit</code> <code>--bulk-input</code> <code>--row</code></td></tr>
-<tr><td><code>sflow compose</code></td><td>Merge multiple YAMLs</td><td><code>--resolve</code> <code>--missable-tasks</code> <code>-o</code></td></tr>
-<tr><td><code>sflow visualize</code></td><td>Render DAG graph</td><td><code>--format png/svg/mermaid</code></td></tr>
-<tr><td><code>sflow sample</code></td><td>List / copy examples</td><td><code>--list</code> <code>-o</code></td></tr>
-<tr><td><code>sflow skill</code></td><td>Install AI agent skills</td><td><code>--list</code> <code>-o</code></td></tr>
-<tr><td><code>sflow upgrade</code></td><td>Reinstall in place (alias: <code>sflow update</code>)</td><td><code>--branch</code> <code>--dry-run</code> <code>--force</code></td></tr>
+<tr><td><code>sflow run</code></td><td>执行工作流</td><td><code>--dry-run</code> <code>--tui</code> <code>--set</code> <code>-f</code>（多文件）</td></tr>
+<tr><td><code>sflow batch</code></td><td>生成 sbatch 脚本</td><td><code>--submit</code> <code>--bulk-input</code> <code>--row</code></td></tr>
+<tr><td><code>sflow compose</code></td><td>合并多个 YAML</td><td><code>--resolve</code> <code>--missable-tasks</code> <code>-o</code></td></tr>
+<tr><td><code>sflow visualize</code></td><td>渲染 DAG 图</td><td><code>--format png/svg/mermaid</code></td></tr>
+<tr><td><code>sflow sample</code></td><td>列出 / 复制示例</td><td><code>--list</code> <code>-o</code></td></tr>
+<tr><td><code>sflow skill</code></td><td>安装 AI Agent 技能</td><td><code>--list</code> <code>-o</code></td></tr>
+<tr><td><code>sflow upgrade</code></td><td>原地重装（别名：<code>sflow update</code>）</td><td><code>--branch</code> <code>--dry-run</code> <code>--force</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -1250,25 +1250,25 @@ networking config match Dynamo disagg routing.</div>
 <div class="pt" style="width:4px;height:4px;background:var(--cy);top:30%;left:85%;opacity:.3;animation-duration:16s;animation-delay:3s"></div>
 <span class="sn">16 / 18</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Developer Experience</span>
-<h2 class="r al d1 ms">Agent-native workflows improve with every run</h2>
+<span class="pill pg r ap d0 ms">开发者体验</span>
+<h2 class="r al d1 ms">Agent 原生的工作流，每跑一次就更好一点</h2>
 <div class="agent-loop-shell r as d2">
   <div class="dev-flow">
-    <div class="dev-step" style="--dev-delay:.3s"><span class="step-num">01</span><h3>Author · agent-native</h3><div class="dev-context"><span>AGENTS.md workflow rules</span><span>writing-sflow-yaml skill</span><span>schema + examples</span></div></div>
+    <div class="dev-step" style="--dev-delay:.3s"><span class="step-num">01</span><h3>编写 · Agent 原生</h3><div class="dev-context"><span>AGENTS.md 工作流规则</span><span>writing-sflow-yaml 技能</span><span>schema + 示例</span></div></div>
     <div class="dev-arrow">&#10132;</div>
-    <div class="dev-step" style="--dev-delay:.55s"><span class="step-num">02</span><h3>Validate</h3><div class="dev-context"><span>sflow run --dry-run</span><span>resolved variables</span><span>resource / GPU plan</span></div></div>
+    <div class="dev-step" style="--dev-delay:.55s"><span class="step-num">02</span><h3>校验</h3><div class="dev-context"><span>sflow run --dry-run</span><span>解析后的变量</span><span>资源 / GPU 方案</span></div></div>
     <div class="dev-arrow">&#10132;</div>
-    <div class="dev-step" style="--dev-delay:.8s"><span class="step-num">03</span><h3>Run &amp; observe</h3><div class="dev-context"><span>timestamped task events</span><span>TUI + readiness probes</span><span>sflow_monitor.log</span></div></div>
+    <div class="dev-step" style="--dev-delay:.8s"><span class="step-num">03</span><h3>运行与观测</h3><div class="dev-context"><span>带时间戳的任务事件</span><span>TUI + 就绪探针</span><span>sflow_monitor.log</span></div></div>
     <div class="dev-arrow">&#10132;</div>
-    <div class="dev-step" style="--dev-delay:1.05s"><span class="step-num">04</span><h3>Diagnose &amp; evolve</h3><div class="dev-context"><span>sflow_summary.log</span><span>task.log + failure hints</span><span>result.json metrics</span></div></div>
+    <div class="dev-step" style="--dev-delay:1.05s"><span class="step-num">04</span><h3>诊断与演进</h3><div class="dev-context"><span>sflow_summary.log</span><span>task.log + 失败提示</span><span>result.json 指标</span></div></div>
   </div>
   <div class="agent-feedback">
     <svg class="agent-feedback-orbit" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
       <path class="agent-loop-arrow" d="M-7,-5 L7,0 L-7,5 Z"/>
     </svg>
-    <span class="agent-chip">AGENT LOOP</span>
-    <div class="feedback-evidence"><span>timestamps</span><span>summary</span><span>monitor</span><span>failure hints</span></div>
-    <span class="feedback-action">rerun ← adjust YAML ← read context</span>
+    <span class="agent-chip">AGENT 闭环</span>
+    <div class="feedback-evidence"><span>时间戳</span><span>汇总</span><span>监控</span><span>失败提示</span></div>
+    <span class="feedback-action">重跑 ← 调整 YAML ← 读取上下文</span>
   </div>
 </div>
 </div>
@@ -1281,29 +1281,29 @@ networking config match Dynamo disagg routing.</div>
 <div class="orb og" style="width:250px;height:250px;bottom:-70px;right:-50px"></div>
 <span class="sn">17 / 18</span>
 <div class="inner">
-<span class="pill pg r ap d0 ms">Vision</span>
-<h2 class="r al d1 ms">Heterogeneous Computing</h2>
-<p class="r au d2" style="max-width:720px">One recipe can route each stage of a disaggregated pipeline to the best resource pool while preserving one workflow contract.</p>
+<span class="pill pg r ap d0 ms">愿景</span>
+<h2 class="r al d1 ms">异构计算</h2>
+<p class="r au d2" style="max-width:720px">一份 recipe 就能把分离式流水线的每个阶段路由到最合适的资源池，同时保持同一份工作流契约。</p>
 <div class="r as d3" style="width:100%;max-width:650px;margin:0 auto">
 <svg viewBox="0 0 650 140" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
 <defs><linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#e3b341"/></linearGradient></defs>
 <!-- Resource pools (left) -->
 <rect x="10" y="10" width="120" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
-<text x="70" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="10" font-weight="600">Vera Rubin</text>
-<text x="70" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">GPU pool &bull; Prefill</text>
+<text x="70" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">Vera Rubin</text>
+<text x="70" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">GPU 资源池 &bull; Prefill</text>
 <rect x="10" y="80" width="120" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
-<text x="70" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="10" font-weight="600">LPU Cluster</text>
-<text x="70" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">Accelerator &bull; Decode</text>
+<text x="70" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">LPU Cluster</text>
+<text x="70" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">加速器 &bull; Decode</text>
 <!-- sflow center -->
 <circle cx="325" cy="70" r="35" fill="#060a10" stroke="url(#hg)" stroke-width="2.5"/>
-<text x="325" y="76" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, sans-serif" font-size="13" font-weight="800">sflow</text>
+<text x="325" y="76" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, 'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC', sans-serif" font-size="13" font-weight="800">sflow</text>
 <!-- Disaggregated output (right) -->
 <rect x="500" y="10" width="140" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
-<text x="570" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,monospace" font-size="10" font-weight="600">prefill_server</text>
-<text x="570" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">Vera Rubin GPUs</text>
+<text x="570" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">prefill_server</text>
+<text x="570" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">Vera Rubin GPUs</text>
 <rect x="500" y="80" width="140" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
-<text x="570" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,monospace" font-size="10" font-weight="600">decode_server</text>
-<text x="570" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,monospace" font-size="8">LPU accelerators</text>
+<text x="570" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">decode_server</text>
+<text x="570" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">LPU 加速器</text>
 <!-- Wires: pools -> sflow -->
 <path d="M130,35 C210,35 250,65 290,70" fill="none" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
 <path d="M130,105 C210,105 250,75 290,70" fill="none" stroke="#e3b341" stroke-width="2" opacity="0.6"/>
@@ -1317,7 +1317,7 @@ networking config match Dynamo disagg routing.</div>
 <polygon points="495,100 505,105 495,110" fill="#e3b341" opacity="0.6"/>
 </svg>
 </div>
-<div class="output-strip r au d4">One DAG · specialized accelerators · one workflow contract</div>
+<div class="output-strip r au d4">一份 DAG · 专用加速器 · 同一份工作流契约</div>
 </div>
 </section>
 
@@ -1328,27 +1328,27 @@ networking config match Dynamo disagg routing.</div>
 <div class="orb og" style="width:280px;height:280px;top:-90px;right:18%"></div>
 <span class="sn">18 / 18</span>
 <div class="inner">
-<span class="pill pc r ap d0 ms">Try It</span>
-<h2 class="r al d1 ms">Install. Explore. Run.</h2>
-<p class="r au d2" style="max-width:760px">Start locally, validate before allocating hardware, then use the docs and repository as your source of truth.</p>
+<span class="pill pc r ap d0 ms">立即上手</span>
+<h2 class="r al d1 ms">安装。探索。运行。</h2>
+<p class="r au d2" style="max-width:760px">先在本地起步，在申请硬件之前完成校验，再以文档和代码仓库作为唯一事实来源。</p>
 <div class="try-layout">
-  <div class="term install-panel r al d2"><span class="section"># install from the repository</span>
+  <div class="term install-panel r al d2"><span class="section"># 从代码仓库安装</span>
 <span class="command">$ uv venv --python python3 &amp;&amp; source .venv/bin/activate</span>
 <span class="command">$ uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"</span>
 
-<span class="section"># verify and try a local workflow</span>
+<span class="section"># 验证并试跑一个本地工作流</span>
 <span class="command">$ sflow --version</span>
 <span class="command">$ sflow sample self_contained/local/hello_world</span>
 <span class="command">$ sflow run -f hello_world.yaml --dry-run</span>
-<span class="success">✓ validate first; run when the plan looks right</span></div>
+<span class="success">✓ 先校验；确认方案无误后再运行</span></div>
   <div class="try-links r ar d3">
-    <a class="try-link" href="https://github.com/NVIDIA/nv-sflow" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">GIT</span><span><b>GitHub Repository</b><small>github.com/NVIDIA/nv-sflow</small></span><span class="try-link-arrow">→</span></a>
-    <a class="try-link" href="docs/user/intro" target="_top" onclick="event.stopPropagation()"><span class="try-link-icon">DOC</span><span><b>Documentation</b><small>nvidia.github.io/nv-sflow/docs</small></span><span class="try-link-arrow">→</span></a>
-    <a class="try-link" href="docs/user/quickstart" target="_top" onclick="event.stopPropagation()"><span class="try-link-icon">01</span><span><b>Quickstart</b><small>docs/user/quickstart</small></span><span class="try-link-arrow">→</span></a>
-    <a class="try-link" href="feature-map" target="_top" onclick="event.stopPropagation()"><span class="try-link-icon">MAP</span><span><b>Feature Map</b><small>Find the right guide by intent</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="https://github.com/NVIDIA/nv-sflow" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">GIT</span><span><b>GitHub 仓库</b><small>github.com/NVIDIA/nv-sflow</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="https://nvidia.github.io/nv-sflow/docs/user/intro" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">DOC</span><span><b>文档</b><small>nvidia.github.io/nv-sflow/docs</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="https://nvidia.github.io/nv-sflow/docs/user/quickstart" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">01</span><span><b>快速上手</b><small>docs/user/quickstart</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="https://nvidia.github.io/nv-sflow/feature-map" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">MAP</span><span><b>功能地图</b><small>按意图找到对应的指南</small></span><span class="try-link-arrow">→</span></a>
   </div>
 </div>
-<div class="try-footer r au d4"><span>Local</span><span>Docker</span><span>Slurm</span><span>Kubernetes</span><span>one workflow contract</span></div>
+<div class="try-footer r au d4"><span>本地</span><span>Docker</span><span>Slurm</span><span>Kubernetes</span><span>同一份工作流契约</span></div>
 </div>
 </section>
 
@@ -1365,7 +1365,7 @@ var dots=dotsEl.querySelectorAll('.dot');
 // deep in the deck costs you your place, which is enough to stop people switching.
 var langLink=document.getElementById('langToggle'),
     langHref=langLink?langLink.getAttribute('href'):'',
-    LANG_TARGET='zh';
+    LANG_TARGET='en';
 function syncLang(i){if(langLink)langLink.setAttribute('href',langHref+'#'+secs[i].id)}
 // On the site homepage this deck runs inside an iframe. Swapping the frame in place
 // would leave the address bar on "/", so the other language could not be shared or
@@ -1397,7 +1397,7 @@ function startTimer(){tmr.style.transition='none';tmr.style.width='0%';requestAn
 function go(i){cur=((i%N)+N)%N;secs[cur].scrollIntoView({behavior:'smooth'});activate(cur);resetAuto()}
 function next(){if(!paused)go(cur+1)}
 function resetAuto(){clearInterval(timer);if(!paused)timer=setInterval(next,D)}
-function toggleAuto(){paused=!paused;badge.textContent=paused?'press P to enable auto-scroll':'AUTO-SCROLL ON \u2014 press P to pause';badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()}
+function toggleAuto(){paused=!paused;badge.textContent=paused?'按 P 开启自动播放':'自动播放已开启 \u2014 按 P 暂停';badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()}
 document.addEventListener('keydown',function(e){if(e.key==='p'||e.key==='P'){toggleAuto();return}if(['ArrowDown',' ','ArrowRight','PageDown'].indexOf(e.key)>=0){e.preventDefault();go(cur+1)}else if(['ArrowUp','ArrowLeft','PageUp'].indexOf(e.key)>=0){e.preventDefault();go(cur-1)}});
 var obs=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){for(var i=0;i<N;i++)if(secs[i]===e.target){cur=i;activate(i);break}}})},{threshold:.4});
 for(var i=0;i<N;i++)obs.observe(secs[i]);

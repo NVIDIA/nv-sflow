@@ -121,6 +121,9 @@ const config = {
         },
         items: [
           { type: "doc", docId: "user/intro", label: "Docs", position: "left" },
+          // Agent Skills is a peer of Docs, not a subsection of it. Targets the
+          // standalone `agents` sidebar so the entry follows the version dropdown.
+          { type: "docSidebar", sidebarId: "agents", label: "Agent Skills", position: "left" },
           { type: "search", position: "left" },
           { type: "docsVersionDropdown", position: "right" },
           {
