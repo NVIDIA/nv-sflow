@@ -1,0 +1,1373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sflow — 面向大规模 GPU 集群的声明式工作流描述器</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-snap-type:y mandatory;scroll-behavior:smooth;height:100%;overflow-x:hidden}
+body{font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;background:#060a10;color:#dce3ed;height:100%}
+:root{
+  --cy:#00d4ff;--gr:#76ff02;--bg:#060a10;--card:#0d1420;--card-h:#141e2e;
+  --txt:#dce3ed;--dim:#6b7d95;--bdr:rgba(0,212,255,0.12);
+  --grad:linear-gradient(135deg,#00d4ff,#76ff03);
+  --t:clamp(2rem,5.5vw,4.5rem);--h:clamp(1.6rem,3.8vw,3.0rem);
+  --b:clamp(1.2rem,2vw,1.5rem);--s:clamp(.72rem,1.1vw,.95rem);
+  --pad:clamp(1rem,4vw,4rem);--gap:clamp(.5rem,1.8vw,1.6rem);
+  --font-display:'Syne','Bahnschrift','Segoe UI','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',sans-serif;
+  --font-heavy:'Archivo Black','Arial Black','Segoe UI Black','Bahnschrift','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',sans-serif;
+}
+.sec{width:100vw;min-height:100vh;height:100dvh;overflow:hidden;scroll-snap-align:start;position:relative;display:flex;align-items:center;justify-content:center;content-visibility:auto;contain-intrinsic-size:100vh;contain:layout paint style}
+.legacy-hidden{display:none!important}
+.inner{position:relative;z-index:2;width:100%;max-width:1200px;padding:var(--pad);display:flex;flex-direction:column;gap:var(--gap)}
+h1{font-family:var(--font-display);font-weight:800;font-size:var(--t);letter-spacing:-.03em;line-height:1.1;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+h2{font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-weight:700;font-size:var(--h);color:var(--txt);line-height:1.2}
+h3{font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-weight:600;font-size:clamp(.95rem,1.4vw,1.15rem);color:var(--txt);margin-bottom:.15rem}
+p,li{font-size:var(--b);color:var(--dim);line-height:1.6}
+code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:.95em}
+.accent{color:var(--cy)}.green{color:var(--gr)}
+
+/* === ANIMATIONS (only run on visible slides) === */
+@keyframes fu{from{opacity:0;transform:translateY(50px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fl{from{opacity:0;transform:translateX(-60px)}to{opacity:1;transform:translateX(0)}}
+@keyframes fr{from{opacity:0;transform:translateX(60px)}to{opacity:1;transform:translateX(0)}}
+@keyframes si{from{opacity:0;transform:scale(.8)}to{opacity:1;transform:scale(1)}}
+@keyframes pi{from{opacity:0;transform:scale(.4)}to{opacity:1;transform:scale(1)}}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes ri{from{opacity:0;transform:translateX(-30px)}to{opacity:1;transform:translateX(0)}}
+@keyframes filltxt{from{width:0}to{width:100%}}
+@keyframes scanhi{0%,100%{filter:drop-shadow(0 0 0 rgba(0,212,255,0));opacity:.65}50%{filter:drop-shadow(0 0 8px rgba(118,255,2,.45));opacity:1}}
+@keyframes dagready{from{opacity:.12;transform:translateY(8px) scale(.97);filter:saturate(.3)}to{opacity:1;transform:translateY(0) scale(1);filter:saturate(1)}}
+@keyframes dagflow{from{opacity:.12;color:#3d444d;transform:scaleY(.2)}to{opacity:1;color:var(--gr);transform:scaleY(1)}}
+@keyframes xflowmove{from{offset-distance:0%}to{offset-distance:100%}}
+
+.r{opacity:0;animation-fill-mode:forwards;animation-play-state:paused}
+.sec.on .r{animation-play-state:running}
+.au{animation:fu .8s cubic-bezier(.16,1,.3,1) forwards}
+.al{animation:fl .8s cubic-bezier(.16,1,.3,1) forwards}
+.ar{animation:fr .9s cubic-bezier(.16,1,.3,1) forwards}
+.as{animation:si .8s cubic-bezier(.16,1,.3,1) forwards}
+.ap{animation:pi .6s cubic-bezier(.34,1.56,.64,1) forwards}
+.d0{animation-delay:0s}.d1{animation-delay:.12s}.d2{animation-delay:.24s}
+.d3{animation-delay:.36s}.d4{animation-delay:.48s}.d5{animation-delay:.6s}
+.d6{animation-delay:.72s}.d7{animation-delay:.84s}.d8{animation-delay:.96s}
+.xflow-dot{offset-rotate:0deg;animation:xflowmove 2.4s linear infinite}
+.xflow-recipe{offset-path:path("M200,110 C245,110 268,110 288,110");animation-duration:1.8s}
+.xflow-local{offset-path:path("M377,100 C420,85 454,25 500,25");animation-delay:.1s}
+.xflow-docker{offset-path:path("M377,105 C425,98 455,75 500,75");animation-delay:.5s}
+.xflow-slurm{offset-path:path("M377,115 C425,122 455,125 500,125");animation-delay:.9s}
+.xflow-k8s{offset-path:path("M377,120 C420,135 454,175 500,175");animation-delay:1.3s}
+
+/* === BACKGROUNDS (static — no animated blur or grid movement) === */
+.gbg{position:absolute;inset:0;z-index:0;background-image:linear-gradient(rgba(0,212,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.03) 1px,transparent 1px);background-size:60px 60px}
+.orb{position:absolute;border-radius:50%;z-index:0;pointer-events:none;opacity:.1}
+.oc{background:radial-gradient(circle,var(--cy),transparent 70%)}.og{background:radial-gradient(circle,var(--gr),transparent 70%)}
+
+/* === LAYOUT === */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:clamp(1rem,3vw,3rem);align-items:start}
+@media(max-width:768px){.two{grid-template-columns:1fr}}
+.fg{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(.5rem,1.2vw,1rem)}
+@media(max-width:900px){.fg{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:550px){.fg{grid-template-columns:1fr}}
+
+/* === FEATURE LIFECYCLE === */
+@keyframes phasein{from{opacity:.12;transform:translateY(12px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+.lifecycle-flow{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr);gap:clamp(.4rem,1.2vw,.9rem);align-items:stretch}
+.phase{position:relative;background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:clamp(.7rem,1.6vw,1.15rem);opacity:.12;overflow:hidden}
+.phase::before{content:attr(data-step);position:absolute;right:clamp(.35rem,.8vw,.65rem);top:calc(-1 * clamp(.25rem,.5vw,.4rem));font-family:var(--font-heavy);font-size:clamp(2.6rem,6vw,5rem);color:rgba(0,212,255,.06)}
+.phase h3{color:var(--cy);font-family:var(--font-display);font-size:clamp(1rem,1.8vw,1.35rem);margin-bottom:clamp(.35rem,.7vw,.6rem)}
+.phase.execute h3{color:var(--gr)}.phase.understand h3{color:#e3b341}
+.phase-item{display:flex;align-items:center;gap:clamp(.3rem,.7vw,.55rem);padding:clamp(.28rem,.55vw,.45rem) 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:clamp(.58rem,.9vw,.74rem);color:var(--dim)}
+.phase-item:last-child{border-bottom:0}.phase-item b{color:var(--txt);font-weight:600}
+.phase-icon{flex:0 0 auto;width:clamp(1.35rem,2.5vw,1.85rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;color:var(--cy);font-size:clamp(.55rem,.9vw,.72rem)}
+.execute .phase-icon{color:var(--gr)}.understand .phase-icon{color:#e3b341}
+.flow-arrow{align-self:center;color:#3d444d;font-size:clamp(1rem,2vw,1.5rem);opacity:.2}
+.sec.on .phase{animation:phasein .55s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--phase-delay)}
+.sec.on .flow-arrow{animation:dagflow .3s ease forwards;animation-delay:var(--phase-delay)}
+@media(max-width:760px){.lifecycle-flow{grid-template-columns:1fr}.flow-arrow{transform:rotate(90deg)}.phase{padding:clamp(.45rem,1vw,.7rem)}}
+
+/* === BACKEND ADAPTER MAP === */
+@keyframes adapterin{from{opacity:.12;transform:translateY(10px);border-color:#2b3544}to{opacity:1;transform:translateY(0);border-color:currentColor}}
+.contract-strip,.output-strip{align-self:center;width:min(92vw,900px);padding:clamp(.5rem,1vw,.75rem);border:1px solid var(--cy);border-radius:8px;background:#0d1420;text-align:center;color:var(--txt);font-size:clamp(.6rem,1vw,.82rem)}
+.contract-strip b{color:var(--cy)}.output-strip{border-color:var(--gr);color:var(--gr)}
+.backend-lanes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(.45rem,1vw,.8rem)}
+.backend-lane{border:1px solid #2b3544;border-radius:8px;background:#0d1117;padding:clamp(.55rem,1.1vw,.8rem);text-align:center;color:var(--cy);opacity:.12}
+.backend-lane:nth-child(2){color:var(--gr)}.backend-lane:nth-child(3){color:#e3b341}.backend-lane:nth-child(4){color:var(--cy)}
+.backend-symbol{width:clamp(2rem,4vw,3rem);aspect-ratio:1;margin:0 auto clamp(.25rem,.55vw,.45rem);display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;font-size:clamp(.8rem,1.5vw,1.1rem);box-shadow:inset 0 0 10px currentColor}
+.backend-lane h3{color:currentColor;margin-bottom:clamp(.15rem,.35vw,.3rem)}.backend-lane p{font-size:clamp(.5rem,.78vw,.66rem);line-height:1.35}
+.sec.on .backend-lane{animation:adapterin .5s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--adapter-delay)}
+@media(max-width:760px){.backend-lanes{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* === PROBLEM: DUPLICATED PLATFORM PLUMBING === */
+@keyframes copycell{from{opacity:.28;transform:translateX(calc(-1 * clamp(.3rem,.8vw,.6rem)));border-color:#2b3544}to{opacity:1;transform:translateX(0);border-color:#ff7b72}}
+.problem-source{align-self:center;width:min(86vw,760px);padding:clamp(.55rem,1.2vw,.85rem);border:1px solid var(--cy);border-radius:8px;background:var(--card);text-align:center;color:var(--txt);font-size:clamp(.62rem,1vw,.82rem)}
+.problem-source b{color:var(--cy)}
+.dup-matrix{display:grid;grid-template-columns:minmax(6.8rem,.8fr) repeat(3,minmax(0,1fr));gap:clamp(.22rem,.55vw,.4rem);width:100%;max-width:1040px;align-self:center}
+.dup-head{padding:clamp(.25rem,.5vw,.4rem);border-bottom:1px solid rgba(255,123,114,.35);color:#ff7b72;text-align:center;font-family:var(--font-display);font-size:clamp(.62rem,1vw,.82rem)}
+.dup-corner{color:var(--dim);text-align:left;font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.48rem,.72vw,.6rem)}
+.dup-label{display:flex;align-items:center;padding:clamp(.28rem,.55vw,.42rem);border-left:2px solid rgba(255,123,114,.45);color:var(--txt);font-size:clamp(.54rem,.82vw,.68rem);font-weight:700}
+.dup-cell{position:relative;min-width:0;padding:clamp(.28rem,.58vw,.44rem) clamp(.35rem,.7vw,.55rem);border:1px solid rgba(255,123,114,.58);border-radius:5px;background:rgba(255,123,114,.07);color:#ff7b72;opacity:.68;overflow:hidden}
+.dup-cell::after{content:"重复";position:absolute;right:clamp(.18rem,.4vw,.3rem);top:clamp(.12rem,.3vw,.22rem);color:rgba(255,123,114,.42);font-size:clamp(.38rem,.56vw,.46rem);font-weight:700}
+.dup-cell code{display:block;padding-right:clamp(1.6rem,3vw,2.4rem);color:#a99296;font-size:clamp(.46rem,.68vw,.56rem);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dup-total{align-self:center;width:min(90vw,820px);display:flex;justify-content:center;gap:clamp(.4rem,1vw,.8rem);padding:clamp(.42rem,.85vw,.65rem);border:1px solid rgba(255,123,114,.55);border-radius:8px;background:rgba(255,123,114,.035);color:var(--dim);font-size:clamp(.56rem,.86vw,.7rem)}
+.dup-total b{color:#ff7b72}
+.sec.on .dup-cell{animation:copycell .42s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--copy-delay)}
+@media(max-width:720px){.dup-matrix{grid-template-columns:minmax(5.5rem,.7fr) repeat(3,minmax(0,1fr))}.dup-cell::after{display:none}.dup-cell code{padding-right:0}}
+
+/* === MERGE-POD BEFORE / AFTER === */
+@keyframes mergeglow{from{opacity:.55;box-shadow:none}to{opacity:1;box-shadow:0 0 20px rgba(118,255,2,.25)}}
+.merge-topology{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1.15fr);gap:clamp(.65rem,1.5vw,1.2rem);align-items:center}
+.topology-panel{border:1px solid var(--bdr);border-radius:10px;background:var(--card);padding:clamp(.65rem,1.3vw,.95rem)}
+.topology-panel h3{font-family:var(--font-display);margin-bottom:clamp(.35rem,.7vw,.6rem)}
+.pod-pair{display:grid;grid-template-columns:1fr auto 1fr;gap:clamp(.3rem,.65vw,.5rem);align-items:center}
+.pod-box{border:1px solid #ff7b72;border-radius:7px;padding:clamp(.45rem,.9vw,.7rem);text-align:center;color:#ff7b72;font-size:clamp(.55rem,.85vw,.7rem)}
+.pod-box span{display:block;color:var(--dim);font-size:clamp(.45rem,.68vw,.56rem);margin-top:.25em}
+.slow-link{color:#ff7b72;font-size:clamp(.48rem,.72vw,.6rem);text-align:center}
+.merge-action{color:var(--gr);text-align:center;font-size:clamp(.58rem,.95vw,.78rem);font-weight:700}
+.merged-topology{border-color:var(--gr);opacity:.55}
+.worker-row,.shared-gpus{display:flex;gap:clamp(.35rem,.8vw,.6rem);justify-content:center;flex-wrap:wrap}
+.worker-tag{padding:.25em .65em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);font-size:clamp(.5rem,.75vw,.62rem)}
+.shared-gpus{margin-top:clamp(.45rem,.9vw,.7rem);padding:clamp(.4rem,.8vw,.6rem);border:1px solid rgba(118,255,2,.35);border-radius:7px}
+.shared-gpu{width:clamp(2.1rem,4vw,3rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid var(--gr);border-radius:5px;color:var(--gr);font-size:clamp(.48rem,.72vw,.6rem)}
+.nvlink-bus{text-align:center;color:var(--gr);font-size:clamp(.5rem,.78vw,.64rem);margin-top:clamp(.3rem,.6vw,.5rem)}
+.merge-assumption{margin-top:clamp(.45rem,1vw,.75rem);padding:clamp(.4rem,.8vw,.6rem);border-left:3px solid #e3b341;color:var(--dim);font-size:clamp(.58rem,.86vw,.7rem)}
+.sec.on .merged-topology{animation:mergeglow .75s ease forwards 1.1s}
+@media(max-width:760px){.merge-topology{grid-template-columns:1fr}.merge-action{transform:rotate(90deg)}}
+
+/* === MODULAR RECIPE ASSEMBLY === */
+@keyframes treebranch{from{opacity:.18;transform:translateX(calc(-1 * clamp(.35rem,.9vw,.7rem)))}to{opacity:1;transform:translateX(0)}}
+@keyframes leafselect{from{border-color:#2b3544;box-shadow:none;color:var(--dim)}to{border-color:var(--gr);box-shadow:0 0 13px rgba(118,255,2,.24);color:var(--gr)}}
+@keyframes flowhop{from{opacity:.12;transform:translateX(calc(-1 * clamp(.3rem,.8vw,.6rem)));color:var(--dim)}to{opacity:1;transform:translateX(0);color:var(--gr)}}
+.recipe-tree{display:grid;grid-template-columns:minmax(7.5rem,.65fr) minmax(0,2.35fr);gap:clamp(.9rem,2.2vw,1.7rem);width:100%;max-width:1040px;align-self:center;align-items:center}
+.tree-root{position:relative;padding:clamp(.8rem,1.5vw,1.1rem);border:1px solid var(--cy);border-radius:9px;background:var(--card);text-align:center;color:var(--cy);font-family:var(--font-heavy);font-size:clamp(1rem,2vw,1.5rem);box-shadow:0 0 14px rgba(0,212,255,.12)}
+.tree-root small{display:block;margin-top:clamp(.18rem,.4vw,.3rem);color:var(--dim);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.46rem,.68vw,.56rem);font-weight:400}
+.tree-root::after{content:"";position:absolute;left:100%;top:50%;width:clamp(.9rem,2.2vw,1.7rem);height:1px;background:var(--cy);opacity:.45}
+.tree-branches{display:grid;gap:clamp(.28rem,.65vw,.48rem);padding-left:clamp(.75rem,1.8vw,1.35rem);border-left:1px solid rgba(0,212,255,.45)}
+.tree-branch{position:relative;display:grid;grid-template-columns:minmax(7.5rem,.8fr) minmax(0,2fr);gap:clamp(.4rem,.9vw,.7rem);align-items:center;opacity:.68}
+.tree-branch::before{content:"";position:absolute;right:100%;top:50%;width:clamp(.75rem,1.8vw,1.35rem);height:1px;background:rgba(0,212,255,.45)}
+.branch-label{padding:clamp(.36rem,.72vw,.55rem);border:1px solid var(--bdr);border-radius:6px;background:#0d1117;color:var(--txt);font-size:clamp(.56rem,.85vw,.7rem);font-weight:700}
+.branch-label code{color:var(--cy)}
+.tree-leaves{display:flex;flex-wrap:wrap;gap:clamp(.25rem,.55vw,.42rem)}
+.tree-leaf{padding:clamp(.24rem,.48vw,.36rem) clamp(.38rem,.72vw,.56rem);border:1px solid #2b3544;border-radius:999px;background:rgba(255,255,255,.015);color:var(--dim);font-size:clamp(.48rem,.72vw,.6rem);white-space:nowrap}
+.tree-leaf.selected{border-color:rgba(118,255,2,.6);box-shadow:0 0 8px rgba(118,255,2,.14);color:var(--gr)}
+.tree-leaf.fixed{border-style:dashed;color:var(--cy)}
+.tree-selection{text-align:center;color:var(--gr);font-size:clamp(.52rem,.8vw,.66rem)}
+.compose-result{align-self:center;width:min(88vw,760px);padding:clamp(.55rem,1.05vw,.8rem);border:1px solid var(--gr);border-radius:8px;text-align:center;color:var(--gr);background:#0d1420;font-size:clamp(.62rem,.95vw,.78rem)}
+.sec.on .tree-branch{animation:treebranch .48s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--branch-delay)}
+.sec.on .tree-leaf.selected{animation:leafselect .45s ease forwards;animation-delay:var(--leaf-delay)}
+@media(max-width:780px){.recipe-tree{grid-template-columns:minmax(6.2rem,.55fr) minmax(0,2.45fr);gap:clamp(.55rem,1.3vw,.9rem)}.tree-root::after{width:clamp(.55rem,1.3vw,.9rem)}.tree-branch{grid-template-columns:minmax(6.4rem,.7fr) minmax(0,2fr)}}
+
+/* === DEVELOPER EXPERIENCE LOOP === */
+.agent-loop-shell{position:relative;display:grid;gap:clamp(.45rem,1vw,.75rem);padding:clamp(.42rem,.85vw,.65rem) clamp(.48rem,1vw,.8rem)}
+.dev-flow{position:relative;z-index:2;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr);gap:clamp(.35rem,.8vw,.65rem);align-items:center}
+.dev-step{position:relative;min-height:clamp(8.2rem,14vw,10.5rem);border:1px solid var(--bdr);border-radius:9px;background:var(--card);padding:clamp(.62rem,1.15vw,.88rem);text-align:left;opacity:.12;overflow:hidden}
+.dev-step .step-num{position:absolute;right:clamp(.35rem,.7vw,.55rem);top:calc(-1 * clamp(.25rem,.5vw,.4rem));color:rgba(0,212,255,.08);font-family:var(--font-heavy);font-size:clamp(2.3rem,5vw,3.8rem)}
+.dev-step h3{position:relative;font-family:var(--font-display);color:var(--txt);font-size:clamp(.78rem,1.25vw,1rem);margin-bottom:clamp(.35rem,.7vw,.55rem)}
+.dev-step:nth-child(5) h3{color:#e3b341}.dev-step:nth-child(7) h3{color:var(--gr)}
+.dev-context{position:relative;display:grid;gap:clamp(.2rem,.42vw,.32rem)}
+.dev-context span{display:block;padding:clamp(.18rem,.36vw,.27rem) clamp(.28rem,.55vw,.42rem);border-left:2px solid var(--cy);background:rgba(0,212,255,.035);color:var(--dim);font-size:clamp(.46rem,.68vw,.56rem);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dev-step:nth-child(3) .dev-context span{border-color:var(--gr)}.dev-step:nth-child(5) .dev-context span{border-color:#e3b341}.dev-step:nth-child(7) .dev-context span{border-color:var(--gr)}
+.dev-arrow{color:var(--gr);opacity:.12;font-size:clamp(.9rem,1.5vw,1.2rem)}
+.agent-feedback{position:relative;z-index:2;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:clamp(.45rem,1vw,.8rem);align-items:center;width:min(94vw,980px);justify-self:center;padding:clamp(.45rem,.85vw,.65rem);border:1px dashed rgba(0,212,255,.42);border-radius:999px;background:rgba(6,10,16,.88);color:var(--dim);font-size:clamp(.5rem,.76vw,.62rem);overflow:hidden}
+.agent-feedback-orbit{position:absolute;inset:0;width:100%;height:100%;z-index:3;overflow:visible;pointer-events:none}
+.agent-loop-arrow{offset-path:path("M48 8 H952 Q992 8 992 50 Q992 92 952 92 H48 Q8 92 8 50 Q8 8 48 8 Z");offset-rotate:auto;animation:xflowmove 5s linear infinite;fill:var(--gr);filter:drop-shadow(0 0 7px rgba(118,255,2,.9))}
+.agent-chip{position:relative;z-index:1;padding:clamp(.2rem,.4vw,.3rem) clamp(.4rem,.75vw,.58rem);border:1px solid var(--gr);border-radius:999px;color:var(--gr);font-weight:700}
+.feedback-evidence{position:relative;z-index:1;display:flex;justify-content:center;gap:clamp(.25rem,.55vw,.42rem);flex-wrap:wrap}
+.feedback-evidence span{padding:clamp(.14rem,.3vw,.22rem) clamp(.3rem,.58vw,.45rem);border:1px solid var(--bdr);border-radius:999px;background:#0d1117}
+.feedback-action{position:relative;z-index:1;color:var(--cy);white-space:nowrap}
+.sec.on .dev-step{animation:treebranch .5s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--dev-delay)}
+.sec.on .dev-arrow:nth-child(2){animation:flowhop .35s ease forwards .42s}.sec.on .dev-arrow:nth-child(4){animation:flowhop .35s ease forwards .67s}.sec.on .dev-arrow:nth-child(6){animation:flowhop .35s ease forwards .92s}
+@media(max-width:780px){.dev-flow{grid-template-columns:repeat(2,minmax(0,1fr))}.dev-arrow{display:none}.dev-step{min-height:clamp(6.8rem,18vw,8.5rem)}.agent-feedback{grid-template-columns:auto 1fr}.feedback-action{grid-column:1/-1;text-align:center}}
+@media(prefers-reduced-motion:reduce){.agent-loop-arrow{display:none}}
+
+/* === VISION ROUTING MOTION === */
+.vision-route-dot{offset-rotate:0deg;animation:xflowmove 2s linear infinite}
+.vision-prefill-dot{offset-path:path("M360,62 C400,50 440,35 500,35")}
+.vision-decode-dot{offset-path:path("M360,78 C400,90 440,105 500,105")}
+
+/* === TRY IT / RESOURCE LINKS === */
+.try-layout{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(0,.88fr);gap:clamp(.7rem,2vw,1.5rem);align-items:stretch}
+.install-panel{font-size:clamp(.52rem,.82vw,.7rem);line-height:1.55;white-space:pre-wrap}
+.install-panel .section{color:var(--dim)}.install-panel .command{color:var(--cy)}.install-panel .success{color:var(--gr)}
+.try-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(.4rem,.9vw,.7rem)}
+.try-link{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:clamp(.35rem,.75vw,.55rem);align-items:center;padding:clamp(.55rem,1vw,.8rem);border:1px solid var(--bdr);border-radius:8px;background:var(--card);color:var(--txt);text-decoration:none;transition:transform .25s,border-color .25s,box-shadow .25s}
+.try-link:hover{transform:translateY(-3px);border-color:var(--cy);box-shadow:0 0 16px rgba(0,212,255,.16)}
+.try-link-icon{width:clamp(1.8rem,3.5vw,2.6rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;color:var(--cy);font-size:clamp(.46rem,.7vw,.58rem);font-weight:700}
+.try-link:nth-child(even) .try-link-icon{color:var(--gr)}
+.try-link b{display:block;font-family:var(--font-display);font-size:clamp(.66rem,1vw,.82rem)}
+.try-link small{display:block;margin-top:clamp(.12rem,.25vw,.2rem);color:var(--dim);font-size:clamp(.44rem,.64vw,.54rem);line-height:1.35}
+.try-link-arrow{color:var(--gr)}
+.try-footer{display:flex;justify-content:center;gap:clamp(.35rem,.8vw,.6rem);flex-wrap:wrap;color:var(--dim);font-size:clamp(.5rem,.75vw,.62rem)}
+.try-footer span{padding:clamp(.16rem,.32vw,.24rem) clamp(.35rem,.65vw,.5rem);border:1px solid var(--bdr);border-radius:999px}
+@media(max-width:760px){.try-layout{grid-template-columns:1fr}.try-links{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-height:600px){.install-panel{font-size:clamp(.46rem,.72vw,.6rem);line-height:1.42}.try-link{padding:clamp(.42rem,.78vw,.6rem)}}
+
+/* === WORKLOAD EVOLUTION (slide 2) ===
+   Two transition tracks -- deployment scale and serving architecture -- each read
+   left-to-right, from one quiet box to a multi-stage chain. Reuses the deck's
+   existing treebranch/flowhop keyframes so the motion vocabulary matches the
+   recipe-tree and developer-loop slides rather than introducing a new one. */
+.evo-grid{display:grid;gap:clamp(.5rem,1.15vw,.9rem);width:100%;max-width:1120px;align-self:center}
+.evo-row{display:grid;grid-template-columns:minmax(5rem,.4fr) minmax(0,.82fr) auto minmax(0,1.9fr);gap:clamp(.38rem,.9vw,.7rem);align-items:stretch}
+.evo-axis{display:flex;flex-direction:column;justify-content:center;padding-left:clamp(.35rem,.75vw,.55rem);border-left:2px solid rgba(0,212,255,.5);color:var(--txt);font-family:var(--font-display);font-size:clamp(.6rem,.92vw,.78rem);font-weight:700}
+.evo-axis small{margin-top:.25em;color:var(--dim);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.44rem,.66vw,.55rem);font-weight:400}
+.evo-panel{position:relative;display:flex;flex-direction:column;justify-content:center;gap:clamp(.3rem,.62vw,.48rem);padding:clamp(.55rem,1.05vw,.8rem);border:1px solid #3d444d;border-radius:8px;background:#0d1117;opacity:.12}
+.evo-cap{position:absolute;top:calc(-1 * clamp(.42rem,.85vw,.62rem));left:clamp(.5rem,1vw,.75rem);padding:0 clamp(.28rem,.55vw,.45rem);background:var(--bg);color:var(--dim);font-size:clamp(.44rem,.66vw,.55rem);font-weight:700;letter-spacing:.1em}
+.evo-now{border-color:rgba(118,255,2,.5)}.evo-now .evo-cap{color:var(--gr)}
+.evo-chain{display:flex;align-items:center;gap:clamp(.22rem,.5vw,.4rem);flex-wrap:wrap}
+.evo-chip{padding:clamp(.24rem,.5vw,.38rem) clamp(.4rem,.8vw,.6rem);border:1px solid #3d444d;border-radius:6px;background:rgba(255,255,255,.02);color:var(--dim);font-size:clamp(.5rem,.78vw,.66rem);font-weight:700;white-space:nowrap;opacity:.12;--evo-delay:0s}
+.evo-now .evo-chip{border-color:rgba(118,255,2,.55);color:var(--gr);background:rgba(118,255,2,.05)}
+.evo-now .evo-chip.hetero{border-color:rgba(227,179,65,.62);color:#e3b341;background:rgba(227,179,65,.05)}
+.evo-link{color:var(--gr);font-size:clamp(.5rem,.8vw,.66rem);opacity:.45}
+.evo-note{color:var(--dim);font-size:clamp(.46rem,.7vw,.58rem);line-height:1.4}
+/* Filled bars, not outlined squares: an empty bordered box at text size sitting
+   inline beside CJK copy is indistinguishable from a missing-glyph tofu box. */
+.evo-mini{display:flex;align-items:flex-end;gap:clamp(.1rem,.24vw,.19rem);color:#4a5364}
+.evo-now .evo-mini{color:var(--gr)}
+.evo-mini i{width:clamp(.19rem,.4vw,.28rem);height:clamp(.5rem,1.05vw,.76rem);background:currentColor;border-radius:1px;opacity:.85;box-shadow:0 0 5px currentColor}
+.evo-arrow{align-self:center;color:var(--gr);font-size:clamp(.95rem,1.8vw,1.4rem);opacity:.12}
+.sec.on .evo-panel{animation:treebranch .5s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--evo-delay)}
+.sec.on .evo-chip{animation:treebranch .42s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--evo-delay)}
+.sec.on .evo-arrow{animation:flowhop .35s ease forwards;animation-delay:var(--evo-delay)}
+@media(max-width:820px){.evo-row{grid-template-columns:1fr}.evo-arrow{transform:rotate(90deg)}}
+
+/* === ORCHESTRATION PERSPECTIVE (slide 3) ===
+   A bottom-up stack: hardware at the floor, the app workflow on top. Each layer
+   spans every node (the four bars), and the right-hand rail names what has to
+   match across those nodes. Two motion waves -- the stack builds upward first,
+   then the cross-node rail lights up -- so "compose as a whole" and "align across
+   nodes" land as two separate beats instead of one busy reveal. */
+.persp-strip{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:clamp(.4rem,.95vw,.75rem);align-items:stretch;width:100%;max-width:1120px;align-self:center}
+.persp-side{border:1px solid #3d444d;border-radius:8px;background:#0d1117;padding:clamp(.45rem,.9vw,.68rem) clamp(.55rem,1.05vw,.8rem)}
+.persp-side b{display:block;color:var(--txt);font-family:var(--font-display);font-size:clamp(.56rem,.88vw,.72rem);margin-bottom:.25em}
+.persp-side span{color:var(--dim);font-size:clamp(.46rem,.7vw,.58rem);line-height:1.4}
+.persp-side.now{border-color:rgba(118,255,2,.5)}.persp-side.now b{color:var(--gr)}
+.persp-arrow{align-self:center;color:var(--gr);font-size:clamp(.95rem,1.8vw,1.4rem)}
+
+.stack{--stackcols:minmax(6.4rem,.92fr) minmax(0,2.1fr) minmax(6.2rem,1.02fr);
+  display:grid;grid-template-columns:auto minmax(0,1fr);gap:clamp(.4rem,.9vw,.7rem);
+  width:100%;max-width:1120px;align-self:center}
+.stack-axis{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:clamp(.2rem,.45vw,.35rem);padding:0 clamp(.3rem,.65vw,.5rem)}
+.stack-axis::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:2px;transform:translateX(-50%);background:linear-gradient(to top,var(--cy),var(--gr));opacity:.5}
+.stack-axis span{position:relative;z-index:1;background:var(--bg);padding:clamp(.2rem,.45vw,.35rem) 0;color:var(--gr);font-size:clamp(.6rem,.95vw,.8rem)}
+.stack-axis em{position:relative;z-index:1;writing-mode:vertical-rl;font-style:normal;background:var(--bg);padding:clamp(.25rem,.55vw,.4rem) 0;color:var(--dim);font-family:var(--font-display);font-size:clamp(.5rem,.78vw,.64rem);letter-spacing:.22em}
+.stack-layers{display:grid;gap:clamp(.22rem,.5vw,.36rem)}
+.stack-head,.layer{display:grid;grid-template-columns:var(--stackcols);gap:clamp(.35rem,.8vw,.6rem);align-items:center}
+.stack-head .head-nodes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(.25rem,.55vw,.42rem)}
+.stack-head .head-nodes i{font-style:normal;text-align:center;color:var(--dim);font-size:clamp(.44rem,.66vw,.55rem);letter-spacing:.06em}
+.layer{padding:clamp(.35rem,.7vw,.55rem) clamp(.45rem,.9vw,.68rem);border:1px solid var(--bdr);border-radius:7px;background:var(--card);opacity:.12}
+.layer-name b{display:block;color:currentColor;font-family:var(--font-display);font-size:clamp(.56rem,.88vw,.72rem)}
+.layer-name small{display:block;margin-top:.15em;color:var(--dim);font-size:clamp(.42rem,.64vw,.53rem);line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.layer-nodes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(.25rem,.55vw,.42rem)}
+.layer-nodes i{display:block;height:clamp(.28rem,.55vw,.4rem);border-radius:2px;background:currentColor;opacity:.6;box-shadow:0 0 6px currentColor}
+.layer-align{color:var(--dim);font-size:clamp(.44rem,.68vw,.56rem);text-align:right;opacity:.12;line-height:1.35}
+.layer-align b{color:var(--gr);font-weight:700}
+.sec.on .layer{animation:dagready .45s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--layer-delay)}
+.sec.on .layer-align{animation:flowhop .4s ease forwards;animation-delay:var(--align-delay)}
+@media(max-width:820px){.stack{grid-template-columns:1fr}.stack-axis{flex-direction:row}.stack-axis em{writing-mode:horizontal-tb}.stack-head,.layer{grid-template-columns:1fr}.layer-align{text-align:left}}
+
+/* === PLATFORM FRAGMENTATION (slide 4) ===
+   Four platform "dialect" cards, each showing the native syntax you actually have
+   to write, plus a learning-curve meter. Below them a two-lane mini-gantt: the app
+   lane stalls on a wait block exactly as long as the platform lane's compat work,
+   which is the whole point of the slide. Idle gantt cells are borderless on
+   purpose -- an empty bordered cell reads as a missing glyph. */
+.dialect-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(.4rem,.95vw,.75rem);width:100%;max-width:1120px;align-self:center}
+.dialect{display:flex;flex-direction:column;gap:clamp(.28rem,.6vw,.45rem);padding:clamp(.5rem,1vw,.75rem);border:1px solid var(--bdr);border-radius:8px;background:var(--card);opacity:.12}
+.dialect h3{color:currentColor;font-family:var(--font-display);font-size:clamp(.62rem,.98vw,.8rem);margin:0}
+.dialect-code{padding:clamp(.32rem,.65vw,.5rem);border:1px solid #2b3544;border-left:2px solid currentColor;border-radius:4px;background:#0d1117;color:var(--dim);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.4rem,.62vw,.52rem);line-height:1.5;white-space:pre;overflow:hidden;text-overflow:ellipsis}
+.dialect-learn{color:var(--dim);font-size:clamp(.4rem,.62vw,.52rem);line-height:1.4}
+.dialect-meter{display:flex;align-items:center;gap:clamp(.18rem,.4vw,.3rem);margin-top:auto}
+.dialect-meter em{font-style:normal;color:var(--dim);font-size:clamp(.38rem,.58vw,.48rem);letter-spacing:.06em}
+.dialect-meter i{flex:1;height:clamp(.24rem,.48vw,.34rem);border-radius:2px;background:#2b3544}
+.dialect-meter i.lit{background:currentColor;box-shadow:0 0 5px currentColor}
+
+.drag-band{display:grid;gap:clamp(.28rem,.6vw,.45rem);width:100%;max-width:1120px;align-self:center;padding:clamp(.5rem,1vw,.75rem);border:1px solid rgba(255,123,114,.4);border-radius:8px;background:rgba(255,123,114,.03)}
+.drag-row{display:grid;grid-template-columns:minmax(4.6rem,auto) minmax(0,1fr);gap:clamp(.35rem,.8vw,.6rem);align-items:center}
+.drag-label{color:var(--txt);font-family:var(--font-display);font-size:clamp(.5rem,.78vw,.64rem);font-weight:700}
+.drag-track{display:flex;gap:clamp(.14rem,.3vw,.24rem);align-items:center}
+.drag-track i{display:flex;align-items:center;justify-content:center;height:clamp(.95rem,1.9vw,1.35rem);border-radius:3px;font-style:normal;font-size:clamp(.4rem,.6vw,.5rem);white-space:nowrap;overflow:hidden}
+.blk.go{background:rgba(118,255,2,.18);border:1px solid rgba(118,255,2,.55);color:var(--gr)}
+.blk.wait{background:repeating-linear-gradient(135deg,rgba(255,123,114,.16) 0 6px,transparent 6px 12px);border:1px dashed rgba(255,123,114,.6);color:#ff7b72}
+.blk.work{background:rgba(227,179,65,.16);border:1px solid rgba(227,179,65,.6);color:#e3b341}
+.blk.idle{background:none;border:0}
+.sec.on .dialect{animation:adapterin .5s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--dia-delay)}
+.sec.on .drag-track i{animation:copycell .4s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--blk-delay)}
+.drag-track i{opacity:.12}.blk.idle{opacity:1!important;animation:none!important}
+@media(max-width:820px){.dialect-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.drag-row{grid-template-columns:1fr}}
+
+/* === DAG SLIDE LAYOUT (slide 7) ===
+   The graph is a tall narrow column on a 16:9 stage, so the takeaway cards sit
+   beside it rather than under it -- stacked they cost ~130px of height and left
+   the slide packed edge to edge with the wide sides empty. */
+.dag-layout{display:grid;grid-template-columns:minmax(0,1fr) clamp(12rem,17vw,16rem);gap:clamp(.7rem,1.8vw,1.5rem);align-items:center;width:100%}
+/* The six-node stage row must stay on ONE line -- a wrapped row reads as an
+   extra stage that does not exist. Sized down so it fits the narrower column
+   whichever monospace face the browser actually resolves. */
+.dag-layout .dag{font-size:clamp(.5rem,.82vw,.7rem)}
+.dag-main{display:grid;gap:clamp(.5rem,1.1vw,.9rem);min-width:0}
+.dag-main .contract-strip{width:100%;align-self:stretch}
+.dag-aside{display:grid;gap:clamp(.4rem,.9vw,.7rem);min-width:0}
+.dag-aside .fc{padding:clamp(.5rem,1.1vw,.85rem)}
+.dag-aside .ic{font-size:clamp(.9rem,1.4vw,1.2rem);margin-bottom:.15rem}
+.dag-aside .fc h3{font-size:clamp(.7rem,1.1vw,.9rem)}
+.dag-aside .fc p{font-size:clamp(.55rem,.85vw,.72rem);line-height:1.45}
+@media(max-width:900px){.dag-layout{grid-template-columns:1fr}}
+
+/* === COMPONENTS === */
+/* align-self, because .inner is a flex column: without it the default `stretch`
+   inflates every section pill to the full slide width, so a two-word label reads
+   as a full-bleed bar instead of a tag. */
+.pill{display:inline-block;align-self:flex-start;padding:.2em .8em;border-radius:999px;font-size:var(--b);font-weight:500;border:1px solid}
+.pc{border-color:var(--cy);color:var(--cy)}.pg{border-color:var(--gr);color:var(--gr)}
+
+.fc{background:var(--card);border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.1rem);position:relative;overflow:hidden;transition:transform .4s,border-color .4s,background .4s}
+.fc:hover{transform:translateY(-4px);border-color:var(--cy);background:var(--card-h)}
+.fc .ic{font-size:clamp(1.1rem,1.8vw,1.6rem);display:block;margin-bottom:.2rem}
+.fc p{font-size:var(--s);margin:0;line-height:1.35}
+
+/* === TERMINAL BLOCK === */
+.term{background:#0d1117;border:1px solid var(--bdr);border-radius:8px;padding:clamp(.6rem,1.5vw,1.2rem);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.6rem,1vw,.88rem);line-height:1.55;color:#8b949e;position:relative;overflow:hidden;white-space:pre;overflow-x:auto}
+.term .hi{color:var(--txt)}.term .cy{color:var(--cy)}.term .gr{color:var(--gr)}
+.term .rd{color:#ff7b72}.term .yl{color:#e3b341}.term .wh{color:#c9d1d9}
+.livebar{display:inline-block;width:30ch;position:relative;color:transparent;vertical-align:bottom}
+.livebar::after{content:attr(data-bar);position:absolute;left:0;top:0;width:0;overflow:hidden;white-space:nowrap;color:var(--gr)}
+.livebar.cy::after{color:var(--cy)}
+.spark{display:inline-block;position:relative;color:transparent;vertical-align:bottom}
+.spark::after{content:attr(data-spark);position:absolute;left:0;top:0;width:0;overflow:hidden;white-space:nowrap;color:var(--gr)}
+.spark.cy::after{color:var(--cy)}
+.term .livebar.cy,.term .spark.cy{color:transparent}
+.runline{display:block;opacity:.45;transform:translateX(-8px)}
+.sec.on .runline{animation:ri .5s ease forwards,scanhi 2.5s ease-in-out infinite .6s}
+.sec.on .runline:nth-of-type(1){animation-delay:.1s,.7s}
+.sec.on .runline:nth-of-type(2){animation-delay:.24s,.9s}
+.sec.on .runline:nth-of-type(3){animation-delay:.38s,1.1s}
+.sec.on .runline:nth-of-type(4){animation-delay:.52s,1.3s}
+.sec.on .runline:nth-of-type(5){animation-delay:.66s,1.5s}
+.sec.on .runline.summary-row{animation-delay:.1s,.7s}
+.sec.on .livebar.prefill::after,.sec.on .livebar.decode::after,.sec.on .livebar.benchmark::after{animation:filltxt 4s steps(30,end) forwards}
+.sec.on .livebar:not(.prefill):not(.decode):not(.benchmark)::after{animation:filltxt 2.4s steps(30,end) forwards}
+.sec.on .spark::after{animation:filltxt 3s steps(10,end) forwards,scanhi 2.2s ease-in-out infinite 3s}
+
+/* === OBSERVABILITY HARDWARE CHARTS === */
+@keyframes obspulse{0%,100%{opacity:.76;filter:drop-shadow(0 0 3px rgba(0,212,255,.18))}50%{opacity:1;filter:drop-shadow(0 0 8px rgba(118,255,2,.42))}}
+.obs-chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(.45rem,1vw,.8rem);width:100%}
+.obs-chart-card{min-height:clamp(4.2rem,10vh,6rem);padding:clamp(.45rem,.9vw,.7rem);border:1px solid var(--bdr);border-radius:8px;background:#0d1117;overflow:hidden}
+.obs-chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:clamp(.35rem,.8vw,.6rem)}
+.obs-chart-label{color:var(--cy);font-size:clamp(.5rem,.76vw,.64rem);font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+.obs-chart-card:nth-child(2) .obs-chart-label{color:var(--gr)}.obs-chart-card:nth-child(3) .obs-chart-label{color:#e3b341}
+.obs-chart-value{color:var(--txt);font-family:var(--font-heavy);font-size:clamp(.9rem,2vw,1.5rem);line-height:1}
+.obs-line-chart{width:100%;height:clamp(1.55rem,4.8vh,2.7rem);margin-top:clamp(.2rem,.45vw,.35rem)}
+.obs-line-chart path{fill:none;stroke-width:4;stroke-linecap:round;opacity:.82}
+.sec.on .obs-line-chart path{animation:obspulse 2.2s ease-in-out infinite}
+@media(max-height:600px){.obs-chart-card{min-height:clamp(3.6rem,9vh,4.7rem);padding:clamp(.32rem,.65vw,.5rem)}.obs-line-chart{height:clamp(1.2rem,3.8vh,1.9rem)}}
+
+/* === DAG FLOWCHART === */
+.dag{display:flex;flex-direction:column;align-items:center;gap:clamp(.3rem,.6vw,.5rem);font-family:'Consolas','Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace;font-size:clamp(.6rem,1vw,.85rem)}
+.dag-row{display:flex;gap:clamp(.3rem,.8vw,.6rem);justify-content:center;flex-wrap:wrap}
+.dag-node{border:1px solid #3d444d;border-radius:4px;padding:.25em .7em;color:#c9d1d9;background:#161b22;white-space:nowrap;transition:border-color .3s,box-shadow .3s}
+.dag-node:hover{border-color:var(--cy);box-shadow:0 0 10px rgba(0,212,255,.15)}
+.dag-arrow{color:#3d444d;font-size:clamp(.6rem,1vw,.8rem);display:flex;justify-content:center}
+.dag-stage{opacity:.12;transform:translateY(8px) scale(.97)}
+.dag-link{opacity:.12;transform:scaleY(.2);transform-origin:top}
+.sec.on .dag-stage{animation:dagready .42s cubic-bezier(.16,1,.3,1) forwards;animation-delay:var(--dag-delay)}
+.sec.on .dag-link{animation:dagflow .24s ease forwards;animation-delay:var(--dag-delay)}
+
+/* === TOPOLOGY-AWARE GPU ALLOCATION === */
+@keyframes gpuassign{from{opacity:.12;transform:scale(.82) translateY(8px);border-color:#2b3544;box-shadow:none}to{opacity:1;transform:scale(1) translateY(0);border-color:currentColor;box-shadow:0 0 12px currentColor}}
+.planner-node{align-self:center;min-width:min(72vw,420px);padding:clamp(.45rem,1vw,.75rem);border:1px solid var(--gr);border-radius:8px;background:#0d1420;text-align:center;color:var(--gr);font-size:clamp(.72rem,1.2vw,.95rem);font-weight:700;box-shadow:0 0 14px rgba(118,255,2,.12)}
+.planner-node small{display:block;color:var(--dim);font-size:clamp(.52rem,.82vw,.7rem);font-weight:400;margin-top:clamp(.12rem,.3vw,.25rem)}
+.alloc-arrow{text-align:center;color:var(--gr);font-size:clamp(.8rem,1.5vw,1.15rem);line-height:1}
+.alloc-board{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(.7rem,2vw,1.5rem);width:100%;max-width:980px;align-self:center}
+.compute-node{background:var(--card);border:1px solid var(--bdr);border-radius:8px;padding:clamp(.55rem,1.25vw,.9rem)}
+.node-head{display:flex;align-items:center;justify-content:space-between;gap:clamp(.3rem,.8vw,.6rem);margin-bottom:clamp(.4rem,.8vw,.65rem);font-size:clamp(.65rem,1vw,.82rem)}
+.node-head strong{color:var(--txt)}.node-head span{color:var(--dim)}
+.gpu-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(.35rem,.8vw,.6rem)}
+.task-allocation{position:relative;border:1px solid #3d444d;border-radius:8px;padding:clamp(.55rem,1vw,.75rem);background:rgba(227,179,65,.025)}
+.task-allocation-label{position:absolute;top:calc(-1 * clamp(.5rem,1vw,.72rem));left:clamp(.45rem,1vw,.75rem);padding:0 clamp(.3rem,.6vw,.5rem);background:var(--card);color:#e3b341;font-size:clamp(.48rem,.75vw,.64rem);font-weight:700}
+@keyframes taskgroup{from{opacity:.4;border-color:#3d444d;box-shadow:none}to{opacity:1;border-color:#e3b341;box-shadow:0 0 18px rgba(227,179,65,.28)}}
+.decode-allocation{opacity:.4}
+.sec.on .decode-allocation{animation:taskgroup .55s ease forwards 1.3s}
+.gpu-slot{display:flex;align-items:center;gap:clamp(.3rem,.7vw,.55rem);min-width:0;padding:clamp(.35rem,.7vw,.55rem);border:1px solid #2b3544;border-radius:6px;background:#0d1117;opacity:.12;color:var(--cy)}
+.gpu-slot.decode{color:#e3b341}
+.gpu-chip-icon{flex:0 0 auto;width:clamp(1.35rem,2.8vw,2rem);aspect-ratio:1;display:grid;place-items:center;border:1px solid currentColor;border-radius:4px;font-size:clamp(.42rem,.7vw,.58rem);font-weight:700;box-shadow:inset 0 0 8px currentColor}
+.gpu-copy{min-width:0}.gpu-copy b{display:block;color:var(--txt);font-size:clamp(.55rem,.85vw,.72rem);white-space:nowrap}.gpu-copy span{display:block;color:currentColor;font-size:clamp(.45rem,.7vw,.6rem);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sec.on .gpu-slot{animation:gpuassign .55s cubic-bezier(.34,1.56,.64,1) forwards;animation-delay:var(--assign-delay)}
+@media(max-width:700px){.alloc-board{grid-template-columns:1fr}.gpu-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.gpu-slot{flex-direction:column;text-align:center}.gpu-copy span{display:none}.task-allocation{padding-top:clamp(.65rem,1.4vw,.9rem)}}
+
+/* === MINI TABLE === */
+.mtbl{border-collapse:collapse;font-size:var(--s);width:100%}
+.mtbl th,.mtbl td{padding:clamp(.25rem,.5vw,.4rem) clamp(.4rem,.8vw,.7rem);text-align:left;border-bottom:1px solid var(--bdr)}
+.mtbl th{color:var(--cy);font-family:var(--font-display);font-weight:600}
+.mtbl code{background:#161b22;padding:.1em .4em;border-radius:3px;font-size:.85em}
+.sec.on .mtbl tbody tr{animation:ri .5s ease forwards;opacity:0}
+.sec.on .mtbl tbody tr:nth-child(1){animation-delay:.2s}
+.sec.on .mtbl tbody tr:nth-child(2){animation-delay:.3s}
+.sec.on .mtbl tbody tr:nth-child(3){animation-delay:.4s}
+.sec.on .mtbl tbody tr:nth-child(4){animation-delay:.5s}
+.sec.on .mtbl tbody tr:nth-child(5){animation-delay:.6s}
+.sec.on .mtbl tbody tr:nth-child(6){animation-delay:.7s}
+.mtbl tbody tr{opacity:0;transition:background .3s}
+.mtbl tbody tr:hover{background:rgba(0,212,255,.04)}
+
+/* === LOGO === */
+.logo{width:clamp(80px,12vw,160px);height:auto;border-radius:16px;margin-bottom:var(--gap)}
+
+/* === NAV / CHROME === */
+.sn{position:absolute;top:clamp(.6rem,2vh,1.2rem);right:clamp(.6rem,2vw,1.2rem);font-size:var(--s);color:var(--dim);opacity:.3;z-index:3}
+.prog{position:fixed;top:0;left:0;height:3px;z-index:300;background:var(--grad);width:0%;transition:width .4s}
+.tmr{position:fixed;top:3px;left:0;height:2px;z-index:301;background:rgba(255,255,255,.2);width:0%}
+.dots{position:fixed;right:clamp(.3rem,1vw,.6rem);top:50%;transform:translateY(-50%);z-index:300;display:flex;flex-direction:column;gap:7px}
+.dot{width:5px;height:5px;border-radius:50%;background:var(--dim);opacity:.2;cursor:pointer;border:none;padding:0;transition:all .4s cubic-bezier(.34,1.56,.64,1)}
+.dot.on{background:var(--cy);opacity:1;height:18px;border-radius:3px;box-shadow:0 0 10px rgba(0,212,255,.5)}
+.badge{position:fixed;bottom:clamp(.6rem,2vh,1.2rem);left:50%;transform:translateX(-50%);z-index:300;background:rgba(0,0,0,.75);border:1px solid var(--bdr);border-radius:999px;padding:.3em 1em;font-size:var(--s);color:var(--dim);opacity:0;transition:opacity .3s;pointer-events:none}
+/* === SCROLL CUE (hero slide — hints there is more below the fold) === */
+@keyframes scrollcuebounce{0%,100%{transform:translateY(0);opacity:.7}50%{transform:translateY(7px);opacity:1}}
+@keyframes scrollcuein{from{opacity:0}to{opacity:1}}
+.scroll-cue{position:absolute;left:50%;bottom:clamp(2.6rem,8vh,4.5rem);transform:translateX(-50%);z-index:3;display:flex;flex-direction:column;align-items:center;gap:clamp(.2rem,.6vw,.4rem);color:var(--cy);text-decoration:none;animation:scrollcuein .8s ease 1.1s both}
+.scroll-cue span{font-family:var(--font-display);font-size:var(--s);letter-spacing:.22em;text-transform:uppercase;color:var(--dim);transition:color .3s}
+.scroll-cue svg{display:block;width:clamp(20px,2.4vw,26px);height:auto;animation:scrollcuebounce 1.8s ease-in-out infinite}
+.scroll-cue:hover span{color:var(--cy)}
+@media(max-height:600px){.scroll-cue{display:none}}
+#s1 .inner{gap:calc(var(--gap) * .75)}
+.doc-btn{display:inline-flex;align-items:center;justify-content:center;margin-top:var(--gap);padding:.6em 1.6em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--b);font-family:var(--font-display);font-weight:600;transition:all .3s;cursor:pointer;z-index:10;position:relative;height:clamp(2.4rem,4vw,3.2rem);line-height:1}
+.doc-btn:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.3)}
+/* Hero CTA hierarchy. Three identically outlined chips gave the title slide no
+   focal point and read as clutter; one filled primary plus two quiet text links
+   says the same thing with a third of the borders. */
+.doc-btn.primary{background:var(--cy);color:#060a10;border-color:var(--cy);box-shadow:0 0 26px rgba(0,212,255,.22)}
+.doc-btn.primary:hover{background:#5ce1ff;border-color:#5ce1ff;box-shadow:0 0 32px rgba(0,212,255,.4)}
+.doc-btn.ghost{border-color:transparent;background:none;box-shadow:none;color:var(--dim);padding-left:.5em;padding-right:.5em}
+.doc-btn.ghost:hover{background:none;box-shadow:none;color:var(--cy)}
+
+/* === HERO (slide 1) ===
+   A centred stack: brand lockup, one descriptor sentence, the slogan, then the CTA.
+   The backend-agnostic claim deliberately is NOT here -- slide 3 is devoted to it,
+   and repeating it on the title slide was what made this read as a wall of text. */
+.hero{display:flex;flex-direction:column;align-items:center;text-align:center;gap:clamp(.5rem,1.5vw,1.15rem);width:100%}
+.hero-brand{display:flex;align-items:center;gap:clamp(.5rem,1.4vw,1rem)}
+.hero-brand img{width:clamp(44px,5vw,76px);height:auto;border-radius:14px;margin:0}
+.hero-brand span{font-family:var(--font-heavy);font-size:clamp(2.3rem,6.2vw,4.8rem);line-height:1;
+  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero-desc{font-size:clamp(1rem,1.9vw,1.7rem);color:var(--txt);line-height:1.35}
+.hero-slogan{font-size:var(--b);color:var(--dim)}
+.hero-cta{display:flex;gap:clamp(.3rem,1vw,.7rem);flex-wrap:wrap;align-items:center;justify-content:center;margin-top:calc(var(--gap) * .3)}
+/* Tighter than the stock .doc-btn so all three sit on one row. */
+.hero-cta .doc-btn{margin-top:0;padding:.55em 1.15em;height:clamp(2.2rem,3.5vw,2.9rem)}
+.hero-cta .doc-btn.ghost{padding-left:.2em;padding-right:.2em;font-size:calc(var(--b) * .95)}
+
+/* === HERO ATMOSPHERE (slide 1 only) ===
+   The title slide was inert: a flat 3% grid, two motionless orbs, and one entrance
+   animation that finished inside a second. Everything below adds depth and slow,
+   continuous life WITHOUT changing a word of the content. Scoped to #s1 so the
+   other twelve slides are untouched, and the global prefers-reduced-motion rule
+   further down switches all of it off. */
+
+/* Depth pass 1 -- a GPU-field of dots over the base grid, drifting one cell every
+   46s and masked to an ellipse so it reads as atmosphere, never as a pattern. */
+#s1 .gbg::after{content:"";position:absolute;inset:-12%;
+  background-image:radial-gradient(rgba(0,212,255,.17) 1px,transparent 1.6px);
+  background-size:26px 26px;
+  -webkit-mask-image:radial-gradient(ellipse 64% 56% at 50% 47%,#000 28%,transparent 76%);
+  mask-image:radial-gradient(ellipse 64% 56% at 50% 47%,#000 28%,transparent 76%);
+  animation:fielddrift 46s linear infinite}
+@keyframes fielddrift{to{transform:translate3d(26px,26px,0)}}
+
+/* Depth pass 2 -- the two colour pools drift and breathe on different clocks, so
+   the background never sits still long enough to read as a flat panel. */
+#s1 .orb{animation:orbdrift 26s ease-in-out infinite alternate;will-change:transform}
+#s1 .orb.og{animation-duration:34s;animation-delay:-9s}
+@keyframes orbdrift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(4vw,3vh,0) scale(1.2)}}
+
+/* Depth pass 3 -- a vignette to seat the composition and stop the corners glowing. */
+#s1::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+  background:radial-gradient(ellipse 72% 62% at 50% 50%,transparent 44%,rgba(2,5,9,.6) 100%)}
+
+/* The wordmark's gradient FLOWS through the letters rather than sitting frozen,
+   and the letters settle in from wide-and-blurred on load -- one high-impact
+   moment instead of scattered fidgets. */
+.hero-brand span{background-size:230% 100%;
+  animation:gradflow 9s ease-in-out infinite alternate,
+            settle 1.1s cubic-bezier(.16,1,.3,1) both}
+@keyframes gradflow{from{background-position:0% 50%}to{background-position:100% 50%}}
+@keyframes settle{from{letter-spacing:.18em;filter:blur(7px);opacity:0}
+                  to{letter-spacing:normal;filter:blur(0);opacity:1}}
+
+/* The logo tile is a flat black square in the asset, which left it sitting on the
+   background rather than in the composition. A hairline ring plus a glow that
+   breathes on the wordmark's clock ties the two halves of the lockup together. */
+#s1 .hero-brand img{box-shadow:0 0 0 1px rgba(0,212,255,.28),0 0 26px rgba(0,212,255,.16);
+  animation:logoglow 9s ease-in-out infinite alternate}
+@keyframes logoglow{from{box-shadow:0 0 0 1px rgba(0,212,255,.28),0 0 22px rgba(0,212,255,.14)}
+                    to{box-shadow:0 0 0 1px rgba(118,255,2,.32),0 0 34px rgba(118,255,2,.20)}}
+
+/* === HERO FLOW BAND (slide 1) ===
+   Its own row, deliberately: the previous version put the fans either side of the
+   headline, which squeezed the centre column and wrapped the slogan onto two lines.
+   As a separate band the slogan keeps the full width and stays on ONE line, and the
+   diagram gets to be read left-to-right on its own terms:
+       frameworks -> [ sflow ] -> platforms
+   The sflow mark is the hub, so the logo appears once, doing work, instead of being
+   duplicated in a lockup above. Direction is carried by colour -- cyan in, green
+   out -- rather than by arrowheads. */
+.hero-desc{white-space:nowrap}
+.flow-band{--rowpx:calc(var(--s) * 1.701);
+  display:grid;grid-template-columns:auto auto auto auto auto;
+  align-items:center;justify-content:center;gap:clamp(.3rem,1.1vw,.85rem);
+  margin-top:calc(var(--gap) * .35)}
+.fan{--row:1.62em;font-size:calc(var(--s) * 1.05);pointer-events:none;display:contents}
+.flow-band svg{display:block;width:auto;overflow:visible}
+.flow-in  svg{height:calc(6 * var(--rowpx))}
+.flow-out svg{height:calc(3 * var(--rowpx))}
+.flow-band path{fill:none;stroke-width:2.2;opacity:.5;stroke-dasharray:220;stroke-dashoffset:220;
+  animation:fandraw 1s cubic-bezier(.16,1,.3,1) forwards}
+.flow-band circle{opacity:0;animation:fannode .45s ease forwards}
+.flow-in path,.flow-in circle{stroke:var(--cy)}  .flow-in circle{fill:var(--cy)}
+.flow-out path,.flow-out circle{stroke:var(--gr)} .flow-out circle{fill:var(--gr)}
+.flow-out path{stroke-width:3.7}
+@keyframes fandraw{to{stroke-dashoffset:0}}
+@keyframes fannode{to{opacity:.85}}
+/* Travelling pulses, so the diagram FLOWS instead of just having been drawn once.
+   pathLength="100" normalises every connector to the same nominal length, so one
+   keyframe set gives identical speed on a long outer curve and the short middle
+   run -- without that, the centre pulse visibly outruns the others.
+   These are separate overlaid paths: the base lines keep their own draw-in
+   animation, which a single element could not do at the same time. */
+.flow-band path.pulse{stroke-dasharray:4 100;stroke-dashoffset:104;stroke-width:5;
+  opacity:0;animation:flowpulse 2.6s linear infinite;stroke-linecap:round}
+@keyframes flowpulse{
+  0%{stroke-dashoffset:104;opacity:0}
+  12%{opacity:.95}
+  88%{opacity:.95}
+  100%{stroke-dashoffset:0;opacity:0}}
+/* Frameworks feed in first, platforms carry on half a cycle later, so a pulse
+   reaching the hub is handed straight out the other side. */
+.flow-in  path.pulse:nth-of-type(7){animation-delay:2.6s}
+.flow-in  path.pulse:nth-of-type(8){animation-delay:3.0s}
+.flow-in  path.pulse:nth-of-type(9){animation-delay:3.4s}
+.flow-in  path.pulse:nth-of-type(10){animation-delay:3.8s}
+.flow-in  path.pulse:nth-of-type(11){animation-delay:4.2s}
+.flow-in  path.pulse:nth-of-type(12){animation-delay:4.6s}
+.flow-out path.pulse:nth-of-type(4){animation-delay:3.9s}
+.flow-out path.pulse:nth-of-type(5){animation-delay:4.3s}
+.flow-out path.pulse:nth-of-type(6){animation-delay:4.7s}
+/* "and more": the label carries the meaning, so its connector just recedes. */
+.flow-labels i.more{opacity:.5;letter-spacing:.16em;font-size:1.15em}
+.flow-in path:nth-of-type(6){opacity:.24}
+.flow-in path.pulse:nth-of-type(12){opacity:0;animation-name:flowpulsefaint}
+@keyframes flowpulsefaint{0%{stroke-dashoffset:104;opacity:0}12%{opacity:.4}88%{opacity:.4}100%{stroke-dashoffset:0;opacity:0}}
+/* Each label box is exactly --row tall and each svg is (rows * --row), so a curve
+   endpoint at n/2rows of the viewBox lands dead centre of its label. */
+.flow-labels{display:flex;flex-direction:column;font-size:calc(var(--s) * 1.05)}
+.flow-labels i{font-style:normal;height:var(--rowpx);display:flex;align-items:center;
+  font-family:var(--font-display);font-weight:700;letter-spacing:.09em;
+  white-space:nowrap;opacity:0;
+  animation:fanlabel .6s cubic-bezier(.16,1,.3,1) forwards}
+.flow-in  .flow-labels i{justify-content:flex-end;color:var(--cy)}
+.flow-out .flow-labels i{color:var(--gr)}
+@keyframes fanlabel{from{opacity:0;transform:translateX(-6px)}to{opacity:.9;transform:none}}
+/* The hub: the mark sits on the axis both fans point at. */
+.flow-hub{display:grid;place-items:center;padding:0 clamp(.15rem,.7vw,.5rem)}
+.flow-hub img{width:clamp(46px,5.2vw,78px);height:auto;border-radius:14px;margin:0;
+  box-shadow:0 0 0 1px rgba(0,212,255,.28),0 0 26px rgba(0,212,255,.16);
+  animation:logoglow 9s ease-in-out infinite alternate}
+/* Narrow: five columns will not hold. Drop the connectors and let the two label
+   groups read as rows above and below the hub -- same order, same colours. */
+@media(max-width:820px){
+  .flow-band{grid-template-columns:1fr;justify-items:center;gap:.45rem}
+  .flow-band svg{display:none}
+  .flow-labels{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:.35em .9em;
+    font-size:calc(var(--s) * .92)}
+  .flow-labels i{height:auto}
+  .flow-in{order:-1}
+  .hero-desc{white-space:normal}
+}
+/* Staggered along the direction of flow: frameworks land, converge on the hub,
+   then fan out to the platforms. */
+.flow-in .flow-labels i:nth-child(1){animation-delay:.55s}
+.flow-in .flow-labels i:nth-child(2){animation-delay:.62s}
+.flow-in .flow-labels i:nth-child(3){animation-delay:.69s}
+.flow-in .flow-labels i:nth-child(4){animation-delay:.76s}
+.flow-in .flow-labels i:nth-child(5){animation-delay:.83s}
+.flow-in .flow-labels i:nth-child(6){animation-delay:.90s}
+.flow-in circle:nth-of-type(1){animation-delay:.60s}
+.flow-in circle:nth-of-type(2){animation-delay:.67s}
+.flow-in circle:nth-of-type(3){animation-delay:.74s}
+.flow-in circle:nth-of-type(4){animation-delay:.81s}
+.flow-in circle:nth-of-type(5){animation-delay:.88s}
+.flow-in circle:nth-of-type(6){animation-delay:.95s}
+.flow-in path{animation-delay:.95s}
+.flow-out path:nth-of-type(1){animation-delay:1.45s}
+.flow-out path:nth-of-type(2){animation-delay:1.53s}
+.flow-out path:nth-of-type(3){animation-delay:1.61s}
+.flow-out circle:nth-of-type(1){animation-delay:2.1s}
+.flow-out circle:nth-of-type(2){animation-delay:2.18s}
+.flow-out circle:nth-of-type(3){animation-delay:2.26s}
+.flow-out .flow-labels i:nth-child(1){animation-delay:2.15s}
+.flow-out .flow-labels i:nth-child(2){animation-delay:2.23s}
+.flow-out .flow-labels i:nth-child(3){animation-delay:2.31s}
+
+/* The primary CTA breathes, and a light sweep crosses it every few seconds so the
+   one call to action on the page reads as live rather than painted on. */
+#s1 .doc-btn.primary{overflow:hidden;animation:ctapulse 3.8s ease-in-out infinite}
+@keyframes ctapulse{0%,100%{box-shadow:0 0 26px rgba(0,212,255,.22)}
+                    50%{box-shadow:0 0 42px rgba(0,212,255,.46)}}
+#s1 .doc-btn.primary::after{content:"";position:absolute;top:0;bottom:0;left:-60%;width:36%;
+  pointer-events:none;transform:skewX(-18deg);
+  background:linear-gradient(100deg,transparent,rgba(255,255,255,.5),transparent);
+  animation:ctashine 5.6s ease-in-out infinite}
+@keyframes ctashine{0%,74%{left:-60%}100%{left:140%}}
+.doc-btn svg{flex-shrink:0}
+.gh-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(.6rem,2vw,1.2rem);z-index:400;padding:.3em .5em;border:1px solid rgba(255,255,255,.2);border-radius:50%;color:rgba(255,255,255,.6);text-decoration:none;background:rgba(6,10,16,.92);transition:all .3s;display:flex;align-items:center;justify-content:center}
+.gh-corner:hover{border-color:#fff;color:#fff;background:rgba(255,255,255,.15);box-shadow:0 0 12px rgba(255,255,255,.15)}
+.corner-links{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(3.2rem,6vw,4.5rem);z-index:400;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.doc-corner,.map-corner{padding:.35em .9em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s;box-shadow:0 0 8px rgba(0,212,255,.15)}
+.map-corner{border-color:var(--gr);color:var(--gr);background:rgba(6,10,16,.92);box-shadow:0 0 8px rgba(118,255,2,.15)}
+/* Persistent nav, so it should recede. Neutral hairline instead of a lit brand
+   border keeps these legible over busy slides without reading as two more chips
+   competing with the slide's own content; the colour returns on hover. */
+.doc-corner,.map-corner{border-color:rgba(255,255,255,.14);box-shadow:none}
+.doc-corner:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.35)}
+.map-corner:hover{background:var(--gr);color:#060a10;box-shadow:0 0 20px rgba(118,255,2,.3)}
+.mb{margin-bottom:var(--gap)}.ms{margin-bottom:calc(var(--gap)*.4)}
+@media(max-height:700px){:root{--pad:clamp(.6rem,2.5vw,1.5rem);--gap:clamp(.3rem,1vw,.7rem);--t:clamp(1.5rem,4.5vw,2.8rem);--h:clamp(1.3rem,3.2vw,2.1rem)}}
+@media(max-height:600px){:root{--pad:clamp(.5rem,2vw,1.2rem);--gap:clamp(.25rem,.8vw,.55rem);--t:clamp(1.25rem,4vw,2.2rem);--h:clamp(1.05rem,2.8vw,1.65rem);--b:clamp(.72rem,1.3vw,.95rem)}}
+@media(max-height:500px){:root{--pad:clamp(.4rem,1.6vw,.9rem);--gap:clamp(.2rem,.6vw,.4rem);--t:clamp(1.1rem,3.5vw,1.7rem);--h:clamp(.9rem,2.4vw,1.3rem);--b:clamp(.65rem,1vw,.82rem)}}
+@media(max-height:550px){.dots{display:none}}
+/* animation-delay too, not just duration: collapsing the frames but keeping the
+   stagger meant a reduced-motion visitor still waited out the full choreography
+   (1.75s for the last backend label) in front of a half-drawn slide. Reduced
+   motion should mean "show me the end state now", so the delays go as well. */
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-delay:0s!important;transition-duration:.15s!important}html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<a href="https://github.com/NVIDIA/nv-sflow" class="gh-corner" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+</a>
+<div class="corner-links">
+<a href="https://nvidia.github.io/nv-sflow/docs/user/intro" class="doc-corner" target="_blank" rel="noopener" onclick="event.stopPropagation()">文档 &rarr;</a>
+<a href="https://nvidia.github.io/nv-sflow/feature-map" class="map-corner" target="_blank" rel="noopener" onclick="event.stopPropagation()">功能地图 &rarr;</a>
+</div>
+<div class="prog" id="prog"></div>
+<div class="tmr" id="tmr"></div>
+<nav class="dots" id="dots"></nav>
+<div class="badge" id="badge">按 P 开启自动播放</div>
+
+<!-- 1: Title -->
+<section class="sec" id="s1">
+<div class="gbg"></div>
+<div class="orb oc" style="width:450px;height:450px;top:-120px;left:-120px"></div>
+<div class="orb og" style="width:320px;height:320px;bottom:-80px;right:-80px"></div>
+<span class="sn">01 / 16</span>
+<div class="inner"><div class="hero">
+<div class="hero-brand r as d0"><span>NV-SFLOW</span></div>
+<h2 class="hero-desc r au d1">面向<span class="accent">大规模 GPU 集群</span>的<span class="green">通用</span>工作流编排引擎</h2>
+<p class="hero-slogan r au d2">一次描述，随处运行。<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
+<div class="flow-band r au d3">
+<span class="fan flow-in"><span class="flow-labels"><i>vLLM</i><i>SGLang</i><i>TensorRT-LLM</i><i>Dynamo</i><i>PyTorch</i><i class="more">&hellip;</i></span><svg viewBox="0 0 104 120" aria-hidden="true"><path pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path pathLength="100" d="M5,110 C50,110 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,110 C50,110 58,60 99,60"/><circle cx="5" cy="10" r="3.2"/><circle cx="5" cy="30" r="3.2"/><circle cx="5" cy="50" r="3.2"/><circle cx="5" cy="70" r="3.2"/><circle cx="5" cy="90" r="3.2"/><circle cx="5" cy="110" r="3.2"/></svg></span>
+<span class="flow-hub"><img src="../../../docs-site/static/img/sflow-logo.jpg" alt="sflow" decoding="async" fetchpriority="high"></span>
+<span class="fan flow-out"><svg viewBox="0 0 174 100" aria-hidden="true"><path pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path pathLength="100" d="M8,50 L166,50"/><path pathLength="100" d="M8,50 C78,50 94,84 166,84"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path class="pulse" pathLength="100" d="M8,50 L166,50"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,84 166,84"/><circle cx="166" cy="16" r="5.4"/><circle cx="166" cy="50" r="5.4"/><circle cx="166" cy="84" r="5.4"/></svg><span class="flow-labels"><i>Kubernetes</i><i>Slurm</i><i>Docker</i></span></span>
+</div>
+<div class="hero-cta r au d3">
+<a href="https://nvidia.github.io/nv-sflow/docs/user/intro" class="doc-btn primary" target="_blank" rel="noopener" onclick="event.stopPropagation()">查看文档 &rarr;</a>
+<a href="https://nvidia.github.io/nv-sflow/feature-map" class="doc-btn ghost" target="_blank" rel="noopener" onclick="event.stopPropagation()">功能地图 &rarr;</a>
+<a href="https://github.com/NVIDIA/nv-sflow" class="doc-btn ghost gh-btn" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;margin-right:.4em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+</div>
+</div></div>
+<a href="#s2" class="scroll-cue" aria-label="向下滚动继续浏览">
+<span>滚动</span>
+<svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 8l7 7 7-7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+</a>
+</section>
+
+<!-- 2: LLM workload evolution -->
+<section class="sec" id="s1b">
+<div class="gbg"></div>
+<div class="orb og" style="width:300px;height:300px;top:-70px;right:10%"></div>
+<span class="sn">02 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">工作负载演进</span>
+<h2 class="r al d1 ms">从本地单机容器，到集群级多阶段服务</h2>
+<div class="evo-grid r as d2">
+  <div class="evo-row">
+    <div class="evo-axis">部署规模<small>跑在哪里</small></div>
+    <div class="evo-panel" style="--evo-delay:.3s">
+      <span class="evo-cap">过去</span>
+      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:.45s">本地单机</span><span class="evo-mini"><i></i></span></div>
+      <div class="evo-note">1 个节点 · 1-8 张 GPU · 无跨节点依赖</div>
+    </div>
+    <div class="evo-arrow" style="--evo-delay:.6s">&#10132;</div>
+    <div class="evo-panel evo-now" style="--evo-delay:.75s">
+      <span class="evo-cap">现在</span>
+      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:.9s">多节点集群级服务</span><span class="evo-mini"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></div>
+      <div class="evo-note">数十至数百个节点 · 跨节点通信与拓扑 · 调度器、配额与生命周期</div>
+    </div>
+  </div>
+  <div class="evo-row">
+    <div class="evo-axis">服务架构<small>怎么被服务</small></div>
+    <div class="evo-panel" style="--evo-delay:1.05s">
+      <span class="evo-cap">过去</span>
+      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:1.2s">Agg Server</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:1.3s">Client</span></div>
+      <div class="evo-note">单阶段 · 一条命令拉起服务</div>
+    </div>
+    <div class="evo-arrow" style="--evo-delay:1.45s">&#10132;</div>
+    <div class="evo-panel evo-now" style="--evo-delay:1.6s">
+      <span class="evo-cap">现在</span>
+      <div class="evo-chain"><span class="evo-chip" style="--evo-delay:1.75s">Router</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:1.9s">PD 分离</span><span class="evo-link">&rarr;</span><span class="evo-chip" style="--evo-delay:2.05s">KV Transfer</span><span class="evo-link">&rarr;</span><span class="evo-chip hetero" style="--evo-delay:2.2s">异构计算</span></div>
+      <div class="evo-note">多阶段 · 多组件协同 · 每个阶段各自的资源与就绪条件</div>
+    </div>
+  </div>
+</div>
+<div class="merge-assumption r au d4"><b style="color:#e3b341">复杂度就此转移：</b>模型还是那个模型，但把它跑起来，已经从「起一个进程」变成「编排一整套分布式系统」。</div>
+</div>
+</section>
+
+<!-- 3: Orchestration perspective -->
+<section class="sec" id="s1c">
+<div class="gbg"></div>
+<div class="orb oc" style="width:280px;height:280px;bottom:-70px;left:8%"></div>
+<span class="sn">03 / 16</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">视角转变</span>
+<h2 class="r al d1 ms">更宏观的编排视角：从一台机器，到一个集群</h2>
+<div class="persp-strip r as d2">
+  <div class="persp-side"><b>单机视角</b><span>五层都挤在同一台机器里，天然就是一致的 &mdash; 装好、跑起来，就结束了。</span></div>
+  <div class="persp-arrow">&#10132;</div>
+  <div class="persp-side now"><b>集群视角</b><span>同样五层要在每个节点上各来一份，还必须彼此对齐 &mdash; 任何一层错位，整个工作流都跑不起来。</span></div>
+</div>
+<div class="stack r as d3">
+  <div class="stack-axis"><span>&#8593;</span><em>自下而上</em></div>
+  <div class="stack-layers">
+    <div class="stack-head"><span></span><div class="head-nodes"><i>node-0</i><i>node-1</i><i>node-2</i><i>node-3</i></div><span></span></div>
+    <div class="layer" style="--layer-delay:1.15s;--align-delay:1.95s;color:var(--gr)">
+      <div class="layer-name"><b>应用工作流</b><small>DAG · 任务依赖 · 探针</small></div>
+      <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
+      <div class="layer-align">跨节点<b>依赖与就绪对齐</b></div>
+    </div>
+    <div class="layer" style="--layer-delay:1s;--align-delay:1.8s;color:#a4e83a">
+      <div class="layer-name"><b>基础设施平台</b><small>Slurm · Kubernetes · Docker</small></div>
+      <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
+      <div class="layer-align">跨节点<b>调度、配额与网络</b></div>
+    </div>
+    <div class="layer" style="--layer-delay:.85s;--align-delay:1.65s;color:#e3b341">
+      <div class="layer-name"><b>软件</b><small>vLLM · SGLang · TensorRT-LLM · 镜像</small></div>
+      <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
+      <div class="layer-align">跨节点<b>版本与镜像一致</b></div>
+    </div>
+    <div class="layer" style="--layer-delay:.7s;--align-delay:1.5s;color:#4fc3e8">
+      <div class="layer-name"><b>驱动</b><small>CUDA · NCCL · 网卡驱动</small></div>
+      <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
+      <div class="layer-align">跨节点<b>驱动与固件对齐</b></div>
+    </div>
+    <div class="layer" style="--layer-delay:.55s;--align-delay:1.35s;color:var(--cy)">
+      <div class="layer-name"><b>硬件</b><small>GPU · NVLink · IB · 拓扑</small></div>
+      <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
+      <div class="layer-align">跨节点<b>拓扑与可见性一致</b></div>
+    </div>
+  </div>
+</div>
+<div class="merge-assumption r au d5"><b style="color:#e3b341">于是编排的对象变了：</b>不再是「把一个进程跑起来」，而是把五层<b style="color:var(--gr)">当成一个整体来组合</b>，并让节点之间<b style="color:var(--gr)">共享同一份信息、保持同一套约定</b>。</div>
+</div>
+</section>
+
+<!-- 4: Platform fragmentation -->
+<section class="sec" id="s1d">
+<div class="gbg"></div>
+<div class="orb og" style="width:270px;height:270px;top:-60px;right:14%"></div>
+<span class="sn">04 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">基础设施差异</span>
+<h2 class="r al d1 ms">每个平台一套语义，迁移与适配成本倍增</h2>
+<div class="dialect-grid r as d2">
+  <div class="dialect" style="--dia-delay:.3s;color:#e3b341">
+    <h3>Slurm</h3>
+    <div class="dialect-code">#SBATCH --gres=gpu:8
+srun --ntasks=16 ...</div>
+    <div class="dialect-learn">分区、账户与 QoS · sbatch 语法 · hostlist 展开规则</div>
+    <div class="dialect-meter"><em>学习曲线</em><i class="lit"></i><i class="lit"></i><i class="lit"></i><i></i></div>
+  </div>
+  <div class="dialect" style="--dia-delay:.45s;color:var(--cy)">
+    <h3>Kubernetes</h3>
+    <div class="dialect-code">resources.limits:
+  nvidia.com/gpu: 8</div>
+    <div class="dialect-learn">manifest 与 CRD · label 与 affinity · RBAC 与 namespace</div>
+    <div class="dialect-meter"><em>学习曲线</em><i class="lit"></i><i class="lit"></i><i class="lit"></i><i class="lit"></i></div>
+  </div>
+  <div class="dialect" style="--dia-delay:.6s;color:var(--gr)">
+    <h3>Docker</h3>
+    <div class="dialect-code">docker run --gpus all
+  --network host ...</div>
+    <div class="dialect-learn">镜像与挂载 · 设备映射 · compose 语法</div>
+    <div class="dialect-meter"><em>学习曲线</em><i class="lit"></i><i class="lit"></i><i></i><i></i></div>
+  </div>
+</div>
+<div class="drag-band r as d3">
+  <div class="drag-row">
+    <span class="drag-label">应用迭代</span>
+    <div class="drag-track">
+      <i class="blk go" style="flex:1;--blk-delay:1s">改一版</i>
+      <i class="blk go" style="flex:1;--blk-delay:1.1s">跑一次</i>
+      <i class="blk wait" style="flex:5;--blk-delay:1.25s">卡住 &mdash; 等平台适配做完</i>
+      <i class="blk go" style="flex:1;--blk-delay:1.9s">改一版</i>
+    </div>
+  </div>
+  <div class="drag-row">
+    <span class="drag-label">平台适配</span>
+    <div class="drag-track">
+      <i class="blk idle" style="flex:2"></i>
+      <i class="blk work" style="flex:5;--blk-delay:1.45s">学语法 · 对 schema · 调权限 · 补兼容</i>
+      <i class="blk idle" style="flex:1"></i>
+    </div>
+  </div>
+</div>
+<div class="merge-assumption r au d4"><b style="color:#e3b341">真正被拖慢的是应用：</b>模型和参数只改了一行，时间却全花在「让它能在这个平台上跑起来」&mdash; 换一个基础设施平台，就要<b style="color:#ff7b72">重写整个工作流编排</b>。</div>
+</div>
+</section>
+
+<!-- 2: Problem -->
+<section class="sec" id="s2">
+<div class="gbg"></div>
+<div class="orb oc" style="width:280px;height:280px;top:60%;right:-60px"></div>
+<span class="sn">05 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">问题</span>
+<h2 class="r al d1 ms">工作负载始终不变，平台适配成本却成倍增长。</h2>
+<div class="problem-source r as d2"><b>稳定的工作流：</b> etcd → NATS → 前端 → GPU 工作节点 → 基准测试</div>
+<div class="dup-matrix r as d3">
+  <div class="dup-head dup-corner">重复的关注点</div><div class="dup-head">Slurm</div><div class="dup-head">Docker</div><div class="dup-head">Kubernetes</div>
+  <div class="dup-label">启动</div><div class="dup-cell" style="--copy-delay:.35s"><code>sbatch + srun</code></div><div class="dup-cell" style="--copy-delay:.45s"><code>docker run</code></div><div class="dup-cell" style="--copy-delay:.55s"><code>Pod / Job</code></div>
+  <div class="dup-label">GPU 放置</div><div class="dup-cell" style="--copy-delay:.5s"><code>GPU 参数</code></div><div class="dup-cell" style="--copy-delay:.6s"><code>设备映射</code></div><div class="dup-cell" style="--copy-delay:.7s"><code>claims + Affinity</code></div>
+  <div class="dup-label">网络</div><div class="dup-cell" style="--copy-delay:.65s"><code>hostlist + 端口</code></div><div class="dup-cell" style="--copy-delay:.75s"><code>host 网络</code></div><div class="dup-cell" style="--copy-delay:.85s"><code>Service + DNS</code></div>
+  <div class="dup-label">就绪检测</div><div class="dup-cell" style="--copy-delay:.8s"><code>shell 轮询</code></div><div class="dup-cell" style="--copy-delay:.9s"><code>healthcheck</code></div><div class="dup-cell" style="--copy-delay:1s"><code>probes</code></div>
+  <div class="dup-label">日志与清理</div><div class="dup-cell" style="--copy-delay:.95s"><code>sacct + 文件</code></div><div class="dup-cell" style="--copy-delay:1.05s"><code>docker logs</code></div><div class="dup-cell" style="--copy-delay:1.15s"><code>日志转发 + 生命周期</code></div>
+</div>
+<div class="dup-total r au d4"><b>5 类关注点 × 3 个平台</b><span>围绕同一个稳定的工作流，重复着同样的编排工作</span></div>
+</div>
+</section>
+
+<!-- 3: Solution -->
+<section class="sec" id="s3">
+<div class="gbg"></div>
+<div class="orb og" style="width:350px;height:350px;top:15%;right:-100px"></div>
+<span class="sn">06 / 16</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">后端无关的设计</span>
+<h2 class="r al d1 mb">保留<span class="accent">做什么</span>，替换<span class="green">在哪跑</span>，无需重写。</h2>
+<div class="fg">
+<div class="fc r au d2"><span class="ic">&#9998;</span><h3>统一语义</h3><p>部署逻辑始终不变 &mdash; 变的只是基础设施适配。</p></div>
+<div class="fc r au d3"><span class="ic">&#8644;</span><h3>只换后端配置块</h3><p>同一份 <code>sflow.yaml</code> 可运行在 Docker、Slurm 与 Kubernetes 上。</p></div>
+<div class="fc r au d4"><span class="ic">&#9881;</span><h3>委托，而非重造</h3><p>后端交由各平台的原生生态处理，而不是重新实现一遍。</p></div>
+</div>
+<div class="r as d5" style="width:100%;max-width:700px;margin:0 auto">
+<svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
+<defs>
+<linearGradient id="wg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#00d4ff"/></linearGradient>
+<filter id="gl"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+</defs>
+<!-- One stable recipe source -->
+<rect x="20" y="62" width="180" height="96" rx="8" fill="#0d1420" stroke="#00d4ff" stroke-width="1.8"/>
+<text x="110" y="91" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="15" font-weight="700">sflow.yaml</text>
+<text x="110" y="116" text-anchor="middle" fill="#dce3ed" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="9">DAG · 脚本 · 探针</text>
+<text x="110" y="134" text-anchor="middle" fill="#6b7d95" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="9">资源 · 结果 · 产物</text>
+
+<!-- Recipe enters the sflow adapter -->
+<path id="recipeIn" d="M200,110 C245,110 268,110 288,110" fill="none" stroke="url(#wg)" stroke-width="3"/>
+<polygon points="283,105 293,110 283,115" fill="#76ff03"/>
+<circle class="xflow-dot xflow-recipe" r="5" fill="#00d4ff" filter="url(#gl)"/>
+
+<!-- sflow adapter -->
+<circle cx="335" cy="110" r="42" fill="#060a10" stroke="url(#wg)" stroke-width="2.5" filter="url(#gl)"/>
+<text x="335" y="116" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, 'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC', sans-serif" font-size="16" font-weight="800">sflow</text>
+
+<!-- Backend-native fan-out -->
+<path id="toLocal" d="M377,100 C420,85 454,25 500,25" fill="none" stroke="#00d4ff" stroke-width="2.2" opacity=".8"/>
+<path id="toDocker" d="M377,105 C425,98 455,75 500,75" fill="none" stroke="#76ff03" stroke-width="2.2" opacity=".8"/>
+<path id="toSlurm" d="M377,115 C425,122 455,125 500,125" fill="none" stroke="#e3b341" stroke-width="2.2" opacity=".8"/>
+<path id="toK8S" d="M377,120 C420,135 454,175 500,175" fill="none" stroke="#00d4ff" stroke-width="2.2" opacity=".8"/>
+<circle class="xflow-dot xflow-local" r="4" fill="#00d4ff" filter="url(#gl)"/>
+<circle class="xflow-dot xflow-docker" r="4" fill="#76ff03" filter="url(#gl)"/>
+<circle class="xflow-dot xflow-slurm" r="4" fill="#e3b341" filter="url(#gl)"/>
+<circle class="xflow-dot xflow-k8s" r="4" fill="#00d4ff" filter="url(#gl)"/>
+
+<!-- Supported execution backends -->
+<rect x="500" y="5" width="180" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="590" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Local · bash</text>
+<rect x="500" y="55" width="180" height="40" rx="6" fill="#0d1420" stroke="#76ff03" stroke-width="1.5"/>
+<text x="590" y="80" text-anchor="middle" fill="#76ff03" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Docker · docker_run</text>
+<rect x="500" y="105" width="180" height="40" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="590" y="130" text-anchor="middle" fill="#e3b341" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Slurm · srun</text>
+<rect x="500" y="155" width="180" height="40" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="590" y="180" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="12" font-weight="600">Kubernetes · k8s</text>
+<polygon points="495,20 505,25 495,30" fill="#00d4ff"/>
+<polygon points="495,70 505,75 495,80" fill="#76ff03"/>
+<polygon points="495,120 505,125 495,130" fill="#e3b341"/>
+<polygon points="495,170 505,175 495,180" fill="#00d4ff"/>
+</svg>
+</div>
+</div>
+</section>
+
+<!-- 4: DAG (native CSS flowchart) -->
+<section class="sec" id="s4">
+<div class="gbg"></div>
+<div class="orb oc" style="width:240px;height:240px;top:8%;left:-70px"></div>
+<span class="sn">07 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">DAG 编排</span>
+<h2 class="r al d1 ms">任务与依赖，全部由你定义</h2>
+<div class="dag-layout r as d2">
+<div class="dag-main">
+<div class="contract-strip"><b>有向无环图(DAG)</b> &nbsp; 每个阶段在依赖就绪时自动启动</div>
+<div class="dag">
+<div class="dag-row dag-stage" style="--dag-delay:.2s"><div class="dag-node" style="border-color:var(--cy)">load_image</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:.5s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:.65s"><div class="dag-node">install_dependency</div><div class="dag-node">gpu_monitor</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:.95s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:1.1s"><div class="dag-node">nats_server</div><div class="dag-node">etcd_server</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:1.4s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:1.55s"><div class="dag-node">frontend_server_0</div><div class="dag-node">frontend_server_1</div><div class="dag-node">frontend_server_2</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:1.85s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:2s"><div class="dag-node">nginx_server</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_0</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_1</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_2</div><div class="dag-node" style="border-color:var(--gr)">prefill_server_3</div><div class="dag-node" style="border-color:var(--cy)">decode_server_0</div></div>
+<div class="dag-arrow dag-link" style="--dag-delay:2.3s">&#9660;</div>
+<div class="dag-row dag-stage" style="--dag-delay:2.45s"><div class="dag-node" style="border-color:var(--cy)">benchmark_client</div></div>
+</div>
+</div>
+<div class="dag-aside">
+<div class="fc r au" style="animation-delay:2.7s"><span class="ic">&#9998;</span><h3>任务 = 任意命令</h3><p>bash、python、容器入口都可以。</p></div>
+<div class="fc r au" style="animation-delay:2.82s"><span class="ic">&#8644;</span><h3>依赖 = 任意 DAG</h3><p>串行、并行、分支与汇聚，阶段数不设上限。</p></div>
+<div class="fc r au" style="animation-delay:2.94s"><span class="ic">&#8734;</span><h3>不限定领域</h3><p>推理、训练、评测、数据处理均可自由编排。</p></div>
+</div>
+</div>
+</div>
+</section>
+
+<!-- 5: GPU Allocation (native terminal) -->
+<section class="sec" id="s5">
+<div class="gbg"></div>
+<div class="orb og" style="width:300px;height:300px;bottom:-90px;right:8%"></div>
+<span class="sn">08 / 16</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">大规模集群级编排</span>
+<h2 class="r al d1 ms">拓扑感知的 GPU 分配</h2>
+<div class="planner-node r ap d2">sflow 拓扑规划器<small>GPU 容量 · 节点亲和性 · 任务依赖</small></div>
+<div class="alloc-arrow r au d2">&#9660; 以后端原生方式下发</div>
+<div class="alloc-board r as d3">
+  <div class="compute-node">
+    <div class="node-head"><strong>node-0</strong><span>NVLink 域 A · 4 张 GPU</span></div>
+    <div class="gpu-grid">
+      <div class="gpu-slot" style="--assign-delay:.65s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 0</b><span>prefill_0</span></span></div>
+      <div class="gpu-slot" style="--assign-delay:.85s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 1</b><span>prefill_1</span></span></div>
+      <div class="gpu-slot" style="--assign-delay:1.05s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 2</b><span>prefill_2</span></span></div>
+      <div class="gpu-slot" style="--assign-delay:1.25s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 3</b><span>prefill_3</span></span></div>
+    </div>
+  </div>
+  <div class="compute-node">
+    <div class="node-head"><strong>node-1</strong><span>NVLink 域 B · 4 张 GPU</span></div>
+    <div class="task-allocation decode-allocation">
+      <span class="task-allocation-label">decode_0 · 4 GPU 任务</span>
+      <div class="gpu-grid">
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 0</b><span>decode_0</span></span></div>
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 1</b><span>decode_0</span></span></div>
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 2</b><span>decode_0</span></span></div>
+        <div class="gpu-slot decode" style="--assign-delay:1.45s"><span class="gpu-chip-icon">GPU</span><span class="gpu-copy"><b>GPU 3</b><span>decode_0</span></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="merge-assumption r au d4">节点与 GPU 放置、多节点副本与参数扫描、就绪探针、批量提交 &mdash; 于是<b style="color:#e3b341">一份描述文件即可驱动数百张 GPU</b>，而不是一堆手写的 bash 脚本。</div>
+</div>
+</section>
+
+<!-- 6: Features -->
+<section class="sec" id="s6">
+<div class="gbg"></div>
+<div class="orb oc" style="width:200px;height:200px;top:-40px;right:28%"></div>
+<span class="sn">09 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">工作流生命周期</span>
+<h2 class="r al d1 ms">定义。执行。洞察。</h2>
+<div class="lifecycle-flow r as d2">
+  <div class="phase define" data-step="01" style="--phase-delay:.25s">
+    <h3>定义</h3>
+    <div class="phase-item"><span class="phase-icon">DAG</span><span><b>任务与依赖</b><br>一份声明式工作流</span></div>
+    <div class="phase-item"><span class="phase-icon">{ }</span><span><b>变量与产物</b><br>可移植的输入与表达式</span></div>
+    <div class="phase-item"><span class="phase-icon">✓</span><span><b>探针</b><br>就绪与失败判定</span></div>
+  </div>
+  <div class="flow-arrow" style="--phase-delay:.75s">&#10132;</div>
+  <div class="phase execute" data-step="02" style="--phase-delay:.95s">
+    <h3>执行</h3>
+    <div class="phase-item"><span class="phase-icon">GPU</span><span><b>资源规划</b><br>节点、GPU、拓扑</span></div>
+    <div class="phase-item"><span class="phase-icon">N×</span><span><b>副本与参数扫描</b><br>并行或串行</span></div>
+    <div class="phase-item"><span class="phase-icon">→</span><span><b>后端适配器</b><br>Local、Docker、Slurm、K8S</span></div>
+  </div>
+  <div class="flow-arrow" style="--phase-delay:1.45s">&#10132;</div>
+  <div class="phase understand" data-step="03" style="--phase-delay:1.65s">
+    <h3>洞察</h3>
+    <div class="phase-item"><span class="phase-icon">TUI</span><span><b>实时状态</b><br>任务、日志、就绪</span></div>
+    <div class="phase-item"><span class="phase-icon">∿</span><span><b>汇总与监控</b><br>时间线与硬件图表</span></div>
+    <div class="phase-item"><span class="phase-icon">⇧</span><span><b>结果与上传</b><br>JSON 指标与 S3</span></div>
+  </div>
+</div>
+</div>
+</section>
+
+<!-- 7: Backend Adapters -->
+<section class="sec" id="s7">
+<div class="gbg"></div>
+<div class="orb oc" style="width:260px;height:260px;top:-70px;right:16%"></div>
+<span class="sn">10 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">后端适配器</span>
+<h2 class="r al d1 ms">同一份意图，落地为四套原生执行方案</h2>
+<div class="contract-strip r al d2"><b>可移植的工作流契约</b> &nbsp; DAG · 资源 · 探针 · 产物 · 结果</div>
+<div class="alloc-arrow r au d2">&#9660; sflow 委托给各平台的原生生态</div>
+<div class="backend-lanes r as d3">
+  <div class="backend-lane" style="--adapter-delay:.45s"><span class="backend-symbol">&gt;_</span><h3>Local</h3><p>bash 进程<br>模拟的节点 / GPU 映射</p></div>
+  <div class="backend-lane" style="--adapter-delay:.65s"><span class="backend-symbol">&#9635;</span><h3>Docker</h3><p>docker run<br>容器 GPU 设备</p></div>
+  <div class="backend-lane" style="--adapter-delay:.85s"><span class="backend-symbol">#</span><h3>Slurm</h3><p>salloc + srun<br>调度器分配</p></div>
+  <div class="backend-lane" style="--adapter-delay:1.05s"><span class="backend-symbol">&#9096;</span><h3>Kubernetes</h3><p>pods + claims<br>绑定与生命周期</p></div>
+</div>
+<div class="alloc-arrow r au d4">&#9660;</div>
+<div class="output-strip r ar d4">一致的输出 &nbsp; task.log · result.json · summary · 产物</div>
+</div>
+</section>
+
+<!-- 8: Merge Pod -->
+<section class="sec" id="s8">
+<div class="gbg"></div>
+<div class="orb og" style="width:300px;height:300px;bottom:-90px;left:12%"></div>
+<span class="sn">11 / 16</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">Merge Pod</span>
+<h2 class="r al d1 ms">GPU 任务同机部署，共享高速的节点内互联</h2>
+<div class="merge-topology r as d2">
+  <div class="topology-panel">
+    <h3 style="color:#ff7b72">独立 Pod · 视图相互隔离</h3>
+    <div class="pod-pair">
+      <div class="pod-box">worker A<span>仅可见 GPU 0-1</span></div>
+      <div class="slow-link">IB / TCP<br>&#8596;</div>
+      <div class="pod-box">worker B<span>仅可见 GPU 2-3</span></div>
+    </div>
+  </div>
+  <div class="merge-action">sflow merge<br>&#10132;</div>
+  <div class="topology-panel merged-topology">
+    <h3 style="color:var(--gr)">单个 Pod · 合并的 GPU 视图</h3>
+    <div class="worker-row"><span class="worker-tag">worker A</span><span class="worker-tag">worker B</span></div>
+    <div class="shared-gpus"><span class="shared-gpu">GPU 0</span><span class="shared-gpu">GPU 1</span><span class="shared-gpu">GPU 2</span><span class="shared-gpu">GPU 3</span></div>
+    <div class="nvlink-bus">CUDA IPC · NVLink · NVSwitch</div>
+  </div>
+</div>
+<div class="merge-assumption r au d4"><b style="color:#e3b341">安全边界：</b>同一工作流 + 同一后端 + 同一节点 + 同一镜像。典型场景：PD 分离的 KV 传输。同时契合当前每节点 IMEX 的约束。</div>
+</div>
+</section>
+
+<!-- 9: Monitor and Summary -->
+<section class="sec" id="s9">
+<div class="gbg"></div>
+<div class="orb oc" style="width:220px;height:220px;top:-50px;left:20%"></div>
+<span class="sn">12 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">可观测性</span>
+<h2 class="r al d1 ms">每一次运行都会自我解释</h2>
+<div class="two">
+<div class="term r al d2" style="font-size:clamp(.45rem,.72vw,.62rem)"><span class="cy">sflow_summary.log</span>
+Task Duration Chart
+<span class="runline summary-row">prefill    |<span class="livebar cy prefill" data-bar="####..........................">####..........................</span>| 58.412s READY</span>
+<span class="runline summary-row">decode     |<span class="livebar decode" data-bar="##########################....">##########################....</span>| 6m14.882s READY</span>
+<span class="runline summary-row">benchmark  |<span class="livebar cy benchmark" data-bar="..........................####">..........................####</span>| 47.906s COMPLETED</span>
+
+Timeline
+<span class="runline">12:31:33  +00.000s  prefill    SUBMITTED</span>
+<span class="runline">12:31:33  +00.000s  decode     SUBMITTED</span>
+<span class="runline">12:32:31  +58.412s  prefill    READY</span>
+<span class="runline">12:37:48  +06m15s   decode     READY</span>
+<span class="runline">12:37:49  +06m16s   benchmark  SUBMITTED</span>
+<span class="runline">12:38:36  +07m03s   benchmark  COMPLETED</span></div>
+<div class="term r ar d3" style="font-size:clamp(.45rem,.72vw,.62rem)"><span class="gr">sflow_monitor.log</span>
+Metric Summary
+<span class="runline">GPU util %        min=42  avg=87  max=99</span>
+<span class="runline">GPU mem used GiB  min=18  avg=61  max=76</span>
+<span class="runline">GPU power W       min=310 avg=642 max=718</span>
+
+Timelines (cluster avg)
+<span class="runline">GPU util %        <span class="spark cy" data-spark="▁▂▅▇████▆▅">▁▂▅▇████▆▅</span></span>
+<span class="runline">GPU mem used GiB  <span class="spark" data-spark="▁▃▄▆▇█████">▁▃▄▆▇█████</span></span>
+<span class="runline">Net RX MiB/s      <span class="spark cy" data-spark="▁▁▂▅▇▆▃▂▁">▁▁▂▅▇▆▃▂▁</span></span></div>
+</div>
+<div class="obs-chart-grid r au d4" aria-label="硬件利用率图表示例">
+  <div class="obs-chart-card">
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU 利用率</span><span class="obs-chart-value">87%</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU 利用率折线图"><path d="M5 64 C35 58 42 34 70 36 S108 10 137 16 S180 48 235 20" stroke="#00d4ff"/></svg>
+  </div>
+  <div class="obs-chart-card">
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU 显存</span><span class="obs-chart-value">61 GiB</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU 显存折线图"><path d="M5 68 C35 66 58 54 80 48 S120 28 155 24 S200 22 235 18" stroke="#76ff03"/></svg>
+  </div>
+  <div class="obs-chart-card">
+    <div class="obs-chart-head"><span class="obs-chart-label">GPU 功耗</span><span class="obs-chart-value">642 W</span></div>
+    <svg class="obs-line-chart" viewBox="0 0 240 80" aria-label="GPU 功耗折线图"><path d="M5 58 C28 20 55 74 82 35 S135 14 160 42 S205 60 235 28" stroke="#e3b341"/></svg>
+  </div>
+</div>
+</div>
+</section>
+
+<!-- 10: Modular Composition -->
+<section class="sec" id="s10">
+<div class="gbg"></div>
+<div class="orb og" style="width:260px;height:260px;top:-60px;left:20%"></div>
+<span class="sn">13 / 16</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">模块化组合</span>
+<h2 class="r al d1 ms">换掉一个叶子，复用整棵树。</h2>
+<div class="recipe-tree r as d2">
+  <div class="tree-root">recipe/<small>组合根目录</small></div>
+  <div class="tree-branches">
+    <div class="tree-branch" style="--branch-delay:.3s">
+      <div class="branch-label"><code>backend/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf">local.yaml</span><span class="tree-leaf">docker.yaml</span><span class="tree-leaf">slurm.yaml</span><span class="tree-leaf selected" style="--leaf-delay:.75s">k8s.yaml ✓</span></div>
+    </div>
+    <div class="tree-branch" style="--branch-delay:.45s">
+      <div class="branch-label"><code>common/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf fixed">common_workflow.yaml · 共享 DAG</span></div>
+    </div>
+    <div class="tree-branch" style="--branch-delay:.6s">
+      <div class="branch-label"><code>workload/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf selected" style="--leaf-delay:.95s">vllm/ ✓</span><span class="tree-leaf">sglang/</span><span class="tree-leaf">trtllm/</span></div>
+    </div>
+    <div class="tree-branch" style="--branch-delay:.75s">
+      <div class="branch-label"><code>benchmark/</code></div>
+      <div class="tree-leaves"><span class="tree-leaf selected" style="--leaf-delay:1.15s">aiperf.yaml ✓</span><span class="tree-leaf">infmax.yaml</span></div>
+    </div>
+  </div>
+</div>
+<div class="tree-selection r au d3">&#9660; 选中的叶子完成组合</div>
+<div class="compose-result r ap d4"><b>composed.yaml</b> &nbsp; k8s + 共享工作流 + vLLM + AIPerf</div>
+<div class="output-strip r au d5">只替换高亮的那个叶子，共享分支保持不变。</div>
+</div>
+</section>
+
+<!-- 11: Error Analysis (real example — Job 1865443) -->
+<section class="sec legacy-hidden" id="s11">
+<div class="gbg"></div>
+<div class="orb oc" style="width:220px;height:220px;bottom:-50px;left:15%"></div>
+<span class="sn">11 / 15</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">真实场景调试</span>
+<h2 class="r al d1 ms">结构化的错误分析</h2>
+<div class="two">
+<div>
+<div class="term r al d2" style="font-size:clamp(.42rem,.68vw,.58rem);margin-bottom:var(--gap)"><span class="hi">Workflow:</span> <span class="cy">b200-fp8-low-latency-tep8-1p-1d</span>
+Model: DeepSeek R1 FP8 | 2 nodes &times; 8 GPUs | ISL=8192, OSL=1024
+
+<span class="hi">Allocation Map</span>
+&#9500;&#9472; <span class="gr">slurm-node-01</span> (node 0)
+&#9474;   GPU 0-7: <span class="cy">prefill_server_0</span> (TP=8)
+&#9474;   Also: load_image, nats, etcd, frontend, benchmark_*
+&#9492;&#9472; <span class="gr">slurm-node-02</span> (node 1)
+    GPU 0-7: <span class="yl">decode_server_0</span> (TP=8)
+    Also: load_image, gpu_monitor
+
+<span class="hi">Timeline</span>
+01:57:08 &mdash; load_image + install_aiperf <span class="wh">submitted</span>
+01:59:10 &mdash; load_image <span class="gr">COMPLETED</span> on both nodes
+01:59:43 &mdash; nats_server <span class="gr">READY</span>
+01:59:45 &mdash; etcd_server <span class="gr">READY</span>
+02:00:31 &mdash; frontend_server_0 <span class="gr">READY</span> (10.52.32.8)
+02:05:14 &mdash; prefill + decode <span class="gr">READY</span> &rarr; benchmark_4 starts
+02:05:20 &mdash; <span class="rd">HTTP 500</span> &mdash; all benchmark requests fail
+02:05:41 &mdash; Workflow finished (8m 33s)
+
+<span class="rd">Error from frontend logs:</span>
+<span class="wh">Invalid TCP address 'dynamo_prefill.generate-58b49ce145f56609'</span>
+<span class="wh">Invalid TCP address 'dynamo_backend.generate-58b49ce145f5660b'</span></div>
+</div>
+<div>
+<p class="r ar d3 ms" style="font-size:var(--s);color:var(--txt)">诊断 &mdash; sflow 编排层 vs 应用层错误</p>
+<table class="mtbl r ar d3">
+<thead><tr><th>层级</th><th>状态</th><th>细节</th></tr></thead>
+<tbody>
+<tr><td><span class="green">sflow</span></td><td style="color:var(--gr)">&#10003; OK</td><td>DAG 已执行，全部任务已拉起，探针通过</td></tr>
+<tr><td><span class="green">GPU 分配</span></td><td style="color:var(--gr)">&#10003; OK</td><td>每节点 8 张 GPU，无重叠，每个 server TP=8</td></tr>
+<tr><td><span class="green">基础设施</span></td><td style="color:var(--gr)">&#10003; OK</td><td>etcd、NATS、frontend 均已 READY</td></tr>
+<tr><td><span style="color:#ff7b72">路由</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>frontend 拿到的是服务名，而不是 host:port</td></tr>
+<tr><td><span style="color:#ff7b72">基准测试</span></td><td style="color:#ff7b72">&#10007; FAIL</td><td>0/800 请求成功（全部 HTTP 500）</td></tr>
+</tbody>
+</table>
+<div class="term r ar d5" style="font-size:clamp(.42rem,.65vw,.55rem);margin-top:var(--gap)"><span class="hi">根因</span>
+frontend 收到的是<span class="rd">服务发现的服务名</span>
+（例如 dynamo_prefill.generate-58b49...）
+而不是 <span class="gr">host:port</span> 地址。
+
+NATS/etcd 服务注册表返回的内部标识符
+TCP 路由无法解析。
+
+<span class="yl">修复：</span>检查 DYN_REQUEST_PLANE 与 frontend
+网络配置是否匹配 Dynamo 分离式路由。</div>
+</div>
+</div>
+</div>
+</section>
+
+<!-- 12: CLI -->
+<section class="sec legacy-hidden" id="s12">
+<div class="gbg"></div>
+<span class="sn">12 / 15</span>
+<div class="inner">
+<h2 class="r au d0 mb">CLI 速览</h2>
+<table class="mtbl r au d1" style="max-width:800px">
+<thead><tr><th>命令</th><th>用途</th><th>关键参数</th></tr></thead>
+<tbody>
+<tr><td><code>sflow run</code></td><td>执行工作流</td><td><code>--dry-run</code> <code>--tui</code> <code>--set</code> <code>-f</code>（多文件）</td></tr>
+<tr><td><code>sflow batch</code></td><td>生成 sbatch 脚本</td><td><code>--submit</code> <code>--bulk-input</code> <code>--row</code></td></tr>
+<tr><td><code>sflow compose</code></td><td>合并多个 YAML</td><td><code>--resolve</code> <code>--missable-tasks</code> <code>-o</code></td></tr>
+<tr><td><code>sflow visualize</code></td><td>渲染 DAG 图</td><td><code>--format png/svg/mermaid</code></td></tr>
+<tr><td><code>sflow sample</code></td><td>列出 / 复制示例</td><td><code>--list</code> <code>-o</code></td></tr>
+<tr><td><code>sflow skill</code></td><td>安装 AI Agent 技能</td><td><code>--list</code> <code>-o</code></td></tr>
+<tr><td><code>sflow upgrade</code></td><td>原地重装（别名：<code>sflow update</code>）</td><td><code>--branch</code> <code>--dry-run</code> <code>--force</code></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- 13: AI Agent Skills -->
+<section class="sec" id="s13">
+<div class="gbg"></div>
+<div class="orb og" style="width:280px;height:280px;top:-50px;left:-60px"></div>
+<div class="pt" style="width:4px;height:4px;background:var(--cy);top:30%;left:85%;opacity:.3;animation-duration:16s;animation-delay:3s"></div>
+<span class="sn">14 / 16</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">开发者体验</span>
+<h2 class="r al d1 ms">Agent 原生的工作流，每跑一次就更好一点</h2>
+<div class="agent-loop-shell r as d2">
+  <div class="dev-flow">
+    <div class="dev-step" style="--dev-delay:.3s"><span class="step-num">01</span><h3>编写 · Agent 原生</h3><div class="dev-context"><span>AGENTS.md 工作流规则</span><span>writing-sflow-yaml 技能</span><span>schema + 示例</span></div></div>
+    <div class="dev-arrow">&#10132;</div>
+    <div class="dev-step" style="--dev-delay:.55s"><span class="step-num">02</span><h3>校验</h3><div class="dev-context"><span>sflow run --dry-run</span><span>解析后的变量</span><span>资源 / GPU 方案</span></div></div>
+    <div class="dev-arrow">&#10132;</div>
+    <div class="dev-step" style="--dev-delay:.8s"><span class="step-num">03</span><h3>运行与观测</h3><div class="dev-context"><span>带时间戳的任务事件</span><span>TUI + 就绪探针</span><span>sflow_monitor.log</span></div></div>
+    <div class="dev-arrow">&#10132;</div>
+    <div class="dev-step" style="--dev-delay:1.05s"><span class="step-num">04</span><h3>诊断与演进</h3><div class="dev-context"><span>sflow_summary.log</span><span>task.log + 失败提示</span><span>result.json 指标</span></div></div>
+  </div>
+  <div class="agent-feedback">
+    <svg class="agent-feedback-orbit" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
+      <path class="agent-loop-arrow" d="M-7,-5 L7,0 L-7,5 Z"/>
+    </svg>
+    <span class="agent-chip">AGENT 闭环</span>
+    <div class="feedback-evidence"><span>时间戳</span><span>汇总</span><span>监控</span><span>失败提示</span></div>
+    <span class="feedback-action">重跑 ← 调整 YAML ← 读取上下文</span>
+  </div>
+</div>
+</div>
+</section>
+
+<!-- 14: Heterogeneous Computing Vision -->
+<section class="sec" id="s14">
+<div class="gbg"></div>
+<div class="orb oc" style="width:300px;height:300px;top:-60px;left:-80px"></div>
+<div class="orb og" style="width:250px;height:250px;bottom:-70px;right:-50px"></div>
+<span class="sn">15 / 16</span>
+<div class="inner">
+<span class="pill pg r ap d0 ms">愿景</span>
+<h2 class="r al d1 ms">异构计算</h2>
+<p class="r au d2" style="max-width:720px">一份 recipe 就能把分离式流水线的每个阶段路由到最合适的资源池，同时保持同一份工作流契约。</p>
+<div class="r as d3" style="width:100%;max-width:650px;margin:0 auto">
+<svg viewBox="0 0 650 140" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
+<defs><linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="50%" stop-color="#76ff03"/><stop offset="100%" stop-color="#e3b341"/></linearGradient></defs>
+<!-- Resource pools (left) -->
+<rect x="10" y="10" width="120" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="70" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">Vera Rubin</text>
+<text x="70" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">GPU 资源池 &bull; Prefill</text>
+<rect x="10" y="80" width="120" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="70" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">LPU Cluster</text>
+<text x="70" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">加速器 &bull; Decode</text>
+<!-- sflow center -->
+<circle cx="325" cy="70" r="35" fill="#060a10" stroke="url(#hg)" stroke-width="2.5"/>
+<text x="325" y="76" text-anchor="middle" fill="#76ff03" font-family="Arial Black, Bahnschrift, 'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC', sans-serif" font-size="13" font-weight="800">sflow</text>
+<!-- Disaggregated output (right) -->
+<rect x="500" y="10" width="140" height="50" rx="6" fill="#0d1420" stroke="#00d4ff" stroke-width="1.5"/>
+<text x="570" y="30" text-anchor="middle" fill="#00d4ff" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">prefill_server</text>
+<text x="570" y="46" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">Vera Rubin GPUs</text>
+<rect x="500" y="80" width="140" height="50" rx="6" fill="#0d1420" stroke="#e3b341" stroke-width="1.5"/>
+<text x="570" y="100" text-anchor="middle" fill="#e3b341" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="10" font-weight="600">decode_server</text>
+<text x="570" y="116" text-anchor="middle" fill="#3d444d" font-family="Consolas,'Microsoft YaHei','PingFang SC','Noto Sans SC','Noto Sans CJK SC','Source Han Sans SC',monospace" font-size="8">LPU 加速器</text>
+<!-- Wires: pools -> sflow -->
+<path d="M130,35 C210,35 250,65 290,70" fill="none" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
+<path d="M130,105 C210,105 250,75 290,70" fill="none" stroke="#e3b341" stroke-width="2" opacity="0.6"/>
+<!-- Wires: sflow -> tasks (animated) -->
+<path id="hw1" d="M360,62 C400,50 440,35 500,35" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
+<path id="hw2" d="M360,78 C400,90 440,105 500,105" fill="none" stroke="url(#hg)" stroke-width="2.5" opacity="0.7"/>
+<circle class="vision-route-dot vision-prefill-dot" r="3.5" fill="#00d4ff"/>
+<circle class="vision-route-dot vision-decode-dot" r="3.5" fill="#e3b341"/>
+<!-- Arrows -->
+<polygon points="495,30 505,35 495,40" fill="#00d4ff" opacity="0.6"/>
+<polygon points="495,100 505,105 495,110" fill="#e3b341" opacity="0.6"/>
+</svg>
+</div>
+<div class="output-strip r au d4">一份 DAG · 专用加速器 · 同一份工作流契约</div>
+</div>
+</section>
+
+<!-- 13: Try It -->
+<section class="sec" id="s15">
+<div class="gbg"></div>
+<div class="orb oc" style="width:420px;height:420px;bottom:-160px;left:28%"></div>
+<div class="orb og" style="width:280px;height:280px;top:-90px;right:18%"></div>
+<span class="sn">16 / 16</span>
+<div class="inner">
+<span class="pill pc r ap d0 ms">立即上手</span>
+<h2 class="r al d1 ms">安装。探索。运行。</h2>
+<p class="r au d2" style="max-width:760px">先在本地起步，在申请硬件之前完成校验，再以文档和代码仓库作为唯一事实来源。</p>
+<div class="try-layout">
+  <div class="term install-panel r al d2"><span class="section"># 从代码仓库安装</span>
+<span class="command">$ uv venv --python python3 &amp;&amp; source .venv/bin/activate</span>
+<span class="command">$ uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"</span>
+
+<span class="section"># 验证并试跑一个本地工作流</span>
+<span class="command">$ sflow --version</span>
+<span class="command">$ sflow sample self_contained/local/hello_world</span>
+<span class="command">$ sflow run -f hello_world.yaml --dry-run</span>
+<span class="success">✓ 先校验；确认方案无误后再运行</span></div>
+  <div class="try-links r ar d3">
+    <a class="try-link" href="https://github.com/NVIDIA/nv-sflow" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">GIT</span><span><b>GitHub 仓库</b><small>github.com/NVIDIA/nv-sflow</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="https://nvidia.github.io/nv-sflow/docs/user/intro" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">DOC</span><span><b>文档</b><small>nvidia.github.io/nv-sflow/docs</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="https://nvidia.github.io/nv-sflow/docs/user/quickstart" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">01</span><span><b>快速上手</b><small>docs/user/quickstart</small></span><span class="try-link-arrow">→</span></a>
+    <a class="try-link" href="https://nvidia.github.io/nv-sflow/feature-map" target="_blank" rel="noopener" onclick="event.stopPropagation()"><span class="try-link-icon">MAP</span><span><b>功能地图</b><small>按意图找到对应的指南</small></span><span class="try-link-arrow">→</span></a>
+  </div>
+</div>
+<div class="try-footer r au d4"><span>本地</span><span>Docker</span><span>Slurm</span><span>Kubernetes</span><span>同一份工作流契约</span></div>
+</div>
+</section>
+
+<script>
+(function(){
+var D=6500,secs=document.querySelectorAll('.sec:not(.legacy-hidden)'),
+dotsEl=document.getElementById('dots'),prog=document.getElementById('prog'),
+tmr=document.getElementById('tmr'),badge=document.getElementById('badge'),
+N=secs.length,cur=0,paused=true,timer=null;
+for(var i=0;i<N;i++){var d=document.createElement('button');d.className='dot';d.setAttribute('data-i',i);d.onclick=function(){go(+this.getAttribute('data-i'))};dotsEl.appendChild(d)}
+var dots=dotsEl.querySelectorAll('.dot');
+function activate(i){
+  // Keep SMIL clocks live: pausing offscreen SVGs can strand delayed animateMotion intervals during load/scroll restoration.
+  for(var j=0;j<N;j++){
+    secs[j].classList.remove('on');
+  }
+  secs[i].classList.add('on');
+  for(var j=0;j<N;j++)dots[j].classList.toggle('on',j===i);
+  prog.style.width=((i+1)/N*100)+'%';
+  startTimer()
+}
+function startTimer(){tmr.style.transition='none';tmr.style.width='0%';requestAnimationFrame(function(){requestAnimationFrame(function(){tmr.style.transition='width '+D+'ms linear';tmr.style.width='100%'})})}
+function go(i){cur=((i%N)+N)%N;secs[cur].scrollIntoView({behavior:'smooth'});activate(cur);resetAuto()}
+function next(){if(!paused)go(cur+1)}
+function resetAuto(){clearInterval(timer);if(!paused)timer=setInterval(next,D)}
+function toggleAuto(){paused=!paused;badge.textContent=paused?'按 P 开启自动播放':'自动播放已开启 \u2014 按 P 暂停';badge.style.opacity=paused?'1':'0';if(paused){clearInterval(timer);tmr.style.transitionDuration='0s'}else resetAuto()}
+document.addEventListener('keydown',function(e){if(e.key==='p'||e.key==='P'){toggleAuto();return}if(['ArrowDown',' ','ArrowRight','PageDown'].indexOf(e.key)>=0){e.preventDefault();go(cur+1)}else if(['ArrowUp','ArrowLeft','PageUp'].indexOf(e.key)>=0){e.preventDefault();go(cur-1)}});
+var obs=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){for(var i=0;i<N;i++)if(secs[i]===e.target){cur=i;activate(i);break}}})},{threshold:.4});
+for(var i=0;i<N;i++)obs.observe(secs[i]);
+activate(0);badge.style.opacity='1';
+})();
+</script>
+</body>
+</html>
