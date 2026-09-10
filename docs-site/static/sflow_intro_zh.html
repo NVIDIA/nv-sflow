@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>sflow — 面向大规模 GPU 集群的声明式工作流描述器</title>
+<!-- Relative, so the pair stays linked under any deploy baseUrl (site root, /nv-sflow/, ...). -->
+<link rel="alternate" hreflang="en" href="sflow_intro.html">
+<link rel="alternate" hreflang="zh-Hans" href="sflow_intro_zh.html">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-snap-type:y mandatory;scroll-behavior:smooth;height:100%;overflow-x:hidden}
@@ -630,6 +633,11 @@ code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Not
 .doc-corner,.map-corner{border-color:rgba(255,255,255,.14);box-shadow:none}
 .doc-corner:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.35)}
 .map-corner:hover{background:var(--gr);color:#060a10;box-shadow:0 0 20px rgba(118,255,2,.3)}
+/* Language switch. Deliberately not brand-coloured: the two chips beside it are
+   destinations, this one only relabels the page you are already on. */
+.lang-corner{display:inline-flex;align-items:center;gap:.4em;padding:.35em .9em;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:var(--dim);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s}
+.lang-corner:hover{border-color:rgba(255,255,255,.5);color:#fff;background:rgba(255,255,255,.15)}
+.lang-corner svg{flex-shrink:0}
 .mb{margin-bottom:var(--gap)}.ms{margin-bottom:calc(var(--gap)*.4)}
 @media(max-height:700px){:root{--pad:clamp(.6rem,2.5vw,1.5rem);--gap:clamp(.3rem,1vw,.7rem);--t:clamp(1.5rem,4.5vw,2.8rem);--h:clamp(1.3rem,3.2vw,2.1rem)}}
 @media(max-height:600px){:root{--pad:clamp(.5rem,2vw,1.2rem);--gap:clamp(.25rem,.8vw,.55rem);--t:clamp(1.25rem,4vw,2.2rem);--h:clamp(1.05rem,2.8vw,1.65rem);--b:clamp(.72rem,1.3vw,.95rem)}}
@@ -647,8 +655,12 @@ code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Not
 <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
 </a>
 <div class="corner-links">
-<a href="https://nvidia.github.io/nv-sflow/docs/user/intro" class="doc-corner" target="_blank" rel="noopener" onclick="event.stopPropagation()">文档 &rarr;</a>
-<a href="https://nvidia.github.io/nv-sflow/feature-map" class="map-corner" target="_blank" rel="noopener" onclick="event.stopPropagation()">功能地图 &rarr;</a>
+<a href="docs/user/intro" class="doc-corner" target="_top" onclick="event.stopPropagation()">文档 &rarr;</a>
+<a href="feature-map" class="map-corner" target="_top" onclick="event.stopPropagation()">功能地图 &rarr;</a>
+<!-- No target: the deck is also iframed as the site homepage, and swapping in place
+     keeps the reader where they are instead of punting them to a bare file URL. -->
+<a href="sflow_intro.html" class="lang-corner" id="langToggle" hreflang="en" lang="en" title="Switch to English" onclick="event.stopPropagation()">
+<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>English</a>
 </div>
 <div class="prog" id="prog"></div>
 <div class="tmr" id="tmr"></div>
@@ -660,14 +672,14 @@ code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Not
 <div class="gbg"></div>
 <div class="orb oc" style="width:450px;height:450px;top:-120px;left:-120px"></div>
 <div class="orb og" style="width:320px;height:320px;bottom:-80px;right:-80px"></div>
-<span class="sn">01 / 16</span>
+<span class="sn">01 / 18</span>
 <div class="inner"><div class="hero">
 <div class="hero-brand r as d0"><span>NV-SFLOW</span></div>
 <h2 class="hero-desc r au d1">面向<span class="accent">大规模 GPU 集群</span>的<span class="green">通用</span>工作流编排引擎</h2>
 <p class="hero-slogan r au d2">一次描述，随处运行。<span style="animation:bl 1s step-end infinite;color:var(--cy)">_</span></p>
 <div class="flow-band r au d3">
 <span class="fan flow-in"><span class="flow-labels"><i>vLLM</i><i>SGLang</i><i>TensorRT-LLM</i><i>Dynamo</i><i>PyTorch</i><i class="more">&hellip;</i></span><svg viewBox="0 0 104 120" aria-hidden="true"><path pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path pathLength="100" d="M5,110 C50,110 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,10 C50,10 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,30 C50,30 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,50 C50,50 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,70 C50,70 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,90 C50,90 58,60 99,60"/><path class="pulse" pathLength="100" d="M5,110 C50,110 58,60 99,60"/><circle cx="5" cy="10" r="3.2"/><circle cx="5" cy="30" r="3.2"/><circle cx="5" cy="50" r="3.2"/><circle cx="5" cy="70" r="3.2"/><circle cx="5" cy="90" r="3.2"/><circle cx="5" cy="110" r="3.2"/></svg></span>
-<span class="flow-hub"><img src="../../../docs-site/static/img/sflow-logo.jpg" alt="sflow" decoding="async" fetchpriority="high"></span>
+<span class="flow-hub"><img src="img/sflow-logo.jpg" alt="sflow" decoding="async" fetchpriority="high"></span>
 <span class="fan flow-out"><svg viewBox="0 0 174 100" aria-hidden="true"><path pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path pathLength="100" d="M8,50 L166,50"/><path pathLength="100" d="M8,50 C78,50 94,84 166,84"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,16 166,16"/><path class="pulse" pathLength="100" d="M8,50 L166,50"/><path class="pulse" pathLength="100" d="M8,50 C78,50 94,84 166,84"/><circle cx="166" cy="16" r="5.4"/><circle cx="166" cy="50" r="5.4"/><circle cx="166" cy="84" r="5.4"/></svg><span class="flow-labels"><i>Kubernetes</i><i>Slurm</i><i>Docker</i></span></span>
 </div>
 <div class="hero-cta r au d3">
@@ -686,7 +698,7 @@ code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Not
 <section class="sec" id="s1b">
 <div class="gbg"></div>
 <div class="orb og" style="width:300px;height:300px;top:-70px;right:10%"></div>
-<span class="sn">02 / 16</span>
+<span class="sn">02 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">工作负载演进</span>
 <h2 class="r al d1 ms">从本地单机容器，到集群级多阶段服务</h2>
@@ -728,7 +740,7 @@ code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Not
 <section class="sec" id="s1c">
 <div class="gbg"></div>
 <div class="orb oc" style="width:280px;height:280px;bottom:-70px;left:8%"></div>
-<span class="sn">03 / 16</span>
+<span class="sn">03 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">视角转变</span>
 <h2 class="r al d1 ms">更宏观的编排视角：从一台机器，到一个集群</h2>
@@ -747,14 +759,14 @@ code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Not
       <div class="layer-align">跨节点<b>依赖与就绪对齐</b></div>
     </div>
     <div class="layer" style="--layer-delay:1s;--align-delay:1.8s;color:#a4e83a">
-      <div class="layer-name"><b>基础设施平台</b><small>Slurm · Kubernetes · Docker</small></div>
-      <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
-      <div class="layer-align">跨节点<b>调度、配额与网络</b></div>
-    </div>
-    <div class="layer" style="--layer-delay:.85s;--align-delay:1.65s;color:#e3b341">
       <div class="layer-name"><b>软件</b><small>vLLM · SGLang · TensorRT-LLM · 镜像</small></div>
       <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
       <div class="layer-align">跨节点<b>版本与镜像一致</b></div>
+    </div>
+    <div class="layer" style="--layer-delay:.85s;--align-delay:1.65s;color:#e3b341">
+      <div class="layer-name"><b>基础设施平台</b><small>Slurm · Kubernetes · Docker</small></div>
+      <div class="layer-nodes"><i></i><i></i><i></i><i></i></div>
+      <div class="layer-align">跨节点<b>调度、配额与网络</b></div>
     </div>
     <div class="layer" style="--layer-delay:.7s;--align-delay:1.5s;color:#4fc3e8">
       <div class="layer-name"><b>驱动</b><small>CUDA · NCCL · 网卡驱动</small></div>
@@ -776,10 +788,10 @@ code{color:var(--cy);font-family:'Consolas','Microsoft YaHei','PingFang SC','Not
 <section class="sec" id="s1d">
 <div class="gbg"></div>
 <div class="orb og" style="width:270px;height:270px;top:-60px;right:14%"></div>
-<span class="sn">04 / 16</span>
+<span class="sn">04 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">基础设施差异</span>
-<h2 class="r al d1 ms">每个平台一套语义，迁移与适配成本倍增</h2>
+<h2 class="r al d1 ms">每个平台一套语义，编排流程重复构建</h2>
 <div class="dialect-grid r as d2">
   <div class="dialect" style="--dia-delay:.3s;color:#e3b341">
     <h3>Slurm</h3>
@@ -830,7 +842,7 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s2">
 <div class="gbg"></div>
 <div class="orb oc" style="width:280px;height:280px;top:60%;right:-60px"></div>
-<span class="sn">05 / 16</span>
+<span class="sn">05 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">问题</span>
 <h2 class="r al d1 ms">工作负载始终不变，平台适配成本却成倍增长。</h2>
@@ -851,7 +863,7 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s3">
 <div class="gbg"></div>
 <div class="orb og" style="width:350px;height:350px;top:15%;right:-100px"></div>
-<span class="sn">06 / 16</span>
+<span class="sn">06 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">后端无关的设计</span>
 <h2 class="r al d1 mb">保留<span class="accent">做什么</span>，替换<span class="green">在哪跑</span>，无需重写。</h2>
@@ -913,7 +925,7 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s4">
 <div class="gbg"></div>
 <div class="orb oc" style="width:240px;height:240px;top:8%;left:-70px"></div>
-<span class="sn">07 / 16</span>
+<span class="sn">07 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">DAG 编排</span>
 <h2 class="r al d1 ms">任务与依赖，全部由你定义</h2>
@@ -947,7 +959,7 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s5">
 <div class="gbg"></div>
 <div class="orb og" style="width:300px;height:300px;bottom:-90px;right:8%"></div>
-<span class="sn">08 / 16</span>
+<span class="sn">08 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">大规模集群级编排</span>
 <h2 class="r al d1 ms">拓扑感知的 GPU 分配</h2>
@@ -984,7 +996,7 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s6">
 <div class="gbg"></div>
 <div class="orb oc" style="width:200px;height:200px;top:-40px;right:28%"></div>
-<span class="sn">09 / 16</span>
+<span class="sn">09 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">工作流生命周期</span>
 <h2 class="r al d1 ms">定义。执行。洞察。</h2>
@@ -1017,7 +1029,7 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s7">
 <div class="gbg"></div>
 <div class="orb oc" style="width:260px;height:260px;top:-70px;right:16%"></div>
-<span class="sn">10 / 16</span>
+<span class="sn">10 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">后端适配器</span>
 <h2 class="r al d1 ms">同一份意图，落地为四套原生执行方案</h2>
@@ -1038,7 +1050,7 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s8">
 <div class="gbg"></div>
 <div class="orb og" style="width:300px;height:300px;bottom:-90px;left:12%"></div>
-<span class="sn">11 / 16</span>
+<span class="sn">11 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">Merge Pod</span>
 <h2 class="r al d1 ms">GPU 任务同机部署，共享高速的节点内互联</h2>
@@ -1067,10 +1079,10 @@ srun --ntasks=16 ...</div>
 <section class="sec" id="s9">
 <div class="gbg"></div>
 <div class="orb oc" style="width:220px;height:220px;top:-50px;left:20%"></div>
-<span class="sn">12 / 16</span>
+<span class="sn">12 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">可观测性</span>
-<h2 class="r al d1 ms">每一次运行都会自我解释</h2>
+<h2 class="r al d1 ms">完备的自动运行时信息收集以供事后审查</h2>
 <div class="two">
 <div class="term r al d2" style="font-size:clamp(.45rem,.72vw,.62rem)"><span class="cy">sflow_summary.log</span>
 Task Duration Chart
@@ -1117,10 +1129,10 @@ Timelines (cluster avg)
 <section class="sec" id="s10">
 <div class="gbg"></div>
 <div class="orb og" style="width:260px;height:260px;top:-60px;left:20%"></div>
-<span class="sn">13 / 16</span>
+<span class="sn">13 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">模块化组合</span>
-<h2 class="r al d1 ms">换掉一个叶子，复用整棵树。</h2>
+<h2 class="r al d1 ms">公共路径无需重复修改, 模块替换自由组合</h2>
 <div class="recipe-tree r as d2">
   <div class="tree-root">recipe/<small>组合根目录</small></div>
   <div class="tree-branches">
@@ -1144,15 +1156,15 @@ Timelines (cluster avg)
 </div>
 <div class="tree-selection r au d3">&#9660; 选中的叶子完成组合</div>
 <div class="compose-result r ap d4"><b>composed.yaml</b> &nbsp; k8s + 共享工作流 + vLLM + AIPerf</div>
-<div class="output-strip r au d5">只替换高亮的那个叶子，共享分支保持不变。</div>
+<div class="output-strip r au d5">替换叶子节点以部分切换工作流，共享分支保持不变。</div>
 </div>
 </section>
 
 <!-- 11: Error Analysis (real example — Job 1865443) -->
-<section class="sec legacy-hidden" id="s11">
+<section class="sec" id="s11">
 <div class="gbg"></div>
 <div class="orb oc" style="width:220px;height:220px;bottom:-50px;left:15%"></div>
-<span class="sn">11 / 15</span>
+<span class="sn">14 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">真实场景调试</span>
 <h2 class="r al d1 ms">结构化的错误分析</h2>
@@ -1211,9 +1223,9 @@ TCP 路由无法解析。
 </section>
 
 <!-- 12: CLI -->
-<section class="sec legacy-hidden" id="s12">
+<section class="sec" id="s12">
 <div class="gbg"></div>
-<span class="sn">12 / 15</span>
+<span class="sn">15 / 18</span>
 <div class="inner">
 <h2 class="r au d0 mb">CLI 速览</h2>
 <table class="mtbl r au d1" style="max-width:800px">
@@ -1236,7 +1248,7 @@ TCP 路由无法解析。
 <div class="gbg"></div>
 <div class="orb og" style="width:280px;height:280px;top:-50px;left:-60px"></div>
 <div class="pt" style="width:4px;height:4px;background:var(--cy);top:30%;left:85%;opacity:.3;animation-duration:16s;animation-delay:3s"></div>
-<span class="sn">14 / 16</span>
+<span class="sn">16 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">开发者体验</span>
 <h2 class="r al d1 ms">Agent 原生的工作流，每跑一次就更好一点</h2>
@@ -1267,7 +1279,7 @@ TCP 路由无法解析。
 <div class="gbg"></div>
 <div class="orb oc" style="width:300px;height:300px;top:-60px;left:-80px"></div>
 <div class="orb og" style="width:250px;height:250px;bottom:-70px;right:-50px"></div>
-<span class="sn">15 / 16</span>
+<span class="sn">17 / 18</span>
 <div class="inner">
 <span class="pill pg r ap d0 ms">愿景</span>
 <h2 class="r al d1 ms">异构计算</h2>
@@ -1314,7 +1326,7 @@ TCP 路由无法解析。
 <div class="gbg"></div>
 <div class="orb oc" style="width:420px;height:420px;bottom:-160px;left:28%"></div>
 <div class="orb og" style="width:280px;height:280px;top:-90px;right:18%"></div>
-<span class="sn">16 / 16</span>
+<span class="sn">18 / 18</span>
 <div class="inner">
 <span class="pill pc r ap d0 ms">立即上手</span>
 <h2 class="r al d1 ms">安装。探索。运行。</h2>
@@ -1348,6 +1360,28 @@ tmr=document.getElementById('tmr'),badge=document.getElementById('badge'),
 N=secs.length,cur=0,paused=true,timer=null;
 for(var i=0;i<N;i++){var d=document.createElement('button');d.className='dot';d.setAttribute('data-i',i);d.onclick=function(){go(+this.getAttribute('data-i'))};dotsEl.appendChild(d)}
 var dots=dotsEl.querySelectorAll('.dot');
+// Carry the current slide across the language swap. Both decks ship the same section
+// ids, so the hash is a stable cross-language cursor; without it, switching language
+// deep in the deck costs you your place, which is enough to stop people switching.
+var langLink=document.getElementById('langToggle'),
+    langHref=langLink?langLink.getAttribute('href'):'',
+    LANG_TARGET='en';
+function syncLang(i){if(langLink)langLink.setAttribute('href',langHref+'#'+secs[i].id)}
+// On the site homepage this deck runs inside an iframe. Swapping the frame in place
+// would leave the address bar on "/", so the other language could not be shared or
+// bookmarked and a reload would silently revert. When framed, drive the TOP url
+// (?lang=zh) instead and let the homepage pick the deck; standalone, the plain
+// sibling link is already correct.
+if(langLink)langLink.addEventListener('click',function(e){
+  if(window.top===window.self)return;
+  var topLoc;
+  try{topLoc=window.top.location;void topLoc.href}catch(_){return} // cross-origin ancestor: leave the default
+  e.preventDefault();
+  var u=new URL(topLoc.href);
+  if(LANG_TARGET==='zh')u.searchParams.set('lang','zh');else u.searchParams.delete('lang');
+  u.hash=secs[cur].id;
+  topLoc.href=u.toString();
+});
 function activate(i){
   // Keep SMIL clocks live: pausing offscreen SVGs can strand delayed animateMotion intervals during load/scroll restoration.
   for(var j=0;j<N;j++){
@@ -1356,6 +1390,7 @@ function activate(i){
   secs[i].classList.add('on');
   for(var j=0;j<N;j++)dots[j].classList.toggle('on',j===i);
   prog.style.width=((i+1)/N*100)+'%';
+  syncLang(i);
   startTimer()
 }
 function startTimer(){tmr.style.transition='none';tmr.style.width='0%';requestAnimationFrame(function(){requestAnimationFrame(function(){tmr.style.transition='width '+D+'ms linear';tmr.style.width='100%'})})}
@@ -1366,7 +1401,16 @@ function toggleAuto(){paused=!paused;badge.textContent=paused?'按 P 开启自�
 document.addEventListener('keydown',function(e){if(e.key==='p'||e.key==='P'){toggleAuto();return}if(['ArrowDown',' ','ArrowRight','PageDown'].indexOf(e.key)>=0){e.preventDefault();go(cur+1)}else if(['ArrowUp','ArrowLeft','PageUp'].indexOf(e.key)>=0){e.preventDefault();go(cur-1)}});
 var obs=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){for(var i=0;i<N;i++)if(secs[i]===e.target){cur=i;activate(i);break}}})},{threshold:.4});
 for(var i=0;i<N;i++)obs.observe(secs[i]);
-activate(0);badge.style.opacity='1';
+// Land on the slide the other language handed us. Pattern-check the hash rather than
+// feeding it straight to querySelector, which throws on a malformed selector.
+var start=0;
+if(/^#s[0-9a-z]+$/i.test(location.hash)){
+  var want=location.hash.slice(1);
+  for(var i=0;i<N;i++)if(secs[i].id===want){start=i;break}
+}
+activate(start);
+if(start)secs[start].scrollIntoView({behavior:'auto'});
+badge.style.opacity='1';
 })();
 </script>
 </body>

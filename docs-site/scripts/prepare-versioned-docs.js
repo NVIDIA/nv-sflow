@@ -5,7 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { buildDocsSidebar } = require("../sidebarsConfig");
+const { buildDocsSidebar, buildAgentsSidebar } = require("../sidebarsConfig");
 const { mirrorSkillsToAgents } = require("./mirror-skills");
 
 const DOCS_SITE_DIR = path.resolve(__dirname, "..");
@@ -281,9 +281,15 @@ function prepareVersionedDocs(plan, options = {}) {
       handwrittenDir: paths.agentsSrcDir,
       destDir: path.join(versionDir, "agents"),
     });
+    // Versions that predate the skills feature get no `agents` sidebar at all --
+    // see buildAgentsSidebar. The navbar entry is guarded to match.
+    const agentsSidebar = buildAgentsSidebar(versionDir);
     writeJson(
       path.join(paths.versionedSidebarsDir, `${safeVersionDirName(version.label)}-sidebars.json`),
-      { docs: buildDocsSidebar(versionDir) },
+      {
+        docs: buildDocsSidebar(versionDir),
+        ...(agentsSidebar ? { agents: agentsSidebar } : {}),
+      },
     );
   }
 
