@@ -8,11 +8,11 @@ CLI command for generating sbatch scripts to run sflow in batch mode.
 import csv
 import json
 import os
+import re
 import shlex
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
-from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Annotated, Any, List, Optional, Protocol
 from urllib.parse import urlparse
@@ -22,18 +22,26 @@ import typer
 import yaml as _yaml
 
 from sflow.app.sflow import SflowApp
+from sflow.config.loader import safe_load
 from sflow.cli import DOCS_URL, app
 from sflow.cli._args import (  # split_list_arg re-exported for back-compat
     EnableTaskMonitorOption,
     EnableWorkflowMonitorOption,
     ExcludeNodesOption,
     IncludeNodesOption,
+    SshFetchOption,
+    SshFollowOption,
+    SshOption,
+    SshRemoteRootOption,
+    SshTtyOption,
+    reject_unhandled_ssh,
     split_list_arg,
 )
 from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
 from sflow.logging import configure_logging, get_logger
 from sflow.resolution import enrich_error_with_location
 from sflow.runtime_info import log_runtime_info
+from sflow.utils.distribution import installed_distribution
 from sflow.utils.extra_args import dedup_merge_extra_args
 from sflow.utils.install import (
     DEFAULT_SFLOW_GIT_URL,
@@ -202,14 +210,23 @@ def _repo_path_from_direct_url(url: str) -> Path | None:
     return None
 
 
+# A final release version, which has a tag on GitHub. Pre-release tags are not
+# synced there and .devN/+local builds have no tag at all; both pass through.
+_RELEASE_VERSION = re.compile(r"\d+(\.\d+)*")
+
+
 def _resolve_effective_sflow_version(sflow_version: str | None) -> str | None:
-    """Resolve the git ref/version that generated batch scripts should install."""
+    """Resolve the git ref that generated batch scripts should install.
+
+    An explicit value and a ref recorded in ``direct_url.json`` are used as given.
+    Only the last resort, the distribution version of an index/PyPI install, is
+    mapped to its release tag: ``git+...@0.3.1`` is not a ref, ``@v0.3.1`` is.
+    """
     if sflow_version:
         return sflow_version
 
-    try:
-        dist = importlib_metadata.distribution("sflow")
-    except importlib_metadata.PackageNotFoundError:
+    dist = installed_distribution()
+    if dist is None:
         return None
 
     try:
@@ -237,13 +254,10 @@ def _resolve_effective_sflow_version(sflow_version: str | None) -> str | None:
                     return repo_ref
 
     version = getattr(dist, "version", None)
-    if version:
-        return str(version)
-
-    try:
-        return importlib_metadata.version("sflow")
-    except importlib_metadata.PackageNotFoundError:
+    if not version:
         return None
+    version = str(version)
+    return f"v{version}" if _RELEASE_VERSION.fullmatch(version) else version
 
 
 # Install-spec helpers are shared with `sflow upgrade`; see sflow.utils.install.
@@ -279,10 +293,9 @@ def _resolve_sbatch_extra_args(
     domain_map: dict[str, list[Any]] = {}
     for cfg_path in config_files:
         try:
-            import yaml as _yaml
 
             with open(cfg_path) as fh:
-                data = _yaml.safe_load(fh)
+                data = safe_load(fh)
             if data:
                 var_map.update(_build_var_map(data))
                 domain_map.update(extract_domains_from_raw_config(data))
@@ -803,10 +816,13 @@ def _generate_sbatch_script(
         ]
     else:
         # Route 1 -- git: install the resolved ref (--sflow-version, or the running
-        # env's ref / 'main' when omitted) from the sflow git repo.
+        # env's ref / 'main' when omitted) from the sflow git repo. A bare VCS URL,
+        # not 'nv-sflow @ ...': the distribution was renamed from 'sflow', and a
+        # named requirement is rejected by uv/pip whenever the ref builds the other
+        # name (every pre-rename tag, or a fork that has not synced).
         effective_sflow_version = _resolve_effective_sflow_version(sflow_version)
         sflow_install_cmd = (
-            f"{shlex.quote(f'sflow @ {_sflow_git_install_url(effective_sflow_version)}')} "
+            f"{shlex.quote(_sflow_git_install_url(effective_sflow_version))} "
             "--prerelease=allow"
         )
         sflow_install_lines = [
@@ -1691,6 +1707,27 @@ def _derive_row_name(
     return f"{_sanitize_name(base)}_{idx:03d}"
 
 
+# Set by SSH delegation to a session-local file. Every job id submitted through
+# this process is appended to it so an interrupted remote session can scancel
+# exactly the jobs it created (see sflow.ssh.remote_helper._cancel).
+SUBMITTED_JOBS_FILE_ENV = "SFLOW_SUBMITTED_JOBS_FILE"
+
+
+def _record_submitted_job(message: str) -> None:
+    import re
+
+    path = os.environ.get(SUBMITTED_JOBS_FILE_ENV)
+    match = re.search(r"Submitted batch job (\d+)", message)
+    if not path or not match:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(f"{match.group(1)}\n")
+    except OSError:
+        # Bookkeeping only: never fail a successful submission over it.
+        pass
+
+
 def _submit_sbatch(script_path: Path) -> str:
     """Submit an sbatch script and return the stdout message (e.g. job id)."""
     import subprocess
@@ -1702,7 +1739,9 @@ def _submit_sbatch(script_path: Path) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"sbatch failed: {result.stderr.strip()}")
-    return result.stdout.strip()
+    message = result.stdout.strip()
+    _record_submitted_job(message)
+    return message
 
 
 def _build_var_map(
@@ -1803,7 +1842,6 @@ def _derive_backend_int(
     runs when the regex returns None, so currently-resolving configs are unchanged and
     partial fragments (which the pipeline can't validate) keep their regex result.
     """
-    import yaml as _yaml
 
     merged_var_map: dict[str, Any] = {}
     all_data: list[dict] = []
@@ -1811,7 +1849,7 @@ def _derive_backend_int(
     for f in config_files:
         try:
             with open(f) as fh:
-                raw = _yaml.safe_load(fh)
+                raw = safe_load(fh)
             if isinstance(raw, dict):
                 all_data.append(raw)
                 merged_var_map.update(_build_var_map(raw))
@@ -2108,7 +2146,6 @@ def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
     """
     import glob as _glob
 
-    import yaml as _yaml
 
     candidates: list[Path] = []
     for p in paths:
@@ -2132,8 +2169,8 @@ def _scan_sflow_yamls(paths: list[Path]) -> list[Path]:
     for f in candidates:
         try:
             with open(f) as fh:
-                data = _yaml.safe_load(fh)
-            if isinstance(data, dict) and "version" in data:
+                data = safe_load(fh)
+            if isinstance(data, dict) and "workflow" in data:
                 valid.append(f.resolve())
         except Exception:
             continue
@@ -2216,10 +2253,9 @@ def _run_bulk_submit(
         # Warn about CLI variable overrides
         if cli_var_keys:
             try:
-                import yaml as _yaml
 
                 with open(yaml_file) as fh:
-                    data = _yaml.safe_load(fh)
+                    data = safe_load(fh)
                 config_var_names: set[str] = set()
                 raw_vars = data.get("variables") or []
                 if isinstance(raw_vars, dict):
@@ -2326,10 +2362,9 @@ def _run_bulk_submit(
                 # (loading the YAML) when the backend has no resolvable ``nodes`` field.
                 row_nodes = _derive_nodes([yaml_file], cli_overrides=cli_set_var)
                 if row_nodes is None:
-                    import yaml as _yaml
 
                     with open(yaml_file) as fh:
-                        data = _yaml.safe_load(fh)
+                        data = safe_load(fh)
                     row_nodes = _first_node_column_int(
                         _build_var_map(data, cli_overrides=cli_set_var)
                     )
@@ -3009,7 +3044,7 @@ def batch(
             help="Install sflow from a private PyPI index (e.g. an Artifactory registry "
             "such as https://<host>/artifactory/api/pypi/<repo>/simple) instead of "
             "from git. When set, --sflow-version is treated as a PyPI version specifier: a "
-            "bare version is pinned ('0.2.1' -> 'sflow==0.2.1'), an operator spec is passed "
+            "bare version is pinned ('0.3.2' -> 'nv-sflow==0.3.2'), an operator spec is passed "
             "through ('>=0.2,<0.3'), and omitting it installs the latest available. The index "
             "is added via uv's --extra-index-url so dependencies still resolve from the "
             "default index. Credentials must be available on the compute node (e.g. ~/.netrc) "
@@ -3133,6 +3168,11 @@ def batch(
             "offload_task_logs; no-op for k8s/ssh.",
         ),
     ] = None,
+    ssh: SshOption = None,
+    ssh_follow: SshFollowOption = "auto",
+    ssh_fetch: SshFetchOption = "logs",
+    ssh_remote_root: SshRemoteRootOption = None,
+    ssh_tty: SshTtyOption = "auto",
 ):
     """
     Generate an sbatch script for running sflow in Slurm batch mode.
@@ -3143,7 +3183,8 @@ def batch(
     Three modes are supported:
 
     1. Single-job mode (default): generate one sbatch script from one or more
-       YAML config files (merged into a single workflow). Requires --nodes.
+       YAML config files (merged into a single workflow). --nodes is derived
+       from the config's slurm backend when omitted.
 
     2. Bulk-input mode (--bulk-input): read a CSV file where each row defines
        a job with its own config files and variable/artifact overrides.
@@ -3231,6 +3272,7 @@ def batch(
         # Bulk submit: with variable overrides applied to all configs
         sflow batch -B ./examples/ --set SLURM_NODES=2 --partition gpu --submit
     """
+    reject_unhandled_ssh(ssh)
     configure_logging(level=log_level, console=True)
     log_runtime_info()
 

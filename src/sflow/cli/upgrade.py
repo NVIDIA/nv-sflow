@@ -3,15 +3,16 @@
 
 """``sflow upgrade`` / ``sflow update`` -- reinstall sflow into the current env.
 
-Accepts the same install-route flags as ``sflow batch`` (``--sflow-version``,
-``--sflow-index-url``, ``--sflow-source-path``) so the version you pin for a
-batch job and the version you install locally are described the same way. The
-shared parsing/validation lives in :mod:`sflow.utils.install`.
+With no flags this installs the latest ``nv-sflow`` release from PyPI, like
+``pip install --upgrade`` would. ``--sflow-version`` narrows that to a PEP 440
+version or specifier, ``--sflow-index-url`` adds a private index (an Artifactory
+PyPI repo) that is searched ahead of PyPI, and ``--repo`` / ``--branch`` switch
+to installing a git ref instead -- the route for pre-release branches.
 
-With no flags this installs ``main`` from the public OSS GitHub repo. That is
-deliberately different from ``sflow batch``, which defaults to whatever ref the
-*running* environment was installed from -- ``upgrade`` is an explicit "get me
-the latest" action.
+That is deliberately different from ``sflow batch``, which defaults to whatever
+ref the *running* environment was installed from, and whose ``--sflow-version``
+is a git ref unless an index URL is given: ``upgrade`` is an explicit "get me the
+latest release" action. The shared validation lives in :mod:`sflow.utils.install`.
 """
 
 from __future__ import annotations
@@ -26,6 +27,13 @@ from typing import Annotated, Optional
 
 import typer
 
+from sflow.utils.distribution import (
+    DIST_NAME,
+    FIRST_PYPI_VERSION,
+    LEGACY_DIST_NAME,
+    non_editable_records,
+    reconcile,
+)
 from sflow.cli import DOCS_URL, app
 from sflow.runtime_info import install_info
 from sflow.utils.install import (
@@ -76,12 +84,14 @@ def _resolve_target(
     sflow_version: str | None,
     sflow_index_url: str | None,
     sflow_source_path: Path | None,
-) -> tuple[str, str]:
-    """Return ``(requirement, human_description)`` for the selected route.
+) -> tuple[str, str, str]:
+    """Return ``(route, requirement, human_description)`` for the selected route.
 
-    Rejects flag combinations that describe two different sources at once --
-    ``--sflow-version`` already encodes ``repo-url@ref``, so pairing it with
-    ``--repo``/``--branch`` is ambiguous rather than additive.
+    ``route`` is ``"editable"``, ``"git"`` or ``"pypi"``; the caller shapes the
+    installer flags from it rather than re-deriving the decision from the flags.
+
+    Rejects flag combinations that describe two different sources at once: a
+    PyPI version pin or index URL cannot be applied to a git checkout.
     """
     explicit_git = repo is not None or branch is not None
 
@@ -101,27 +111,36 @@ def _resolve_target(
                 f"--sflow-source-path is mutually exclusive with {', '.join(conflicting)}; "
                 "it installs from a local checkout instead of a remote source."
             )
-        return f"-e{sflow_source_path}", f"editable install from {sflow_source_path}"
+        return "editable", f"-e{sflow_source_path}", f"editable install from {sflow_source_path}"
 
-    if sflow_index_url is not None:
-        if explicit_git:
-            _fail(
-                "--repo/--branch describe a git source and cannot be combined with "
-                "--sflow-index-url; with an index URL, use --sflow-version as the "
-                "PyPI version specifier."
+    if explicit_git:
+        conflicting = [
+            name
+            for name, value in (
+                ("--sflow-version", sflow_version),
+                ("--sflow-index-url", sflow_index_url),
             )
+            if value is not None
+        ]
+        if conflicting:
+            _fail(
+                f"--repo/--branch install a git ref and cannot be combined with "
+                f"{', '.join(conflicting)}; a PyPI version or index does not apply "
+                "to a git checkout."
+            )
+        # Bare VCS URL, no 'nv-sflow @' prefix: a named requirement fails on any
+        # ref that still builds the pre-rename 'sflow' distribution.
+        url = sflow_git_install_url(sflow_git_spec(repo, branch))
+        return "git", url, url
+
+    if sflow_version is None:
+        # "Latest" never reaches below the first migration-aware release: the
+        # pre-rename uploads on pypi.org must not be what a plain upgrade picks.
+        requirement = f"{DIST_NAME}>={FIRST_PYPI_VERSION}"
+    else:
         requirement = sflow_pypi_requirement(sflow_version)
-        return requirement, f"{requirement} from index {sflow_index_url}"
-
-    if sflow_version is not None and explicit_git:
-        _fail(
-            "--sflow-version already encodes the source ('ref' or 'repo-url@ref') and "
-            "cannot be combined with --repo/--branch. Use one form or the other."
-        )
-
-    spec = sflow_version if sflow_version is not None else sflow_git_spec(repo, branch)
-    url = sflow_git_install_url(spec)
-    return f"sflow @ {url}", url
+    where = f"index {sflow_index_url}" if sflow_index_url else "PyPI"
+    return "pypi", requirement, f"{requirement} from {where}"
 
 
 def upgrade(
@@ -129,42 +148,37 @@ def upgrade(
         Optional[str],
         typer.Option(
             "--repo",
-            help="Git repository URL to install sflow from. "
-            f"Defaults to the public OSS repo ({DEFAULT_SFLOW_GIT_URL}). "
-            "Mutually exclusive with --sflow-version, which encodes the repo and "
-            "ref together.",
+            help="Install a git checkout instead of a PyPI release: the repository "
+            f"URL (default: the public OSS repo, {DEFAULT_SFLOW_GIT_URL}). "
+            "Mutually exclusive with --sflow-version/--sflow-index-url.",
         ),
     ] = None,
     branch: Annotated[
         Optional[str],
         typer.Option(
             "--branch",
-            help="Git branch or tag to install "
+            help="Install a git checkout instead of a PyPI release: the branch or tag "
             f"(default: '{DEFAULT_SFLOW_GIT_BRANCH}'). Combined with --repo. "
-            "Mutually exclusive with --sflow-version.",
+            "Mutually exclusive with --sflow-version/--sflow-index-url.",
         ),
     ] = None,
     sflow_version: Annotated[
         Optional[str],
         typer.Option(
             "--sflow-version",
-            help="Git ref (branch or tag) to install from the sflow repo (e.g. 'main', "
-            "'v0.1.0'), or a repository URL with an @ref suffix (e.g. "
-            "'https://git.example.com/example/sflow.git@develop'). Same syntax as "
-            "'sflow batch --sflow-version'. When --sflow-index-url is set, this is "
-            "instead interpreted as a PyPI version specifier (e.g. '0.2.1' or "
-            "'>=0.2,<0.3').",
+            help="PyPI version to install: a bare version is pinned ('0.3.2' -> "
+            "'nv-sflow==0.3.2'), an operator spec is passed through ('>=0.3,<0.4'). "
+            "Default: the latest release. For a git ref use --repo/--branch.",
         ),
     ] = None,
     sflow_index_url: Annotated[
         Optional[str],
         typer.Option(
             "--sflow-index-url",
-            help="Install sflow from a private PyPI index instead of from git. "
-            "--sflow-version is then a PyPI version specifier: a bare version is "
-            "pinned ('0.2.1' -> 'sflow==0.2.1'), an operator spec is passed through, "
-            "and omitting it installs the latest. Credentials must come from ~/.netrc "
-            "or a credential helper; URLs with embedded credentials are rejected.",
+            help="Also search a private PyPI index (e.g. an Artifactory PyPI repo), "
+            "picking the best version across it and PyPI. Credentials must come from "
+            "~/.netrc or a credential helper; URLs with embedded credentials are "
+            "rejected.",
         ),
     ] = None,
     sflow_source_path: Annotated[
@@ -198,7 +212,7 @@ def upgrade(
 ) -> None:
     """Upgrade sflow in the current environment.
 
-    Defaults to the 'main' branch of the public OSS GitHub repo.
+    Defaults to the latest nv-sflow release on PyPI.
     """
     index_url_error = sflow_index_url_error(
         sflow_index_url, hint="use ~/.netrc or a credential helper instead."
@@ -206,19 +220,17 @@ def upgrade(
     if index_url_error:
         _fail(index_url_error)
 
-    version_error = sflow_version_error(
-        sflow_version, registry=sflow_index_url is not None
-    )
-    if version_error:
-        _fail(version_error)
-
-    requirement, description = _resolve_target(
+    route, requirement, description = _resolve_target(
         repo=repo,
         branch=branch,
         sflow_version=sflow_version,
         sflow_index_url=sflow_index_url,
         sflow_source_path=sflow_source_path,
     )
+
+    version_error = sflow_version_error(sflow_version, registry=True)
+    if version_error:
+        _fail(f"{version_error} For a git branch or tag use --branch/--repo.")
 
     mode, source = install_info()
     if mode in _DEV_INSTALL_MODES and not force and not dry_run:
@@ -232,28 +244,73 @@ def upgrade(
 
     argv, is_uv = _installer_argv()
     argv = list(argv)
-    if sflow_source_path is None:
+    uninstall: list[str] = []
+    if route == "editable":
+        # A wheel under either name keeps its sflow/ files in site-packages, ahead
+        # of the editable .pth, so the checkout would be shadowed. pip replaces
+        # only the same name; the other one has to go first. Its console script
+        # is recreated by the editable install.
+        shadowing = non_editable_records()
+        if shadowing:
+            uninstall = [a if a != "install" else "uninstall" for a in argv]
+            uninstall += ([] if is_uv else ["-y"]) + shadowing
+    if route == "git":
         # A branch head moves without the version string changing, so a plain
         # install can decide sflow is already satisfied and do nothing. Force
-        # exactly sflow to be reinstalled; uv can scope that to one package,
-        # pip cannot.
-        argv += ["--reinstall-package", "sflow"] if is_uv else ["--force-reinstall"]
+        # exactly sflow to be reinstalled under either name the ref may build;
+        # uv can scope that to those packages, pip cannot. Git checkouts build
+        # as .devN versions, so pre-releases must be allowed for the result to
+        # be installable at all.
+        argv += (
+            ["--reinstall-package", DIST_NAME, "--reinstall-package", LEGACY_DIST_NAME]
+            if is_uv
+            else ["--force-reinstall"]
+        )
         argv += ["--prerelease=allow"] if is_uv else ["--pre"]
+    elif route == "pypi":
+        # uv's --upgrade upgrades every dependency too; pip's only-if-needed
+        # default leaves them alone. Keep a shared env's other packages as-is.
+        # nv-sflow itself is always reinstalled: a dev build -- a git checkout or
+        # a .devN wheel from a private index -- is versioned above the latest
+        # release, so a plain upgrade would keep it instead of returning to PyPI.
+        # pip has no per-package reinstall, so there it is --force-reinstall.
+        argv += (
+            ["--upgrade-package", DIST_NAME, "--reinstall-package", DIST_NAME]
+            if is_uv
+            else ["--upgrade", "--force-reinstall"]
+        )
     if sflow_index_url is not None:
+        # No --prerelease: an extra index must not turn "latest release" into the
+        # newest .devN build; pin one with --sflow-version to install it. No
+        # unsafe-best-match either: every release reaches the private index before
+        # PyPI, and best-match would compare every dependency across indexes.
         argv += ["--extra-index-url", sflow_index_url]
     argv.append(requirement)
 
     typer.echo(f"Current install : {mode}{f' ({source})' if source else ''}")
     typer.echo(f"Installing      : {description}")
-    # shlex.join, not ' '.join: the requirement is a single argv entry that
-    # contains spaces ("sflow @ git+..."), so an unquoted echo would not be
-    # copy-pasteable.
+    if uninstall:
+        typer.echo(f"Removing first  : {shlex.join(uninstall)}")
+    # shlex.join so the echoed command stays copy-pasteable whatever the
+    # requirement contains (specifier operators, local paths with spaces).
     typer.echo(f"Command         : {shlex.join(argv)}")
 
     if dry_run:
         typer.echo("Dry run: nothing installed.")
         return
 
+    if uninstall:
+        _run(uninstall)
+    _run(argv)
+    # Crossing the rename (nv-sflow over a GitHub 'sflow' build, or the reverse
+    # via --branch) leaves both records over one set of files. Install first,
+    # then drop the stale record: the files are never missing in between.
+    reconcile()
+
+    typer.echo("Upgrade complete. Run 'sflow --version' to confirm.")
+
+
+def _run(argv: list[str]) -> None:
     try:
         result = subprocess.run(argv, check=False)
     except OSError as exc:
@@ -264,8 +321,6 @@ def upgrade(
             f"Error: install failed with exit code {result.returncode}.", err=True
         )
         raise typer.Exit(code=result.returncode)
-
-    typer.echo("Upgrade complete. Run 'sflow --version' to confirm.")
 
 
 # Registered under both names: 'upgrade' is the primary spelling, 'update' is

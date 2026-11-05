@@ -1,5 +1,7 @@
 ---
 name: sflow-code-review
+metadata:
+  author: Roger Liu <rogliu@nvidia.com>
 description: >-
   Review sflow code changes for functional defects, modular by-purpose structure,
   duplicated logic that should be consolidated, adequate unit + e2e CLI test
@@ -19,6 +21,11 @@ report them, do not silently rewrite the author's code unless asked.
 - The user asks to review a diff, branch, PR, staged changes, or "my sflow changes".
 - Before committing or opening a PR in this repo.
 - After finishing a feature/fix and you want a self-check.
+
+## Instructions
+
+Work through the checklist below in order: scope the change (Step 0), review Aspects 1–5,
+verify, then report in the format at the end.
 
 ## Review workflow
 
@@ -40,7 +47,7 @@ Do not skip Step 0 — every later aspect needs the exact set of changed files a
 ## Step 0: Scope the change
 
 Activate the venv first (project rule), then collect the diff. Pick the base ref that
-matches what is being reviewed (`main`, a PR base, `--staged`, or `HEAD~1`).
+matches what is being reviewed (`main` / `develop`, a PR base, `--staged`, or `HEAD~1`).
 
 ```bash
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
@@ -75,12 +82,28 @@ sflow-specific defect hotspots (verify the behavior end to end, not just locally
 - **CLI flag threading** (`cli/run.py`, `cli/batch.py`): a new flag must flow CLI →
   `app/sflow.py` → assembly → backend/operator. A flag parsed but never passed down is a
   classic silent defect — confirm it reaches the backend and shows in `--dry-run`.
-- **Expression/variable resolution** (`config/resolver.py`, `resolution.py`): `${...}`
+- **Expression/variable resolution** (`config/resolver.py`, `resolution.py`): ``${...}``
   expansion, variable precedence, `--set` / CSV overrides.
 - **Task graph / DAG** (`app/assembly.py`, `core/`): dependencies, `missable_tasks`,
   replicas, resource placement.
 - **Backends** (`plugins/backends/`): `salloc`/`srun`/`#SBATCH` flag construction,
-  `extra_args` merge/de-dup, container mounts.
+  `extra_args` merge/de-dup, container mounts. Docker `hosts:` pools
+  (`plugins/backends/docker.py` host identity → `address`-derived endpoint + rendezvous,
+  pre-flight; `plugins/operators/docker_run.py` per-host fan-out, fail-fast, orphan reaping by
+  `sflow-<machine>p<pid>-…` name): a change here must keep the single-machine (no `hosts:`)
+  path and the declared-pool path behaving the same from the recipe's point of view.
+- **Distribution & install** (`utils/distribution.py`, `utils/install.py`, `cli/upgrade.py`,
+  `cli/batch.py` bootstrap): the distribution is `nv-sflow` on PyPI but GitHub builds and
+  old releases are `sflow`; both records may coexist and are reconciled at startup. Git refs
+  install as bare `git+<url>@<ref>`; `--sflow-version` is PEP 440 for `upgrade` and for
+  `batch --sflow-index-url`, a git ref for plain `batch`. Breaking either name path breaks
+  upgrades for everyone.
+- **Remote controller** (`ssh/`, `cli/remote.py`: `--ssh`, `watch`, `fetch`): what gets
+  uploaded (source + explicit inputs + relative artifacts only), the receipt contract,
+  Ctrl-C vs dropped-connection semantics.
+- **Config loading** (`config/loader.py`): YAML 1.2 scalar rules (unquoted `H:MM:SS` stays a
+  string) and the optional `version` default — a loader change silently re-types every
+  recipe's values.
 - **Probes** (`plugins/probes/`): readiness/failure conditions, timeouts, log-watch regex.
 - **Artifacts** (`plugins/artifacts/`): `file://` content, same-path auto-mount across backends.
 - **Results & uploads** (`core/results.py`, `core/uploads.py`, `plugins/storage/`): `result:`
@@ -160,7 +183,9 @@ Two-part check:
      `test_plugin_operators_*`, `utils/`→`test_utils_*`, artifacts→`test_artifacts_*`.
    - e2e/CLI coverage: an `examples/` YAML exercised by `scripts/full_sample_tests.sh -P`
      (dry-run preflight), and/or an integration test using Typer `CliRunner` against a
-     real example. User-facing changes also need the `src/sflow/samples/` copy kept in sync.
+     real example. Samples live in **two identical copies** — `examples/` and the packaged
+     `src/sflow/samples/` (what `sflow sample` ships) — a change to one without the other is
+     a finding. New YAML need not declare `version:` (optional, defaults to `"0.1"`).
    - Use coverage to find untested new lines: `pytest --cov=src --cov-report=term-missing`.
 
 2. **Existing tests were not weakened.** In the diff, inspect every change under `tests/`
@@ -270,6 +295,15 @@ Group findings by aspect, ordered by severity. Use file:line references.
 Severity: 🔴 Critical (must fix — bug, broken caller, weakened test) · 🟡 Major (should
 fix — missing coverage, misplaced logic, abstraction that shapes future code) ·
 🟢 Minor/Nit (optional improvement, local simplification).
+
+## Examples
+
+A typical Aspect 1 finding in the report format above:
+
+```
+- 🔴 Critical: src/sflow/cli/run.py:<line> — new flag is parsed but never passed down →
+  thread it through app/sflow.py → assembly → backend, and check it shows in --dry-run
+```
 
 ## Additional resources
 

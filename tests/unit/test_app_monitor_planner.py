@@ -348,6 +348,136 @@ def test_monitor_on_replicated_owner_attaches_per_replica(tmp_path):
     assert state.monitor_registry.collector_count == 2
 
 
+def _build_docker_pool(workflow: dict, tmp_path, hosts=None):
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "docker_cluster",
+                    "type": "docker",
+                    "default": True,
+                    "image": "nvcr.io/example/img:1",
+                    "gpus_per_node": 1,
+                    "hosts": hosts
+                    or [
+                        {"name": "node-0", "address": "10.0.0.11"},
+                        {"name": "node-1", "address": "10.0.0.12"},
+                    ],
+                }
+            ],
+            "workflow": workflow,
+        }
+    )
+    return asyncio.run(build_state(config, allocate=False, output_dir=tmp_path))
+
+
+def test_docker_host_pool_gets_one_bare_collector_per_host(tmp_path):
+    """Each host is sampled on its OWN machine, over ssh.
+
+    Running the bare-host collector here would sample the driver and publish the
+    result under 'node-0'/'node-1'; both hosts would then report identical,
+    wrong hardware.
+    """
+    state = _build_docker_pool(
+        {
+            "name": "wf",
+            "monitor": {"interval": 1000, "report": {"enabled": True}},
+            "tasks": [{"name": "a", "script": ["echo a"]}],
+        },
+        tmp_path,
+    )
+    reg = state.monitor_registry
+    assert reg is not None
+    assert reg.collector_count == 2
+
+    for index, node in enumerate(("node-0", "node-1")):
+        collector = reg._collectors[("docker_cluster", node)]
+        cmd = collector.command.as_str()
+        # Run on that host, bare -- not in the driver, not in a container.
+        assert f"ssh -o BatchMode=yes -o ConnectTimeout=20 10.0.0.1{index + 1}" in cmd
+        assert "docker run" not in cmd
+        # The collector reads its source from stdin (`python3 -`); the driver's
+        # shell supplies those bytes by redirecting the materialized file, so
+        # the remote host never has to see that path itself.
+        assert "python3 - " in cmd
+        assert cmd.rstrip().rstrip("'").endswith("hardware_monitor.py")
+        assert "--stdout" in cmd
+        # The source itself must not be pasted into the command.
+        assert "def _read_meminfo" not in cmd
+        assert len(cmd) < 600, f"collector command is {len(cmd)} chars"
+        # Samples are filed under this node's index, mirroring SLURM_NODEID.
+        assert collector.stream_node_id == str(index)
+        # No driver-filesystem path in an off-host collector's environment: the
+        # node shares no filesystem with the driver, so an output dir pointing
+        # there describes somewhere this collector can never write.
+        assert "SFLOW_TASK_OUTPUT_DIR" not in cmd
+
+
+def test_docker_host_pool_no_longer_warns_about_skipping(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING):
+        _build_docker_pool(
+            {
+                "name": "wf",
+                "monitor": {"interval": 1000},
+                "tasks": [{"name": "a", "script": ["echo a"]}],
+            },
+            tmp_path,
+        )
+    messages = [r.getMessage() for r in caplog.records]
+    assert not [m for m in messages if "Hardware monitor skipped" in m]
+    assert not [m for m in messages if "resolved to no nodes" in m]
+
+
+def test_unmonitorable_backend_does_not_mute_an_unrelated_broken_monitor(tmp_path, caplog):
+    """A skipped backend explains only ITS OWN monitors' missing nodes.
+
+    The skip set is cumulative across the whole plan, so keying the "resolved to
+    no nodes" warning off it silenced a genuine misconfiguration on a healthy
+    backend whenever an unmonitorable one merely coexisted. Here the slurm task
+    monitor excludes every node it has -- a real mistake the user must hear about,
+    even though the k8s backend elsewhere in the config is unmonitorable.
+    """
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "slurm", "type": "slurm", "default": True, "nodes": 2,
+                    "gpus_per_node": 8, "partition": "p", "account": "a",
+                    "time": "01:00:00",
+                },
+                {
+                    "name": "k8s", "type": "kubernetes", "namespace": "ns",
+                    "nodes": 1, "gpus_per_node": 8,
+                },
+            ],
+            "workflow": {
+                "name": "wf",
+                "monitor": {"interval": 1000},
+                "tasks": [
+                    {
+                        "name": "a",
+                        "script": ["echo a"],
+                        "monitor": {
+                            "interval": 1000,
+                            "resources": {"nodes": {"exclude": [0, 1]}},
+                        },
+                    }
+                ],
+            },
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(build_state(config, allocate=False, output_dir=tmp_path))
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert [m for m in messages if "resolved to no nodes" in m], (
+        "excluding every slurm node is a real misconfiguration and must warn, "
+        "even though the unrelated k8s backend is unmonitorable"
+    )
+
+
 def test_docker_monitor_runs_on_bare_host_not_container(tmp_path):
     """A Docker-backend collector runs on the host (bash), never inside the
     workload container -- otherwise it can't read the host-materialized
@@ -815,3 +945,81 @@ def test_shared_view_credits_both_the_workflow_and_the_task_monitor(tmp_path):
         for owner in view.contributors:
             folders_by_owner[owner] = folders_by_owner.get(owner, 0) + 1
     assert folders_by_owner["task:work"] == 1
+
+
+_DAEMON_HOSTS = [
+    {"name": "node-0", "docker_host": "tcp://10.0.0.11:2376", "rendezvous_address": "10.0.0.11"},
+    {"name": "node-1", "docker_host": "tcp://10.0.0.12:2376", "rendezvous_address": "10.0.0.12"},
+]
+
+
+def _build_docker_pool_no_gpus(workflow: dict, tmp_path):
+    """A daemon-endpoint pool (container collector) that declares no GPUs
+    anywhere -- neither per host nor backend-wide."""
+    config = SflowConfig.model_validate(
+        {
+            "version": "0.1",
+            "backends": [
+                {
+                    "name": "docker_cluster",
+                    "type": "docker",
+                    "default": True,
+                    "image": "nvcr.io/example/img:1",
+                    "hosts": _DAEMON_HOSTS,
+                }
+            ],
+            "workflow": workflow,
+        }
+    )
+    return asyncio.run(build_state(config, allocate=False, output_dir=tmp_path))
+
+
+def test_a_pool_with_no_gpus_collects_the_other_scopes(tmp_path):
+    """Asking for the gpu scope where the container gets no GPUs is not free.
+
+    The collector's container is only given devices when the pool declares
+    them. Requesting `--gpus` everywhere would fail the whole container on a
+    host with no NVIDIA runtime and cost the cpu/memory/disk/network scopes too,
+    so the gpu scope is dropped instead -- otherwise every sample interval would
+    add an "nvidia-smi not found" row and the report would be empty anyway.
+    """
+    state = _build_docker_pool_no_gpus(
+        {
+            "name": "wf",
+            "monitor": {"interval": 1000, "report": {"enabled": True}},
+            "tasks": [{"name": "a", "script": ["echo a"]}],
+        },
+        tmp_path,
+    )
+    reg = state.monitor_registry
+    assert reg is not None
+
+    cmd = reg._collectors[("docker_cluster", "node-0")].command.as_str()
+    scopes = cmd.split("--scopes ", 1)[1].split()[0]
+
+    assert "gpu" not in scopes.split(","), scopes
+    # The rest still collected -- dropping one scope must not drop the node.
+    for scope in ("cpu", "memory", "disk", "network"):
+        assert scope in scopes.split(","), scopes
+    # And the container is not asked for devices it cannot have.
+    assert "--gpus" not in cmd
+
+
+def test_a_pool_with_gpus_keeps_the_gpu_scope(tmp_path):
+    """The other side of the same branch, so a blanket drop would be caught."""
+    state = _build_docker_pool(
+        {
+            "name": "wf",
+            "monitor": {"interval": 1000, "report": {"enabled": True}},
+            "tasks": [{"name": "a", "script": ["echo a"]}],
+        },
+        tmp_path,
+        hosts=_DAEMON_HOSTS,
+    )
+    cmd = state.monitor_registry._collectors[
+        ("docker_cluster", "node-0")
+    ].command.as_str()
+    scopes = cmd.split("--scopes ", 1)[1].split()[0]
+
+    assert "gpu" in scopes.split(","), scopes
+    assert "--gpus" in cmd

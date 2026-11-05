@@ -16,12 +16,15 @@ from sflow.app.assembly import build_state, release_backends
 from sflow.app.monitor_cli import apply_monitor_cli_overrides
 from sflow.app.monitor_planner import run_monitor_postprocess
 from sflow.app.run_support import (
+    backends_execute_offhost,
     build_run_paths,
     collect_operator_runtime_warnings,
     config_uses_offhost_backend,
     configure_task_runtime,
     find_reserved_env_collisions,
+    offhost_backend_names,
     preflight_validate_artifacts,
+    render_launch_preview,
     validate_container_mounts,
 )
 from sflow.config.loader import ConfigLoader
@@ -498,7 +501,11 @@ class SflowApp:
 
                     # Validate container mount paths (REQ: warn users about invalid mounts)
                     mount_warnings = validate_container_mounts(
-                        plan_tasks, sflow_output_dir=out_dir
+                        plan_tasks,
+                        sflow_output_dir=out_dir,
+                        # Their mounts resolve on another machine; the backend's
+                        # own pre-flight checks those hosts.
+                        offhost_backends=offhost_backend_names(state),
                     )
                     if mount_warnings:
                         _logger.warning("Container mount path validation warnings:")
@@ -887,6 +894,9 @@ class SflowApp:
                                 else:
                                     _logger.info("      └─ operator config: (default)")
 
+                            for line in render_launch_preview(t):
+                                _logger.info(line)
+
                         if not verbose:
                             _logger.info("")
                             _logger.info("  (use --verbose for full per-task details)")
@@ -901,9 +911,19 @@ class SflowApp:
                         )
                         for w in _artifact_warnings:
                             _logger.warning(f"  ⚠ {w}")
-                        _logger.warning(
-                            "These paths must exist before the workflow is run."
-                        )
+                        if backends_execute_offhost(state):
+                            # Checked against THIS machine, which is not where
+                            # the work runs -- saying they must exist here would
+                            # be wrong, and a task may create them anyway.
+                            _logger.warning(
+                                "Checked on this controller only. Tasks run "
+                                "off-host, so these paths must exist (or be "
+                                "created by a task) on the execution hosts."
+                            )
+                        else:
+                            _logger.warning(
+                                "These paths must exist before the workflow is run."
+                            )
 
                     # Storage targets + planned uploads (dry-run only).
                     if state.storage_targets:

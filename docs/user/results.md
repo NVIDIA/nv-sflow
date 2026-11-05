@@ -10,6 +10,10 @@ task — benchmark metrics, scores, throughput numbers — and expose them throu
 stable, machine-readable contract that downstream tasks and external tooling can
 rely on.
 
+:::note
+YAML snippets on this page are fragments: add `workflow.name` (and any `variables:` they reference) before running them.
+:::
+
 For every task with a `result:` entry, sflow writes a canonical per-task file
 `${SFLOW_TASK_OUTPUT_DIR}/result.json` and updates a workflow-level index
 `${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json` after the task finishes successfully.

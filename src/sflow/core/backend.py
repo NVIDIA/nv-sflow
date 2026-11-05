@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 from sflow.logging import get_logger
 
 from .compute_node import ComputeNode
+from .monitor import MonitorDelivery
 from .operator import Operator
 
 if TYPE_CHECKING:
@@ -80,6 +81,14 @@ class BackendCapabilities:
     # it on the sflow driver host would only sample the driver, not the reserved
     # GPU nodes -- so it sets this False and the monitor planner skips it.
     supports_host_monitoring: bool = True
+    # Whether the backend delivers a file:// artifact's inline content into the
+    # task itself (Kubernetes mounts it as a ConfigMap). ONLY such a backend may
+    # skip writing an absolute file:// path on the controller: for every other
+    # backend that path is where the content has to land, so skipping it leaves
+    # the artifact written nowhere at all. Deliberately separate from
+    # supports_host_path_mounts -- a Docker host pool also runs off the
+    # controller, but has no mechanism to inject content.
+    injects_inline_artifact_content: bool = False
 
 
 class Backend(ABC):
@@ -99,8 +108,16 @@ class Backend(ABC):
         self.allocation: Allocation | None = None
         self.capabilities = BackendCapabilities()
 
-    def preflight_validate(self) -> None:
-        """Validate backend-specific prerequisites before allocation."""
+    def preflight_validate(self, *, artifacts: Sequence[Any] = ()) -> None:
+        """Validate backend-specific prerequisites before allocation.
+
+        ``artifacts`` are the workflow's declared artifacts. A backend that
+        checks mount sources needs them, because operators turn local artifact
+        paths into bind mounts but are not built until after this runs -- so a
+        path missing on a remote machine can be named here instead of being
+        created as an empty directory at launch. Backends that validate only
+        local prerequisites ignore it.
+        """
         return None
 
     def planning_capacity(self) -> tuple[int, int | None]:
@@ -234,6 +251,19 @@ class Backend(ABC):
         return configure_bare_monitor_operator(
             operator, backend=self, assigned_nodes=assigned_nodes
         )
+
+    def monitor_delivery(
+        self, *, node_name: str, scopes: Sequence[str]
+    ) -> "MonitorDelivery":
+        """How the collector reaches ``node_name`` and how its samples return.
+
+        The collector's arguments come from ``plan`` and are the same on every
+        backend; this is the only per-backend part, so a new backend costs a
+        delivery rather than another copy of the command. The default suits any
+        node that shares the driver's filesystem (Slurm, local, single-machine
+        Docker): run the materialized script in place and let it write files.
+        """
+        return MonitorDelivery()
 
     def to_dict(self) -> dict[str, list[dict[str, Any]]]:
         """

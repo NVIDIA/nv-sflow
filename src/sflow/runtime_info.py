@@ -11,12 +11,12 @@ import shutil
 import subprocess
 import sys
 import textwrap
-from importlib import metadata as importlib_metadata
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import sflow
 from sflow import __version__
+from sflow.utils.distribution import installed_distribution
 from sflow.logging import get_logger
 
 _logger = get_logger(__name__)
@@ -65,9 +65,8 @@ def _is_remote_url(value: str | None) -> bool:
 
 
 def _install_info() -> tuple[str, str | None]:
-    try:
-        dist = importlib_metadata.distribution("sflow")
-    except importlib_metadata.PackageNotFoundError:
+    dist = installed_distribution()
+    if dist is None:
         return "source-tree", None
 
     direct_url_text = dist.read_text("direct_url.json")

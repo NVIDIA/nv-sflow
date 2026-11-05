@@ -160,6 +160,16 @@ class BackendConfig(BaseModel):
         """Return backend-owned default operator image references, if any."""
         return []
 
+    def executes_offhost(self) -> bool:
+        """Whether tasks run on a machine other than the controller.
+
+        Decided from raw config, before resolution, so a local ``fs://`` path
+        is not hard-validated against the controller's filesystem when the work
+        runs elsewhere. Backends that are off-host conditionally (Docker with a
+        ``hosts:`` pool) answer per config rather than per type.
+        """
+        return False
+
     def planning_node_count(self) -> Any | None:
         """Return the statically configured planning node count, if available."""
         return None
@@ -833,7 +843,7 @@ class MonitorReportConfig(StrictBaseModel):
 
     Defaults to CSV + SVG, both produced with only the Python standard library
     (no third-party deps). ``png`` is also available but requires matplotlib
-    (the optional ``sflow[monitor]`` extra).
+    (the optional ``nv-sflow[monitor]`` extra).
 
     Set ``enabled: false`` to opt OUT. Worth doing on large fan-outs: a report
     folder is a per-view copy of the samples, so the cost scales with
@@ -1194,7 +1204,9 @@ class SflowConfig(StrictBaseModel):
     Main configuration model for Sflow.
     """
 
-    version: str
+    # Optional. Only "0.1" has ever existed, so requiring it bought nothing but a
+    # line of boilerplate at the top of every recipe. Omitting it means "0.1".
+    version: str = "0.1"
     variables: Optional[
         Annotated[List[VariableConfig], BeforeValidator(_normalize_to_list)]
     ] = None

@@ -13,7 +13,7 @@ items:
 
       set -e
 
-      nats-server -js'
+      nats-server -js --port 4222'
   kind: ConfigMap
   metadata:
     labels:
@@ -45,6 +45,8 @@ items:
         name: sflow-scripts
       - mountPath: /dev/shm
         name: dshm
+      - mountPath: /models/Qwen3-0.6B
+        name: sflow-fs-0
     hostIPC: true
     hostNetwork: true
     nodeSelector:
@@ -62,6 +64,9 @@ items:
         path: /dev/shm
         type: Directory
       name: dshm
+    - hostPath:
+        path: /models/Qwen3-0.6B
+      name: sflow-fs-0
 kind: List
 ---
 # task: etcd_server (operator: K8sOperator)
@@ -75,9 +80,7 @@ items:
 
       etcd --listen-client-urls "http://0.0.0.0:2379" --advertise-client-urls "http://0.0.0.0:2379" --listen-peer-urls
       "http://0.0.0.0:2380" --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380" --initial-cluster
-      "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd
-
-      '
+      "default=http://${HEAD_NODE_IP}:2380" --data-dir /tmp/etcd'
   kind: ConfigMap
   metadata:
     labels:
@@ -109,6 +112,8 @@ items:
         name: sflow-scripts
       - mountPath: /dev/shm
         name: dshm
+      - mountPath: /models/Qwen3-0.6B
+        name: sflow-fs-0
     hostIPC: true
     hostNetwork: true
     nodeSelector:
@@ -126,6 +131,9 @@ items:
         path: /dev/shm
         type: Directory
       name: dshm
+    - hostPath:
+        path: /models/Qwen3-0.6B
+      name: sflow-fs-0
 kind: List
 ---
 # task: frontend_server (operator: K8sOperator)
@@ -169,6 +177,8 @@ items:
         name: sflow-scripts
       - mountPath: /dev/shm
         name: dshm
+      - mountPath: /models/Qwen3-0.6B
+        name: sflow-fs-0
     hostIPC: true
     hostNetwork: true
     nodeSelector:
@@ -186,6 +196,9 @@ items:
         path: /dev/shm
         type: Directory
       name: dshm
+    - hostPath:
+        path: /models/Qwen3-0.6B
+      name: sflow-fs-0
 kind: List
 ---
 # task: server (operator: K8sOperator)
@@ -196,7 +209,8 @@ items:
     entrypoint.sh: "if [ -d /usr/local/nvidia/lib64 ]; then\n  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}\n\
       fi\nif [ -d /usr/local/nvidia/bin ]; then\n  export PATH=/usr/local/nvidia/bin:${PATH:-}\nfi\n#\
       \ sflow: fail-fast\nset -e\nset -x\npython3 -m dynamo.sglang --model-path /models/Qwen3-0.6B --served-model-name\
-      \ Qwen3-0.6B --tensor-parallel-size 4 --skip-tokenizer-init --trust-remote-code"
+      \ Qwen3-0.6B --tensor-parallel-size 4 --host 0.0.0.0 --watchdog-timeout 1800 --skip-tokenizer-init\
+      \ --trust-remote-code"
   kind: ConfigMap
   metadata:
     labels:
@@ -231,6 +245,8 @@ items:
         name: sflow-scripts
       - mountPath: /dev/shm
         name: dshm
+      - mountPath: /models/Qwen3-0.6B
+        name: sflow-fs-0
     hostIPC: true
     hostNetwork: true
     nodeSelector:
@@ -248,6 +264,9 @@ items:
         path: /dev/shm
         type: Directory
       name: dshm
+    - hostPath:
+        path: /models/Qwen3-0.6B
+      name: sflow-fs-0
 kind: List
 ---
 # task: benchmark (operator: K8sOperator)
@@ -255,21 +274,22 @@ apiVersion: v1
 items:
 - apiVersion: v1
   data:
-    entrypoint.sh: '# sflow: fail-fast
-
-      set -e
-
-      pip install aiperf==0.3.0
-
-      set -x
-
-      export COLUMNS=200
-
-      aiperf profile --model Qwen3-0.6B --tokenizer Qwen3-0.6B --endpoint-type chat --endpoint /v1/chat/completions
-      --streaming --url http://0.0.0.1:8000 --synthetic-input-tokens-mean 1024 --output-tokens-mean 1024
-      --concurrency 64 --request-count 512 --warmup-request-count 64
-
-      echo "Benchmarking finished"'
+    entrypoint.sh: "# sflow: fail-fast\nset -e\npip install aiperf==0.3.0\nset -x\nexport COLUMNS=200\n\
+      export AIPERF_DIR=\"${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_64\"\naiperf profile --artifact-dir\
+      \ \"${AIPERF_DIR}\" --model Qwen3-0.6B --tokenizer /models/Qwen3-0.6B --endpoint-type chat --endpoint\
+      \ /v1/chat/completions --streaming --url http://0.0.0.1:8000 --synthetic-input-tokens-mean 1024\
+      \ --synthetic-input-tokens-stddev 0 --output-tokens-mean 1024 --output-tokens-stddev 0 --extra-inputs\
+      \ \"min_tokens:1024\" --extra-inputs \"ignore_eos:true\" --extra-inputs \"repetition_penalty:1.0\"\
+      \ --extra-inputs \"temperature: 0.0\" --concurrency 64 --request-count 512 --warmup-request-count\
+      \ 64 --num-dataset-entries 512 --random-seed 100 -H 'Authorization: Bearer NOT USED' -H 'Accept:\
+      \ text/event-stream' -H 'Connection: close' --record-processors 8 --ui simple\ncsv=\"${AIPERF_DIR}/profile_export_aiperf.csv\"\
+      \nif [ ! -s \"$csv\" ]; then\n  echo \"aiperf produced no results: $csv is missing or empty.\" >&2\n\
+      \  echo \"Read the AIPerf errors above -- aiperf exits 0 even when it measures nothing.\" >&2\n\
+      \  exit 1\nfi\nif ! grep -q \"Time to First Token\" \"$csv\"; then\n  echo \"aiperf measured no\
+      \ generation: $csv has no per-request latency\" >&2\n  echo \"metrics, so the server accepted the\
+      \ requests but returned no tokens.\" >&2\n  echo \"Check the server logs for KV-transfer / handshake\
+      \ errors.\" >&2\n  exit 1\nfi\necho \"aiperf wrote $(($(wc -l < \"$csv\") - 1)) metric rows to $csv\"\
+      \n\necho \"Benchmarking finished\""
   kind: ConfigMap
   metadata:
     labels:
@@ -301,6 +321,8 @@ items:
         name: sflow-scripts
       - mountPath: /dev/shm
         name: dshm
+      - mountPath: /models/Qwen3-0.6B
+        name: sflow-fs-0
     hostIPC: true
     hostNetwork: true
     nodeSelector:
@@ -318,4 +340,7 @@ items:
         path: /dev/shm
         type: Directory
       name: dshm
+    - hostPath:
+        path: /models/Qwen3-0.6B
+      name: sflow-fs-0
 kind: List

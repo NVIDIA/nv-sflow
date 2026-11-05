@@ -15,9 +15,6 @@ variables:
   SERVER_IMAGE:
     description: "Dynamo TRT-LLM runtime image"
     value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
-  MODEL_PATH:
-    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
-    value: /models/Qwen3-0.6B
   SERVER_GPUS:
     description: "GPUs per server (tensor-parallel size)"
     type: integer
@@ -37,6 +34,19 @@ variables:
     description: "Engine max_seq_len (must exceed ISL+OSL)"
     type: integer
     value: 24576
+  MAX_BATCH_SIZE:
+    description: >-
+      Engine max_batch_size. Also the upper bound of the CUDA-graph batch sizes TRT-LLM
+      captures at startup, whose memory scales with it; on a small board lower it to what
+      the benchmark concurrency needs.
+    type: integer
+    value: 128
+  KV_FREE_GPU_MEMORY_FRACTION:
+    description: >-
+      Fraction of the GPU memory left after model load that the KV cache may take. TRT-LLM
+      still allocates "Additional executor resources" after the KV cache, so on a small
+      board (24 GB L4) 0.9 leaves too little and executor creation fails; lower it there.
+    value: 0.9
 
 artifacts:
   # file:// + inline content works on every backend: a ConfigMap mount on k8s,
@@ -47,13 +57,13 @@ artifacts:
       tensor_parallel_size: ${{ variables.SERVER_GPUS }}
       moe_expert_parallel_size: ${{ variables.SERVER_GPUS }}
       pipeline_parallel_size: 1
-      max_batch_size: 128
+      max_batch_size: ${{ variables.MAX_BATCH_SIZE }}
       max_num_tokens: ${{ variables.MAX_NUM_TOKENS }}
       max_seq_len: ${{ variables.MAX_SEQ_LEN }}
       print_iter_log: true
       kv_cache_config:
         enable_block_reuse: false
-        free_gpu_memory_fraction: 0.9
+        free_gpu_memory_fraction: ${{ variables.KV_FREE_GPU_MEMORY_FRACTION }}
         dtype: ${{ variables.KV_CACHE_DTYPE }}
 
 workflow:
@@ -67,14 +77,15 @@ workflow:
         # k8s_mpi cross-node UCX: bind to the primary interface, let UCX auto-pick transports.
         - export TRTLLM_UCX_INTERFACE=${SFLOW_PRIMARY_IFACE:-eth0}
         - unset UCX_TLS
-        # ONE MPI world across SERVER_GPUS ranks -- a local mpirun on a single k8s pod, or
-        # cross-node over the injected hostfile on k8s_mpi/slurm. The mpirun launch is REQUIRED:
-        # sflow's k8s_mpi operator only spans nodes when the final command is `mpirun` (else each
-        # pod runs a lone 1-rank MPI world and the engine's tp_size=SERVER_GPUS fails validation).
+        # ONE MPI world across SERVER_GPUS ranks. MPI_LAUNCH comes from the backend fragment:
+        # an mpirun prefix on k8s / k8s_mpi / slurm / docker (sflow's k8s_mpi operator only
+        # spans nodes when the final command is `mpirun`; without it each pod is a lone 1-rank
+        # world and tp_size=SERVER_GPUS fails validation), empty on slurm_mpi where srun
+        # already starts one task per rank under pmix.
         - >
-          mpirun -np ${{ variables.SERVER_GPUS }} --allow-run-as-root
+          ${{ variables.MPI_LAUNCH }}
           trtllm-llmapi-launch python3 -m dynamo.trtllm
-          --model-path ${{ variables.MODEL_PATH }}
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${{ variables.SERVED_MODEL_NAME }}
           --extra-engine-args ${{ artifacts.SERVER_CONFIG.path }}
       resources:

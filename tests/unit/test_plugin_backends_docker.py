@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import logging
 import os
 import shlex
 import unittest.mock as mock
@@ -10,7 +9,6 @@ import unittest.mock as mock
 import pytest
 from pydantic import ValidationError
 
-import sflow.plugins.backends.docker as docker_mod
 from sflow.app.run_support import configure_task_runtime
 from sflow.core.backend import Allocation
 from sflow.core.command import format_command
@@ -21,6 +19,7 @@ from sflow.plugins.backends.docker import (
 )
 from sflow.plugins.operators.bash import BashOperator
 from sflow.plugins.operators.docker_run import (
+    _OWNER_PREFIX,
     DockerRunOperator,
     DockerRunOperatorConfig,
     _safe_container_name,
@@ -28,8 +27,8 @@ from sflow.plugins.operators.docker_run import (
 
 
 def _cname(task: str, node: str) -> str:
-    """Expected container name: sflow-p<pid>-<task>-<node> (same process = same pid)."""
-    return f"sflow-p{os.getpid()}-{task}-{node}"
+    """Expected name: <owner-prefix><pid>-<task>-<node> (same process = same pid)."""
+    return f"{_OWNER_PREFIX}{os.getpid()}-{task}-{node}"
 
 
 class _IdentityResolver:
@@ -39,40 +38,22 @@ class _IdentityResolver:
         return value
 
 
-def _capture_warnings() -> tuple[logging.Handler, list[str]]:
-    """Attach a handler to the docker backend module logger and collect WARNINGs.
+def test_docker_backend_without_hosts_allocates_one_local_node():
+    """No pool means this machine, and this machine is one node.
 
-    sflow loggers set propagate=False, so caplog can't see them; capture directly
-    off the module logger (same pattern as the slurm/k8s backend tests).
+    `nodes: >1` without `hosts:` is refused at construction -- see
+    tests/unit/test_docker_allocation_honesty.py.
     """
-    messages: list[str] = []
-
-    class _Capture(logging.Handler):
-        def emit(self, record: logging.LogRecord):
-            if record.levelno >= logging.WARNING:
-                messages.append(record.getMessage())
-
-    return _Capture(), messages
-
-
-def test_docker_backend_allocates_synthetic_local_nodes():
     backend = DockerBackend(
-        DockerBackendConfig(
-            name="docker",
-            type="docker",
-            image="ubuntu:22.04",
-            nodes=2,
-            gpus_per_node=4,
-        )
+        DockerBackendConfig(name="docker", type="docker", image="ubuntu:22.04")
     )
 
     allocation = asyncio.run(backend.allocate())
 
     assert allocation.allocation_id == "docker"
     assert allocation.owned is False
-    assert [n.name for n in allocation.nodes] == ["localhost", "localhost-1"]
-    assert [n.ip_address for n in allocation.nodes] == ["127.0.0.1", "127.0.0.1"]
-    assert [n.num_gpus for n in allocation.nodes] == [4, 4]
+    assert [n.name for n in allocation.nodes] == ["localhost"]
+    assert [n.ip_address for n in allocation.nodes] == ["127.0.0.1"]
 
 
 def test_docker_backend_config_merges_extra_args_without_duplicates():
@@ -275,6 +256,23 @@ def test_docker_backend_exclude_drops_hosts():
     assert backend.host_for_node("dgx-b") is None
 
 
+def test_docker_backend_exclude_keeps_declared_node_count_valid():
+    # nodes: matches the three declared hosts; steering the run down to two
+    # with --exclude-nodes must not turn that into a config error.
+    backend = DockerBackend(_docker_hosts_cfg(nodes=3, exclude_nodes=["dgx-b"]))
+    assert [n.name for n in asyncio.run(backend.allocate()).nodes] == ["dgx-a", "dgx-c"]
+
+
+def test_docker_host_ssh_url_gives_target_with_port_and_rendezvous():
+    from sflow.plugins.backends.docker import _ssh_target
+
+    host = DockerHostConfig(name="h", docker_host="ssh://me@gpu-box:2222")
+    assert _ssh_target(host) == ("-p", "2222", "me@gpu-box")
+    assert host.rendezvous() == "gpu-box"
+    assert _ssh_target(DockerHostConfig(name="h", address="box", user="u")) == ("u@box",)
+    assert DockerHostConfig(name="h", context="ctx").rendezvous() is None
+
+
 def test_docker_backend_include_removing_all_hosts_raises():
     with pytest.raises(ValueError):
         DockerBackend(
@@ -295,7 +293,9 @@ def test_docker_backend_context_keeps_configured_ips_per_node():
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
+                # A context names a daemon, not a machine -> nothing for peers
+                # to dial, so the node carries no ip_address.
+                {"name": "dgx-a", "context": "dgx-a-context"},
                 {
                     "name": "dgx-b",
                     "context": "dgx-b-context",
@@ -319,8 +319,8 @@ def test_docker_backend_dry_run_details_describe_multi_host_config():
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
-                {"name": "dgx-b", "context": "dgx-b-context"},
+                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "address": "10.0.0.11"},
+                {"name": "dgx-b", "context": "dgx-b-context", "address": "10.0.0.12"},
             ],
             gpus_per_node=8,
         )
@@ -329,8 +329,37 @@ def test_docker_backend_dry_run_details_describe_multi_host_config():
     details = dict(backend.dry_run_details())
 
     assert details["image"] == "ubuntu:22.04"
-    assert details["hosts"] == "dgx-a, dgx-b"
+    # Each host names its concrete endpoint; the rendezvous is shown because
+    # peers dial it rather than the endpoint.
+    assert details["host dgx-a"] == "dgx-a (rendezvous=10.0.0.11)"
+    assert details["host dgx-b"] == "context dgx-b-context (rendezvous=10.0.0.12)"
     assert details["gpus_per_node"] == "8"
+
+
+def test_dry_run_details_show_each_hosts_login_and_address():
+    backend = DockerBackend(
+        DockerBackendConfig(
+            name="docker_cluster",
+            type="docker",
+            image="ubuntu:22.04",
+            hosts=[
+                {"name": "node-0", "address": "10.0.0.11", "user": "svc"},
+                {"name": "node-1", "address": "10.0.0.12", "gpus_per_node": 4},
+                {
+                    "name": "node-2",
+                    "address": "10.0.0.13",
+                    "rendezvous_address": "192.168.1.13",
+                },
+            ],
+        )
+    )
+
+    details = dict(backend.dry_run_details())
+
+    # Rendezvous equal to the address adds nothing, so only the login shows.
+    assert details["host node-0"] == "svc@10.0.0.11"
+    assert details["host node-1"] == "10.0.0.12 (gpus=4)"
+    assert details["host node-2"] == "10.0.0.13 (rendezvous=192.168.1.13)"
 
 
 def test_docker_run_operator_warns_on_unrecognised_literal_image(image_warnings):
@@ -368,7 +397,7 @@ def test_configure_task_runtime_skips_implicit_mounts_for_remote_docker_hosts(tm
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
+                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "address": "10.0.0.11"},
             ],
         )
     )
@@ -396,15 +425,15 @@ def test_configure_task_runtime_skips_implicit_mounts_for_remote_docker_hosts(tm
     assert operator.config.mounts == []
 
 
-def test_docker_run_operator_builds_multi_host_wrapper_without_inlining_env_values():
+def test_docker_run_operator_builds_multi_host_members_without_inlining_env_values():
     backend = DockerBackend(
         DockerBackendConfig(
             name="docker_cluster",
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "gpus_per_node": 8},
-                {"name": "dgx-b", "context": "dgx-b-context", "gpus_per_node": 8},
+                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "address": "10.0.0.11", "gpus_per_node": 8},
+                {"name": "dgx-b", "context": "dgx-b-context", "address": "10.0.0.12", "gpus_per_node": 8},
             ],
         )
     )
@@ -417,24 +446,110 @@ def test_docker_run_operator_builds_multi_host_wrapper_without_inlining_env_valu
         artifacts=[],
         cuda_visible_devices="0",
     )
-    cmd = operator.build_command(
-        task_name="distributed_job",
-        script=["./run_worker.sh"],
-        envs={"TOKEN": "sensitivevalue"},
+    argv = [
+        command.as_list()
+        for _member, command in operator._multi_node_commands(
+            task_name="distributed_job",
+            script=["./run_worker.sh"],
+            envs={"TOKEN": "sensitivevalue"},
+        )
+    ]
+
+    assert argv[0][:3] == ["docker", "--host", "ssh://dgx-a"]
+    assert argv[1][:3] == ["docker", "--context", "dgx-b-context"]
+    assert all('"device=0"' in args for args in argv)
+    # Env is forwarded BY NAME; a value in the argv would leak a secret into
+    # every process listing and command log on the host.
+    assert all("TOKEN" in args for args in argv)
+    assert all("sensitivevalue" not in args for args in argv)
+
+    # Each member is reaped on the daemon that ran it.
+    teardown = [c.as_list() for c in operator.teardown_commands(task_name="distributed_job")]
+    assert teardown[0][:5] == ["docker", "--host", "ssh://dgx-a", "rm", "-f"]
+    assert teardown[1][:5] == ["docker", "--context", "dgx-b-context", "rm", "-f"]
+
+
+def test_docker_run_rm_defaults_to_on():
+    """The default has to stay `--rm` -- existing recipes rely on it."""
+    assert DockerRunOperatorConfig(name="op", image="ubuntu:22.04").rm is True
+
+
+@pytest.mark.parametrize(
+    "rm, expect_flag, expect_teardown",
+    [
+        (True, True, ["rm", "-f"]),
+        (False, False, ["stop"]),
+    ],
+)
+def test_docker_run_rm_gates_both_the_flag_and_teardown_removal(
+    rm, expect_flag, expect_teardown
+):
+    """`rm: false` must survive teardown to mean anything.
+
+    The driver force-removes every container it named, so omitting `--rm` alone
+    would still leave nothing to inspect. Teardown therefore downgrades to
+    `docker stop`, which keeps the container while still guaranteeing it is not
+    left running after the workflow.
+    """
+    backend = DockerBackend(
+        DockerBackendConfig(name="docker", type="docker", image="ubuntu:22.04")
+    )
+    operator = DockerRunOperator(
+        DockerRunOperatorConfig(name="op", image="ubuntu:22.04", rm=rm)
+    )
+    operator.apply_backend_context(
+        backend=backend, assigned_nodes=["localhost"], artifacts=[]
     )
 
-    assert cmd.as_list()[:2] == ["bash", "-lc"]
-    script = cmd.as_list()[2]
-    assert "docker --host ssh://dgx-a run" in script
-    assert "docker --context dgx-b-context run" in script
-    # --gpus device list is double-quoted (shlex re-quotes it in the wrapper).
-    assert '"device=0"' in script
-    assert "-e TOKEN" in script
-    assert "sensitivevalue" not in script
-    assert "wait \"$pid\"" in script
-    assert "trap 'cleanup; exit 143' HUP INT TERM" in script
-    assert "docker --host ssh://dgx-a rm -f" in script
-    assert "docker --context dgx-b-context rm -f" in script
+    rendered = format_command(
+        operator.build_command(task_name="server", script=["echo hi"], envs={})
+    )
+    assert ("--rm" in rendered) is expect_flag
+
+    teardown = [c.as_list() for c in operator.teardown_commands(task_name="server")]
+    assert teardown[0] == ["docker", *expect_teardown, _cname("server", "localhost")]
+
+
+def test_a_kept_container_frees_its_name_for_a_retry():
+    """`docker run --name X` refuses while ANY container X exists, in any state.
+
+    Without the rename, a kept container makes every retry of the task die with
+    "name already in use" -- the name is deterministic within a run -- so
+    `rm: false` would be unusable with `retries:`.
+    """
+    backend = DockerBackend(
+        DockerBackendConfig(name="docker", type="docker", image="ubuntu:22.04")
+    )
+    operator = DockerRunOperator(
+        DockerRunOperatorConfig(name="op", image="ubuntu:22.04", rm=False)
+    )
+    operator.apply_backend_context(
+        backend=backend, assigned_nodes=["localhost"], artifacts=[]
+    )
+
+    teardown = [c.as_list() for c in operator.teardown_commands(task_name="server")]
+    name = _cname("server", "localhost")
+
+    assert teardown[0] == ["docker", "stop", name]
+    assert teardown[1][:3] == ["docker", "rename", name]
+    assert teardown[1][3].startswith(f"{name}-kept-"), "kept under a findable name"
+
+
+def test_removing_containers_needs_no_rename():
+    operator = DockerRunOperator(
+        DockerRunOperatorConfig(name="op", image="ubuntu:22.04", rm=True)
+    )
+    operator.apply_backend_context(
+        backend=DockerBackend(
+            DockerBackendConfig(name="docker", type="docker", image="ubuntu:22.04")
+        ),
+        assigned_nodes=["localhost"],
+        artifacts=[],
+    )
+
+    teardown = [c.as_list() for c in operator.teardown_commands(task_name="server")]
+
+    assert len(teardown) == 1, "rm -f already frees the name"
 
 
 def test_docker_run_single_node_names_container_and_teardown_matches():
@@ -503,22 +618,26 @@ def test_stale_reap_command_removes_only_dead_pid_containers():
     script = reap[0].as_list()[2]
     assert reap[0].as_list()[:2] == ["bash", "-c"]
     # lists only sflow-p* containers, checks liveness, force-removes the dead ones
-    assert "ps -a --filter name=sflow-p" in script
+    assert f"ps -a --filter name={_OWNER_PREFIX}" in script
     assert "kill -0" in script
     assert "rm -f" in script
 
 
-def test_stale_reap_skips_remote_hosts():
-    # The dead-PID sweep is local-only: on a shared remote daemon the kill -0
-    # check reads the wrong host's process table and could reap a live container.
+def test_stale_reap_covers_remote_hosts():
+    """The sweep reaches every daemon the task targets, not just the local one.
+
+    See tests/unit/test_docker_multinode.py for why that is safe (the name
+    carries the driver's machine identity) and why it is necessary (a SIGKILLed
+    driver never runs teardown, so remote containers have no other route back).
+    """
     backend = DockerBackend(
         DockerBackendConfig(
             name="docker_cluster",
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
-                {"name": "dgx-b", "context": "dgx-b-context"},
+                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "address": "10.0.0.11"},
+                {"name": "dgx-b", "context": "dgx-b-context", "address": "10.0.0.12"},
             ],
         )
     )
@@ -528,8 +647,11 @@ def test_stale_reap_skips_remote_hosts():
         backend=backend, assigned_nodes=["dgx-a", "dgx-b"], artifacts=[]
     )
 
-    # Remote-only task -> no orphan sweep at all.
-    assert operator.stale_reap_commands(task_name="job") == []
+    scripts = [c.as_list()[2] for c in operator.stale_reap_commands(task_name="job")]
+
+    assert len(scripts) == 2, "one sweep per distinct daemon"
+    assert any("docker --host ssh://dgx-a ps -a" in s for s in scripts)
+    assert any("docker --context dgx-b-context ps -a" in s for s in scripts)
 
 
 def test_docker_run_multi_host_teardown_covers_every_node():
@@ -539,8 +661,8 @@ def test_docker_run_multi_host_teardown_covers_every_node():
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
-                {"name": "dgx-b", "context": "dgx-b-context"},
+                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "address": "10.0.0.11"},
+                {"name": "dgx-b", "context": "dgx-b-context", "address": "10.0.0.12"},
             ],
         )
     )
@@ -571,7 +693,7 @@ def test_docker_run_operator_builds_single_remote_host_command():
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "gpus_per_node": 8},
+                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "address": "10.0.0.11", "gpus_per_node": 8},
             ],
         )
     )
@@ -745,14 +867,20 @@ def test_resolve_config_clamps_nodes_min_one():
 # ---------------------------------------------------------------------------
 
 
-def test_host_config_requires_exactly_one_endpoint():
-    # both endpoints -> reject
-    with pytest.raises(ValidationError, match="exactly one"):
+def test_host_config_requires_a_machine_or_an_endpoint_override():
+    """`address` identifies the machine; the endpoints are overrides of it.
+
+    See tests/unit/test_docker_host_identity.py for the derivation rules; this
+    only pins that a host cannot be anonymous and cannot set both overrides.
+    """
+    # both endpoint overrides -> reject
+    with pytest.raises(ValidationError, match="docker_host.*context"):
         DockerHostConfig(name="dgx-a", docker_host="ssh://dgx-a", context="ctx")
-    # neither endpoint -> reject
-    with pytest.raises(ValidationError, match="exactly one"):
+    # nothing at all -> reject
+    with pytest.raises(ValidationError, match="address"):
         DockerHostConfig(name="dgx-a")
-    # exactly one -> accept
+    # any one of the three identifies the host
+    assert DockerHostConfig(name="dgx-a", address="10.0.0.11").address
     assert DockerHostConfig(name="dgx-a", docker_host="ssh://dgx-a").docker_host
     assert DockerHostConfig(name="dgx-b", context="ctx").context
 
@@ -774,7 +902,7 @@ def test_planning_node_count_hosts_vs_nodes():
         image="ubuntu:22.04",
         nodes=5,
         hosts=[
-            {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
+            {"name": "dgx-a", "docker_host": "ssh://dgx-a", "address": "10.0.0.11"},
             {"name": "dgx-b", "context": "ctx"},
         ],
     )
@@ -818,27 +946,28 @@ def test_monitor_operator_returns_bash():
     assert operator.config.log_to_file is False
 
 
-def test_monitor_operator_warns_on_remote_host():
+def test_endpoint_only_host_still_gets_a_container_collector():
+    """A tcp:// `docker_host:` names a daemon and no machine. It has no address
+    to ssh to, but the collector does not need one -- it rides the same endpoint
+    the workload does."""
     backend = DockerBackend(
         DockerBackendConfig(
             name="docker_cluster",
             type="docker",
             image="ubuntu:22.04",
-            hosts=[{"name": "dgx-a", "docker_host": "ssh://dgx-a"}],
+            hosts=[{"name": "dgx-a", "docker_host": "tcp://dgx-a:2376"}],
         )
     )
     backend.allocation = asyncio.run(backend.allocate())
 
-    handler, messages = _capture_warnings()
-    docker_mod._logger.addHandler(handler)
-    try:
-        operator = backend.monitor_operator(name="mon", assigned_nodes=["dgx-a"])
-    finally:
-        docker_mod._logger.removeHandler(handler)
-
-    assert isinstance(operator, BashOperator)
-    # Bare-node monitoring runs on the local driver, not the remote host.
-    assert any("remote" in m for m in messages)
+    assert backend.capabilities.supports_host_monitoring is True
+    prefix = list(
+        backend.monitor_delivery(
+            node_name="dgx-a",
+            scopes=["cpu"],
+        ).launch_prefix
+    )
+    assert prefix[1:3] == ["--host", "tcp://dgx-a:2376"]
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +981,7 @@ def test_dry_run_details_synthetic_node_config():
             name="docker",
             type="docker",
             image="ubuntu:22.04",
-            nodes=2,
+            nodes=1,
             gpus_per_node=4,
             workdir="/work",
             mounts=["/data:/data:ro"],
@@ -863,7 +992,7 @@ def test_dry_run_details_synthetic_node_config():
     details = dict(backend.dry_run_details())
 
     assert details["image"] == "ubuntu:22.04"
-    assert details["nodes"] == "2"
+    assert details["nodes"] == "1"
     assert details["gpus_per_node"] == "4"
     assert details["workdir"] == "/work"
     assert "/data:/data:ro" in details["mounts"]
@@ -1006,49 +1135,6 @@ def test_apply_backend_context_keeps_auto_mount_for_local_node():
 # ---------------------------------------------------------------------------
 
 
-def test_build_command_local_multi_node_wrapper_uses_bare_docker():
-    """Two synthetic localhost nodes must produce a bash wrapper that launches
-    two *bare* `docker run` containers (no --host/--context) and reaps both with
-    a bare `docker rm -f` in cleanup()."""
-    backend = DockerBackend(
-        DockerBackendConfig(
-            name="docker", type="docker", image="ubuntu:22.04", nodes=2
-        )
-    )
-    operator = backend.default_operator(
-        name="default_docker", assigned_nodes=["localhost", "localhost-1"]
-    )
-    operator.apply_backend_context(
-        backend=backend,
-        assigned_nodes=["localhost", "localhost-1"],
-        artifacts=[],
-    )
-
-    # envs={} keeps this a plain wrapper (no log-offload rewrap).
-    parts = operator.build_command(
-        task_name="job", script=["echo hi"], envs={}
-    ).as_list()
-
-    assert parts[:2] == ["bash", "-lc"]
-    script = parts[2]
-    # Local nodes address the default daemon: no --host / --context anywhere.
-    assert "--host" not in script and "--context" not in script
-    # Both containers launched with per-run unique names.
-    assert f"docker run --rm --name {_cname('job', 'localhost')} " in script
-    assert f"docker run --rm --name {_cname('job', 'localhost-1')} " in script
-    # cleanup() reaps both with a bare `docker rm -f`.
-    assert f"docker rm -f {_cname('job', 'localhost')} >/dev/null" in script
-    assert f"docker rm -f {_cname('job', 'localhost-1')} >/dev/null" in script
-    # wrapper harness: signal trap + wait on each pid.
-    assert "trap 'cleanup; exit 143' HUP INT TERM" in script
-    assert 'wait "$pid"' in script
-
-
-# ---------------------------------------------------------------------------
-# build_command: per-host mounts / extra_args injection
-# ---------------------------------------------------------------------------
-
-
 def test_build_command_injects_per_host_mounts_and_extra_args():
     """A host's own mounts/extra_args (not just backend-level ones) must be
     merged into that node's `docker run`."""
@@ -1173,13 +1259,13 @@ def _run_reap_script(tmp_path, fake_process, container_names: list[str]) -> list
 
 def test_reap_removes_containers_whose_owner_is_dead(tmp_path, fake_process):
     # PID 999999999 cannot exist -> its container is an orphan from a crashed run.
-    removed = _run_reap_script(tmp_path, fake_process, ["sflow-p999999999-oldtask-localhost"])
-    assert removed == ["sflow-p999999999-oldtask-localhost"]
+    removed = _run_reap_script(tmp_path, fake_process, [f"{_OWNER_PREFIX}999999999-oldtask-localhost"])
+    assert removed == [f"{_OWNER_PREFIX}999999999-oldtask-localhost"]
 
 
 def test_reap_keeps_containers_of_a_live_owner(tmp_path, fake_process):
     # Our own PID is alive, so our own containers must survive the sweep.
-    removed = _run_reap_script(tmp_path, fake_process, [f"sflow-p{os.getpid()}-mytask-localhost"])
+    removed = _run_reap_script(tmp_path, fake_process, [f"{_OWNER_PREFIX}{os.getpid()}-mytask-localhost"])
     assert removed == []
 
 
@@ -1188,13 +1274,22 @@ def test_reap_keeps_containers_owned_by_another_users_live_run(tmp_path, fake_pr
     # by a different user, so a liveness check built on it alone would call a
     # co-tenant's running `sflow run` dead and force-remove its live containers.
     # PID 1 (init, root-owned) stands in for that other user's driver.
-    removed = _run_reap_script(tmp_path, fake_process, ["sflow-p1-othertask-localhost"])
+    removed = _run_reap_script(tmp_path, fake_process, [f"{_OWNER_PREFIX}1-othertask-localhost"])
     assert removed == [], "must not reap a live container owned by another user"
+
+
+def test_reap_spares_containers_kept_on_purpose(tmp_path, fake_process):
+    # `rm: false` renames a finished container to `<name>-kept-<ns>` so it stays
+    # around for `docker logs`/`inspect`. Its owning driver is EXPECTED to be
+    # gone by then, so the dead-owner rule would have the next run on this host
+    # delete exactly the evidence the flag exists to preserve.
+    kept = f"{_OWNER_PREFIX}999999999-server-localhost-kept-1700000000000000000"
+    assert _run_reap_script(tmp_path, fake_process, [kept]) == []
 
 
 def test_reap_ignores_names_without_a_numeric_pid(tmp_path, fake_process):
     removed = _run_reap_script(
-        tmp_path, fake_process, ["sflow-pnotapid-x-localhost", "sflow-p-localhost"]
+        tmp_path, fake_process, [f"{_OWNER_PREFIX}notapid-x-localhost", f"{_OWNER_PREFIX}-localhost"]
     )
     assert removed == []
 
@@ -1205,12 +1300,12 @@ def test_reap_handles_a_mixed_and_empty_container_list(tmp_path, fake_process):
         tmp_path,
         fake_process,
         [
-            f"sflow-p{os.getpid()}-live-localhost",
-            "sflow-p999999999-dead-localhost",
-            "sflow-p1-otheruser-localhost",
+            f"{_OWNER_PREFIX}{os.getpid()}-live-localhost",
+            f"{_OWNER_PREFIX}999999999-dead-localhost",
+            f"{_OWNER_PREFIX}1-otheruser-localhost",
         ],
     )
-    assert removed == ["sflow-p999999999-dead-localhost"]
+    assert removed == [f"{_OWNER_PREFIX}999999999-dead-localhost"]
 
 
 # ---------------------------------------------------------------------------
@@ -1333,3 +1428,143 @@ def test_unrelated_flag_values_do_not_look_like_gpu_grants():
     )
     parts = op.build_command(task_name="t", script=["echo hi"], envs={}).as_list()
     assert "NVIDIA_VISIBLE_DEVICES=void" in parts
+
+
+def test_resolve_config_resolves_every_declared_host_field():
+    """`resolve_config` rebuilds DockerHostConfig by hand-listing its fields.
+
+    That list and the model are two places holding one fact. Add an eleventh
+    field and it parses, validates, and is accepted -- but its `${{ }}` is never
+    substituted, so the raw template string reaches a docker flag. This pins
+    them together so the drift fails here instead of at runtime.
+    """
+    resolver = _MapResolver(
+        {
+            "${{ v.name }}": "h0",
+            "${{ v.address }}": "10.0.0.1",
+            "${{ v.user }}": "svc",
+            "${{ v.rendezvous }}": "10.1.0.1",
+            "${{ v.gpus }}": 4,
+            "${{ v.mount }}": "/data:/data",
+            "${{ v.extra }}": "--shm-size=1g",
+        }
+    )
+    conf = DockerBackendConfig(
+        name="cluster",
+        type="docker",
+        image="img:1",
+        hosts=[
+            {
+                "name": "${{ v.name }}",
+                "address": "${{ v.address }}",
+                "user": "${{ v.user }}",
+                "rendezvous_address": "${{ v.rendezvous }}",
+                "gpus_per_node": "${{ v.gpus }}",
+                "mounts": ["${{ v.mount }}"],
+                "extra_args": ["${{ v.extra }}"],
+            }
+        ],
+    )
+    resolved = DockerBackend.resolve_config(
+        conf, resolver=resolver, ctx={}, workflow_name="wf"
+    )
+    host = resolved.hosts[0]
+
+    # Every field the model declares must come back substituted. Fields this
+    # case leaves unset (docker_host/context/ip_address) are mutually exclusive
+    # with the ones above, so they are asserted absent rather than resolved.
+    for field_name in DockerHostConfig.model_fields:
+        value = getattr(host, field_name)
+        assert "${{" not in str(value), (
+            f"DockerHostConfig.{field_name} was not resolved by "
+            f"DockerBackend.resolve_config: got {value!r}"
+        )
+
+
+def test_a_node_count_that_contradicts_the_host_pool_is_rejected():
+    """`hosts:` defines the nodes, so a different `nodes:` is not an override --
+    it is a number the run will not honour.
+
+    Asking for 4 nodes against a 2-host pool silently produced 2: fewer workers
+    than the recipe sizes its parallelism for. That is the same class of untrue
+    configuration `_reject_invented_gpus` already refuses.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        DockerBackend(
+            DockerBackendConfig(
+                name="cluster",
+                type="docker",
+                image="img:1",
+                nodes=4,
+                hosts=[
+                    {"name": "h1", "address": "10.0.0.1"},
+                    {"name": "h2", "address": "10.0.0.2"},
+                ],
+            )
+        )
+    message = str(excinfo.value)
+    assert "4" in message and "2" in message
+    assert "hosts" in message
+
+
+def test_a_node_count_that_agrees_with_the_pool_is_accepted():
+    """Redundant is not wrong: the number is true, just already implied."""
+    backend = DockerBackend(
+        DockerBackendConfig(
+            name="cluster",
+            type="docker",
+            image="img:1",
+            nodes=2,
+            hosts=[
+                {"name": "h1", "address": "10.0.0.1"},
+                {"name": "h2", "address": "10.0.0.2"},
+            ],
+        )
+    )
+    assert backend._nodes == 2
+
+
+def test_a_pool_without_an_explicit_node_count_is_unaffected():
+    backend = DockerBackend(
+        DockerBackendConfig(
+            name="cluster",
+            type="docker",
+            image="img:1",
+            hosts=[{"name": "h1", "address": "10.0.0.1"}],
+        )
+    )
+    assert backend._nodes == 1
+
+
+class TestBackendImageIsOptional:
+    """The backend `image:` is only the default for operator-less tasks and the
+    monitor container on non-ssh hosts. A recipe whose tasks all name an operator
+    had to repeat an image nothing used; now it can leave it out, and the two
+    consumers that do need one say so instead of failing somewhere downstream."""
+
+    @staticmethod
+    def _backend(**kwargs):
+        from sflow.plugins.backends.docker import DockerBackend, DockerBackendConfig
+
+        return DockerBackend(DockerBackendConfig(name="pool", type="docker", **kwargs))
+
+    def test_a_backend_without_image_builds_and_reports_none(self):
+        backend = self._backend(hosts=[{"name": "a", "address": "10.0.0.11"}])
+        assert backend.config.container_images() == []
+        assert ("image", None) not in backend.dry_run_details()
+        assert not [k for k, _ in backend.dry_run_details() if k == "image"]
+
+    def test_an_operator_less_task_names_both_knobs(self):
+        backend = self._backend(nodes=1)
+        with pytest.raises(ValueError, match="'hello'.*no 'operator:'.*'pool'.*no 'image:'"):
+            backend.default_operator(name="hello")
+
+    def test_ssh_hosts_monitor_bare_without_an_image(self):
+        backend = self._backend(hosts=[{"name": "a", "address": "10.0.0.11"}])
+        delivery = backend.monitor_delivery(node_name="a", scopes=["cpu", "gpu"])
+        assert delivery.launch_prefix[0] == "ssh"
+
+    def test_a_context_host_needs_the_image_for_its_monitor_container(self):
+        backend = self._backend(hosts=[{"name": "ctx", "context": "lab"}])
+        with pytest.raises(ValueError, match="no ssh endpoint.*'image:'"):
+            backend.monitor_delivery(node_name="ctx", scopes=["cpu"])

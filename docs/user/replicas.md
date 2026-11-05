@@ -5,6 +5,10 @@ sidebar_position: 7.5
 
 `replicas` allows you to run multiple instances of the same task, either in parallel or sequentially. This is useful for scaling workloads, running parameter sweeps, or executing benchmarks with different configurations.
 
+:::note
+YAML snippets on this page are fragments: add `workflow.name` (and any `variables:` they reference) before running them.
+:::
+
 ## Basic Usage
 
 To create multiple identical copies of a task:

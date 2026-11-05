@@ -40,9 +40,14 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 repo_dir = Path(sys.argv[1]).resolve()
-try:
-    dist = metadata.distribution("sflow")
-except metadata.PackageNotFoundError:
+# Either name: nv-sflow (PyPI, internal builds) or sflow (GitHub checkouts).
+for name in ("nv-sflow", "sflow"):
+    try:
+        dist = metadata.distribution(name)
+        break
+    except metadata.PackageNotFoundError:
+        dist = None
+if dist is None:
     sys.exit(f"ERROR: sflow is not installed in {sys.executable}.")
 
 url = json.loads(dist.read_text("direct_url.json") or "{}").get("url") or ""

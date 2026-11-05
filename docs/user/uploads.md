@@ -9,6 +9,10 @@ sflow can automatically upload selected files to cloud storage (S3 today; GCS/Az
 planned as additional plugins) as each task completes. You declare named **storage targets**
 at the top of `sflow.yaml`, then attach per-task `uploads:` specs.
 
+:::note
+YAML snippets on this page are fragments: add `workflow.name` (and any `variables:` they reference) before running them.
+:::
+
 Uploads run **per task, on `COMPLETED`** — partial results survive a fail-fast workflow
 cancellation.
 
@@ -120,7 +124,7 @@ S3 uses boto3's default credential chain. **Never put secrets in YAML.** Support
 S3 support requires `boto3`. Install via the extra:
 
 ```bash
-pip install 'sflow[s3]'
+pip install 'nv-sflow[s3]'
 ```
 
 Using an S3 storage target without `boto3` raises a friendly error during planning, before task execution starts.

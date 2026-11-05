@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import select
 import signal
 import sys
@@ -42,9 +43,18 @@ import time
 from typing import BinaryIO
 
 from sflow.plugins.k8s.render import MERGE_MUX_CLOSE, MERGE_MUX_OPEN
+from sflow.utils.console_text import _ANSI_ESCAPE_RE
 
 _OPEN = MERGE_MUX_OPEN.encode()
 _CLOSE = MERGE_MUX_CLOSE.encode()
+# <task>.log carries no ANSI on any other write path (stream mode and the
+# offload prefixer strip at write time), and it is read by regexes -- log_watch
+# probes above all. Until here a merged pod's live log kept its colour until the
+# pod-terminal sanitize, so a readiness pattern on a coloured `key=value` line
+# (dynamo italicises every field name) could not match while it mattered. The
+# bytes form of the one shared pattern; the single-pod `kubectl logs -f >> file`
+# path has no process to do this in and is still cleaned only at terminal.
+_ANSI = re.compile(_ANSI_ESCAPE_RE.pattern.encode())
 
 # 64 KiB reads keep a chatty/large stream cheap (few syscalls per MB).
 _READ_SIZE = 1 << 16
@@ -97,6 +107,8 @@ class _Router:
                 if target is not None:
                     path = target
                     payload = rest[idx + len(_CLOSE) :]
+        if b"\x1b" in payload:  # memchr-fast; skips the regex on the common plain line
+            payload = _ANSI.sub(b"", payload)
         fh = self._handle(path)
         fh.write(payload)
         fh.write(b"\n")

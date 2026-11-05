@@ -8,7 +8,7 @@ import os
 import shlex
 import subprocess
 import sys
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 try:
     import pty
@@ -90,6 +90,14 @@ _PARTIAL_FLUSH_INTERVAL = 0.4
 # reader stays registered, so any remaining data is drained on the next tick.
 _MAX_PTY_READS_PER_LOOP = 8
 
+# How long a cancelled streaming command gets to exit on SIGTERM before SIGKILL.
+# Short on purpose: the only such command is a sampler whose rows are flushed as
+# they are produced, so there is nothing buffered to lose. A `docker run` client
+# does not return promptly here -- it is waiting on its container -- and the
+# container is removed by name afterwards regardless, so waiting longer just
+# added dead time to every node's teardown.
+_STREAM_TERMINATE_GRACE_S = 1.0
+
 
 # ANSI stripping and `\r` collapsing now live in sflow.utils.console_text, shared with
 # the k8s tailer and the on-disk log rebuild so the three cannot drift apart on how they
@@ -98,6 +106,123 @@ _MAX_PTY_READS_PER_LOOP = 8
 
 class SubprocessLauncher:
     """A command launcher for launching commands."""
+
+    @staticmethod
+    def _prepare_exec(
+        command: Command | str | list[str],
+        *,
+        shell: bool,
+        env: Mapping[str, str] | None,
+    ) -> tuple[list[str], dict[str, str]]:
+        """``(argv, environment)`` for a command, however it was spelled.
+
+        Shared by the PTY path and the streaming path so the two cannot disagree
+        on what a given ``Command``/str/list actually executes.
+        """
+        if isinstance(command, Command):
+            command = command.as_list()
+        if shell:
+            cmd_str = shlex.join(command) if isinstance(command, list) else command
+            args = ["/bin/sh", "-c", cmd_str]
+        elif isinstance(command, str):
+            args = shlex.split(command)
+        else:
+            args = list(command)
+
+        proc_env = os.environ.copy()
+        if env is not None:
+            proc_env.update({str(k): str(v) for k, v in env.items()})
+        return args, proc_env
+
+    async def _run_streaming(
+        self,
+        command: Command | str | list[str],
+        *,
+        shell: bool,
+        output_logger: Optional[logging.Logger],
+        env: Mapping[str, str] | None,
+        task_name: str | None,
+        stdout_sink: Callable[[str], None],
+    ) -> int:
+        """Run ``command`` with stdout as a DATA channel fed to ``stdout_sink``.
+
+        Deliberately not the PTY path: that one exists to render human output and
+        rewrites carriage-return frames in place, which silently mangles and drops
+        machine-readable rows. Here stdout is a plain pipe delivered verbatim, one
+        line per call, and stderr stays a log channel.
+        """
+        pfx = self._console_prefix(task_name)
+        _logger.info(f"{pfx}========== Command ==========")
+        _logger.info(f"{pfx}{format_command(command)}")
+        _logger.info(f"{pfx}=============================")
+
+        args, proc_env = self._prepare_exec(command, shell=shell, env=env)
+
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=proc_env,
+        )
+        record_active_command(command, task_name=task_name, shell=shell)
+
+        async def _pump_stdout() -> None:
+            # readline() splits on b"\n" only, so a row containing "\r" stays one
+            # row. A final unterminated line still arrives (readline returns it
+            # at EOF), which is why the last sample is not lost on a kill.
+            while True:
+                raw = await process.stdout.readline()
+                if not raw:
+                    return
+                stdout_sink(raw.decode("utf-8", "replace").rstrip("\n"))
+
+        async def _pump_stderr() -> None:
+            while True:
+                raw = await process.stderr.readline()
+                if not raw:
+                    return
+                text = raw.decode("utf-8", "replace").rstrip()
+                if text:
+                    _emit_task_output_line(
+                        text,
+                        pfx=pfx,
+                        output_logger=output_logger,
+                        stream_console=_console_streams_task_output(),
+                    )
+
+        pumps = asyncio.gather(_pump_stdout(), _pump_stderr())
+        try:
+            await pumps
+            return await process.wait()
+        except asyncio.CancelledError:
+            pumps.cancel()
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=_STREAM_TERMINATE_GRACE_S
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    process.kill()
+                    await process.wait()
+            raise
+        finally:
+            if output_logger is not None:
+                for handler in list(getattr(output_logger, "handlers", []) or []):
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+            # Close the transport here rather than leaving it to __del__, which
+            # runs at interpreter shutdown -- after the event loop is gone -- and
+            # raises "Event loop is closed" onto a completed run's output.
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
 
     def _console_prefix(self, task_name: str | None) -> str:
         """
@@ -113,8 +238,18 @@ class SubprocessLauncher:
         output_logger: Optional[logging.Logger] = None,
         env: Mapping[str, str] | None = None,
         task_name: str | None = None,
+        stdout_sink: Callable[[str], None] | None = None,
     ) -> int:
         pfx = self._console_prefix(task_name)
+        if stdout_sink is not None:
+            return await self._run_streaming(
+                command,
+                shell=shell,
+                output_logger=output_logger,
+                env=env,
+                task_name=task_name,
+                stdout_sink=stdout_sink,
+            )
         # Orchestration hint: goes to sflow.log + console (and Slurm stdout/err).
         # Intentionally NOT written to the per-task log: LogWatchProbe scans the
         # per-task log file and would false-match patterns inside the command text.
@@ -127,26 +262,10 @@ class SubprocessLauncher:
         # only additionally streamed to the console for interactive TTY sessions.
         stream_console = _console_streams_task_output()
 
+        args, proc_env = self._prepare_exec(command, shell=shell, env=env)
         if isinstance(command, Command):
+            # record_active_command below logs the resolved argv, not the object.
             command = command.as_list()
-
-        # Prepare command arguments
-        if shell:
-            if isinstance(command, list):
-                cmd_str = shlex.join(command)
-            else:
-                cmd_str = command
-            args = ["/bin/sh", "-c", cmd_str]
-        else:
-            if isinstance(command, str):
-                args = shlex.split(command)
-            else:
-                args = list(command)
-
-        # Prepare environment
-        proc_env = os.environ.copy()
-        if env is not None:
-            proc_env.update({str(k): str(v) for k, v in env.items()})
 
         # Use PTY to make subprocess think it's connected to a terminal
         # This prevents output buffering issues with progress bars

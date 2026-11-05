@@ -165,7 +165,7 @@ variables:
 
   # Container
   DYNAMO_IMAGE:
-    value: nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0
+    value: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0
 
 artifacts:
   - name: LOCAL_MODEL_PATH
@@ -450,7 +450,7 @@ backends:
 ```bash
 sflow compose slurm_config.yaml common_workflow.yaml \
   sglang/prefill.yaml sglang/decode.yaml benchmark_aiperf.yaml \
-  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0 \
+  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0 \
   --missable-tasks agg_server \
   -o merged.yaml
 
@@ -463,7 +463,7 @@ sflow run -f merged.yaml --tui
 sflow run \
   -f slurm_config.yaml -f common_workflow.yaml \
   -f sglang/agg.yaml -f benchmark_aiperf.yaml \
-  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0 \
+  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0 \
   --missable-tasks prefill_server --missable-tasks decode_server \
   --tui
 ```
@@ -475,7 +475,7 @@ sflow batch \
   -f slurm_config.yaml -f common_workflow.yaml \
   -f sglang/prefill.yaml -f sglang/decode.yaml -f benchmark_aiperf.yaml \
   -p my_partition -A my_account -N 4 --gpus-per-node 8 \
-  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0 \
+  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0 \
   --submit
 ```
 
@@ -529,7 +529,7 @@ sflow_config_file,SLURM_NODES,NUM_CTX_SERVERS,NUM_GEN_SERVERS,CTX_TP_SIZE,GEN_TP
 ```bash
 sflow batch --bulk-input bulk_input.csv \
   -p my_partition -A my_account --gpus-per-node 8 \
-  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.8.0 \
+  --set DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0 \
   --submit
 ```
 
@@ -547,6 +547,9 @@ run on the bare node host; reports are generated once after the run.
 
 ```yaml
 version: "0.1"
+variables:
+  SLURM_ACCOUNT: { value: my_account }
+  SLURM_PARTITION: { value: my_partition }
 backends:
   - name: slurm_cluster
     type: slurm
@@ -555,7 +558,11 @@ backends:
     gpus_per_node: 8
     partition: ${{ variables.SLURM_PARTITION }}
     account: ${{ variables.SLURM_ACCOUNT }}
-    time: "01:00:00"
+    time: 01:00:00                 # quotes optional
+operators:
+  - name: my_container
+    type: srun
+    container_image: nvcr.io/nvidia/pytorch:24.12-py3
 workflow:
   name: serve_and_bench
   monitor:                       # whole pool, full workflow lifetime
@@ -585,7 +592,10 @@ workflow:
 ```
 
 After the run, see `<output_dir>/<run_id>/sflow_monitor.log` for the terminal
-overview and `<output_dir>/<run_id>/sflow_monitor/` for detailed CSVs.
+overview and `<output_dir>/<run_id>/sflow_monitor/` for detailed CSVs. The same block works
+on `local` and `docker` — including a Docker `hosts:` pool, where the collector runs bare on
+each host over ssh (the host needs `python3`, and `nvidia-smi` for the `gpu` scope); it is
+skipped on `kubernetes`.
 
 ---
 
@@ -624,10 +634,11 @@ workflow:
         - python train.py
 ```
 
-Run: `sflow run -f k8s_gpu.yaml --kubeconfig ~/.kube/config --kube-context my-ctx --kube-namespace ml-team`
+Run: `sflow run -f k8s_gpu.yaml --kube-context my-ctx --kube-namespace ml-team`
 
 Key patterns:
-- Cluster selection is CLI (`--kubeconfig` / `--kube-context` / `--kube-namespace`), keeping
+- Cluster selection is CLI (`--kube-context` / `--kube-namespace`; kubectl's default config
+  file unless overridden, see `sflow run --help`), keeping
   the recipe cluster-agnostic.
 - A multi-node task (`resources.nodes`) becomes one pod per node (leader = index 0), with
   `SFLOW_TASK_NODE_INDEX` / `SFLOW_LEADER_ADDRESS` injected for rendezvous.
@@ -640,7 +651,7 @@ Key patterns:
 ## Example 9: Post-Run S3 Uploads
 
 Declare a `storage:` target and attach per-task `uploads:`. Credentials come from the boto3
-default chain — never put secrets in YAML. Install with `pip install 'sflow[s3]'`.
+default chain — never put secrets in YAML. Install with `pip install 'nv-sflow[s3]'`.
 
 ```yaml
 version: "0.1"
@@ -678,7 +689,7 @@ workflow:
 ```
 
 Key patterns:
-- `${{ task.output_dir }}` resolves to `SFLOW_TASK_OUTPUT_DIR` at task completion.
+- ``${{ task.output_dir }}`` resolves to `SFLOW_TASK_OUTPUT_DIR` at task completion.
 - `on_error: fail` flips the task to `FAILED` (triggers fail-fast) — use only when the upload
   IS the deliverable.
 - For S3-compatible stores (MinIO, Ceph RGW) set `endpoint_url:` (sflow defaults
@@ -692,7 +703,7 @@ Key patterns:
 A pod's filesystem is not the driver host's disk, so cluster-resident data (a model on shared
 storage) must come from a **PersistentVolumeClaim**. Declare it once as a backend `volumes:`
 entry, then point an `fs://` artifact at a path *under* its `mount_path`: sflow sees the PVC
-covers the path, skips the hostPath fallback, and `${{ artifacts.MODEL.path }}` resolves to the
+covers the path, skips the hostPath fallback, and ``${{ artifacts.MODEL.path }}`` resolves to the
 in-pod path on the PVC. The PVC (and its data) must already exist in the namespace.
 
 ```yaml
@@ -756,7 +767,7 @@ workflow:
           log_watch: { regex_pattern: "Traceback (most recent call last)" }
 ```
 
-Run: `sflow run -f k8s_pvc.yaml --kubeconfig ~/.kube/config --kube-namespace ml-team`
+Run: `sflow run -f k8s_pvc.yaml --kube-namespace ml-team`
 
 Key patterns:
 - Backend `volumes:` is workflow-wide storage — mounted into every task pod, even ones whose
@@ -777,7 +788,7 @@ On Slurm, keep models, datasets, the workspace, and the output dir on the shared
 (Lustre / GPFS / NFS) so every node sees the *same absolute path*. A single `fs://` artifact
 then auto-mounts identically into the pyxis container on every node — no per-node mount config,
 no manual `container_mounts`. The auto-mount is a same-path bind (`{path}:{path}:rw`), so
-`${{ artifacts.X.path }}` is valid on the host and inside the container alike.
+``${{ artifacts.X.path }}`` is valid on the host and inside the container alike.
 
 ```yaml
 version: "0.1"
@@ -833,7 +844,7 @@ workflow:
 ```
 
 Run from a login node whose cwd is on shared storage:
-`sflow run -f slurm_lustre.yaml --output-dir /lustre/shared/runs/$USER/sflow_output`
+``sflow run -f slurm_lustre.yaml --output-dir /lustre/shared/runs/$USER/sflow_output``
 
 Key patterns:
 - Shared storage + same-path mount = one `fs://` artifact works across all nodes with zero
@@ -849,8 +860,8 @@ Key patterns:
 ## Example 12: Declarative Result Parsing (`result:`)
 
 Turn a task's log/stdout into structured metrics with a `result:` block — sflow writes
-`${SFLOW_TASK_OUTPUT_DIR}/result.json` per task and aggregates a workflow-level
-`${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json`. Prefer this over the legacy `outputs:`. A task
+``${SFLOW_TASK_OUTPUT_DIR}/result.json`` per task and aggregates a workflow-level
+``${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json``. Prefer this over the legacy `outputs:`. A task
 is **not** `COMPLETED` until parsing finishes (and any `uploads:` run).
 
 ```yaml
@@ -899,3 +910,91 @@ Key patterns:
 - `result.json` keys: `schema, task, status, ok, values, metadata, matches, errors`; the env
   vars `SFLOW_TASK_RESULT_FILE` / `SFLOW_WORKFLOW_RESULT_FILE` point at the two files.
 - See the results doc: [nvidia.github.io/nv-sflow/docs/user/results](https://nvidia.github.io/nv-sflow/docs/user/results).
+
+---
+
+## Example 13: Multi-Host Docker (`hosts:` pool)
+
+A handful of machines you can already ssh into is a cluster sflow can drive without a
+scheduler. Declare each one once under `hosts:` with its **`address`**; sflow derives the
+`ssh://` docker endpoint *and* the address peers dial from it, places a `resources.nodes`
+task across the pool (one container per host, supervised as one task), and pre-flights every
+host before anything launches. Shipped as `sflow sample self_contained/docker/multi_node`.
+
+```yaml
+version: "0.1"
+
+variables:
+  PYTORCH_IMAGE:
+    value: nvcr.io/nvidia/pytorch:24.12-py3
+  MASTER_PORT:
+    description: "torchrun rendezvous port reachable on every host"
+    type: integer
+    value: 29500
+
+backends:
+  - name: docker_cluster
+    type: docker
+    default: true
+    # No backend `image`: every task below names a docker_run operator.
+    # `hosts:` IS the node list -- omit `nodes:` (or set it to 2).
+    hosts:
+      - name: node-0
+        address: 10.0.0.11          # the machine; ssh from the driver must already work
+        user: ubuntu                # only when the login differs from yours
+        gpus_per_node: 8
+      - name: node-1
+        address: dgx-b              # an ~/.ssh/config alias: port/key/ProxyJump come from there
+        rendezvous_address: 10.0.0.12   # ...but peers cannot resolve an alias: say what they dial
+        gpus_per_node: 8
+        mounts: ["/mnt/fast/models:/models:ro"]   # this box only, added to backend mounts
+
+operators:
+  - name: torchrun_container
+    type: docker_run
+    image: ${{ variables.PYTORCH_IMAGE }}
+    extra_args:
+      - --entrypoint=             # third-party images may set an app entrypoint; sflow runs bash
+      - --network=host            # docker creates no cross-host network: rendezvous on the host NIC
+    # rm: false                   # keep exited containers for `docker logs` / `inspect`
+
+workflow:
+  name: docker_multi_node
+  tasks:
+    - name: distributed_job
+      operator: torchrun_container
+      resources:
+        nodes: { count: 2 }       # one container per assigned host
+        gpus: { count: 2 }        # TOTAL across the task's nodes: one GPU per host
+      script:
+        - set -euo pipefail
+        - echo "node=${SFLOW_TASK_NODE_INDEX}/${SFLOW_TASK_NUM_NODES} leader=${SFLOW_LEADER_ADDRESS} host=$(hostname)"
+        - >
+          torchrun --nnodes="$SFLOW_TASK_NUM_NODES" --nproc-per-node=1
+          --node-rank="$SFLOW_TASK_NODE_INDEX" --master-addr="$SFLOW_LEADER_ADDRESS"
+          --master-port=${{ variables.MASTER_PORT }} --no-python
+          bash -lc 'echo "rank=${RANK}/${WORLD_SIZE} cuda=${CUDA_VISIBLE_DEVICES}"; nvidia-smi -L'
+```
+
+Run: `sflow run -f docker_pool.yaml --dry-run --verbose` first — it prints the whole fan-out,
+one `docker run` per member labelled with its rank and the daemon it targets.
+
+Key patterns:
+- One `address` per machine. Override only what genuinely differs: `docker_host` (jump host,
+  `tcp://`) or `context` for the endpoint, `rendezvous_address` for what peers dial.
+  `ip_address` still works but is deprecated (alias for `rendezvous_address`).
+- `nodes: 2` with no `hosts:` is rejected at plan time; a `nodes:` that disagrees with the
+  pool size is rejected too. Multi-node docker means several *machines*.
+- Each member gets `SFLOW_TASK_NODE_INDEX` / `SFLOW_TASK_NUM_NODES` / `SFLOW_LEADER_ADDRESS`
+  (rank 0 = first assigned host). The first non-zero exit fails the task with that code and
+  stops the peers; the task log is one merged, rank-labelled stream.
+- Pre-flight: a bounded `docker version` per host plus a check that every bind-mount source
+  (declared `mounts`, local `fs://` artifacts) exists *on that machine*; all problems are
+  reported together, naming the host. `SFLOW_SKIP_DOCKER_PREFLIGHT=1` bypasses it.
+- The controller's workspace/output dirs are **not** auto-mounted on a declared host; put
+  shared data under `mounts:` at the same path everywhere. Local artifacts are mounted
+  same-path and must exist on each host.
+- Containers are reclaimed on every host after a crash; a driver running inside a container
+  (CI) should set `SFLOW_DRIVER_ID`. Monitoring works across the pool — each host needs
+  `python3` (and `nvidia-smi` for the `gpu` scope).
+- There is no cross-host GPU lease: own the hosts exclusively, or coordinate externally.

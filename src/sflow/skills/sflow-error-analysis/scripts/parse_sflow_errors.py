@@ -44,7 +44,7 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         category="config",
         pattern=re.compile(r"Configuration file is empty:\s*(.+)"),
         description="Empty configuration file",
-        fix='Add valid sflow YAML content. At minimum: version: "0.1"',
+        fix="Add valid sflow YAML content. At minimum a workflow: section with a name and tasks.",
     ),
     ErrorPattern(
         category="config",
@@ -122,7 +122,7 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         category="merge",
         pattern=re.compile(r"Version conflict:\s*'(.+?)'\s*vs\s*'(.+?)'"),
         description="Version mismatch between merged files",
-        fix='All files must use version: "0.1".',
+        fix='Use version: "0.1" wherever version is declared, or drop the field (it is optional).',
     ),
     ErrorPattern(
         category="merge",
@@ -134,7 +134,7 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         category="merge",
         pattern=re.compile(r"Merged configuration from \[(.+?)\] is incomplete"),
         description="Incomplete merged configuration",
-        fix="Ensure all required sections (version, workflow, tasks) exist across the merged files.",
+        fix="Ensure the merged files provide workflow.name and workflow.tasks (version is optional).",
     ),
     # SLURM
     ErrorPattern(
@@ -142,6 +142,32 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         pattern=re.compile(r"scontrol getaddrs failed with exit code (\d+)"),
         description="scontrol address resolution failed",
         fix="Ensure you're in a SLURM allocation or on a node with scontrol access.",
+    ),
+    # Specific Slurm signatures go BEFORE the generic `srun: error:` / `salloc failed`
+    # catch-alls: the first matching pattern wins.
+    ErrorPattern(
+        category="slurm",
+        pattern=re.compile(r"No devices were found|No CUDA GPUs are available"),
+        description="No GPUs in the allocation (GRES partition, none requested)",
+        fix="On a partition that declares gpu:N GRES, sflow's gpus_per_node is planning-only: add "
+        "--extra-salloc-args '--gpus-per-node=N' or backend extra_args ['--gpus-per-node=N']. "
+        "Confirm in <task>/sflow_gpus.log: visible_gpu_count=0 with nvidia_visible_devices_inherited=all. "
+        "(On docker: install the NVIDIA container toolkit and set gpus_per_node.)",
+    ),
+    ErrorPattern(
+        category="slurm",
+        pattern=re.compile(
+            r"Job allocation \d+ has been revoked|are still not ready|Something is wrong with the boot of the nodes"
+        ),
+        description="Allocation lost to a node prolog/boot failure",
+        fix="Not a recipe problem: the node was drained (Prolog error). Re-run; --exclude-nodes <node> if it recurs.",
+    ),
+    ErrorPattern(
+        category="slurm",
+        pattern=re.compile(r"Unable to confirm allocation for job \d+|Expired or invalid job"),
+        description="Allocation expired before the tasks launched (partner backend still queued)",
+        fix="In a two-backend recipe one allocation hit its time: while the other was queued. Raise time: on both, "
+        "run when the partner partition is quieter, or use one backend.",
     ),
     ErrorPattern(
         category="slurm",
@@ -194,9 +220,41 @@ ERROR_PATTERNS: list[ErrorPattern] = [
     ),
     ErrorPattern(
         category="runtime",
+        pattern=re.compile(
+            r"enroot-mount: failed to mount|couldn't start container|mv: not replacing"
+        ),
+        description="Cold enroot cache race on first container start (retry succeeds)",
+        fix="Pre-import the image once per node: srun -N<n> --ntasks-per-node=1 --container-image=<img> true; "
+        "or give the task retries:.",
+    ),
+    ErrorPattern(
+        category="runtime",
         pattern=re.compile(r"pyxis:|nvidia-container-cli"),
         description="Container/Pyxis error",
         fix="Verify container image URI and registry access. Try: enroot import docker://<image>",
+    ),
+    ErrorPattern(
+        category="runtime",
+        pattern=re.compile(
+            r"ptxas fatal\s*: Value 'sm_\w+' is not defined|no kernel image is available for execution"
+        ),
+        description="Container toolchain predates the GPU architecture",
+        fix="Use an image whose CUDA matches the GPU (GB300/sm_103a needs CUDA 13, e.g. "
+        "vllm-runtime:1.2.1-cuda13; 0.8.0 cannot). On the samples: --set DYNAMO_IMAGE=<newer tag>.",
+    ),
+    ErrorPattern(
+        category="runtime",
+        pattern=re.compile(r"OOM during general warmup|ncclMemAlloc.*unhandled cuda error"),
+        description="GPU memory not yet released by a previous run's pods",
+        fix="Another recipe's pods were just deleted on this node: wait a minute or two (check nvidia-smi "
+        "on the node) before relaunching there, or pin elsewhere with --include-nodes.",
+    ),
+    ErrorPattern(
+        category="runtime",
+        pattern=re.compile(r"Processed 0 valid requests and \d+ errors"),
+        description="aiperf measured nothing (every request failed; exit 0 anyway)",
+        fix="The CSV is empty. Read the error breakdown in the aiperf log (404 = wrong --endpoint/model name, "
+        "connection refused = frontend down/wrong URL) and the frontend task log.",
     ),
     ErrorPattern(
         category="runtime",
@@ -283,14 +341,62 @@ ERROR_PATTERNS: list[ErrorPattern] = [
             r"Unable to connect to the server|connection to the server.*refused|namespaces \".+\" not found"
         ),
         description="Kubernetes cluster/namespace unreachable",
-        fix="Fix --kubeconfig/--kube-context/--kube-namespace; verify the cluster is reachable.",
+        fix="Fix --kube-context/--kube-namespace (or the config-file override in sflow run --help); verify the cluster is reachable.",
     ),
     # Docker
     ErrorPattern(
         category="docker",
+        pattern=re.compile(r"asks for \d+ nodes but declares no 'hosts:'"),
+        description="Docker nodes > 1 without a hosts: pool",
+        fix="Multi-node docker means several machines: list them under hosts: (one address each), or set nodes: 1.",
+    ),
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(r"declares \d+ host\(s\) but asks for nodes:"),
+        description="Docker nodes: disagrees with the hosts: pool size",
+        fix="hosts: is the node list. Drop nodes:, or declare a host per node.",
+    ),
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(
+            r"docker host '.+?' (needs an 'address'|has address|has user|sets both 'docker_host'|sets 'user' without)"
+        ),
+        description="Docker host identity misdeclared",
+        fix="Each host needs a bare `address` (IP/hostname/ssh alias; no scheme, no user@) with the login in `user`, "
+        "or one endpoint override (docker_host OR context).",
+    ),
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(r"cannot resolve a rendezvous address for host\(s\)"),
+        description="Multi-node docker host has no address peers can dial",
+        fix="Give every host in the task an `address` (or `rendezvous_address`); a context:-only host cannot join a multi-node task.",
+    ),
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(r"Pre-flight validation failed for Docker backend"),
+        description="Docker pre-flight failed (host unreachable / mount source missing / no docker CLI)",
+        fix="Read the per-host lines that follow: `unreachable: <reason>` = fix ssh (BatchMode: host key, key/agent) "
+        "or the daemon on that machine; `no response within 20s` = network/ProxyJump; `mount source(s) not found "
+        "on that machine` = create the path or fix mounts:/artifacts on that host. SFLOW_SKIP_DOCKER_PREFLIGHT=1 bypasses.",
+    ),
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(r"has no 'image:' to run it with|needs the backend's 'image:'"),
+        description="Docker backend image needed but not set",
+        fix="Name a docker_run operator on the task (or set the backend image:); a monitor collector on a "
+        "context:/tcp:// host also runs from the backend image.",
+    ),
+    ErrorPattern(
+        category="docker",
+        pattern=re.compile(r"'ip_address' is deprecated"),
+        description="Deprecated docker host field ip_address",
+        fix="Rename to rendezvous_address, or drop it when address is what peers dial.",
+    ),
+    ErrorPattern(
+        category="docker",
         pattern=re.compile(r"Cannot connect to the Docker daemon"),
         description="Docker daemon not reachable",
-        fix="Ensure Docker is running (`docker info`). For remote hosts check docker_host/context.",
+        fix="Ensure Docker is running (`docker info`). For a `hosts:` pool check that `ssh <address>` works non-interactively (or the host's docker_host/context override); `sflow run` pre-flights every host and names the failing one.",
     ),
     ErrorPattern(
         category="docker",
@@ -305,13 +411,13 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         category="storage",
         pattern=re.compile(r"requires boto3"),
         description="S3 storage requires boto3",
-        fix="Install with: pip install 'sflow[s3]'",
+        fix="Install with: pip install 'nv-sflow[s3]'",
     ),
     ErrorPattern(
         category="storage",
         pattern=re.compile(r"no AWS credentials detected"),
         description="No AWS credentials for S3 upload",
-        fix="Provide credentials via the boto3 chain (env vars, ~/.aws/credentials, or IAM role). Never put secrets in YAML.",
+        fix="Provide credentials via the boto3 chain (env vars, the AWS shared credentials file, or IAM role). Never put secrets in YAML.",
     ),
     ErrorPattern(
         category="storage",
@@ -371,6 +477,45 @@ ERROR_PATTERNS: list[ErrorPattern] = [
         description="--missable-tasks with single file",
         fix="Use multiple -f flags for modular composition, or remove --missable-tasks.",
     ),
+    # Install / upgrade (sflow upgrade, sflow batch bootstrap)
+    ErrorPattern(
+        category="install",
+        pattern=re.compile(r"is not a valid PyPI version specifier"),
+        description="--sflow-version is PEP 440 only (git ref given)",
+        fix="sflow upgrade: --sflow-version <ref> -> --branch <ref>; <repo>@<ref> -> --repo <repo> --branch <ref>. "
+        "(sflow batch --sflow-version still takes a git ref unless --sflow-index-url is set.)",
+    ),
+    ErrorPattern(
+        category="install",
+        pattern=re.compile(r"cannot be combined with --sflow-version|is mutually exclusive with --"),
+        description="Two install sources given at once",
+        fix="Pick one route: PyPI (--sflow-version/--sflow-index-url), git (--repo/--branch) or --sflow-source-path.",
+    ),
+    ErrorPattern(
+        category="install",
+        pattern=re.compile(r"\(development\) install"),
+        description="sflow upgrade refused to replace an editable/dev install",
+        fix="That is the guard working: git pull in the checkout, or re-run with --force to install a release over it.",
+    ),
+    ErrorPattern(
+        category="install",
+        pattern=re.compile(r"neither 'uv' nor 'pip' is available"),
+        description="No installer in this environment",
+        fix="Install uv, or add pip with `<python> -m ensurepip --upgrade`, then retry.",
+    ),
+    ErrorPattern(
+        category="install",
+        pattern=re.compile(r"install failed with exit code \d+|No matching distribution found for nv-sflow|No solution found.*nv-sflow"),
+        description="Installer failed (release not on the index?)",
+        fix="Read the installer output above. Wheels <= v0.3.1 are named `sflow`, so a private index has no "
+        "nv-sflow==0.3.1: use the git tag (sflow upgrade --branch v0.3.1 / sflow batch --sflow-version v0.3.1).",
+    ),
+    ErrorPattern(
+        category="install",
+        pattern=re.compile(r"--sflow-index-url must not"),
+        description="Credentials / query string in --sflow-index-url",
+        fix="Use ~/.netrc or a credential helper; the URL is embedded verbatim in scripts and logs.",
+    ),
 ]
 
 CATEGORY_LABELS = {
@@ -386,6 +531,7 @@ CATEGORY_LABELS = {
     "runtime": "Runtime / Task Execution",
     "batch": "Batch / CSV Processing",
     "cli": "CLI Arguments",
+    "install": "Install / Upgrade",
 }
 
 CATEGORY_PRIORITY = list(CATEGORY_LABELS.keys())

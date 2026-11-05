@@ -76,6 +76,9 @@ _NETWORK_METRICS = (
     ("tx_bytes_per_s", "bytes/s"),
     ("rx_packets_per_s", "packets/s"),
     ("tx_packets_per_s", "packets/s"),
+    # Appended later than the rest; rows written before it exists are shorter,
+    # so the reader below takes whichever of these the row actually carries.
+    ("loopback_bytes_per_s", "bytes/s"),
 )
 
 # Key metrics rendered as sparklines in the terminal overview.
@@ -89,6 +92,9 @@ _OVERVIEW_SPARKLINES = (
     ("disk", "disk_used_pct", "Disk used %"),
     ("network", "rx_bytes_per_s", "Net RX MiB/s"),
     ("network", "tx_bytes_per_s", "Net TX MiB/s"),
+    # Two processes on one host never touch a NIC, so a co-located transfer is
+    # invisible in rx/tx. Worth a line of its own when it is the whole story.
+    ("network", "loopback_bytes_per_s", "Loopback MiB/s"),
 )
 
 _SPARK_TICKS = "▁▂▃▄▅▆▇█"
@@ -462,6 +468,7 @@ def parse_monitor_log(monitor_log_path: Path) -> list[dict[str, object]]:
             metrics = [
                 (name, parts[1 + i], unit)
                 for i, (name, unit) in enumerate(_NETWORK_METRICS)
+                if 1 + i < len(parts)
             ]
         else:
             continue
@@ -1308,7 +1315,7 @@ class _MatplotlibUnavailable(RuntimeError):
 _PNG_INSTALL_HINT = (
     "PNG monitor timelines require matplotlib (an optional extra). "
     "CSV and SVG reports were still written. Install it with "
-    "`pip install sflow[monitor]` (or `uv pip install sflow[monitor]`) to enable "
+    "`pip install nv-sflow[monitor]` (or `uv pip install nv-sflow[monitor]`) to enable "
     "PNG, or drop 'png' from monitor.report.format to silence this message."
 )
 

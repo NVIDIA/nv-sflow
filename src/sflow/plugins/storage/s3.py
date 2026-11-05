@@ -83,7 +83,7 @@ class S3StorageTarget(StorageTarget):
                 from botocore.config import Config  # type: ignore[import-not-found]
             except ImportError as e:
                 raise ImportError(
-                    "S3 storage requires boto3. Install with: pip install 'sflow[s3]'"
+                    "S3 storage requires boto3. Install with: pip install 'nv-sflow[s3]'"
                 ) from e
 
             client_kwargs: dict[str, Any] = {}
@@ -129,7 +129,7 @@ class S3StorageTarget(StorageTarget):
         except ImportError:
             return [
                 f"storage target '{self.name}' (s3) requires boto3, which is not "
-                f"installed — uploads will fail. Install with: pip install 'sflow[s3]'"
+                f"installed — uploads will fail. Install with: pip install 'nv-sflow[s3]'"
             ]
 
         creds_file = Path(

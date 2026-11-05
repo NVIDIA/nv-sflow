@@ -24,8 +24,9 @@ from sflow.cli import app
         ("self_contained/docker/hello_world.yaml", "docker"),
         ("self_contained/docker/multi_node.yaml", "docker_cluster"),
         ("self_contained/docker/sglang_qwen3.yaml", "local_docker"),
+        ("self_contained/docker/sglang_glm52.yaml", "docker_host"),
     ],
-    ids=["hello_world", "multi_node", "sglang_qwen3"],
+    ids=["hello_world", "multi_node", "sglang_qwen3", "sglang_glm52"],
 )
 def test_cli_run_dry_run_docker_example_exits_zero_without_daemon(
     tmp_path: Path, example: str, backend_name: str

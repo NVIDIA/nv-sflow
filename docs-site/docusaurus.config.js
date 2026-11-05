@@ -37,6 +37,17 @@ const config = {
   },
   organizationName: "NVIDIA",
   projectName: "nv-sflow",
+  clientModules: [
+    require.resolve("./src/clientModules/hashScroll.client.js"),
+    // Break out of a wrapping frame (e.g. a hosting proxy/portal around GitLab Pages) so the
+    // browser address bar shows the real per-page URL and links stay shareable. No-op when
+    // not framed (local dev, direct Pages). See src/utils/frameEscape.js.
+    require.resolve("./src/clientModules/frameEscape.client.js"),
+    // Publishes the vLLM Recipes selection rules for the command-builder page,
+    // whose builder.js is a classic script webpack never sees. See
+    // src/utils/recipeSelection.js.
+    require.resolve("./src/clientModules/recipeSelection.client.js"),
+  ],
   deploymentBranch: "gh-pages",
   themes: ["@docusaurus/theme-mermaid"],
 
@@ -76,6 +87,16 @@ const config = {
   ],
 
   plugins: [
+    // @docusaurus/theme-mermaid >=3.10 dynamically imports the optional
+    // @mermaid-js/layout-elk peer behind a DefinePlugin flag but no longer
+    // aliases it away when absent (3.9.2 did), so webpack fails to resolve
+    // it at build time. We don't use ELK layouts; stub the module out.
+    () => ({
+      name: "mermaid-elk-stub",
+      configureWebpack: () => ({
+        resolve: { alias: { "@mermaid-js/layout-elk": false } },
+      }),
+    }),
     [
       require.resolve("@cmfcmf/docusaurus-search-local"),
       {

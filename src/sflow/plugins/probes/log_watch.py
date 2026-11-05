@@ -43,7 +43,9 @@ def _clip(text: str, limit: int = 160) -> str:
     which is the cost this branch exists to avoid.
     """
     if len(text) <= _CLIP_EXACT_MAX:
-        flat = text.replace("\r", " ").replace("\t", " ").strip()
+        # "\n" too: a `re:` pattern that spans lines makes the matched "line" a
+        # multi-line slice, and the trace must stay one record per line.
+        flat = text.replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
         return flat if len(flat) <= limit else flat[:limit] + "..."
     first = _FIRST_VISIBLE_RE.search(text)
     if first is None:
@@ -51,7 +53,11 @@ def _clip(text: str, limit: int = 160) -> str:
     start = first.start()
     # Already past the indentation, so rstrip alone finishes the job.
     window = (
-        text[start : start + limit].replace("\r", " ").replace("\t", " ").rstrip()
+        text[start : start + limit]
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .replace("\t", " ")
+        .rstrip()
     )
     return window + "..."
 
@@ -117,8 +123,28 @@ class LogWatchProbe(Probe):
         self._last_line = ""
         self._last_match_line = ""
 
-    def _count_matches(self, text: str) -> int:
-        return len(self._regex.findall(text))
+    def _consume(self, consumed: bytes) -> None:
+        """Count matches in newly appended log bytes and update the trace lines.
+
+        One ``finditer`` pass counts and keeps the final match; its line and the
+        chunk's last non-empty line are cut out with find/rfind rather than
+        splitting the whole chunk into lines and searching each again (that was
+        ~8x the work per tick), and without copying it (``rstrip`` would).
+        """
+        text = consumed.decode("utf-8", errors="ignore")
+        last = None
+        for last in self._regex.finditer(text):
+            self._match_total += 1
+        if last is not None:
+            start = text.rfind("\n", 0, last.start()) + 1
+            # `consumed` ends in "\n", so a -1 here means the match swallowed the
+            # final newline and the slice correctly stops just short of it.
+            self._last_match_line = text[start : text.find("\n", last.end())]
+        end = len(text)
+        while end and text[end - 1] == "\n":
+            end -= 1
+        if end:
+            self._last_line = text[text.rfind("\n", 0, end) + 1 : end]
 
     def _log_path(self, task) -> Path:  # type: ignore[override]
         wf_out = task.envs.get("SFLOW_WORKFLOW_OUTPUT_DIR")
@@ -168,16 +194,8 @@ class LogWatchProbe(Probe):
         newline = chunk.rfind(b"\n")
         if newline != -1:
             consumed = chunk[: newline + 1]
-            text = consumed.decode("utf-8", errors="ignore")
-            self._match_total += self._count_matches(text)
+            self._consume(consumed)
             self._offset += len(consumed)  # advance by BYTES, not decoded chars
-            # Track the last line seen and the last matching line for the trace.
-            for line in text.splitlines():
-                if not line:
-                    continue
-                self._last_line = line
-                if self._regex.search(line):
-                    self._last_match_line = line
 
         # Matches accumulate across checks; require at least match_count in total.
         matched = self._match_total >= self._match_count

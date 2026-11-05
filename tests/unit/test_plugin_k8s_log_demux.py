@@ -39,6 +39,35 @@ def test_router_routes_tagged_untagged_and_unknown(tmp_path):
     )
 
 
+def test_router_strips_ansi_so_live_probes_match(tmp_path):
+    """A merged pod's live <task>.log must be ANSI-free like every other write path.
+
+    The real dynamo 0.8.0 line: its formatter italicises field names, so a literal
+    log_watch pattern `endpoint=generate transport` could never match the stored
+    bytes until the pod-terminal sanitize -- after readiness had already timed out.
+    Tagged and untagged lines alike; plain lines pass through byte-identical.
+    """
+    leader = tmp_path / "leader.log"
+    member = tmp_path / "decode.log"
+    coloured = (
+        b"\x1b[2m2026-10-28T05:26:47Z\x1b[0m \x1b[32m INFO\x1b[0m Registering endpoint "
+        b"with request plane server \x1b[3mendpoint\x1b[0m\x1b[2m=\x1b[0mgenerate "
+        b"\x1b[3mtransport\x1b[0m\x1b[2m=\x1b[0m\"tcp\""
+    )
+    router = log_demux._Router(str(leader), {b"decode": str(member)})
+    router.route(b"[[sflow-mux:decode]] " + coloured)
+    router.route(coloured)
+    router.route(b"plain line stays as is")
+    router.close()
+
+    for path in (leader, member):
+        assert b"\x1b" not in path.read_bytes(), path.read_bytes()
+    clean = b'request plane server endpoint=generate transport="tcp"'
+    assert clean in member.read_bytes()
+    assert clean in leader.read_bytes()
+    assert b"plain line stays as is\n" in leader.read_bytes()
+
+
 def test_router_appends_preserving_prefix(tmp_path):
     # Files open in append mode, so a pre-existing apply-diagnostics prefix survives.
     leader = tmp_path / "leader.log"

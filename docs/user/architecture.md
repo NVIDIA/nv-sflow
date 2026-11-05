@@ -222,7 +222,7 @@ stateDiagram-v2
 | **`sflow visualize`** | Render DAG as image/mermaid | `--format` (png/svg/pdf/mermaid/dot), `--show-variables`, `--set/-s`, `--artifact/-a`, `--missable-tasks/-M` |
 | **`sflow sample`** | List/copy example workflows | `--list`, `--force`, `-o/--output` |
 | **`sflow skill`** | Copy agent skills into project (merges into existing directory) | `--list`, `--force` (overwrite existing files), `-o/--output` |
-| **`sflow upgrade`** (alias `sflow update`) | Reinstall sflow in place from git or an index | `--repo`, `--branch`, `--sflow-version`, `--sflow-index-url`, `--sflow-source-path`, `--force`, `--dry-run` |
+| **`sflow upgrade`** (alias `sflow update`) | Upgrade sflow in place from PyPI, a private index, or a git ref | `--repo`, `--branch`, `--sflow-version`, `--sflow-index-url`, `--sflow-source-path`, `--force`, `--dry-run` |
 
 ### Multi-file Input
 

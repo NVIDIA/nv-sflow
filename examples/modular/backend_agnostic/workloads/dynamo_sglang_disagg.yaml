@@ -18,12 +18,16 @@
 version: "0.1"
 
 variables:
+  SGLANG_WATCHDOG_TIMEOUT:
+    description: "Seconds the SGLang scheduler may go without progressing a batch
+      before it SIGQUITs itself. The default (300) is shorter than this model's
+      one-time DeepGEMM JIT pre-compile, so a request that arrives during warmup
+      sat unserviced and killed a healthy worker with exit 137."
+    type: integer
+    value: 1800
   SERVER_IMAGE:
     description: "Dynamo SGLang runtime image"
     value: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
-  MODEL_PATH:
-    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
-    value: /models/Qwen3-0.6B
   SERVER_GPUS:
     description: "GPUs per worker (tensor-parallel size); disagg uses 2 * SERVER_GPUS total"
     type: integer
@@ -41,9 +45,11 @@ workflow:
         - set -x
         - >
           python3 -m dynamo.sglang
-          --model-path ${{ variables.MODEL_PATH }}
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${{ variables.SERVED_MODEL_NAME }}
           --tensor-parallel-size ${{ variables.SERVER_GPUS }}
+          --host 0.0.0.0
+          --watchdog-timeout ${{ variables.SGLANG_WATCHDOG_TIMEOUT }}
           --disaggregation-mode prefill
           --disaggregation-bootstrap-port 8998
           --disaggregation-transfer-backend ${{ variables.KV_TRANSFER_BACKEND }}
@@ -64,6 +70,14 @@ workflow:
           # unreliable for disagg; the per-worker log line is the authoritative
           # "this worker is serving" signal, so the benchmark waits for prefill AND
           # decode to each log it.
+          #
+          # The marker is the runtime registering its `generate` endpoint, i.e. the
+          # moment this worker can be handed work. Do NOT use "Registering model
+          # with endpoint types": only the worker that serves the OpenAI API logs
+          # it, so prefill waited 1200s for a line it never prints and failed the
+          # workflow with a healthy engine (vLLM and TRT-LLM both). It also fires
+          # too EARLY on TRT-LLM decode -- ~4.5 min before the engine finished
+          # loading -- so it was never the right signal for either worker.
           - http_post:
               url: "http://${{ backends.cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
               headers:
@@ -73,7 +87,7 @@ workflow:
             each_check_timeout: 20
             interval: 20
           - log_watch:
-              match_pattern: "re:Registering model with endpoint types|Model registration succeeded"
+              match_pattern: "Registered endpoint 'generate'"
               match_count: 1
             timeout: 1200
             interval: 10
@@ -84,9 +98,11 @@ workflow:
         - set -x
         - >
           python3 -m dynamo.sglang
-          --model-path ${{ variables.MODEL_PATH }}
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${{ variables.SERVED_MODEL_NAME }}
           --tensor-parallel-size ${{ variables.SERVER_GPUS }}
+          --host 0.0.0.0
+          --watchdog-timeout ${{ variables.SGLANG_WATCHDOG_TIMEOUT }}
           --disaggregation-mode decode
           --disaggregation-bootstrap-port 9098
           --disaggregation-transfer-backend ${{ variables.KV_TRANSFER_BACKEND }}
@@ -111,7 +127,7 @@ workflow:
             each_check_timeout: 20
             interval: 20
           - log_watch:
-              match_pattern: "re:Registering model with endpoint types|Model registration succeeded"
+              match_pattern: "Registered endpoint 'generate'"
               match_count: 1
             timeout: 1200
             interval: 10

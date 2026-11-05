@@ -9,8 +9,8 @@ one command instead of three:
   2. check_gpu_plan.py       -- GPU allocation plan + oversubscription (advisory)
   3. sflow ... --dry-run     -- full plan + expression resolution (the source of truth)
 
-On a dry-run failure the captured output is piped through parse_sflow_errors.py
-(when it can be located) to surface the most likely root cause + fix.
+On a dry-run failure the captured output is parsed by parse_sflow_errors.py
+(loaded in-process when it can be located) to surface the most likely root cause + fix.
 
 Usage:
     python preflight.py <file.yaml> [<file2.yaml> ...] [sflow flags] [-- <extra sflow run args>]
@@ -20,17 +20,24 @@ Usage:
     python preflight.py slurm.yaml common.yaml sglang/agg.yaml --set TP_SIZE=8
     python preflight.py agg.yaml --missable-tasks prefill_server -- --verbose
 
-Any non-.yaml/.yml token (before an optional ``--``) and everything after ``--``
-is forwarded verbatim to ``sflow run`` (e.g. ``--set``, ``--missable-tasks``,
-``--kube-namespace``). ``sflow`` is invoked as ``<this-python> -m sflow`` so it
-uses the same interpreter/venv that runs this script.
+Arguments:
+    Recipe files are the ``*.yaml`` / ``*.yml`` tokens. Any other token (before an
+    optional ``--``) and everything after ``--`` is forwarded verbatim to ``sflow run``
+    (e.g. ``--set``, ``--missable-tasks``, ``--kube-namespace``). ``sflow`` is invoked
+    as ``<this-python> -m sflow`` so it uses the same interpreter/venv as this script.
 
-Exit code: 0 when validation has no errors AND the dry-run passes, else 1.
+Output:
+    A report per stage on stdout, then a final PASS/FAIL verdict block.
+
+Exit codes:
+    0  validation has no errors AND the dry-run passes
+    1  validation or dry-run failed
+    2  usage error (no recipe file given, or a file does not exist)
 """
 
 from __future__ import annotations
 
-import os
+import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -70,8 +77,10 @@ def _run_validation(files: list[str]) -> bool:
     try:
         from validate_sflow_yaml import validate_file  # sibling script
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"  (skipped: could not import validate_sflow_yaml: {exc})")
-        return True
+        # Fail closed: a preflight that skips schema checks must not report PASS.
+        print(f"  ERROR: could not import validate_sflow_yaml ({exc}); "
+              "schema/reference checks did not run. Install sflow in this interpreter.")
+        return False
     all_ok = True
     for f in files:
         result = validate_file(f)
@@ -106,20 +115,19 @@ def _find_error_parser() -> Path | None:
 def _run_dry_run(files: list[str], passthrough: list[str]) -> bool:
     """Invoke ``sflow run --dry-run``. Returns True on exit 0."""
     _banner("[3/3] sflow dry-run (plan + expression resolution)")
-    cmd = [sys.executable, "-m", "sflow", "run"]
+    # -X utf8 makes the child's stdio UTF-8 so the decode below never garbles output.
+    cmd = [sys.executable, "-X", "utf8", "-m", "sflow", "run"]
     for f in files:
         cmd += ["-f", f]
     cmd += passthrough + ["--dry-run"]
     print(f"  $ {' '.join(cmd)}\n")
 
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=env,
     )
     output = (proc.stdout or "") + (proc.stderr or "")
     # Show a trimmed tail; the dry-run is verbose and the verdict is at the end.
@@ -131,13 +139,16 @@ def _run_dry_run(files: list[str], passthrough: list[str]) -> bool:
         parser = _find_error_parser()
         if parser is not None:
             _banner("Root-cause analysis (parse_sflow_errors)")
-            subprocess.run(
-                [sys.executable, str(parser), "-"],
-                input=output,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            # Parse in-process: the log is data handed to a function, never to a
+            # second interpreter.
+            # Advisory: a parser failure must not hide the dry-run verdict.
+            try:
+                if str(parser.parent) not in sys.path:
+                    sys.path.insert(0, str(parser.parent))
+                module = importlib.import_module("parse_sflow_errors")
+                module.print_report(module.parse_log(output.splitlines(keepends=True), "<dry-run>"))
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"  (skipped: {exc})")
     return ok
 
 

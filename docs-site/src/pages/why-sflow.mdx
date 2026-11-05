@@ -1,0 +1,207 @@
+---
+title: Why sflow
+description: Write a GPU workload once and run it on a workstation, Slurm or Kubernetes by swapping one file.
+hide_table_of_contents: true
+---
+
+import Tabs from "@theme/Tabs";
+import TabItem from "@theme/TabItem";
+import useBaseUrl from "@docusaurus/useBaseUrl";
+
+export function WhyDeck() {
+  const src = useBaseUrl("/why_sflow.html");
+  return (
+    <div style={{ margin: "1.5rem 0 2.5rem" }}>
+      <div
+        style={{
+          position: "relative",
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          border: "3px solid #0a0a0a",
+          boxShadow: "6px 6px 0 #0a0a0a",
+          background: "#ffffff",
+        }}
+      >
+        <iframe
+          src={src}
+          title="Why sflow, in seven slides"
+          loading="lazy"
+          allowFullScreen
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: 0 }}
+        />
+      </div>
+      <p style={{ marginTop: "0.6rem", fontSize: "0.9rem" }}>
+        <a href={src} target="_blank" rel="noopener noreferrer">Open the slides full screen ↗</a>
+        {" "}· click the slides, then use ← → · the same story in text follows below.
+      </p>
+    </div>
+  );
+}
+
+<div className="container margin-vert--lg" style={{ maxWidth: 900 }}>
+
+# Why sflow
+
+<WhyDeck />
+
+## Write the workload once. Run it on any GPU infrastructure.
+
+A workstation, a Slurm cluster and a Kubernetes cluster can all run the same GPU job, but each one wants its own launch scripts. Teams end up maintaining one set of bash per platform for what is, logically, the same workflow.
+
+sflow splits a workflow into two files:
+
+- the **workload**: what runs, in what order, on how many GPUs, and how to tell it is healthy;
+- the **backend**: how this particular platform launches it.
+
+Moving to another platform means swapping the backend file. The workload does not change.
+
+## One workload, three platforms
+
+Here is the model server from a real example. Notice what is missing: no `srun`, no `docker run`, no pod spec, no host names.
+
+```yaml title="examples/modular/backend_agnostic/workloads/vllm_serve.yaml"
+- name: server
+  operator: server
+  script:
+    - set -x
+    - >
+      vllm serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
+      --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+      --host 0.0.0.0 --port 8000
+      --tensor-parallel-size ${{ variables.SERVER_GPUS }}
+      --trust-remote-code
+  resources:
+    gpus:
+      count: ${{ variables.SERVER_GPUS }}
+  required_by:
+    - benchmark
+  probes:
+    readiness:
+      http_get:
+        url: "http://${{ backends.cluster.nodes[0].ip_address }}:8000/health"
+      timeout: 1200
+      interval: 20
+    failure:
+      log_watch:
+        match_pattern: "Traceback (most recent call last)"
+        match_count: 5
+      interval: 30
+```
+
+`operator: server` names a **role**, and `backends.cluster.nodes[0]` is whichever node the platform hands out. Each backend file says what the `server` role means there:
+
+<Tabs groupId="backend">
+<TabItem value="docker" label="Docker (one workstation)">
+
+```yaml title="examples/modular/backend_agnostic/backends/docker.yaml"
+- name: server
+  type: docker_run
+  image: ${{ variables.SERVER_IMAGE }}
+  extra_args:
+    - --network=host          # client reaches the server on 127.0.0.1
+    - --ipc=host              # NCCL / shared-memory transports between workers
+    - --shm-size=${{ variables.SERVER_SHM_SIZE }}
+```
+
+</TabItem>
+<TabItem value="slurm" label="Slurm">
+
+```yaml title="examples/modular/backend_agnostic/backends/slurm.yaml"
+- name: server
+  type: srun
+  container_image: ${{ variables.SERVER_IMAGE }}
+  container_writable: true
+  mpi: pmix
+  ntasks_per_node: 1
+```
+
+</TabItem>
+<TabItem value="k8s" label="Kubernetes">
+
+```yaml title="examples/modular/backend_agnostic/backends/k8s.yaml"
+- name: server
+  type: k8s
+  image: ${{ variables.SERVER_IMAGE }}
+```
+
+</TabItem>
+</Tabs>
+
+The three runs differ in exactly one file:
+
+```bash
+cd examples/modular/backend_agnostic
+sflow run -f backends/docker.yaml -f workloads/vllm_serve.yaml -f benchmark.yaml   # one workstation
+sflow run -f backends/slurm.yaml  -f workloads/vllm_serve.yaml -f benchmark.yaml   # Slurm cluster
+sflow run -f backends/k8s.yaml    -f workloads/vllm_serve.yaml -f benchmark.yaml   # Kubernetes
+```
+
+Add `--dry-run` to any of them to see the whole plan (placement, GPU assignment, readiness checks) without touching a cluster. The same workload directory holds Dynamo, vLLM, SGLang and TensorRT-LLM servers, aggregated and disaggregated, all written this way: [browse the example on GitHub](https://github.com/NVIDIA/nv-sflow/tree/main/examples/modular/backend_agnostic).
+
+## What changes, and what doesn't
+
+| The workload file (yours, unchanged) | The backend file (per platform, written once) |
+|---|---|
+| tasks and the order they start in | scheduler, account, partition or namespace |
+| the commands each task runs | container runtime and image handling |
+| GPUs per task | launcher: `docker run`, `srun` with MPI, or a pod |
+| readiness and failure checks | networking, mounts, GPU scheduling mode |
+| the benchmark and its results | anything else specific to that platform |
+
+What that buys you:
+
+- **Prove it small, run it big.** Debug on a workstation with Docker, then submit the identical workload to the cluster.
+- **Write platform glue once.** One person writes the Slurm or Kubernetes backend file; everyone else reuses it.
+- **Compare platforms fairly.** Same workload, same benchmark, different backend: the comparison is like for like.
+
+## Built for the hardest case
+
+Multi-node LLM serving is about as hard as workflow orchestration gets: a dozen processes on several nodes that must start in the right order, find each other, share GPUs correctly, and be torn down cleanly when any one of them dies. sflow ships that as ordinary recipes:
+
+- **Disaggregated serving** (separate prefill and decode workers exchanging the KV cache) with Dynamo on SGLang, vLLM and TensorRT-LLM, on Slurm and on Kubernetes ([recipes](https://github.com/NVIDIA/nv-sflow/tree/main/examples/self_contained)).
+- **Workers that span nodes:** prefill and decode workers at tensor parallelism 8, each spread over two 4-GPU GB200 NVL72 nodes through multi-node NVLink ([recipe](https://github.com/NVIDIA/nv-sflow/blob/main/examples/self_contained/kubernetes/qwen3_8b/gb_dynamo_trtllm_disagg.yaml)).
+- **Large MoE models:** DeepSeek-R1 disaggregated serving ([recipe](https://github.com/NVIDIA/nv-sflow/blob/main/examples/self_contained/kubernetes/dynamo_sglang_disagg_dsr1.yaml)).
+
+Growing a run changes numbers, not structure: `NUM_NODES`, the GPUs per task, `replicas` to fan a task out, or `sflow batch` over a CSV of parameter rows. Along the way sflow handles:
+
+- **Placement:** packs tasks onto nodes and specific GPUs, and reports conflicts when it plans the run, not ten minutes into it.
+- **Native launchers:** `srun` with MPI on Slurm, pods (single or MPI) on Kubernetes, `docker run` on a workstation. sflow drives each platform's own tools rather than replacing them.
+- **Real readiness:** a dependent task waits until the service it needs actually answers, not just until its process starts.
+- **Clean teardown** on success, failure or Ctrl-C, and one output directory per run with a log per task.
+
+## The bash you stop writing
+
+| Instead of hand-rolling… | You declare |
+|---|---|
+| `until curl -sf …; do sleep 5; done` | a readiness probe (HTTP, TCP or log pattern) with a timeout |
+| retry loops and backoff arithmetic | `retries: {count, interval, backoff}` |
+| stray-process cleanup and `trap` handlers | nothing: teardown is built in |
+| `grep`/`awk` over logs into a CSV | `result:` parsing into `result.json` |
+| copying configs onto every node | `artifacts:`, mounted at the same path on every backend |
+| `for cfg in …; do sbatch …; done` | `replicas:`, or `sflow batch` over a CSV |
+
+## What sflow is not
+
+- **Not a scheduler.** Slurm, Kubernetes and Docker still schedule. sflow plans the workflow and launches it through them.
+- **Not a service.** It is a command-line tool and YAML files: no server, database or daemon to operate.
+- **Not only for LLMs.** Anything that runs as steps depending on each other fits: build, train, evaluate; stage data, process shards in parallel, merge. LLM serving is the hardest case it is designed around, not the only one.
+
+## Try it in a minute
+
+```bash
+uv tool install nv-sflow
+sflow sample self_contained/local/hello_world -o hello.yaml
+sflow run -f hello.yaml
+```
+
+Or paste this into your AI coding agent and let it install sflow and its skills:
+
+```text
+Set up sflow for me by following
+https://raw.githubusercontent.com/NVIDIA/nv-sflow/main/docs-site/agents-src/setup.md
+step by step, then tell me what you installed and where.
+```
+
+Next: [Quickstart](/docs/user/quickstart) · [Modular workflows](/docs/user/modular-workflows) · [Backends](/docs/user/backends) · [GitHub](https://github.com/NVIDIA/nv-sflow)
+
+</div>

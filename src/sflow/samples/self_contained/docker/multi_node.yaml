@@ -1,31 +1,95 @@
 version: "0.1"
 
+# Two-host torchrun rendezvous smoke test. Each Docker host runs one container
+# and one torchrun process; torchrun blocks until BOTH nodes join, so a run that
+# prints two ranks proves sflow's node index / leader-address wiring end to end.
+#
+# Prerequisites:
+#   - ssh from this driver to each `address` already works
+#   - NVIDIA Container Toolkit is installed on both hosts
+#   - the two hosts can reach each other on MASTER_PORT
+
+variables:
+  NUM_NODES:
+    type: integer
+    value: 2
+  GPUS_PER_NODE:
+    type: integer
+    value: 8
+  NPROC_PER_NODE:
+    description: "torchrun processes and GPUs used per host"
+    type: integer
+    value: 1
+  MASTER_PORT:
+    description: "torchrun rendezvous port reachable on every host"
+    type: integer
+    value: 29500
+  PYTORCH_IMAGE:
+    value: nvcr.io/nvidia/pytorch:24.12-py3
+  # Replace with your machines. An ssh alias works for the ENDPOINT (~/.ssh/config
+  # supplies user, port, key and ProxyJump), but peers cannot resolve an alias --
+  # set the host's `rendezvous_address` when the alias is not what they dial.
+  HOST_0_ADDRESS:
+    value: 10.0.0.11
+  HOST_1_ADDRESS:
+    value: 10.0.0.12
+  SSH_USER:
+    description: "SSH login for both hosts; leave empty to use your own"
+    value: ""
+
 backends:
   - name: docker_cluster
     type: docker
     default: true
-    image: ubuntu:22.04
+    image: ${{ variables.PYTORCH_IMAGE }}
     hosts:
-      - name: dgx-a
-        docker_host: ssh://dgx-a
-        ip_address: 10.0.0.11
-        gpus_per_node: 8
-      - name: dgx-b
-        docker_host: ssh://dgx-b
-        ip_address: 10.0.0.12
-        gpus_per_node: 8
+      # `address` is the machine: sflow derives the ssh:// docker endpoint from
+      # it AND hands it to peers as the rendezvous address. Add `user:` when the
+      # login differs from yours.
+      - name: node-0
+        address: ${{ variables.HOST_0_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+      - name: node-1
+        address: ${{ variables.HOST_1_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: torchrun_container
+    type: docker_run
+    image: ${{ variables.PYTORCH_IMAGE }}
+    extra_args:
+      # Third-party images may define an application entrypoint; sflow launches
+      # the task through bash, so clear it explicitly.
+      - --entrypoint=
+      # Docker creates no cross-host network, so the rendezvous port has to be
+      # reachable on the host's own interface.
+      - --network=host
 
 workflow:
   name: docker_multi_node
   tasks:
     - name: distributed_job
+      operator: torchrun_container
       resources:
         nodes:
-          count: 2
-        # gpus.count is the TOTAL across the task's nodes, and every node takes
-        # the same slice -- so 2 here means 1 GPU on each of the 2 nodes.
+          count: ${{ variables.NUM_NODES }}
         gpus:
-          count: 2
+          # gpus.count is the TOTAL across the task's nodes: one GPU per host.
+          count: ${{ variables.NUM_NODES * variables.NPROC_PER_NODE }}
       script:
-        - echo "Running on ${SFLOW_TASK_ASSIGNED_NODE_NAMES}"
-        - ./run_worker.sh
+        - set -euo pipefail
+        # Printed before torchrun so the wiring is visible even if rendezvous
+        # never completes.
+        - echo "sflow wiring: node=${SFLOW_TASK_NODE_INDEX}/${SFLOW_TASK_NUM_NODES} leader=${SFLOW_LEADER_ADDRESS} host=$(hostname)"
+        - >
+          torchrun
+          --nnodes="$SFLOW_TASK_NUM_NODES"
+          --nproc-per-node=${{ variables.NPROC_PER_NODE }}
+          --node-rank="$SFLOW_TASK_NODE_INDEX"
+          --master-addr="$SFLOW_LEADER_ADDRESS"
+          --master-port=${{ variables.MASTER_PORT }}
+          --no-python
+          bash -lc
+          'echo "torchrun rank=${RANK}/${WORLD_SIZE} local_rank=${LOCAL_RANK} node=${SFLOW_TASK_NODE_INDEX} host=$(hostname) cuda=${CUDA_VISIBLE_DEVICES}"; nvidia-smi -L'

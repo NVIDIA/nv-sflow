@@ -119,9 +119,9 @@ def test_format_runtime_info_reports_editable_direct_url(monkeypatch, tmp_path):
             )
 
     monkeypatch.setattr(
-        runtime_info.importlib_metadata,
-        "distribution",
-        lambda _name: FakeDistribution(),
+        runtime_info,
+        "installed_distribution",
+        lambda: FakeDistribution(),
     )
     monkeypatch.setattr(runtime_info, "_git_info_for_repo", lambda _repo: "(main abc123)")
 
@@ -144,9 +144,9 @@ def test_format_runtime_info_reports_local_direct_url(monkeypatch, tmp_path):
             return '{"url": "file://' + str(wheel_source) + '"}'
 
     monkeypatch.setattr(
-        runtime_info.importlib_metadata,
-        "distribution",
-        lambda _name: FakeDistribution(),
+        runtime_info,
+        "installed_distribution",
+        lambda: FakeDistribution(),
     )
     monkeypatch.setattr(runtime_info, "_git_info_for_repo", lambda _repo: "")
 
@@ -167,9 +167,9 @@ def test_format_runtime_info_reports_vcs_direct_url_source(monkeypatch):
             )
 
     monkeypatch.setattr(
-        runtime_info.importlib_metadata,
-        "distribution",
-        lambda _name: FakeDistribution(),
+        runtime_info,
+        "installed_distribution",
+        lambda: FakeDistribution(),
     )
     monkeypatch.setattr(runtime_info, "_git_info_for_repo", lambda _repo: "")
 
@@ -194,9 +194,9 @@ def test_format_runtime_info_reports_imported_repo_source_as_editable(
             return None
 
     monkeypatch.setattr(
-        runtime_info.importlib_metadata,
-        "distribution",
-        lambda _name: FakeDistribution(),
+        runtime_info,
+        "installed_distribution",
+        lambda: FakeDistribution(),
     )
     monkeypatch.setattr(runtime_info.sflow, "__file__", str(package / "__init__.py"))
     monkeypatch.setattr(runtime_info, "_git_info_for_repo", lambda _repo: "")
@@ -222,9 +222,9 @@ def test_format_runtime_info_omits_parent_repo_git_for_regular_install(
             return None
 
     monkeypatch.setattr(
-        runtime_info.importlib_metadata,
-        "distribution",
-        lambda _name: FakeDistribution(),
+        runtime_info,
+        "installed_distribution",
+        lambda: FakeDistribution(),
     )
     monkeypatch.setattr(runtime_info.sflow, "__file__", str(package / "__init__.py"))
     monkeypatch.setattr(runtime_info, "_find_repo_root", lambda _path: project)

@@ -457,7 +457,14 @@ def test_build_task_graph_passes_gpu_count_to_operator_when_backend_skips_gpu_pl
     assert "CUDA_VISIBLE_DEVICES" not in t1.envs
 
 
-def test_build_task_graph_docker_nodes_count_launches_one_container_per_host():
+def test_build_task_graph_rejects_a_task_asking_for_more_hosts_than_the_pool_has():
+    """Over-asking is caught by the ordinary planner rule, not a docker one.
+
+    A declared `hosts:` pool is just an allocation, the same shape Slurm hands
+    back after discovery, so the generic "needs N nodes, allocation has M" check
+    already covers it. Pinned here because the value of that uniformity is
+    exactly that nobody adds a backend-specific version of it later.
+    """
     state = _state()
     backend = DockerBackend(
         DockerBackendConfig(
@@ -465,8 +472,8 @@ def test_build_task_graph_docker_nodes_count_launches_one_container_per_host():
             type="docker",
             image="ubuntu:22.04",
             hosts=[
-                {"name": "dgx-a", "docker_host": "ssh://dgx-a", "gpus_per_node": 8},
-                {"name": "dgx-b", "docker_host": "ssh://dgx-b", "gpus_per_node": 8},
+                {"name": "dgx-a", "address": "10.0.0.11"},
+                {"name": "dgx-b", "address": "10.0.0.12"},
             ],
         )
     )
@@ -483,8 +490,59 @@ def test_build_task_graph_docker_nodes_count_launches_one_container_per_host():
                 "default": True,
                 "image": "ubuntu:22.04",
                 "hosts": [
-                    {"name": "dgx-a", "docker_host": "ssh://dgx-a"},
-                    {"name": "dgx-b", "docker_host": "ssh://dgx-b"},
+                    {"name": "dgx-a", "address": "10.0.0.11"},
+                    {"name": "dgx-b", "address": "10.0.0.12"},
+                ],
+            }
+        ],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="too_many",
+                    resources=ResourcesConfig(nodes=NodeResourceConfig(count=3)),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        build_task_graph(config, state)
+
+    message = str(excinfo.value)
+    assert "too_many" in message, "the task must be named"
+    assert "3" in message and "2" in message, "asked-for and available counts"
+
+
+def test_build_task_graph_docker_nodes_count_launches_one_container_per_host():
+    state = _state()
+    backend = DockerBackend(
+        DockerBackendConfig(
+            name="docker_cluster",
+            type="docker",
+            image="ubuntu:22.04",
+            hosts=[
+                {"name": "dgx-a", "address": "10.0.0.11", "gpus_per_node": 8},
+                {"name": "dgx-b", "address": "10.0.0.12", "gpus_per_node": 8},
+            ],
+        )
+    )
+    backend.allocation = asyncio.run(backend.allocate())
+    state.backends = {"docker_cluster": backend}
+    state.default_backend = backend
+
+    config = SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "docker_cluster",
+                "type": "docker",
+                "default": True,
+                "image": "ubuntu:22.04",
+                "hosts": [
+                    {"name": "dgx-a", "address": "10.0.0.11"},
+                    {"name": "dgx-b", "address": "10.0.0.12"},
                 ],
             }
         ],
@@ -512,10 +570,24 @@ def test_build_task_graph_docker_nodes_count_launches_one_container_per_host():
     task = tg.get_task("distributed_job")
 
     assert task.assigned_nodes == ["dgx-a", "dgx-b"]
-    script = task.launch_command.as_list()[2]
-    assert script.count("docker --host") == 4  # two run commands and two cleanup commands
-    assert "docker --host ssh://dgx-a run" in script
-    assert "docker --host ssh://dgx-b run" in script
+
+    # One container per assigned host, each addressing its own daemon.
+    argv = [
+        command.as_list()
+        for _member, command in task.operator._multi_node_commands(
+            task_name=task.name, script=task.runnable_script, envs=task.envs
+        )
+    ]
+    assert [args[:4] for args in argv] == [
+        ["docker", "--host", "ssh://10.0.0.11", "run"],
+        ["docker", "--host", "ssh://10.0.0.12", "run"],
+    ]
+    # And teardown reaps exactly those two, on the same daemons.
+    teardown = [c.as_list()[:3] for c in task.operator.teardown_commands(task_name=task.name)]
+    assert teardown == [
+        ["docker", "--host", "ssh://10.0.0.11"],
+        ["docker", "--host", "ssh://10.0.0.12"],
+    ]
 
 
 def test_build_task_graph_does_not_assign_synthetic_nodes_for_backend_without_node_placement():
@@ -565,6 +637,76 @@ def test_build_task_graph_does_not_assign_synthetic_nodes_for_backend_without_no
     assert t1.assigned_nodes == []
     assert "SFLOW_TASK_ASSIGNED_NODE_NAMES" not in t1.envs
     assert "SFLOW_TASK_ASSIGNED_NODE_IPS" not in t1.envs
+
+
+def _two_node_slurm_state(node_total: int = 2) -> SflowState:
+    state = _state()
+    state.backends = {
+        "b1": _FakeBackend(
+            "b1",
+            allocation=Allocation(
+                allocation_id="111",
+                nodes=[
+                    ComputeNode(name=f"n{i + 1}", ip_address=f"10.0.0.{i + 1}", index=i)
+                    for i in range(node_total)
+                ],
+            ),
+        )
+    }
+    state.default_backend = state.backends["b1"]
+    return state
+
+
+def _two_node_slurm_config(node_count: int, node_total: int = 2) -> SflowConfig:
+    return SflowConfig(
+        version="0.1",
+        backends=[
+            {
+                "name": "b1",
+                "type": "slurm",
+                "default": True,
+                "account": "acct",
+                "partition": "batch",
+                "time": "00:10:00",
+                "nodes": node_total,
+                "gpus_per_node": 8,
+            }
+        ],
+        operators=[{"name": "rec", "type": "recording"}],
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="t1",
+                    operator="rec",
+                    resources=ResourcesConfig(
+                        nodes=NodeResourceConfig(count=node_count),
+                    ),
+                    script=["echo hi"],
+                )
+            ],
+        ),
+    )
+
+
+def test_multi_node_task_gets_num_nodes_and_leader_address_on_any_backend():
+    """The multi-node wiring is set where nodes are assigned, not per operator.
+
+    Docker used to be the only backend exporting these, so a recipe that read
+    them ran on Docker and silently produced an empty `--nnodes` on Slurm.
+    """
+    tg = build_task_graph(_two_node_slurm_config(2), _two_node_slurm_state())
+    t1 = tg.get_task("t1")
+    assert t1.envs["SFLOW_TASK_NUM_NODES"] == "2"
+    assert t1.envs["SFLOW_LEADER_ADDRESS"] == "10.0.0.1"
+
+
+def test_single_node_task_gets_no_leader_address():
+    """No peer to rendezvous with, so offering an address would only mislead."""
+    tg = build_task_graph(_two_node_slurm_config(1), _two_node_slurm_state())
+    t1 = tg.get_task("t1")
+    assert t1.envs["SFLOW_TASK_NUM_NODES"] == "1"
+    assert "SFLOW_LEADER_ADDRESS" not in t1.envs
 
 
 def test_build_task_graph_count_only_sizes_non_placement_backend():
@@ -1662,6 +1804,146 @@ def test_build_task_graph_replica_sweep_uses_variable_domain_and_injects_envs():
     assert tg.get_task("benchmark_2").envs["CONCURRENCY"] == "2"
     assert tg.get_task("benchmark_4").envs["SFLOW_REPLICA_INDEX"] == "2"
     assert tg.get_task("benchmark_4").envs["CONCURRENCY"] == "4"
+
+
+def test_build_task_graph_replica_sweep_probes_resolve_per_replica_variables():
+    """SFLOW-245: each replica's probes use that replica's sweep value, not the global one."""
+    state = _state()
+    state.variables = {
+        "PORT": Variable(
+            name="PORT", value=8000, type=VariableType.INTEGER, domain=[8000, 8001]
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="nim",
+                    script=["echo ${PORT}"],
+                    replicas=ReplicaConfig(variables=["PORT"], policy="parallel"),
+                    probes={
+                        "readiness": [
+                            {"http_get": {"url": "http://localhost:${{ variables.PORT }}/ready"}},
+                            {"tcp_port": {"port": "${{ variables.PORT }}"}},
+                        ],
+                        "failure": {
+                            "http_post": {
+                                "url": "http://localhost:${{ variables.PORT }}/fail",
+                                "body": '{"port": ${{ variables.PORT }}}',
+                            }
+                        },
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, state)
+    for port in (8000, 8001):
+        get, tcp, post = tg.get_task(f"nim_{port}").probes
+        assert get._url == f"http://localhost:{port}/ready"
+        assert tcp._port == port
+        assert post._url == f"http://localhost:{port}/fail"
+        assert post._body == f'{{"port": {port}}}'
+
+
+def _port_sweep_state():
+    state = _state()
+    state.variables = {
+        "PORT": Variable(
+            name="PORT", value=8000, type=VariableType.INTEGER, domain=[8000, 8001]
+        )
+    }
+    state.backends = {"local": _FakeBackend("local", allocation=None)}
+    state.default_backend = state.backends["local"]
+    return state
+
+
+def test_build_task_graph_replica_sweep_service_port_resolves_per_replica():
+    """task.<replica>.service.port uses the replica's sweep value, not the global one."""
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="nim",
+                    script=["echo"],
+                    ports=[{"port": "${{ variables.PORT }}"}],
+                    replicas=ReplicaConfig(variables=["PORT"], policy="parallel"),
+                ),
+                TaskConfig(
+                    name="client",
+                    depends_on=["nim"],
+                    script=[
+                        "echo ${{ task.nim_8000.service.port }}",
+                        "echo ${{ task.nim_8001.service.port }}",
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, _port_sweep_state())
+    assert tg.get_task("client").script == ["echo 8000", "echo 8001"]
+
+
+def test_build_task_graph_parallel_replica_probe_not_shared_when_timing_is_swept():
+    """A fixed-URL HTTP probe with a swept timeout/delay is built per replica, not shared."""
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="nim",
+                    script=["echo"],
+                    replicas=ReplicaConfig(variables=["PORT"], policy="parallel"),
+                    probes={
+                        "readiness": {
+                            "http_get": {"url": "http://localhost:9000/ready"},
+                            "timeout": "${{ variables.PORT }}",
+                            "delay": "${{ variables.PORT }}",
+                        }
+                    },
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, _port_sweep_state())
+    assert tg.get_task("nim_8000").readiness_followers == []
+    for port in (8000, 8001):
+        (probe,) = tg.get_task(f"nim_{port}").probes
+        assert probe.timeout == port
+        assert probe.delay == port
+
+
+def test_build_task_graph_parallel_replica_probe_shared_when_unreferenced():
+    """Unchanged: an HTTP probe not mentioning a sweep var is shared via followers."""
+    config = SflowConfig(
+        version="0.1",
+        workflow=WorkflowConfig(
+            name="wf",
+            tasks=[
+                TaskConfig(
+                    name="nim",
+                    script=["echo"],
+                    replicas=ReplicaConfig(variables=["PORT"], policy="parallel"),
+                    probes={"readiness": {"http_get": {"url": "http://localhost:9000/ready"}}},
+                )
+            ],
+        ),
+    )
+
+    tg = build_task_graph(config, _port_sweep_state())
+    assert tg.get_task("nim_8000").readiness_followers == ["nim_8001"]
+    assert tg.get_task("nim_8001").probes == []
 
 
 def test_build_task_graph_resources_nodes_indices_selects_subset_of_allocation_nodes():

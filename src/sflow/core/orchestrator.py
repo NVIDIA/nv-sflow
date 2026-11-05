@@ -770,19 +770,6 @@ class Orchestrator:
                 # Teardown is best-effort; never let cleanup break the run.
                 pass
 
-    def _teardown_task_containers(self, task: Task) -> None:
-        """Synchronously reap external resources (e.g. Docker containers) a task
-        leaves behind.
-
-        Kept synchronous so the ``finally`` below can reap during cancellation
-        unwinding, where an ``await`` would itself be cancelled but a blocking
-        ``subprocess.run`` still completes. Killing the foreground ``docker run``
-        client never stops the daemon-managed container, so without this a
-        long-running server (e.g. an inference server held at READY until
-        teardown) would keep running on the host after the workflow.
-        """
-        self._run_teardown_commands(self._container_teardown_commands(task))
-
     async def _stop_remaining_subprocess_tasks(self, *, reason: str) -> None:
         """Cancel and await any still-running task processes, then clear the map.
 
@@ -907,7 +894,27 @@ class Orchestrator:
             # Runs on success, failure, timeout, and cancellation -- the only path
             # that guarantees the container is gone if the launch process was
             # SIGKILLed before it could honor --rm.
-            self._teardown_task_containers(task)
+            #
+            # Offloaded to a thread for the same reason the release below is. A
+            # reap is a `docker rm -f` per container, which against a REMOTE
+            # daemon is an ssh round trip -- seconds, not milliseconds. Run
+            # inline it froze this loop for ~10s per task (measured: 49s to tear
+            # down five server tasks across two hosts), stalling every other
+            # task's probes and log pumps for the duration.
+            #
+            # The await is safe in a `finally`: once asyncio.to_thread has handed
+            # the call to the executor, the worker runs to completion whatever
+            # happens to this coroutine -- so a cancellation arriving mid-reap
+            # can cost us the *wait*, never the reap itself.
+            #
+            # Only when there is something to reap, mirroring the `if acquires`
+            # below. An await is a cancellation point, so awaiting
+            # unconditionally would let a fail-fast sibling cancel a task that
+            # had already finished, reporting it CANCELLED instead of COMPLETED.
+            # Operators with no containers must keep a finally with no yield.
+            reap_commands = self._container_teardown_commands(task)
+            if reap_commands:
+                await asyncio.to_thread(self._run_teardown_commands, reap_commands)
             # Release the task's acquired resources (e.g. give its reserved GPUs
             # back to the registry). Best-effort; never break the run.
             #

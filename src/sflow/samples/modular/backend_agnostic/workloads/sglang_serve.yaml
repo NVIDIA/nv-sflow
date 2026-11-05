@@ -11,15 +11,19 @@
 version: "0.1"
 
 variables:
+  SGLANG_WATCHDOG_TIMEOUT:
+    description: "Seconds the SGLang scheduler may go without progressing a batch
+      before it SIGQUITs itself. The default (300) is shorter than this model's
+      one-time DeepGEMM JIT pre-compile, so a request that arrives during warmup
+      sat unserviced and killed a healthy worker with exit 137."
+    type: integer
+    value: 1800
   SERVED_MODEL_NAME:
     description: "Served model name (advertised by the OpenAI API)"
     value: Qwen3-0.6B
   SERVER_IMAGE:
     description: "SGLang runtime container image"
     value: lmsysorg/sglang:latest
-  MODEL_PATH:
-    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
-    value: /models/Qwen3-0.6B
   SERVER_GPUS:
     description: "GPUs per server (tensor-parallel size)"
     type: integer
@@ -35,9 +39,10 @@ workflow:
         - set -x
         - >
           python3 -m sglang.launch_server
-          --model-path ${{ variables.MODEL_PATH }}
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${{ variables.SERVED_MODEL_NAME }}
           --host 0.0.0.0 --port 8000
+          --watchdog-timeout ${{ variables.SGLANG_WATCHDOG_TIMEOUT }}
           --tp-size ${{ variables.SERVER_GPUS }}
           --trust-remote-code
       resources:

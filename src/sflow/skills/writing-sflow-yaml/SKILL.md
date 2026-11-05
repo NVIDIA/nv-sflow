@@ -1,5 +1,7 @@
 ---
 name: writing-sflow-yaml
+metadata:
+  author: Roger Liu <rogliu@nvidia.com>
 description: >-
   Write, create, and modify sflow YAML workflow configuration files. Covers schema structure,
   variables, task DAGs, backends (local, slurm, docker, kubernetes), operators, probes,
@@ -29,7 +31,7 @@ Every recipe has the same top-level shape. You design `workflow.tasks` first; th
 optional scaffolding you add only when a step calls for it.
 
 ```yaml
-version: "0.1"        # schema version (NOT the sflow release) — required in EVERY file
+version: "0.1"        # optional — schema version (NOT the sflow release); omit ⇒ "0.1"
 variables: { ... }    # optional — ${{ variables.X }} in YAML, ${X} in scripts
 artifacts: [ ... ]    # optional — named paths/URIs, auto-mounted at the same path
 backends:  [ ... ]    # optional — omit ⇒ a default `local` backend
@@ -44,6 +46,10 @@ Omit `backends`/`operators` and you get `local` + `bash` — enough to prototype
 laptop before touching a cluster.
 
 ---
+
+## Instructions
+
+Work through Steps 1–9 in order; each builds on the previous one.
 
 ## Step 1 — Shape the DAG (do this first)
 
@@ -89,9 +95,9 @@ here and expensive later.
   runs the lines as Python *source* via `python -c`).
 - **Don't inline files or hard-code paths.** Any file a script needs — launch/helper script,
   config, model dir, dataset — belongs in an **artifact** (Step 3), referenced as
-  `${{ artifacts.X.path }}`. Never embed Python via heredocs or `python3 -c` — quoting breaks
+  ``${{ artifacts.X.path }}``. Never embed Python via heredocs or `python3 -c` — quoting breaks
   when YAML → shell → Python nests.
-- **Reference values:** `${{ variables.X }}` in YAML (plan-time), `${X}` in scripts (runtime).
+- **Reference values:** ``${{ variables.X }}`` in YAML (plan-time), ``${X}`` in scripts (runtime).
   For arithmetic/comparison, set the variable's `type` (`integer`, …) or it stays a string.
 
 ```yaml
@@ -110,7 +116,7 @@ See examples.md Examples 1–2.
 **An artifact is a named path/URI that sflow resolves, validates, and — inside containers —
 auto-mounts at the *same absolute path* on every backend.** This is the biggest lever for
 portability: declare a path once and you stop caring *where* it lives or *how* to mount it.
-`${{ artifacts.X.path }}` (YAML, plan-time) and `${X}` (script, runtime) always agree, sflow
+``${{ artifacts.X.path }}`` (YAML, plan-time) and ``${X}`` (script, runtime) always agree, sflow
 **auto-checks** the reference at preflight, and **auto-mounts** it — so you never hand-write
 `container_mounts`, `docker -v`, or k8s `volumes` for it (doing so is redundant — pitfall 13).
 
@@ -217,10 +223,13 @@ Pick a backend and apply *its* rules. Start `local`, move to a cluster once the 
 multi-node placement on one machine.
 
 **`slurm`** — default operator `srun`. Backend needs `partition`, `account`, `time`
-(HH:MM:SS or int minutes), `nodes`, `gpus_per_node`. Containers: put `container_image` /
-`container_name` on an `srun` operator (reuse the image across tasks by `container_name`).
-Keep models / workspace / **output dir** on **shared storage** (Lustre/GPFS/NFS) so an
-`fs://` artifact auto-mounts at the same path on every node.
+(`H:MM:SS`, quoted or not, or int minutes), `nodes`, `gpus_per_node`. Containers: put
+`container_image` / `container_name` on an `srun` operator (reuse the image across tasks by
+`container_name`). Keep models / workspace / **output dir** on **shared storage**
+(Lustre/GPFS/NFS) so an `fs://` artifact auto-mounts at the same path on every node.
+`gpus_per_node` is planning-only: on a partition that declares `gpu:N` GRES, also request
+the GPUs from Slurm (`extra_args: ["--gpus-per-node=8"]` or `--extra-salloc-args`), or the
+allocation has no GPUs and the task sees `No devices were found`.
 
 ```yaml
 backends:
@@ -230,7 +239,7 @@ backends:
     nodes: 1
     partition: ${{ variables.PART }}      # block style: ${{ }} values can't sit in a { } flow map
     account: ${{ variables.ACCT }}
-    time: "01:00:00"                       # HH:MM:SS or int minutes
+    time: 01:00:00                         # H:MM:SS (quotes optional) or int minutes
     gpus_per_node: 8
 operators:
   - { name: ctr, type: srun, container_image: nvcr.io/nvidia/pytorch:24.07-py3,
@@ -238,12 +247,47 @@ operators:
 ```
 
 **`docker`** — backend is `type: docker`, its launch operator is `type: docker_run` (mind
-the naming). The `image` can live on the backend or the operator. Remote/multi-host via a
-`hosts:` list.
+the naming). The backend `image` is optional: it is only used by tasks that declare no
+`operator:` (every task naming a `docker_run` operator ⇒ leave it out). Rules that bite:
+- **Several machines ⇒ a `hosts:` pool**, one `address` per machine (IP, hostname, or
+  `~/.ssh/config` alias; `user:` when the login differs). sflow derives the `ssh://` docker
+  endpoint *and* the address peers dial from it; ssh from the driver must already work.
+  `hosts:` **is** the node list — omit `nodes:` or set it to the pool size; `nodes: N>1`
+  without `hosts:` is rejected at plan time.
+- Set `rendezvous_address` only when peers cannot dial `address` (an ssh alias, a separate
+  fabric). `docker_host` / `context` override the endpoint. `ip_address` is a deprecated
+  alias for `rendezvous_address`.
+- A pool may be heterogeneous: per-host `gpus_per_node`, `mounts`, `extra_args` are
+  *added* to the backend-level ones.
+- Pre-flight checks every host (daemon answers, bind-mount sources exist) before anything
+  launches; `SFLOW_SKIP_DOCKER_PREFLIGHT=1` bypasses it.
+- Controller paths are **not** auto-mounted on a declared host; local `fs://`/`file://`
+  artifacts are (same path), so they must exist on that machine. Put shared data under
+  `mounts:` at the same path on every host.
+- A multi-node task gets `SFLOW_TASK_NODE_INDEX` / `SFLOW_TASK_NUM_NODES` /
+  `SFLOW_LEADER_ADDRESS` per member; the first member to exit non-zero fails the task.
+  Docker creates no cross-host network, so pass `--network=host` for rendezvous ports.
+- `docker_run.rm: false` keeps an exited container for `docker logs` / `inspect`.
+
+```yaml
+backends:
+  - name: docker_cluster
+    type: docker
+    default: true
+    hosts:                                 # one address per machine; nodes: == len(hosts)
+      - { name: dgx-a, address: 10.0.0.11, gpus_per_node: 8 }
+      - { name: dgx-b, address: 10.0.0.12, user: ubuntu, gpus_per_node: 8 }
+operators:
+  - { name: ctr, type: docker_run, image: nvcr.io/nvidia/pytorch:24.12-py3,
+      extra_args: ["--network=host"] }
+```
+
+See examples.md Example 13.
 
 **`kubernetes`** — the workload **`image` lives on the `k8s` operator**, never the backend
 (the backend reserves + pins nodes with placeholder pods). Rules that bite:
-- Cluster access is **CLI-only** (`--kubeconfig` / `--kube-context` / `--kube-namespace`) so
+- Cluster access is **CLI-only** (`--kube-context` / `--kube-namespace`, plus a config-file
+  override listed in `sflow run --help`) so
   recipes stay cluster-agnostic; `namespace` is a backend field (one namespace per backend).
 - `resources.gpus.count` is a per-task **total**, split evenly across the task's nodes → must
   be a multiple of the node count. For an ordinary pod sflow leaves `CUDA_VISIBLE_DEVICES`
@@ -272,14 +316,15 @@ See the backends doc; examples.md Examples 8 (k8s), 10 (k8s + PVC), 11 (slurm + 
 ## Step 8 — Capture outputs
 
 - **Metrics:** add `result:` (a regex map, `patterns:`, or a JSON `file:`) to parse a task's
-  log/output into `${SFLOW_TASK_OUTPUT_DIR}/result.json` plus a workflow `results.json`.
+  log/output into ``${SFLOW_TASK_OUTPUT_DIR}/result.json`` plus a workflow `results.json`.
   Prefer it over the legacy `outputs:`. A task isn't `COMPLETED` until parsing finishes.
 - **Ship files:** name `storage:` S3 targets, then per-task `uploads:` (fire on `COMPLETED`)
   or `workflow.upload_all` (zip the whole run). Credentials come from the **boto3 default
-  chain** — never put secrets in YAML; needs the `sflow[s3]` extra.
-- **Telemetry:** `monitor:` samples GPU/CPU/mem/net on `local`/`slurm`/`docker` (not k8s yet),
-  or enable it without editing the recipe via `--enable-workflow-monitor` /
-  `--enable-task-monitor`.
+  chain** — never put secrets in YAML; needs the `nv-sflow[s3]` extra.
+- **Telemetry:** `monitor:` samples GPU/CPU/mem/net on `local`/`slurm`/`docker` — including
+  a Docker `hosts:` pool, where the collector runs bare on each host over ssh (the host needs
+  `python3`, plus `nvidia-smi` for the `gpu` scope) — not k8s yet. Or enable it without
+  editing the recipe via `--enable-workflow-monitor` / `--enable-task-monitor`.
 
 See examples.md Examples 12 (result parsing), 7 (monitor), 9 (uploads); the results / uploads / monitor docs.
 
@@ -306,7 +351,7 @@ sflow run -f my_workflow.yaml --dry-run                  # full plan + expressio
 ## Modular composition (when splitting across files)
 
 Pass fragments directly: `sflow run -f slurm.yaml -f common.yaml -f sglang/agg.yaml`.
-Files are combined with a **recursive deep merge keyed on `name`** — `version` must match;
+Files are combined with a **recursive deep merge keyed on `name`** — a declared `version` must match;
 `variables` / `artifacts` / `backends` / `operators` / `storage` and same-name
 `workflow.tasks` are deep-merged (one definition can be scattered across files); leaf
 scalars/lists are last-file-wins with a warning. Prefer `required_by:` on optional fragments
@@ -314,8 +359,8 @@ scalars/lists are last-file-wins with a warning. Prefer `required_by:` on option
 
 ## Pitfalls checklist
 
-1. Missing `version: "0.1"` in **every** file (including fragments).
-2. `${{ task.X.nodes }}` in a YAML field — task context works only in scripts.
+1. Declaring a `version` other than `"0.1"` — it is optional; omit it or use `"0.1"`.
+2. ``${{ task.X.nodes }}`` in a YAML field — task context works only in scripts.
 3. Forgetting `depends_on` — tasks run immediately without it.
 4. GPU oversubscription: Σ GPU counts > `nodes × gpus_per_node`.
 5. Probing a short-lived one-shot task (don't probe benchmarks).
@@ -325,11 +370,18 @@ scalars/lists are last-file-wins with a warning. Prefer `required_by:` on option
 9. K8s: an `fs://` path no `volumes:` PVC covers and the node lacks → the pod fails (hostPath). Use a PVC.
 10. Expecting K8s task outputs to persist — the output dir is an ephemeral `emptyDir`; use a PVC or `uploads:`.
 11. Multi-node Slurm with models/workspace/output on **node-local** storage — same-path mounts break; use shared storage.
-12. S3 secrets in YAML (use the boto3 chain) or forgetting the `sflow[s3]` extra.
+12. S3 secrets in YAML (use the boto3 chain) or forgetting the `nv-sflow[s3]` extra.
 13. Hand-writing mounts for a path already declared as an artifact — redundant; artifacts auto-mount same-path.
+14. Docker `nodes: 2` with no `hosts:` (rejected: multi-node docker means several machines), or `nodes:` ≠ the pool size.
+15. Relying on YAML 1.1 sexagesimals: `time: 10:00:00` is now the string it looks like (good), but so is every `H:MM` value — `DURATION: 1:30` is `"1:30"`, not `90`; write the number you mean.
+16. Slurm GRES partition with only `gpus_per_node:` set — that is planning-only; add `--gpus-per-node=N` to `extra_args` or the allocation has no GPUs.
+
+## Examples
+
+13 annotated, runnable recipes (local, Slurm, Docker hosts, Kubernetes, modular, sweeps,
+uploads) → [examples.md](examples.md). The steps above cite the relevant one.
 
 ## Additional resources
 
 - Field reference & merge rules → [schema-reference.md](schema-reference.md)
-- 12 annotated, runnable recipes → [examples.md](examples.md)
 - Full user docs → [nvidia.github.io/nv-sflow/docs/user/intro](https://nvidia.github.io/nv-sflow/docs/user/intro)

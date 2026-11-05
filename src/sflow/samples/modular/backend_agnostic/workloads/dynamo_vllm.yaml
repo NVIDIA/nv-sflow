@@ -13,9 +13,6 @@ variables:
   SERVER_IMAGE:
     description: "Dynamo vLLM runtime image"
     value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
-  MODEL_PATH:
-    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
-    value: /models/Qwen3-0.6B
   SERVER_GPUS:
     description: "GPUs per server (tensor-parallel size)"
     type: integer
@@ -30,7 +27,7 @@ workflow:
         - set -x
         - >
           python3 -m dynamo.vllm
-          --model ${{ variables.MODEL_PATH }}
+          --model ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${{ variables.SERVED_MODEL_NAME }}
           --tensor-parallel-size ${{ variables.SERVER_GPUS }}
       resources:

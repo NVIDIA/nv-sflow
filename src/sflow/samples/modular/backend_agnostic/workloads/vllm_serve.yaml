@@ -16,10 +16,7 @@ variables:
     value: Qwen3-0.6B
   SERVER_IMAGE:
     description: "vLLM OpenAI server container image"
-    value: vllm/vllm-openai:latest
-  MODEL_PATH:
-    description: "Model weights path visible to the server (PVC/hostPath on k8s, shared FS on slurm)"
-    value: /models/Qwen3-0.6B
+    value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
   SERVER_GPUS:
     description: "GPUs per server (tensor-parallel size)"
     type: integer
@@ -34,7 +31,7 @@ workflow:
       script:
         - set -x
         - >
-          vllm serve ${{ variables.MODEL_PATH }}
+          vllm serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --served-model-name ${{ variables.SERVED_MODEL_NAME }}
           --host 0.0.0.0 --port 8000
           --tensor-parallel-size ${{ variables.SERVER_GPUS }}

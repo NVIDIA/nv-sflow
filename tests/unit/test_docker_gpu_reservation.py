@@ -336,18 +336,25 @@ def test_no_nvidia_smi_falls_back_to_plan_slice_instead_of_failing(monkeypatch):
 
 
 def test_local_multi_node_keeps_the_plan_time_slice(monkeypatch):
-    # Synthetic multi-node placements can't use this host's registry (every
-    # "node" is the same machine), so they keep the planner's numeric slice.
+    # A multi-node placement can't use this host's GPU registry -- the members
+    # run on other machines whose devices it knows nothing about -- so it keeps
+    # the planner's numeric slice.
     _patch_gpus(monkeypatch, 8)
     backend = DockerBackend(
         DockerBackendConfig(
-            name="d", type="docker", image="ubuntu:22.04", nodes=2, gpus_per_node=4
+            name="d",
+            type="docker",
+            image="ubuntu:22.04",
+            hosts=[
+                {"name": "n0", "address": "10.0.0.11", "gpus_per_node": 4},
+                {"name": "n1", "address": "10.0.0.12", "gpus_per_node": 4},
+            ],
         )
     )
     op = backend.default_operator(name="op")
     op.apply_backend_context(
         backend=backend,
-        assigned_nodes=["d-node0", "d-node1"],
+        assigned_nodes=["n0", "n1"],
         artifacts=[],
         cuda_visible_devices="0,1",
         gpu_count=2,
@@ -518,13 +525,19 @@ def test_skipped_reservation_on_a_multi_node_placement_is_announced(
     _patch_gpus(monkeypatch, 8)
     backend = DockerBackend(
         DockerBackendConfig(
-            name="d", type="docker", image="ubuntu:22.04", nodes=2, gpus_per_node=4
+            name="d",
+            type="docker",
+            image="ubuntu:22.04",
+            hosts=[
+                {"name": "n0", "address": "10.0.0.11", "gpus_per_node": 4},
+                {"name": "n1", "address": "10.0.0.12", "gpus_per_node": 4},
+            ],
         )
     )
     op = backend.default_operator(name="op")
     op.apply_backend_context(
         backend=backend,
-        assigned_nodes=["d-node0", "d-node1"],
+        assigned_nodes=["n0", "n1"],
         artifacts=[],
         cuda_visible_devices="0,1",
         gpu_count=2,
@@ -532,7 +545,7 @@ def test_skipped_reservation_on_a_multi_node_placement_is_announced(
     with caplog.at_level("WARNING"):
         assert op.acquire_resources(task_name="t", envs={}) is None
     assert "GPU reservation skipped" in caplog.text
-    assert "spans 2 nodes" in caplog.text
+    assert "declared Docker host(s)" in caplog.text
 
     # Warned once, not on every retry/relaunch.
     caplog.clear()
@@ -562,7 +575,7 @@ def test_remote_host_skip_is_announced_too(monkeypatch, caplog):
     )
     with caplog.at_level("WARNING"):
         assert op.acquire_resources(task_name="t", envs={}) is None
-    assert "targets a remote Docker host" in caplog.text
+    assert "declared Docker host(s)" in caplog.text
 
 
 def test_extra_args_that_grant_gpus_are_flagged_against_the_reservation(

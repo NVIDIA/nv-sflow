@@ -5,12 +5,10 @@
 SFLOW - Workflow Orchestrator with Pluggable Backends
 """
 
+from sflow.utils.distribution import installed_distribution
+
 try:
     from sflow._version import version as __version__
 except ImportError:
-    from importlib.metadata import version, PackageNotFoundError
-
-    try:
-        __version__ = version("sflow")
-    except PackageNotFoundError:
-        __version__ = "unknown"
+    _dist = installed_distribution()
+    __version__ = _dist.version if _dist is not None else "unknown"

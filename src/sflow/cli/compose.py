@@ -14,10 +14,19 @@ import yaml
 
 from sflow.app.monitor_cli import inject_cli_monitors_into_dict
 from sflow.cli import DOCS_URL, app
+from sflow.cli._args import (
+    SshFetchOption,
+    SshFollowOption,
+    SshOption,
+    SshRemoteRootOption,
+    SshTtyOption,
+    reject_unhandled_ssh,
+)
 from sflow.config.loader import (
     ConfigLoader,
     _normalize_script_plain_mappings,
     merge_config_dicts,
+    safe_load,
 )
 from sflow.logging import configure_logging, get_logger
 from sflow.resolution import ExpressionResolver, resolve_variables_inline
@@ -85,7 +94,7 @@ def _compose_files(
     config_dicts: List[Dict[str, Any]] = []
     for path in files:
         with open(path, "r") as f:
-            data = yaml.safe_load(f)
+            data = safe_load(f)
         if data is None:
             raise ValueError(f"Configuration file is empty: {path}")
         _normalize_script_plain_mappings(data)
@@ -480,6 +489,22 @@ def compose(
             "and probes with a warning. Only valid with multiple input files or --bulk-input. Repeatable.",
         ),
     ] = None,
+    workspace_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--workspace-dir",
+            help="Workspace root directory for --ssh delegation "
+            "(resolves relative artifacts before staging). Default: current working directory.",
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+        ),
+    ] = None,
+    ssh: SshOption = None,
+    ssh_follow: SshFollowOption = "none",
+    ssh_fetch: SshFetchOption = "logs",
+    ssh_remote_root: SshRemoteRootOption = None,
+    ssh_tty: SshTtyOption = "auto",
 ):
     """
     Compose multiple sflow YAML files into a single valid workflow config.
@@ -512,6 +537,7 @@ def compose(
         # Bulk compose with validation (warns about resource issues)
         sflow compose --bulk-input jobs.csv --validate -o output_dir
     """
+    reject_unhandled_ssh(ssh)
     try:
         configure_logging(
             level=log_level, console=output is not None or bulk_input is not None

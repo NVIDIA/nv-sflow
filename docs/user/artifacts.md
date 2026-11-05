@@ -131,8 +131,8 @@ The expression is resolved before the artifact path is validated. This means:
 `fs://` artifact paths are checked on disk to surface missing paths early (before allocating backend resources). The severity depends on the run mode and backend:
 
 - **`--dry-run`**: a missing `fs://` path is a **warning** — the dry-run still succeeds.
-- **Real run on a local / Slurm / Docker backend**: a missing `fs://` path **fails** the run before allocation (`Artifact path validation failed`), so create input paths first.
-- **Off-host backends (e.g. Kubernetes)**: `fs://` paths are treated as **remote** paths on the cluster/image, so they are **not validated or created locally** — a missing path just warns. Ensure the path exists inside the pod (baked into the image, or mounted via a PVC/hostPath you configure).
+- **Real run on a local / Slurm / single-machine Docker backend**: a missing `fs://` path **fails** the run before allocation (`Artifact path validation failed`), so create input paths first. Docker bind-mounts local `fs://`/`file://` artifacts into the container at the same path, as `srun` does.
+- **Off-host backends (Kubernetes, a Docker backend with a `hosts:` pool)**: `fs://` paths are treated as **remote** paths on the execution hosts, so they are **not validated or created locally** — a missing path just warns. On Kubernetes, ensure the path exists inside the pod (baked into the image, or mounted via a PVC/hostPath you configure); on a Docker pool the backend's pre-flight checks the path on each host before anything launches.
 - **`--skip-artifact-check`**: opts any backend into that same treatment — a missing `fs://` path warns instead of failing, and is left alone rather than created as an empty directory. For paths that exist only where the task runs (e.g. on the Slurm compute nodes, not the login node). For `sflow batch`, pass it there and it is forwarded to the `sflow run` inside the job.
 - **`file://` paths with `content`**: skipped (the file is generated at runtime from the inline content).
 - **URIs with unresolved expressions**: skipped (validated later during full resolution).

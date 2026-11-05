@@ -1,0 +1,94 @@
+# Slurm MPI backend fragment for the modular samples.
+#
+# Same backend and the same logical operator names as backends/slurm.yaml
+# (server / helper / client), differing in ONE thing: how the model server is
+# launched. Here `server` is one MPI rank per GPU under pmix, which is what
+# TRT-LLM expects -- `trtllm-serve` and the Dynamo TRT-LLM workers are started
+# once per rank and discover each other through MPI.
+#
+# This is the Slurm twin of the k8s.yaml / k8s_mpi.yaml pair: the workload
+# fragments never name a launch model, they just say `operator: server`, and the
+# BACKEND fragment you compose decides what that means. Pick this file for
+# TRT-LLM; pick backends/slurm.yaml for vLLM and SGLang, which shard the model
+# inside a single process and would start SERVER_GPUS competing copies here.
+#
+# Compose with a workload + benchmark, e.g.:
+#   sflow run -f backends/slurm_mpi.yaml \
+#             -f workloads/dynamo_common.yaml -f workloads/dynamo_trtllm.yaml \
+#             -f benchmark.yaml --dry-run
+
+version: "0.1"
+
+variables:
+  SLURM_ACCOUNT:
+    description: "Slurm account"
+    value: your_account
+  SLURM_PARTITION:
+    description: "Slurm partition"
+    value: your_partition
+  SLURM_TIME:
+    description: "Slurm time limit (minutes or HH:MM:SS)"
+    value: 120
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 8
+  NUM_NODES:
+    description: "Number of nodes to allocate"
+    type: integer
+    value: 1
+  MPI_LAUNCH:
+    description: >-
+      Launcher prefix for the TRT-LLM workloads. Empty here: the srun operator already
+      starts SERVER_GPUS tasks under pmix, one per rank, so the workload command runs
+      directly in each. The other backend fragments set this to an mpirun prefix.
+    value: ""
+
+backends:
+  - name: cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: ${{ variables.NUM_NODES }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  # Model server launcher. `ntasks` = ranks (one per GPU) so intra/inter-node
+  # tensor parallelism runs under pmix; SERVER_GPUS comes from the workload.
+  # `ntasks_per_node` is capped at the node's GPU count so a server wider than one
+  # node spreads across nodes instead of over-subscribing the first one.
+  - name: server
+    type: srun
+    container_image: ${{ variables.SERVER_IMAGE }}
+    container_writable: true
+    mpi: pmix
+    ntasks: ${{ variables.SERVER_GPUS }}
+    ntasks_per_node: ${{ [ variables.SERVER_GPUS, variables.GPUS_PER_NODE ] | min }}
+  # CPU-only infra helpers (nats / etcd / frontend) share the server image. These
+  # are single-process regardless of how the server is launched.
+  - name: helper
+    type: srun
+    container_image: ${{ variables.SERVER_IMAGE }}
+    container_writable: true
+  # Benchmark client.
+  - name: client
+    type: srun
+    container_image: ${{ variables.CLIENT_IMAGE }}
+    container_writable: true
+
+artifacts:
+  # The model weights, declared HERE rather than in the workloads: getting the
+  # weights in front of the server is a backend concern (how a path becomes
+  # visible inside a container), while a workload only needs to name it. Every
+  # workload references it as `${{ artifacts.LOCAL_MODEL_PATH.path }}`.
+  #
+  # sflow mounts each fs:// artifact into the task container at the SAME path it
+  # has on the host (`--container-mounts` for srun), so the weights are actually
+  # present where the server looks for them -- a plain variable only NAMES a path.
+  #
+  # Point it at a real checkout per run:
+  #   -a LOCAL_MODEL_PATH=fs:///abs/path/to/model
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///models/Qwen3-0.6B

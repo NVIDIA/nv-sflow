@@ -1,3 +1,7 @@
+---
+sidebar_position: 5
+---
+
 # sflow v0.2.0 Release Notes
 
 **Release date:** March 2026  

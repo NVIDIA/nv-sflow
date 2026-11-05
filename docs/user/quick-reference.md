@@ -11,7 +11,7 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 
 | Field | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
-| `version` | Yes | string | — | Schema version. Must be `"0.1"`. |
+| `version` | No | string | `"0.1"` | Schema version. If declared, must be `"0.1"`. |
 | `variables` | | dict / list | — | Global variables available to expressions and task env. |
 | `artifacts` | | dict / list | — | Named resources referenced by URI. |
 | `backends` | | dict / list | — | Compute backends (`local`, `slurm`, `docker`, `kubernetes`). |
@@ -83,11 +83,35 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 |-------|----------|------|---------|-------------|
 | `account` | Yes | string / expr | — | Slurm account. |
 | `partition` | Yes | string / expr | — | Slurm partition. |
-| `time` | Yes | string / int / expr | — | Time limit — `HH:MM:SS` string or integer minutes. |
+| `time` | Yes | string / int / expr | — | Time limit — `HH:MM:SS` (quotes optional: `10:00:00` and `"10:00:00"` are equivalent) or integer minutes. |
 | `nodes` | Yes | int / expr | — | Number of nodes. |
 | `gpus_per_node` | Yes | int / expr | — | GPUs per node for planning. Set to `0` for CPU-only partitions; tasks that request `resources.gpus` against a zero-capacity backend will be rejected. |
 | `extra_args` | | list[string] | `null` | Extra `salloc` arguments (e.g. `--exclusive`, `--gpus-per-node=8`). |
 | `job_name` | | string | `null` | Job name; defaults to workflow name. |
+
+## Backends — Docker
+
+> Additional fields when `type: docker`. See [Docker backend](./backends.md#docker-backend).
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `image` | | string / expr | `null` | Default image for tasks with no `operator:` (and for the monitor container on a host with no ssh endpoint). Not needed when every task names a `docker_run` operator. |
+| `nodes` | | int / expr | `1` | Node count without a pool. With `hosts:` declared it must match the number of hosts (or be omitted). `nodes > 1` without `hosts:` is rejected. |
+| `hosts` | | list[object] | `null` | Static pool of Docker hosts; one container per assigned host for multi-node tasks. Fields below. |
+| `hosts[].name` | Yes | string | — | Node name (what `include_nodes`/`exclude_nodes` and logs refer to). |
+| `hosts[].address` | | string / expr | `null` | The machine: an IP, hostname or `~/.ssh/config` alias. Derives both the endpoint (`ssh://[user@]address`) and the rendezvous address. Required unless `docker_host` or `context` is set. |
+| `hosts[].user` | | string / expr | `null` | SSH user for the derived endpoint. |
+| `hosts[].docker_host` | | string / expr | `null` | Override the derived endpoint (`ssh://…` via a jump host, or `tcp://…`). Mutually exclusive with `context`. |
+| `hosts[].context` | | string / expr | `null` | Reach the daemon through a Docker context instead. Mutually exclusive with `docker_host`. |
+| `hosts[].rendezvous_address` | | string / expr | `null` | What peers dial for rank 0 (`SFLOW_LEADER_ADDRESS`) when it differs from `address`, e.g. an alias peers cannot resolve or a separate fabric. |
+| `hosts[].ip_address` | | string / expr | `null` | **Deprecated** alias for `rendezvous_address`; warns. Must not disagree with `address`. |
+| `hosts[].gpus_per_node` | | int / expr | backend value | This host's GPU count. |
+| `hosts[].mounts` / `hosts[].extra_args` | | list[string] | `null` | Added to the backend-level values for this host's containers only. |
+| `mounts` | | list[string] | `null` | Bind mounts (`host:container[:ro]`) for every container. |
+| `workdir` | | string / expr | `null` | Working directory inside every container. |
+| `extra_args` | | list[string] | `null` | Extra `docker run` args for every container. |
+| `offload_task_logs` | | bool | `true` | Write `<task>.log` on the container side instead of streaming through the driver. |
+| `wait_for_gpus` | | int / expr | `null` | Wait for free GPUs instead of failing fast: `0` forever, `N` seconds. Overridden by `--wait-for-gpus`. |
 
 ## Backends — Kubernetes
 
@@ -233,7 +257,10 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 | `mounts` | | list[string] | `[]` | Bind mounts (e.g. `"/host:/ctr:rw"`). |
 | `gpus` | | string | `null` | GPU spec (e.g. `all`, `device=0`). |
 | `extra_args` | | list[string] | `[]` | Extra `docker run` arguments. |
+| `rm` | | bool | `true` | Pass `--rm`. `false` keeps the exited container for `docker logs`/`inspect`; teardown then stops rather than removes it, and the next run reaps it as an orphan. |
 | `pass_envs` | | bool | `true` | Forward host environment variables. |
+| `auto_mount_runtime_dirs` | | bool | `true` | Bind-mount the workspace/output dirs at their own paths. Forced off on any declared `hosts:` entry. |
+| `log_to_file` | | bool | `true` | Offload this task's `<task>.log` to the container side (see [Operators](./operators.md#operator-matrix)). Skipped for multi-node tasks, whose members stream merged and rank-labelled. |
 
 ## Operators — SSH
 
@@ -490,7 +517,7 @@ To publish a metric literally named `file`, use `patterns:`; a top-level `file:`
 | `interval` | | int | `5000` | Sampling interval (ms) for built-in scopes without their own. |
 | `scopes` | | object | `null` (all) | Which scopes to collect — `cpu`, `gpu`, `memory`, `disk`, `network`, `custom`; omit ⇒ all built-ins active. |
 | `resources` | | object | `null` | Which hardware to target — `nodes` / `gpus` (like task resources) or `used_by_tasks: [names]`. |
-| `report` | | object | `{enabled: true}` | Post-run report. `format`: any of `csv`, `svg`, `png` (`png` needs the `sflow[monitor]` extra). |
+| `report` | | object | `{enabled: true}` | Post-run report. `format`: any of `csv`, `svg`, `png` (`png` needs the `nv-sflow[monitor]` extra). |
 | `report.enabled` | | bool | `true` | **On by default** whenever `monitor:` is set. Set `false` to opt out — worth doing on large fan-outs, since report cost scales with samples × views. Raw samples and the overview are still written. |
 | `window` | | object | `null` | `{start, end}` task-log markers bounding the reported window, so the report covers the benchmark rather than the whole task lifecycle. Task monitors only (rejected on `workflow.monitor`) and requires `report.enabled: true`. |
 
@@ -523,6 +550,8 @@ These are automatically set by sflow and available in every task script.
 | `SFLOW_REPLICA_INDEX` | Zero-based replica index (`0`, `1`, `2`, ...). |
 | `SFLOW_TASK_ASSIGNED_NODE_NAMES` | Comma-separated hostnames of nodes assigned to this task. |
 | `SFLOW_TASK_ASSIGNED_NODE_IPS` | Comma-separated IP addresses of nodes assigned to this task. |
+| `SFLOW_TASK_NUM_NODES` | Number of nodes assigned to this task. |
+| `SFLOW_LEADER_ADDRESS` | Rank 0's address, for peers to rendezvous against. Multi-node tasks only. |
 | `SFLOW_BACKEND_JOB_ID` | Backend allocation/job id when available. For Slurm this mirrors `SLURM_JOB_ID` / `SLURM_JOBID`. |
 | `SFLOW_BACKEND_NODELIST` | Backend allocation nodelist when available. For Slurm this mirrors `SLURM_JOB_NODELIST` / `SLURM_NODELIST`. |
 | `SFLOW_BACKEND_NUM_NODES` | Number of nodes in the backend allocation when available. For Slurm this mirrors `SLURM_NNODES`. |

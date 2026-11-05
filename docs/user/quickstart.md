@@ -5,15 +5,27 @@ sidebar_position: 2
 
 ## Install sflow
 
+**Using an AI coding agent?** Paste this into Claude Code, Codex, Cursor or any other coding agent. It installs sflow, checks that it runs, and installs the sflow skills for that agent (the [agent setup runbook](/docs/agents/setup) is what it follows):
+
+```text
+Set up sflow for me by following
+https://raw.githubusercontent.com/NVIDIA/nv-sflow/main/docs-site/agents-src/setup.md
+step by step, then tell me what you installed and where.
+```
+
+**By hand:**
+
 ```bash
 mkdir -p sflow_workspace && cd sflow_workspace
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python python3
 source .venv/bin/activate
-uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
+uv pip install nv-sflow
 sflow --help
 sflow --version   # or: sflow -V — print version + runtime/build details
 ```
+
+> Coming from **v0.3.1 or earlier**? The distribution is now `nv-sflow` on PyPI: `pip install nv-sflow`, or run `sflow upgrade` twice (GitHub build first, then PyPI). Never `pip install sflow` — that name on pypi.org is an unrelated project.
 
 If `curl` is unavailable (e.g. on some locked-down clusters), install `uv` via pip instead:
 
@@ -24,8 +36,8 @@ pip install uv
 **Optional extras** enable features that pull in extra dependencies:
 
 ```bash
-pip install 'sflow[s3]'        # S3 artifact/result uploads (boto3)
-pip install 'sflow[monitor]'   # PNG charts for the hardware monitor
+pip install 'nv-sflow[s3]'        # S3 artifact/result uploads (boto3)
+pip install 'nv-sflow[monitor]'   # PNG charts for the hardware monitor
 ```
 
 ---
@@ -57,7 +69,7 @@ This guide teaches sflow in three parts:
 - **Part III: Run on Kubernetes** – Take the same config to a Kubernetes cluster
 
 :::tip More backends
-This quickstart covers `local`, `slurm`, and `kubernetes`. The same YAML also runs on the **Docker** backend — just swap the backend block. See [Backends](./backends.md) for all four.
+This quickstart covers `local` (Part I), `slurm` (Part II), `kubernetes` (Part III) and **multi-host Docker** (Part IV). The same YAML moves between them by swapping the backend block. See [Backends](./backends.md) for every field.
 :::
 
 ---
@@ -527,7 +539,7 @@ sflow batch \
   --submit
 ```
 
-> Note: `--gpus-per-node` (`-G`) sets the cluster topology for sflow's resource planning (default: 4). It does NOT add a `#SBATCH --gpus-per-node` directive. If your cluster requires that directive, add it via `-e '--gpus-per-node=4'`.
+> Note: `--gpus-per-node` (`-G`) sets the cluster topology for sflow's resource planning (derived from the config's backend when omitted). It does NOT add a `#SBATCH --gpus-per-node` directive. If your cluster requires that directive, add it via `-e '--gpus-per-node=4'`.
 
 #### With Variable Overrides
 
@@ -587,7 +599,7 @@ After submission, monitor your job with standard Slurm commands:
 ```bash
 squeue -u $USER           # Check job status
 scancel <job_id>          # Cancel a job
-tail -f sflow_output/sflow-<job_id>.out  # Follow output logs
+tail -f sflow_output/<job_id>-sflow-submit.out  # Follow output logs
 ```
 
 ---
@@ -603,7 +615,7 @@ flowchart TD
   Y["recipe.yaml<br/>backends: kubernetes · operators: k8s (image) · workflow.tasks"] -->|sflow run -f recipe.yaml --kube-namespace ml-team| P["1 · Pre-flight RBAC check<br/>2 · Reserve nodes/GPUs<br/>3 · Launch task pods<br/>4 · Execute DAG"]
 ```
 
-:::note Requires sflow v0.3.0+
+:::note
 A few things differ from Slurm on the Kubernetes backend today:
 
 - `sflow run` is **interactive (attached) only** — there is no `sflow batch` / fire-and-forget mode on K8S yet, so the driver process must stay connected for the whole run.
@@ -757,4 +769,132 @@ It shows a 3-node, 8-GPU-per-node backend with `host_network`, `host_ipc` (cross
 ```bash
 sflow sample --list
 ```
+
+---
+
+## Part IV: Multi-host Docker
+
+No scheduler, just a few machines you can already SSH into? Declare them once and
+sflow treats that inventory the way it treats a Slurm partition: one `docker run`
+per assigned host, supervised as a single task. You need sflow installed on the
+driver (see [Install sflow](#install-sflow)) and nothing on the hosts beyond Docker
+itself — and the NVIDIA Container Toolkit for GPU tasks.
+
+**How it works (Docker pool example):**
+
+```mermaid
+flowchart TD
+  Y["recipe.yaml<br/>backends: docker + hosts: · operators: docker_run · workflow.tasks"] -->|sflow run -f recipe.yaml| P["1 · Pre-flight every host (daemon, mounts)<br/>2 · Reserve hosts/GPUs<br/>3 · One docker run per host over ssh<br/>4 · Execute DAG, merged rank-labelled logs"]
+```
+
+:::note
+Compared with Slurm and Kubernetes:
+
+- A host is identified by its **`address`**. sflow derives the Docker endpoint (`ssh://[user@]address`) *and* the address peers dial to rendezvous from it. SSH must already work from the driver; port, key and `ProxyJump` stay in `~/.ssh/config`, and an ssh alias works as the address (set `rendezvous_address` when peers cannot resolve the alias).
+- **`hosts:` is the node list.** A backend-level `nodes:` asking for a different count is rejected rather than ignored.
+- Docker creates no cross-host network, so cross-node traffic uses the hosts' own interfaces — `--network=host` on the operator and a port every host can reach.
+- `monitor:` runs its collector **on each host** over the same SSH connection, so the hardware report shows the pool, not the driver.
+- Like Kubernetes, `sflow run` is attached; there is no `sflow batch` for Docker.
+:::
+
+### 1. Prepare a Multi-host Workflow
+
+The packaged two-host `torchrun` smoke test is the smallest complete example:
+
+```bash
+sflow sample self_contained/docker/multi_node     # writes multi_node.yaml
+```
+
+Its essentials — the pool, the operator, and a task that spans the pool:
+
+```yaml
+backends:
+  - name: docker_cluster
+    type: docker
+    default: true
+    image: ${{ variables.PYTORCH_IMAGE }}
+    hosts:
+      - name: node-0
+        address: ${{ variables.HOST_0_ADDRESS }}   # 10.0.0.11, or an ssh alias
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+      - name: node-1
+        address: ${{ variables.HOST_1_ADDRESS }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: torchrun_container
+    type: docker_run
+    image: ${{ variables.PYTORCH_IMAGE }}
+    extra_args:
+      - --entrypoint=        # third-party images may set one; sflow launches through bash
+      - --network=host       # the rendezvous port must be reachable on the host interface
+
+workflow:
+  name: docker_multi_node
+  tasks:
+    - name: distributed_job
+      operator: torchrun_container
+      resources:
+        nodes:
+          count: ${{ variables.NUM_NODES }}
+        gpus:
+          count: ${{ variables.NUM_NODES * variables.NPROC_PER_NODE }}   # TOTAL across the task's nodes
+      script:
+        - >
+          torchrun
+          --nnodes="$SFLOW_TASK_NUM_NODES"
+          --node-rank="$SFLOW_TASK_NODE_INDEX"
+          --master-addr="$SFLOW_LEADER_ADDRESS"
+          --master-port=${{ variables.MASTER_PORT }}
+          ...
+```
+
+The same `SFLOW_TASK_NUM_NODES` / `SFLOW_TASK_NODE_INDEX` / `SFLOW_LEADER_ADDRESS`
+variables you used on Slurm are set in every container, so a launcher command does
+not change between backends. A host may also carry its own `user`, `mounts` and
+`extra_args` for a pool that is not uniform — see
+[Multi-node Docker hosts](./backends.md#multi-node-docker-hosts).
+
+### 2. Run Across the Pool
+
+Point the recipe at your machines with `--set` (or edit the variable defaults),
+validate without touching them, then run:
+
+```bash
+sflow run -f multi_node.yaml \
+  -s HOST_0_ADDRESS=10.0.0.11 -s HOST_1_ADDRESS=10.0.0.12 -s GPUS_PER_NODE=8 \
+  --dry-run
+
+sflow run -f multi_node.yaml \
+  -s HOST_0_ADDRESS=10.0.0.11 -s HOST_1_ADDRESS=10.0.0.12 -s GPUS_PER_NODE=8 \
+  --tui
+```
+
+Before anything launches, sflow **pre-flights the pool**: a bounded `docker version`
+over each host's endpoint (ssh auth, tunnel and daemon in one call) and a check that
+every bind-mount source exists on that machine (Docker would otherwise create a
+missing source as an empty directory). All problems across the pool are reported
+together, naming the host. During the run the first member to exit non-zero
+**fails the task with its exit code** and the peers are stopped; after a crash the
+next run **reclaims** any container left on any host. A successful run prints both
+ranks, each log line labelled with its node and rank.
+
+**Prerequisites:**
+
+- `ssh <address>` works non-interactively from the driver to every host (keys, `BatchMode`); sflow never prompts.
+- Docker on every host; the NVIDIA Container Toolkit on every host that runs GPU tasks, with `gpus_per_node` set to that host's GPU count.
+- The hosts can reach each other on the ports your launcher uses (`MASTER_PORT` above).
+
+### 3. A Real GPU Workload
+
+For disaggregated LLM serving across two hosts, grab the packaged sample:
+
+```bash
+sflow sample self_contained/docker/dynamo_vllm_disagg
+```
+
+It places the prefill and decode servers on different hosts of the pool, with the
+NATS/etcd/frontend infra and the benchmark client as sibling tasks, and reports the
+pool's GPUs in the hardware monitor. `self_contained/docker/dynamo_vllm_agg` is the
+single-pool aggregated variant. Browse every Docker starter with `sflow sample --list`.
 

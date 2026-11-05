@@ -1066,9 +1066,10 @@ def _sanitize_log_line(body: str) -> str:
     trailing newline.
 
     Used ONLY by the post-run finalize (:func:`sanitize_streamed_logs`), which runs
-    after the pod's follow has ended -- never on the live offload path. So a TTY task's
-    color/cursor/progress control bytes (aiperf/rich, ``pip``) don't pollute the
-    persisted ``<task>.log``, while live streaming stays untouched.
+    after the pod's follow has ended. On the live path, the merged-pod demuxer
+    already strips ANSI per line (so readiness probes see clean text while it
+    matters); the single-pod ``kubectl logs -f >> file`` redirect has no process to
+    do that in, so its colour -- and every path's ``\\r`` redraws -- are cleaned here.
     """
     return strip_ansi(last_visible_frame(body))
 

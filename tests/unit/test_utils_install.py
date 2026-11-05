@@ -63,15 +63,15 @@ class TestGitSpec:
 
 class TestPypiRequirement:
     def test_empty_installs_latest(self):
-        assert sflow_pypi_requirement(None) == "sflow"
-        assert sflow_pypi_requirement("   ") == "sflow"
+        assert sflow_pypi_requirement(None) == "nv-sflow"
+        assert sflow_pypi_requirement("   ") == "nv-sflow"
 
     def test_bare_version_is_pinned(self):
-        assert sflow_pypi_requirement("0.2.1") == "sflow==0.2.1"
+        assert sflow_pypi_requirement("0.2.1") == "nv-sflow==0.2.1"
 
     def test_operator_spec_is_passed_through(self):
-        assert sflow_pypi_requirement(">=0.2,<0.3") == "sflow>=0.2,<0.3"
-        assert sflow_pypi_requirement("~=0.2.0") == "sflow~=0.2.0"
+        assert sflow_pypi_requirement(">=0.2,<0.3") == "nv-sflow>=0.2,<0.3"
+        assert sflow_pypi_requirement("~=0.2.0") == "nv-sflow~=0.2.0"
 
 
 class TestIndexUrlError:

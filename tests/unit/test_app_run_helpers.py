@@ -181,13 +181,17 @@ def test_preflight_validate_artifacts_warns_for_missing_fs_path_when_offhost(tmp
 
 
 def test_config_uses_offhost_backend_detects_kubernetes():
-    k8s = SimpleNamespace(backends=[SimpleNamespace(type="kubernetes")])
-    mixed = SimpleNamespace(
-        backends=[SimpleNamespace(type="slurm"), {"type": "kubernetes"}]
-    )
-    local = SimpleNamespace(
-        backends=[SimpleNamespace(type="slurm"), SimpleNamespace(type="local")]
-    )
+    from sflow.config.schema import BackendConfig
+    from sflow.plugins.backends.kubernetes import KubernetesBackendConfig
+
+    # Typed configs, as SflowConfig.backends holds them: each answers
+    # executes_offhost() for itself.
+    k8s_cfg = KubernetesBackendConfig(name="k", type="kubernetes")
+    slurm_cfg = BackendConfig(name="s", type="slurm")
+    local_cfg = BackendConfig(name="l", type="local")
+    k8s = SimpleNamespace(backends=[k8s_cfg])
+    mixed = SimpleNamespace(backends=[slurm_cfg, k8s_cfg])
+    local = SimpleNamespace(backends=[slurm_cfg, local_cfg])
     assert config_uses_offhost_backend(k8s) is True
     assert config_uses_offhost_backend(mixed) is True
     assert config_uses_offhost_backend(local) is False

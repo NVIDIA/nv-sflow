@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import IO, Any, Dict, List, Optional
 
 import yaml
 from pydantic import ValidationError
@@ -15,6 +16,63 @@ from sflow.resolution import ExpressionResolver
 from .schema import SflowConfig
 
 _logger = get_logger(__name__)
+
+
+# --- YAML 1.2 scalar rules ---------------------------------------------------
+# PyYAML implements YAML 1.1, which resolves `10:00:00` to the base-60 integer
+# 36000. Slurm walltimes are written in exactly that shape, so an unquoted
+# `time: 10:00:00` became `--time=36000` -- and Slurm reads a bare integer as
+# *minutes*, turning a 10-hour request into 25 days. The sexagesimal float form
+# (`10:00:00.5`) failed schema validation outright.
+#
+# Why this is fixed here and not with a pydantic validator on the field: the
+# loss happens strictly upstream of pydantic. By the time a validator runs it
+# has received the integer 36000, which is indistinguishable from a legitimate
+# `time: 5400` (Slurm reads a bare int as minutes). A validator could reject,
+# never repair, and would only cover `slurm.time` rather than every field.
+#
+# YAML 1.2 removed sexagesimal scalars. Below are PyYAML's own int/float
+# patterns with only the `(:[0-5]?[0-9])+` branch dropped; every other rule is
+# copied verbatim, including the quirk that an exponent requires a sign (so
+# `1e10` stays a string exactly as before). Only `H:MM:SS`-shaped values change.
+# `test_patterns_stay_in_sync_with_pyyaml` fails loudly if PyYAML edits these.
+_INT_WITHOUT_SEXAGESIMAL = re.compile(
+    r"""^(?:[-+]?0b[0-1_]+
+        |[-+]?0[0-7_]+
+        |[-+]?(?:0|[1-9][0-9_]*)
+        |[-+]?0x[0-9a-fA-F_]+)$""",
+    re.X,
+)
+_FLOAT_WITHOUT_SEXAGESIMAL = re.compile(
+    r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?
+        |\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?
+        |[-+]?\.(?:inf|Inf|INF)
+        |\.(?:nan|NaN|NAN))$""",
+    re.X,
+)
+_PATCHED_PATTERNS = {
+    "tag:yaml.org,2002:int": _INT_WITHOUT_SEXAGESIMAL,
+    "tag:yaml.org,2002:float": _FLOAT_WITHOUT_SEXAGESIMAL,
+}
+
+
+class SflowSafeLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` without YAML 1.1 base-60 int/float scalars."""
+
+
+# Copying the table first is required: `yaml_implicit_resolvers` is inherited by
+# reference, so mutating it in place would reconfigure `yaml.safe_load` process-wide.
+SflowSafeLoader.yaml_implicit_resolvers = {
+    first_char: [
+        (tag, _PATCHED_PATTERNS.get(tag, pattern)) for tag, pattern in resolvers
+    ]
+    for first_char, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
+def safe_load(stream: str | bytes | IO[str] | IO[bytes]) -> Any:
+    """Drop-in ``yaml.safe_load`` that keeps ``H:MM:SS`` values as strings."""
+    return yaml.load(stream, Loader=SflowSafeLoader)
 
 
 def strip_missable_tasks(
@@ -443,8 +501,8 @@ def merge_config_dicts(
             )
 
     errors: list[str] = []
-    if "version" not in merged:
-        errors.append("No 'version' field found in any input file")
+    # `version` is optional and defaults to "0.1" in the schema. A conflict
+    # between files is still a hard error (handled above), but absence is fine.
     wf = merged.get("workflow")
     if not wf:
         errors.append("No 'workflow' section found in any input file")
@@ -561,7 +619,7 @@ class ConfigLoader:
 
         try:
             with open(path, "r") as f:
-                config_data = yaml.safe_load(f)
+                config_data = safe_load(f)
         except yaml.YAMLError as e:
             raise ValueError(f"Error parsing YAML configuration: {e}")
 
@@ -625,7 +683,7 @@ class ConfigLoader:
                 raise FileNotFoundError(f"Configuration file not found: {path}")
             try:
                 with open(path, "r") as f:
-                    data = yaml.safe_load(f)
+                    data = safe_load(f)
             except yaml.YAMLError as e:
                 raise ValueError(f"Error parsing YAML configuration ({path}): {e}")
             if data is None:

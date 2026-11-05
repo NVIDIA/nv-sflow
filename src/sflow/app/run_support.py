@@ -42,6 +42,8 @@ SFLOW_RESERVED_ENV_VARS = frozenset(
         "SFLOW_BACKEND_STEP_ID",
         "SFLOW_TASK_NODE_NAME",
         "SFLOW_TASK_NODE_INDEX",
+        "SFLOW_TASK_NUM_NODES",
+        "SFLOW_LEADER_ADDRESS",
         "SFLOW_TASK_PROCESS_ID",
         "SFLOW_TASK_LOCAL_PROCESS_ID",
         "SFLOW_TASK_NUM_PROCESSES",
@@ -129,47 +131,69 @@ def _resolve_raw_variable_refs(uri: str, raw_vars: dict[str, Any]) -> str:
     return re.sub(r"\$\{\{(.+?)\}\}", _resolve_var, uri)
 
 
-# Off-host backend detection lives here as the single source of truth. There are
-# two checks because they run at different stages, but they must agree:
-#   * config_uses_offhost_backend  -- by backend *type*, BEFORE resolution.
-#   * backends_execute_offhost     -- by *capability*, AFTER resolution.
-# When adding a new off-host backend, add its type here AND set
-# ``supports_host_path_mounts=False`` on its capabilities so both checks match.
-_OFFHOST_BACKEND_TYPES = frozenset({"kubernetes"})
+# Off-host detection runs at two stages. BEFORE resolution each backend config
+# answers for itself (``BackendConfig.executes_offhost``); AFTER resolution the
+# built backend's ``supports_host_path_mounts`` capability is read. A backend
+# keeps the two in step by deriving the capability from its config's answer.
 
 
 def config_uses_offhost_backend(config: Any) -> bool:
-    """True if any configured backend executes off the controller host (e.g. k8s).
+    """True if any configured backend executes off the controller host.
 
-    Determined from the backend *type* at config time (before backends are
-    resolved). Such backends run tasks remotely, so a local ``fs://`` artifact path
-    refers to a location on the cluster/image, not the controller -- it must not be
-    hard-validated locally. Pre-resolution twin of :func:`backends_execute_offhost`
-    (which checks ``supports_host_path_mounts`` on resolved backends).
+    Pre-resolution twin of :func:`backends_execute_offhost`. Such backends run
+    tasks remotely, so a local ``fs://`` artifact path refers to a location on
+    the cluster/image, not the controller -- it must not be hard-validated
+    locally.
     """
-    for backend in getattr(config, "backends", None) or []:
-        btype = getattr(backend, "type", None)
-        if btype is None and isinstance(backend, dict):
-            btype = backend.get("type")
-        if str(btype) in _OFFHOST_BACKEND_TYPES:
-            return True
-    return False
+    return any(
+        backend.executes_offhost()
+        for backend in getattr(config, "backends", None) or []
+    )
 
 
-def backends_execute_offhost(state: Any) -> bool:
-    """True if any resolved backend executes off the controller host (no host mounts).
+def offhost_backend_names(state: Any) -> set[str]:
+    """Names of resolved backends that execute off the controller host.
 
     Post-resolution twin of :func:`config_uses_offhost_backend`: checks the
     resolved backends' ``supports_host_path_mounts`` capability. Such backends
-    (e.g. Kubernetes) run tasks remotely, so local ``fs://`` artifact paths refer
-    to the cluster/image rather than the controller and must not be validated or
-    created locally.
+    (e.g. Kubernetes, or a Docker pool with declared ``hosts:``) run tasks
+    remotely, so local ``fs://`` artifact paths refer to the cluster/image
+    rather than the controller and must not be validated or created locally.
+
+    Returns the names, not just a flag, because callers need both questions
+    answered from one rule: "is anything off-host?" and "which tasks do I skip?"
+    Answering the second by re-inlining the capability check left two spellings
+    of one predicate that had to be kept in step by hand.
     """
-    return any(
-        not getattr(
+    return {
+        name
+        for name, backend in (getattr(state, "backends", None) or {}).items()
+        if not getattr(
             getattr(backend, "capabilities", None), "supports_host_path_mounts", True
         )
-        for backend in (getattr(state, "backends", None) or {}).values()
+    }
+
+
+def backends_execute_offhost(state: Any) -> bool:
+    """True if any resolved backend executes off the controller host."""
+    return bool(offhost_backend_names(state))
+
+
+def backends_inject_inline_content(state: Any) -> bool:
+    """True if a resolved backend delivers file:// inline content into the task.
+
+    Narrower than :func:`backends_execute_offhost` on purpose. Running off-host
+    means a local ``fs://`` path says nothing about where the work runs; it does
+    NOT mean someone else will deliver the file. Only a backend that injects it
+    natively (Kubernetes, via a ConfigMap) may skip writing an absolute
+    ``file://`` artifact on the controller -- a Docker host pool is off-host with
+    no such mechanism, so for it that write is the only one that ever happens.
+    """
+    return any(
+        getattr(
+            getattr(b, "capabilities", None), "injects_inline_artifact_content", False
+        )
+        for b in (getattr(state, "backends", None) or {}).values()
     )
 
 
@@ -274,11 +298,25 @@ def ensure_sflow_dir_mounts_for_container_operator(
         return
 
 
-def validate_container_mounts(tasks: list[Any], *, sflow_output_dir: Path) -> list[str]:
-    """Check dry-run container mount source paths that should already exist."""
+def validate_container_mounts(
+    tasks: list[Any],
+    *,
+    sflow_output_dir: Path,
+    offhost_backends: set[str] | None = None,
+) -> list[str]:
+    """Check dry-run container mount source paths that should already exist.
+
+    Tasks on an off-host backend are skipped: their mounts resolve on another
+    machine, so stat-ing this one reports a path "missing" that is present
+    everywhere it matters. Those hosts are checked by the backend's own
+    pre-flight instead.
+    """
     warnings: list[str] = []
     sflow_out_str = str(sflow_output_dir)
+    skip_backends = offhost_backends or set()
     for task in tasks:
+        if getattr(task, "backend_name", None) in skip_backends:
+            continue
         op = getattr(task, "operator", None)
         op_conf = getattr(op, "config", None)
         if op_conf is None:
@@ -302,6 +340,39 @@ def validate_container_mounts(tasks: list[Any], *, sflow_output_dir: Path) -> li
                     f"Task '{task.name}': mount source path does not exist: {host_path}"
                 )
     return warnings
+
+
+def render_launch_preview(task: Any) -> list[str]:
+    """Dry-run lines showing every command a fan-out task really launches.
+
+    A task whose operator spreads one logical task over several commands (a
+    Docker pool sending one ``docker run`` per host) otherwise shows a single
+    representative in the plan, and the command log that would show the rest is
+    only written once commands are actually issued -- so the fan-out is
+    invisible in exactly the run you wanted to review it in.
+
+    Returns ``[]`` for ordinary one-command tasks, so nothing changes for the
+    backends that have always rendered fine.
+    """
+    operator = getattr(task, "operator", None)
+    preview = getattr(operator, "dry_run_launch_preview", None)
+    if not callable(preview):
+        return []
+    entries = preview(
+        task_name=task.name,
+        script=getattr(task, "runnable_script", None) or [],
+        envs=getattr(task, "envs", None) or {},
+    )
+    if not entries:
+        return []
+    # Its own block, not another tree branch: "operator config" above already
+    # closes the task's tree with a `└─`, and a second one would read as two
+    # last children of the same node.
+    lines = [f"      fan-out: {len(entries)} commands, one per member"]
+    for label, command in entries:
+        lines.append(f"         • {label}")
+        lines.append(f"           {command}")
+    return lines
 
 
 def collect_operator_runtime_warnings(tasks: list[Any]) -> list[str]:
