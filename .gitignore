@@ -228,6 +228,7 @@ tools
 sflow_output
 .sflow_cache
 docs-site/.generated/
+docs-site/static/vllm-recipes/recipe_data.json.gz
 docs-site/versioned_docs/
 docs-site/versioned_sidebars/
 docs-site/versions.json
