@@ -463,7 +463,7 @@ Given:
 
 ```
 Host dgx-a
-  HostName 10.117.29.197
+  HostName 10.0.0.11
   User ubuntu
   Port 2222
   IdentityFile ~/.ssh/lab

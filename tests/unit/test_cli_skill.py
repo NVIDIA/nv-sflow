@@ -297,7 +297,10 @@ class TestAgentSetupRunbook:
             assert result.exit_code == 0, f"sflow {command}\n{result.output}"
 
     def test_installs_the_published_distribution(self):
-        name = re.search(
-            r'^name = "([^"]+)"', (_REPO / "pyproject.toml").read_text(), re.MULTILINE
-        ).group(1)
-        assert f"uv tool install {name}\n" in _RUNBOOK.read_text(encoding="utf-8")
+        # The runbook installs the PyPI distribution, not whatever this checkout's
+        # pyproject is named: the public GitHub mirror deliberately builds `sflow`
+        # (so pre-0.3.2 `sflow upgrade` keeps resolving) while PyPI is `nv-sflow`.
+        # Reading pyproject here made this test fail on the mirror.
+        from sflow.utils.distribution import DIST_NAME
+
+        assert f"uv tool install {DIST_NAME}\n" in _RUNBOOK.read_text(encoding="utf-8")

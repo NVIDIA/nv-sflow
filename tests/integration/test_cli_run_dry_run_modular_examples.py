@@ -352,7 +352,7 @@ def test_sglang_workers_bind_all_interfaces(workload):
     """SGLang binds its servers to localhost unless told otherwise.
 
     Dynamo advertises the auto-detected LAN IP to discovery, so without
-    ``--host 0.0.0.0`` prefill published ``10.85.54.9:8998`` while its bootstrap
+    ``--host 0.0.0.0`` prefill published ``10.0.0.9:8998`` while its bootstrap
     server was listening on loopback. Decode then failed the KV handshake for
     every request with ``Errno 111 Connection refused`` -- the servers looked
     healthy and READY, aiperf reported "512 valid requests and 0 errors", and not

@@ -207,7 +207,7 @@ artifacts:
   # a missing bind source is created by Docker as an empty directory.
   - name: LOCAL_MODEL_PATH
     description: "GLM-5.3-Flash model weights, present on every host at this path"
-    uri: fs:///lustre/fsw/general_perflab/rogliu/gcn/builds/zai-org-GLM-5.3-Flash
+    uri: fs:///path/to/GLM-5.3-Flash
 
 backends:
   - name: docker_cluster

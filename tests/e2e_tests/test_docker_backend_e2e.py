@@ -109,6 +109,13 @@ _EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 _GPU_EXAMPLES = _EXAMPLES / "gpu_reservation"
 _HOG_SAMPLE = _GPU_EXAMPLES / "hog.yaml"
 _SCHEDULING_SAMPLE = _GPU_EXAMPLES / "scheduling_smoke.yaml"
+# examples/gpu_reservation/ is internal-only: the OSS sync does not publish it, but
+# this file IS published. Without the guard the public repo launches a missing
+# YAML and then waits out every reservation poll (5 min per test) for nothing.
+_needs_gpu_samples = pytest.mark.skipif(
+    not _GPU_EXAMPLES.is_dir(),
+    reason="examples/gpu_reservation/ is internal-only (not shipped to the OSS repo)",
+)
 
 # `e2e` makes these opt-in: they are inside `testpaths`, so without it a bare
 # `pytest` on any machine with a Docker daemon would pull images and launch real
@@ -338,7 +345,7 @@ def test_docker_e2e_multi_node_without_hosts_is_refused(tmp_path: Path):
 
 
 # Two ssh-reachable Docker hosts for the real multi-node case, comma-separated:
-#   SFLOW_E2E_DOCKER_HOSTS=luna-dvt-45.nvidia.com,luna-dvt-46.nvidia.com
+#   SFLOW_E2E_DOCKER_HOSTS=host-a.example.com,host-b.example.com
 # Unset by default: no test should ssh into machines it was not pointed at. The
 # login, key and host-key policy are ssh's business (~/.ssh/config), exactly as
 # they are for a user -- `docker -H ssh://` spawns plain `ssh` and cannot be
@@ -438,7 +445,7 @@ def test_docker_e2e_multi_node_torchrun_rendezvous_across_two_hosts(tmp_path: Pa
 # The dynamo serving samples on the same pair. Both stand up NATS/etcd/frontend
 # on node 0, serve Qwen3-0.6B through dynamo+vLLM, then run aiperf against the
 # frontend; the model is fetched into /opt/sflow/models on first run and cached
-# on the hosts after that. Measured on luna-dvt-45/46: disagg ~5 min end to end.
+# on the hosts after that. Measured on a two-host A100 pair: disagg ~5 min end to end.
 # A 1 GbE link between the hosts makes them slow, not broken -- the budget is
 # generous on purpose, the pass criteria are about correctness, not speed.
 _DYNAMO_RUN_TIMEOUT = 1800
@@ -458,7 +465,7 @@ def _aiperf_metric(haystack: str, label: str) -> float:
 
 
 # Perf gates per sample: (aiperf row, ">=" floor or "<=" ceiling, bound, measured).
-# Floors sit at ~75 % and ceilings at ~1.4-1.5x of what the luna-dvt-45/46 pair
+# Floors sit at ~75 % and ceilings at ~1.4-1.5x of what the reference A100 pair
 # measured on 2026-10-28 -- Qwen3-0.6B, ISL 1024 / OSL 256, concurrency 16,
 # 1 GbE between the hosts. CI always runs on that pair, so the numbers are
 # reproducible (two disagg runs agreed within 2 %); the band is wide enough for
@@ -727,7 +734,18 @@ def test_docker_e2e_monitor_log_window_clips_the_gpu_report(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def _await_reservations(tmp_path: Path, count: int, *, timeout: float = 300.0) -> None:
+def _fail_if_exited(procs: tuple[subprocess.Popen, ...]) -> None:
+    """A run that already exited will never write (or drop) the record being awaited:
+    fail now with its output instead of polling out the whole timeout."""
+    for proc in procs:
+        if proc.poll() is not None:
+            out = proc.stdout.read() if proc.stdout else ""
+            pytest.fail(f"`sflow run` exited (rc={proc.returncode}) while awaited:\n{out}")
+
+
+def _await_reservations(
+    tmp_path: Path, count: int, *procs: subprocess.Popen, timeout: float = 300.0
+) -> None:
     """Block until ``count`` reservation records exist in the shared registry.
 
     The sessions' ordering has to be CAUSAL, not timed: sleeping a fixed few
@@ -742,12 +760,17 @@ def _await_reservations(tmp_path: Path, count: int, *, timeout: float = 300.0) -
     while time.time() < deadline:
         if len(list(registry.glob("*.json"))) >= count:
             return
+        _fail_if_exited(procs)
         time.sleep(0.1)
     pytest.fail(f"expected {count} GPU reservation(s) in {registry}, timed out")
 
 
 def _await_record(
-    registry: Path, pattern: str, *, present: bool, timeout: float = 300.0
+    registry: Path,
+    pattern: str,
+    *procs: subprocess.Popen,
+    present: bool,
+    timeout: float = 300.0,
 ) -> None:
     """Block until a record matching ``pattern`` exists (or is gone).
 
@@ -759,6 +782,7 @@ def _await_record(
     while time.time() < deadline:
         if bool(list(registry.glob(pattern))) is present:
             return
+        _fail_if_exited(procs)
         time.sleep(0.1)
     pytest.fail(f"{pattern} in {registry}: waited for present={present}, timed out")
 
@@ -834,6 +858,7 @@ def _devices_reserved(output: str) -> set[int]:
 @pytest.mark.skipif(
     _GPU_COUNT < 2, reason="needs >= 2 GPUs to prove two sessions land on different ones"
 )
+@_needs_gpu_samples
 def test_concurrent_runs_of_the_sample_get_disjoint_gpus(tmp_path: Path):
     """Two `sflow run` processes on one box must not land on the same GPU.
 
@@ -844,9 +869,9 @@ def test_concurrent_runs_of_the_sample_get_disjoint_gpus(tmp_path: Path):
     _force_remove("hog")
     try:
         first = _start_sflow(_HOG_SAMPLE, tmp_path / "a", sets=common, env=env)
-        _await_reservations(tmp_path, 1)  # first has its GPU before the second asks
+        _await_reservations(tmp_path, 1, first)  # first has its GPU before the second asks
         second = _start_sflow(_HOG_SAMPLE, tmp_path / "b", sets=common, env=env)
-        _await_reservations(tmp_path, 2)  # both hold at once -> the overlap we assert on
+        _await_reservations(tmp_path, 2, first, second)  # both hold at once -> the overlap we assert on
         out_a, _ = first.communicate(timeout=_RUN_TIMEOUT)
         out_b, _ = second.communicate(timeout=_RUN_TIMEOUT)
     finally:
@@ -869,6 +894,7 @@ def test_concurrent_runs_of_the_sample_get_disjoint_gpus(tmp_path: Path):
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_second_run_fails_fast_while_the_first_holds_every_gpu(tmp_path: Path):
     """Default is fail-fast: an oversubscribed box refuses rather than sharing.
 
@@ -885,7 +911,7 @@ def test_a_second_run_fails_fast_while_the_first_holds_every_gpu(tmp_path: Path)
                   "CLAIM": _GPU_COUNT, "HOLD": 25},
             env=env,
         )
-        _await_reservations(tmp_path, 1)  # holder now owns every GPU
+        _await_reservations(tmp_path, 1, holder)  # holder now owns every GPU
         contender = _start_sflow(
             _HOG_SAMPLE,
             tmp_path / "contender",
@@ -905,6 +931,7 @@ def test_a_second_run_fails_fast_while_the_first_holds_every_gpu(tmp_path: Path)
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_second_run_waits_for_gpus_then_succeeds(tmp_path: Path):
     """`--wait-for-gpus` turns the refusal above into a queue-and-proceed.
 
@@ -921,7 +948,7 @@ def test_a_second_run_waits_for_gpus_then_succeeds(tmp_path: Path):
                   "CLAIM": _GPU_COUNT, "HOLD": 12},
             env=env,
         )
-        _await_reservations(tmp_path, 1)  # holder owns the board; the waiter must queue
+        _await_reservations(tmp_path, 1, holder)  # holder owns the board; the waiter must queue
         waiter = _start_sflow(
             _HOG_SAMPLE,
             tmp_path / "waiter",
@@ -975,7 +1002,9 @@ def _run_dir_text(out_dir: Path) -> str:
     return "\n".join(parts)
 
 
-def _await_reusable_record(tmp_path: Path, *, timeout: float = 300.0) -> set:
+def _await_reusable_record(
+    tmp_path: Path, *procs: subprocess.Popen, timeout: float = 300.0
+) -> set:
     """Block until some run has handed GPUs back at READY; return those UUIDs.
 
     This is the causal signal the timing-sensitive tests need. Sleeping instead
@@ -994,6 +1023,7 @@ def _await_reusable_record(tmp_path: Path, *, timeout: float = 300.0) -> set:
                 continue
             if record.get("state") in ("lent", "handover"):
                 return set(record.get("gpu_uuids") or [])
+        _fail_if_exited(procs)
         time.sleep(0.1)
     pytest.fail(f"no reusable GPU reservation appeared in {registry}")
 
@@ -1127,6 +1157,7 @@ def _assert_pipeline_shape(text: str, label: str, *, board: int | None = None) -
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_one_run_pins_one_gpu_and_reshapes_the_rest_as_it_goes(tmp_path: Path):
     """The whole sample in one go, on a board with no slack anywhere.
 
@@ -1184,6 +1215,7 @@ def test_one_run_pins_one_gpu_and_reshapes_the_rest_as_it_goes(tmp_path: Path):
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_a_gpu_freed_mid_run_is_taken_by_a_concurrent_run(tmp_path: Path):
     """A run that frees a GPU WITHOUT finishing hands it to a competing run.
 
@@ -1208,7 +1240,7 @@ def test_a_gpu_freed_mid_run_is_taken_by_a_concurrent_run(tmp_path: Path):
             sets=_pipeline_sets(label="A", hold_a=120, hold_b=2, tail_hold=90),
             env=env,
         )
-        _await_reusable_record(tmp_path)
+        _await_reusable_record(tmp_path, holder)
         contender = _start_sflow(
             _HOG_SAMPLE, tmp_path / "contender",
             sets={"IMAGE": E2E_GPU_IMAGE, "GPUS_PER_NODE": _GPU_COUNT,
@@ -1249,6 +1281,7 @@ def test_a_gpu_freed_mid_run_is_taken_by_a_concurrent_run(tmp_path: Path):
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_another_run_cannot_take_gpus_handed_back_for_in_run_reuse(tmp_path: Path):
     """The `task_ready` hand-back is scoped to the run that made it.
 
@@ -1267,7 +1300,7 @@ def test_another_run_cannot_take_gpus_handed_back_for_in_run_reuse(tmp_path: Pat
             sets=_pipeline_sets(label="A", hold_a=90, hold_b=90, tail_hold=30),
             env=env,
         )
-        handed_back = _await_reusable_record(tmp_path)
+        handed_back = _await_reusable_record(tmp_path, holder)
         outsider = _start_sflow(
             _HOG_SAMPLE, tmp_path / "outsider",
             sets={"IMAGE": E2E_GPU_IMAGE, "GPUS_PER_NODE": _GPU_COUNT,
@@ -1296,6 +1329,7 @@ def test_another_run_cannot_take_gpus_handed_back_for_in_run_reuse(tmp_path: Pat
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_competing_runs_with_dynamic_release_never_share_a_gpu(tmp_path: Path):
     """The full contention scenario, checked as an invariant rather than a schedule.
 
@@ -1430,6 +1464,7 @@ _RACE_CONTENDER_STAGGER_S = 1.0
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_completing_task_does_not_lose_its_successors_gpu_to_waiting_runs(
     tmp_path: Path,
 ):
@@ -1455,7 +1490,7 @@ def test_a_completing_task_does_not_lose_its_successors_gpu_to_waiting_runs(
     try:
         holder = _start_sflow(cfg, out_dir, sets={}, env=env)
         # The workflow owns the board before any contender is allowed to ask.
-        _await_reservations(tmp_path, 1)
+        _await_reservations(tmp_path, 1, holder)
         for i in range(_RACE_CONTENDERS):
             contenders.append(
                 _start_sflow(
@@ -1493,6 +1528,7 @@ def test_a_completing_task_does_not_lose_its_successors_gpu_to_waiting_runs(
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_waiting_run_only_gets_the_gpu_after_the_workflow_is_done_with_it(
     tmp_path: Path,
 ):
@@ -1511,7 +1547,7 @@ def test_a_waiting_run_only_gets_the_gpu_after_the_workflow_is_done_with_it(
         _force_remove(name)
     try:
         holder = _start_sflow(cfg, out_dir, sets={}, env=env)
-        _await_reservations(tmp_path, 1)
+        _await_reservations(tmp_path, 1, holder)
         contender = _start_sflow(
             _HOG_SAMPLE, tmp_path / "contender",
             sets={"IMAGE": E2E_GPU_IMAGE, "GPUS_PER_NODE": _GPU_COUNT,
@@ -1616,6 +1652,7 @@ _LIVE_REUSE_TASKS = ("liveserver", "reuser", "reusetail")
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_live_servers_gpu_is_not_published_when_its_reuser_finishes(tmp_path: Path):
     """The device stays this run's until the SERVER exits, not until the reuser does.
 
@@ -1643,8 +1680,8 @@ def test_a_live_servers_gpu_is_not_published_when_its_reuser_finishes(tmp_path: 
         # it the device is held by a claim of its own and the test would prove
         # nothing; killing the container to get there would just fail the run.
         registry = tmp_path / "registry"
-        _await_record(registry, "*-reuser.json", present=True)
-        _await_record(registry, "*-reuser.json", present=False)
+        _await_record(registry, "*-reuser.json", holder, present=True)
+        _await_record(registry, "*-reuser.json", holder, present=False)
 
         contender = _start_sflow(
             _HOG_SAMPLE, tmp_path / "contender",
@@ -1695,6 +1732,7 @@ _SCHEDULING_BOARD = _SCHEDULING_GPUS["tp8"]
     _GPU_COUNT < _SCHEDULING_BOARD,
     reason=f"the scheduling smoke needs a {_SCHEDULING_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_the_scheduler_never_double_books_a_gpu_across_four_waves(tmp_path: Path):
     """Eleven tasks drain and refill a full board; no two may share a device.
 
