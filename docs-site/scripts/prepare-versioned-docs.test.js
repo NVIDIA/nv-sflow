@@ -106,12 +106,12 @@ test("prepareVersionedDocs materializes current docs, versioned docs, sidebars, 
   commitAll(repo, "main docs");
 
   git(repo, ["checkout", "develop"]);
-  writeFile(path.join(repo, "docs", "user", "intro.md"), "# Release docs\n");
-  writeFile(path.join(repo, "docs", "plc", "sflow_srd.md"), "See [SPP](/docs/sflow_spp).\n");
+  writeFile(path.join(repo, "docs", "user", "intro.md"), "# Release docs\nSee [SPP](/docs/sflow_spp).\n");
   commitAll(repo, "release docs");
   git(repo, ["tag", "v1.2.3"]);
 
   writeFile(path.join(repo, "docs", "user", "intro.md"), "# Local working docs\n");
+  writeFile(path.join(repo, "docs", "developer", "notes.md"), "# unpublished\n");
 
   const plan = {
     current: { label: "develop", ref: "develop", source: "workingTree" },
@@ -128,13 +128,14 @@ test("prepareVersionedDocs materializes current docs, versioned docs, sidebars, 
     fs.readFileSync(path.join(docsSite, ".generated", "current-docs", "user", "intro.md"), "utf8"),
     "# Local working docs\n",
   );
+  assert.equal(fs.existsSync(path.join(docsSite, ".generated", "current-docs", "developer")), false);
   assert.equal(
     fs.readFileSync(path.join(docsSite, "versioned_docs", "version-main", "user", "intro.md"), "utf8"),
     "# Main docs\n",
   );
   assert.equal(
     fs.readFileSync(path.join(docsSite, "versioned_docs", "version-v1.2.3", "user", "intro.md"), "utf8"),
-    "# Release docs\n",
+    "# Release docs\nSee [SPP](/docs/v1.2.3/sflow_spp).\n",
   );
   assert.deepEqual(
     JSON.parse(fs.readFileSync(path.join(docsSite, "versions.json"), "utf8")),
@@ -160,10 +161,39 @@ test("prepareVersionedDocs materializes current docs, versioned docs, sidebars, 
       ],
     },
   );
-  assert.equal(
-    fs.readFileSync(path.join(docsSite, "versioned_docs", "version-v1.2.3", "plc", "sflow_srd.md"), "utf8"),
-    "See [SPP](/docs/v1.2.3/sflow_spp).\n",
+});
+
+// Docs that archive to more than spawnSync's default 1 MiB maxBuffer (the v0.3.2
+// feature video put an .mp4 under docs/) used to kill `git archive` silently.
+test("prepareVersionedDocs archives git refs whose docs exceed 1 MiB", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sflow-docs-big-"));
+  const repo = path.join(tmp, "repo");
+  fs.mkdirSync(repo, { recursive: true });
+  git(repo, ["init", "-b", "develop"]);
+  writeFile(path.join(repo, "docs", "user", "intro.md"), "# Intro\n");
+  writeFile(path.join(repo, "docs", "user", "video.mp4"), Buffer.alloc(2 * 1024 * 1024, 1));
+  // Unpublished dirs (EXCLUDED_DIRS) never reach the site source, whatever their size.
+  writeFile(path.join(repo, "docs", "developer", "rec", "big.mp4"), Buffer.alloc(2 * 1024 * 1024, 2));
+  commitAll(repo, "big docs");
+  git(repo, ["tag", "v1.0.0"]);
+
+  const docsSite = path.join(repo, "docs-site");
+  prepareVersionedDocs(
+    {
+      current: { label: "develop", ref: "develop", source: "gitRef" },
+      versioned: [{ label: "v1.0.0", ref: "v1.0.0", source: "gitRef" }],
+      versionsJson: ["v1.0.0"],
+    },
+    { repoRoot: repo, docsSiteDir: docsSite },
   );
+
+  for (const dir of [
+    path.join(docsSite, ".generated", "current-docs"),
+    path.join(docsSite, "versioned_docs", "version-v1.0.0"),
+  ]) {
+    assert.equal(fs.statSync(path.join(dir, "user", "video.mp4")).size, 2 * 1024 * 1024);
+    assert.equal(fs.existsSync(path.join(dir, "developer")), false);
+  }
 });
 
 test("repairFrozenAnchors fixes a stale anchor only while the old heading is present", () => {

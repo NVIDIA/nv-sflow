@@ -5,7 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { buildDocsSidebar, buildAgentsSidebar } = require("../sidebarsConfig");
+const { buildDocsSidebar, buildAgentsSidebar, EXCLUDED_DIRS } = require("../sidebarsConfig");
 const { mirrorSkillsToAgents } = require("./mirror-skills");
 
 const DOCS_SITE_DIR = path.resolve(__dirname, "..");
@@ -149,14 +149,18 @@ function extractTar(input, dest, stripComponents) {
   });
 }
 
+// Unpublished doc dirs (developer notes, PLC, recordings) never enter the site's
+// docs source, so their media can't be bundled or uploaded with the site.
 function copyDocsFromRef(ref, destination, { repoRoot = REPO_ROOT } = {}) {
   emptyDir(destination);
   const archive = childProcess.spawnSync(
     "git",
-    ["archive", "--format=tar", ref, "docs"],
+    ["archive", "--format=tar", ref, "docs", ...[...EXCLUDED_DIRS].map((dir) => `:(exclude)docs/${dir}`)],
     {
       cwd: repoRoot,
       stdio: ["ignore", "pipe", "inherit"],
+      // spawnSync's default 1 MiB cap kills git silently once docs/ holds media.
+      maxBuffer: Infinity,
     },
   );
   if (archive.status !== 0) {
@@ -171,7 +175,10 @@ function copyDocsFromRef(ref, destination, { repoRoot = REPO_ROOT } = {}) {
 function copyDocsFromWorkingTree(destination, { repoRoot = REPO_ROOT } = {}) {
   const source = path.join(repoRoot, "docs");
   emptyDir(destination);
-  fs.cpSync(source, destination, { recursive: true });
+  fs.cpSync(source, destination, {
+    recursive: true,
+    filter: (src) => !EXCLUDED_DIRS.has(path.relative(source, src).split(path.sep)[0]),
+  });
 }
 
 // Extract the packaged skills tree (src/sflow/skills) from a git ref into a temp
@@ -181,7 +188,7 @@ function extractSkillsFromRef(ref, { repoRoot = REPO_ROOT } = {}) {
   const archive = childProcess.spawnSync(
     "git",
     ["archive", "--format=tar", ref, SKILLS_REPO_PATH],
-    { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"], maxBuffer: Infinity },
   );
   if (archive.status !== 0) return null;
   const dest = fs.mkdtempSync(path.join(os.tmpdir(), "sflow-skills-"));
