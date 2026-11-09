@@ -186,7 +186,7 @@ variables:
 artifacts:
   - name: LOCAL_MODEL_PATH
     description: "GLM-5.3-Flash NVFP4 weights, present on every host at this path"
-    uri: fs:///var/data0/sandbox/rogliu/nvidia-GLM-5.3-Flash-NVFP4
+    uri: fs:///path/to/GLM-5.3-Flash-NVFP4
 
 backends:
   - name: docker_cluster
