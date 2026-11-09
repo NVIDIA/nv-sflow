@@ -7,11 +7,12 @@ layer map, test conventions, defect hotspots, or commands.
 
 | Package / module | Responsibility | Logic that belongs here |
 |------------------|----------------|--------------------------|
-| `cli/` | Typer commands: `run`, `batch`, `compose`, `sample`, `visualize`, `skill` | Argument parsing, flag wiring, delegating to `app/`. No domain logic. |
+| `cli/` | Typer commands: `run`, `batch`, `compose`, `sample`, `visualize`, `skill`, `upgrade`/`update`, `watch`, `fetch` (`remote.py`: the `--ssh*` flags) | Argument parsing, flag wiring, delegating to `app/`. No domain logic. |
 | `app/` | Application layer: `SflowApp` facade, `assembly.py` (task graph, backends, variables), resource/monitor planners, run support | Orchestration, assembly, high-level run flow. |
-| `config/` | `loader.py` (YAML load/merge), `schema.py` (Pydantic), `resolver.py` (expressions) | Config parsing, schema, `${...}` resolution. Cross-cutting. |
+| `config/` | `loader.py` (YAML load/merge), `schema.py` (Pydantic), `resolver.py` (expressions) | Config parsing, schema, ``${...}`` resolution. Cross-cutting. |
 | `core/` | DAG, task graph, orchestrator, launcher, registries, state, results, uploads, `kubectl_config.py` | Domain model and execution engine. Backend-agnostic. |
-| `plugins/backends/` | `local`, `slurm`, `docker`, `kubernetes` | Backend-specific launch/allocation/flag construction. |
+| `plugins/backends/` | `local`, `slurm`, `docker` (local daemon or a declared multi-host `hosts:` pool), `kubernetes` | Backend-specific launch/allocation/flag construction. |
+| `ssh/` | `delegate`, `invocation`, `transport`, `receipt`, `remote_helper` | Running the controller on an SSH host (`--ssh`): payload upload, remote venv cache, receipt, `watch`/`fetch`. |
 | `plugins/operators/` | `bash`, `python`, `srun`, `docker_run`, `ssh`, `k8s`, `k8s_mpi`, `k8s_operator` (base) | How a task is launched. |
 | `plugins/k8s/` | `render`, `shell`, `lifecycle`, `capabilities`, `rdma`, `rdma_preamble`, `probe`, `mpi_bootstrap`, `mpi_lifecycle` | Shared K8s primitives used by both the `kubernetes` backend and the `k8s`/`k8s_mpi` operators. |
 | `plugins/probes/` | `http`, `tcp_port`, `log_watch` | Readiness/failure detection. |
@@ -20,7 +21,7 @@ layer map, test conventions, defect hotspots, or commands.
 | `monitoring/` | Hardware monitor + timeline postprocessing | Monitoring/telemetry. |
 | `ui/` | `rich_tui.py` | Terminal UI. |
 | `utils/` | Shared helpers (see below) | Reusable non-domain helpers used across layers. |
-| `samples/` | Packaged example YAMLs (`sflow sample`) | Keep in sync with `examples/`. |
+| `samples/` | Packaged example YAMLs (`sflow sample`) | Identical copy of `examples/`; every sample change lands in both. |
 | `skills/` | Agent skills + bundled validation scripts | Authoring/validation helpers. |
 | top-level | `resolution.py`, `runtime_info.py`, `logging.py`, `exceptions.py` | Cross-cutting primitives. |
 
@@ -35,6 +36,7 @@ Consolidation targets — prefer extending these over re-implementing:
 | Module | Purpose |
 |--------|---------|
 | `extra_args.py` | `extra_arg_key`, `dedup_merge_extra_args` — de-dup/merge backend `extra_args` (used by CLI `run`, `batch`, docker). The canonical "consolidated module" example. |
+| `distribution.py` / `install.py` | `DIST_NAME` (`nv-sflow`) vs the legacy `sflow` record, `reconcile()` at startup; the one install-spec builder shared by `sflow upgrade` and the `sflow batch` bootstrap (git route = bare `git+<url>@<ref>`, PyPI route = `nv-sflow==…`). |
 | `slurm.py` | Slurm messaging helpers (e.g. `gpus_per_node` warnings). |
 | `container.py` | Container mount extraction/validation from extra args. |
 | `gpu.py` | GPU parsing (`parse_cuda_visible_devices`). |
@@ -87,10 +89,15 @@ def test_run_dry_run_threads_flag(tmp_path):
 
 - CLI flag threading: parsed in `cli/` but must reach `app/sflow.py` → assembly →
   backend/operator and appear in `--dry-run` output.
-- Resolver/variables: `config/resolver.py`, `resolution.py` — `${...}`, precedence,
+- Resolver/variables: `config/resolver.py`, `resolution.py` — ``${...}``, precedence,
   `--set`/CSV overrides, missing-variable handling.
 - Schema compatibility: `config/schema.py` — renamed/removed Pydantic fields break old
-  YAML; changed defaults change behavior silently.
+  YAML; changed defaults change behavior silently. `version` is optional (defaults to
+  `"0.1"`); `backends:` entries, non-`k8s*` operators and `storage.s3` are **not** strict
+  (unknown keys are ignored), so a typo'd field there is not caught by dry-run — a test
+  that relies on rejection of such a key is wrong.
+- Loader: `config/loader.py` — YAML 1.2 scalar rules; an unquoted `10:00:00` is a string,
+  never the integer 36000.
 - Task graph: `app/assembly.py`, `core/` — dependency edges, `missable_tasks`, replicas,
   resource placement, retry/orchestration.
 - Backends: `plugins/backends/` — `salloc`/`srun`/`#SBATCH` flag strings, `extra_args`
@@ -115,6 +122,7 @@ def test_run_dry_run_threads_flag(tmp_path):
 # Setup (always activate venv first)
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 uv pip install -e ".[dev]"          # or ".[dev,s3]" for S3 paths
+# (users install the release: `uv pip install nv-sflow` / `sflow upgrade`; never `pip install sflow`)
 
 # Scope the diff
 git diff --stat main...HEAD

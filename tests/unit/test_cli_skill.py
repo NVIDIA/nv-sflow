@@ -3,6 +3,8 @@
 
 """Unit tests for sflow skill CLI command."""
 
+import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -269,3 +271,36 @@ class TestSkillsModule:
         assert "writing-sflow-yaml" in content
         assert "sflow-error-analysis" in content
         assert "nvidia.github.io/nv-sflow" in content
+
+
+_REPO = Path(__file__).resolve().parents[2]
+_RUNBOOK = _REPO / "docs-site" / "agents-src" / "setup.md"
+
+
+class TestAgentSetupRunbook:
+    """docs-site/agents-src/setup.md is executed verbatim by agents (the README links
+    its raw GitHub copy), so every command it hands them has to actually run."""
+
+    def test_skill_and_sample_commands_run(self, tmp_path, monkeypatch):
+        text = _RUNBOOK.read_text(encoding="utf-8")
+        # Inline `...` spans and fenced lines alike; stop at a closing backtick, a
+        # comment, or a table cell boundary.
+        commands = re.findall(r"sflow ((?:skill|sample) [^`#|\n]+)", text)
+        assert any(c.startswith("skill --target") for c in commands), commands
+        assert any(c.startswith("sample ") for c in commands), commands
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+        # The runbook's `mkdir -p /tmp/sflow-smoke` step, redirected into tmp_path.
+        (tmp_path / "sflow-smoke").mkdir()
+        for command in commands:
+            result = runner.invoke(app, shlex.split(command.replace("/tmp/", f"{tmp_path}/")))
+            assert result.exit_code == 0, f"sflow {command}\n{result.output}"
+
+    def test_installs_the_published_distribution(self):
+        # The runbook installs the PyPI distribution, not whatever this checkout's
+        # pyproject is named: the public GitHub mirror deliberately builds `sflow`
+        # (so pre-0.3.2 `sflow upgrade` keeps resolving) while PyPI is `nv-sflow`.
+        # Reading pyproject here made this test fail on the mirror.
+        from sflow.utils.distribution import DIST_NAME
+
+        assert f"uv tool install {DIST_NAME}\n" in _RUNBOOK.read_text(encoding="utf-8")

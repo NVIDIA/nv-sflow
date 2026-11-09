@@ -18,11 +18,15 @@ Complete field-by-field reference for sflow v0.1 YAML configuration.
 > [outputs](https://nvidia.github.io/nv-sflow/docs/user/outputs),
 > [results](https://nvidia.github.io/nv-sflow/docs/user/results),
 > [cli](https://nvidia.github.io/nv-sflow/docs/user/cli).
+>
+> YAML blocks on this page are fragments: add `workflow.name` (and any `variables:` they
+> reference) before running them. Complete, dry-run-checked recipes are in
+> [examples.md](examples.md).
 
 ## Top-Level Fields
 
 ```yaml
-version: "0.1"          # Required. Only "0.1" is valid (schema version, not release).
+version: "0.1"          # Optional, defaults to "0.1", the only valid value (schema version, not release).
 variables: {}            # Optional. Dict or list of variable declarations.
 artifacts: []            # Optional. List of named URI resources.
 backends: []             # Optional. List of compute backends.
@@ -67,7 +71,7 @@ variables:
 
 ### Expression Syntax
 
-Use `${{ }}` in YAML fields (resolved before execution):
+Use ``${{ }}`` in YAML fields (resolved before execution):
 
 ```yaml
 value: "${{ variables.TP_SIZE * variables.DP_SIZE }}"
@@ -79,11 +83,11 @@ Available expression contexts:
 
 | Context      | Available In       | Example                                              |
 |--------------|--------------------|------------------------------------------------------|
-| `variables`  | YAML fields        | `${{ variables.TP_SIZE }}`                           |
-| `backends`   | YAML fields        | `${{ backends.slurm_cluster.nodes[0].ip_address }}`  |
-| `artifacts`  | YAML fields        | `${{ artifacts.MODEL.path }}`                        |
-| `workflow`   | YAML fields        | `${{ workflow.name }}`                               |
-| `task`       | Scripts only       | `${{ task.server.nodes[0].ip_address }}`             |
+| `variables`  | YAML fields        | ``${{ variables.TP_SIZE }}``                           |
+| `backends`   | YAML fields        | ``${{ backends.slurm_cluster.nodes[0].ip_address }}``  |
+| `artifacts`  | YAML fields        | ``${{ artifacts.MODEL.path }}``                        |
+| `workflow`   | YAML fields        | ``${{ workflow.name }}``                               |
+| `task`       | Scripts only       | ``${{ task.server.nodes[0].ip_address }}``             |
 
 ### Backend Node Properties
 
@@ -114,11 +118,13 @@ For replicated tasks, use `task.<name>_0` or `task.<name>[0]`.
 | `SFLOW_OUTPUT_DIR`              | Output root directory                   |
 | `SFLOW_WORKFLOW_OUTPUT_DIR`     | Workflow-specific output directory      |
 | `SFLOW_TASK_OUTPUT_DIR`         | Task-specific output directory          |
-| `SFLOW_TASK_RESULT_FILE`             | Per-task result file (`${SFLOW_TASK_OUTPUT_DIR}/result.json`) |
-| `SFLOW_WORKFLOW_RESULT_FILE`   | Workflow results index (`${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json`) |
+| `SFLOW_TASK_RESULT_FILE`             | Per-task result file (``${SFLOW_TASK_OUTPUT_DIR}/result.json``) |
+| `SFLOW_WORKFLOW_RESULT_FILE`   | Workflow results index (``${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json``) |
 | `SFLOW_REPLICA_INDEX`           | Replica index (0-based)                 |
 | `SFLOW_TASK_ASSIGNED_NODE_NAMES`| Comma-separated node hostnames          |
 | `SFLOW_TASK_ASSIGNED_NODE_IPS`  | Comma-separated node IP addresses       |
+| `SFLOW_TASK_NUM_NODES`          | Number of nodes assigned to this task   |
+| `SFLOW_LEADER_ADDRESS`          | Rank 0's address; multi-node tasks only |
 | `SFLOW_BACKEND_JOB_ID`          | Backend allocation/job id (Slurm job id when using Slurm) |
 | `SFLOW_BACKEND_NODELIST`        | Backend allocation nodelist             |
 | `SFLOW_BACKEND_NUM_NODES`       | Number of nodes in the backend allocation |
@@ -160,8 +166,8 @@ artifacts:
 | Others    | Kept as string; no download or validation                        |
 
 Access patterns:
-- YAML: `${{ artifacts.LOCAL_MODEL_PATH.path }}`
-- Scripts: `${LOCAL_MODEL_PATH}` (env var)
+- YAML: ``${{ artifacts.LOCAL_MODEL_PATH.path }}``
+- Scripts: ``${LOCAL_MODEL_PATH}`` (env var)
 
 ### Path Resolution & Auto-Mount
 
@@ -170,7 +176,7 @@ preferred way to hand any path (script, config, model, dataset) to a workflow.
 
 **Resolution.** A relative `fs://` / `file://` URI is resolved against `SFLOW_WORKSPACE_DIR`
 (the dir where you invoke `sflow`, or `--workspace-dir`); absolute URIs are used as-is. The
-resolved absolute path is what `${{ artifacts.NAME.path }}` / `${NAME}` expand to. Generated
+resolved absolute path is what ``${{ artifacts.NAME.path }}`` / ``${NAME}`` expand to. Generated
 `file://` files with a *relative* URI are written under the workflow output dir (keeping the
 workspace clean); an *absolute* `file://` is written at that path.
 
@@ -182,15 +188,17 @@ container — no manual mount wiring. Every declared artifact is **global**: it 
 | Backend                | `fs://` (existing path)                                          | `file://` + `content`                                   |
 |------------------------|-----------------------------------------------------------------|---------------------------------------------------------|
 | Slurm (srun/pyxis)     | bind-mount `{path}:{path}:rw` (parent dir when path is a file; `.sqsh` skipped) | file written to output dir, its dir bind-mounted same-path |
-| Docker (`docker_run`)  | same as Slurm (skipped for **remote** `hosts:` via `docker_host`/`context`) | same as Slurm                                           |
+| Docker (`docker_run`)  | same as Slurm, on the local daemon **and** on every declared `hosts:` entry — there the path must already exist on that machine (pre-flight checks it; docker would otherwise create an empty directory) | same as Slurm                                           |
 | Kubernetes             | **hostPath** at the same path (`type: Directory`/`File`, so a missing node path fails loudly) — *skipped when a declared PVC `mount_path` covers the path* | injected as a **ConfigMap**, subPath-mounted read-only at the resolved path |
 | local / bash / ssh     | no container — the path is used directly on the node            | file written; used directly                             |
 
 sflow also auto-mounts the four `SFLOW_*` directories (`SFLOW_WORKSPACE_DIR`,
 `SFLOW_OUTPUT_DIR`, `SFLOW_WORKFLOW_OUTPUT_DIR`, `SFLOW_TASK_OUTPUT_DIR`) into Slurm/Docker
-container tasks at the same path, so a task can write `${SFLOW_TASK_OUTPUT_DIR}` from inside
-the container. On Kubernetes these live on a writable `emptyDir` mounted at `SFLOW_OUTPUT_DIR`
-(see the kubernetes backend `volumes` notes and Uploads for persistence).
+container tasks at the same path, so a task can write ``${SFLOW_TASK_OUTPUT_DIR}`` from inside
+the container — on Docker only for the **local daemon**: a declared `hosts:` entry is another
+machine, where the controller's paths may not exist, so there you mount shared storage
+explicitly (`mounts:`). On Kubernetes these live on a writable `emptyDir` mounted at
+`SFLOW_OUTPUT_DIR` (see the kubernetes backend `volumes` notes and Uploads for persistence).
 
 **Shared-filesystem note (Slurm/Lustre/GPFS/NFS).** The same-path bind mount is what makes a
 single `fs://` artifact work across every node of a multi-node allocation: if the data lives on
@@ -269,27 +277,31 @@ backends:
     default: true
     account: my_account       # required
     partition: my_partition   # required
-    time: "01:00:00"          # required; Slurm time string (or int minutes)
+    time: 01:00:00            # required; H:MM:SS (quotes optional) or int minutes
     nodes: 4                  # required
-    gpus_per_node: 8          # required (0 for CPU-only)
+    gpus_per_node: 8          # required (0 for CPU-only); planning only, adds NO salloc flag
     extra_args:               # extra salloc/#SBATCH flags (de-duped by option; CLI wins)
       - --exclusive
-      - --gpus-per-node=8
+      - --gpus-per-node=8     # needed on a GRES partition, or the allocation has no GPUs
     # job_name: my_job        # optional; defaults to workflow name
 ```
 
+`H:MM:SS`-shaped values load as strings everywhere in a config (YAML 1.2 rules), so `time`
+no longer needs quotes — but a variable like `DURATION: 1:30` is now the string `"1:30"`,
+not `90`.
+
 ### docker
 
-Launches via `docker run` (operator `docker_run`). Uses a synthetic local allocation, or an
-explicit remote `hosts:` pool.
+Launches via `docker run` (operator `docker_run`). Without `hosts:` it plans against the
+local daemon (one node); a declared `hosts:` pool is what lets a task span machines.
 
 ```yaml
 backends:
   - name: docker
     type: docker
     default: true
-    image: ubuntu:22.04       # required (default image for docker_run)
-    nodes: 1                  # default 1 (ignored when `hosts:` is set)
+    image: ubuntu:22.04       # optional: default image for tasks without `operator:`
+    nodes: 1                  # default 1; with `hosts:` it must equal the host count (or be omitted)
     gpus_per_node: 0
     # mounts: ["/data:/data:ro"]
     # workdir: /workspace
@@ -298,17 +310,66 @@ backends:
     #                         # the host. Unset = fail fast when too few are free;
     #                         # 0 = wait forever; N = wait up to N seconds.
     #                         # Overridden by --wait-for-gpus / SFLOW_WAIT_FOR_GPUS.
-    # hosts:                  # optional multi-host pool (each needs docker_host OR context)
-    #   - { name: dgx-a, docker_host: "ssh://dgx-a", ip_address: 10.0.0.11, gpus_per_node: 8 }
-    #   - { name: dgx-b, context: dgx-b-context,    ip_address: 10.0.0.12, gpus_per_node: 8 }
+    # hosts:                  # multi-host pool; one `address` per machine
+    #   - { name: dgx-a, address: 10.0.0.11, gpus_per_node: 8 }
+    #   - { name: dgx-b, address: 10.0.0.12, user: ubuntu, gpus_per_node: 8,
+    #       mounts: ["/mnt/fast/models:/models:ro"], extra_args: ["--shm-size=32g"] }
 ```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `image` | — | Default image for tasks that declare no `operator:` (and for the monitor collector's container on a host with no ssh endpoint). Optional when every task names a `docker_run` operator; reaching either consumer without it fails naming the field. |
+| `nodes` | `1` | Node count **without** a pool. With `hosts:` it must equal the host count or be omitted; `nodes > 1` without `hosts:` is rejected at plan time (multi-node docker means several machines). |
+| `hosts` | — | Static pool of machines (fields below). One container per assigned host for a multi-node task; `include_nodes` / `exclude_nodes` filter it by `name`. |
+| `mounts` / `workdir` / `extra_args` | — | Applied to every container this backend runs. |
+| `offload_task_logs` | `true` | Write `<task>.log` on the container side instead of streaming through the driver (auto-streams on a TTY / `--tui`). Skipped, with a warning, for a multi-node task (members stream merged, rank-labelled). |
+| `wait_for_gpus` | — | Wait for free GPUs instead of failing fast (`0` forever, `N` seconds); overridden by `--wait-for-gpus`. Local single-node docker only. |
+
+`hosts[]` entries:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | required | Node name (logs, `include_nodes` / `exclude_nodes`). |
+| `address` | — | **The machine**: IP, hostname, or `~/.ssh/config` alias. Derives both the control endpoint (`ssh://[user@]address`) and the address peers dial to rendezvous. Required unless `docker_host` or `context` is set. No scheme, no `user@`. |
+| `user` | — | SSH user for the derived endpoint (port/key/ProxyJump stay in `~/.ssh/config`). Only valid with `address`. |
+| `docker_host` | — | Override the derived endpoint: `ssh://…` via a jump host, or `tcp://…`. Mutually exclusive with `context`. |
+| `context` | — | Reach the daemon through a Docker context instead. Mutually exclusive with `docker_host`. A context-only host has no machine address, so it cannot join a multi-node task and its monitor collector runs as a container from the backend `image`. |
+| `rendezvous_address` | `address` | What peers dial for rank 0 (`SFLOW_LEADER_ADDRESS`) when it differs from `address` — an alias peers cannot resolve, or a separate fabric (InfiniBand). sflow never reads `~/.ssh/config` to guess it. |
+| `ip_address` | — | **Deprecated** alias for `rendezvous_address`; warns. Must not disagree with `address`. |
+| `gpus_per_node` | backend value | This host's GPU count (pools may be heterogeneous). |
+| `mounts` / `extra_args` | — | Added to the backend-level values for this host's containers only. |
+
+Behaviour that follows from a declared pool:
+
+- **Pre-flight.** Before anything launches sflow probes every host in parallel — a bounded
+  (20 s) `docker version` over its endpoint, then that its bind-mount sources (declared
+  `mounts` and local `fs://` artifact paths) exist on that machine — and reports every
+  problem across the pool at once, naming the host. Probes run with ssh `BatchMode=yes`, so
+  an unknown host key or a passphrase prompt is a failure, not a hang. Path checks need a
+  shell, so a `context:` host is skipped. `SFLOW_SKIP_DOCKER_PREFLIGHT=1` bypasses it.
+- **Mounts.** The controller's workspace/output dirs are *not* auto-mounted on a declared
+  host (`auto_mount_runtime_dirs` is forced off); local `fs://`/`file://` artifacts *are*
+  bind-mounted same-path and must exist there. Use backend/host `mounts:` for shared data.
+- **Multi-node tasks.** `resources.nodes.count: N` places the task on N hosts; each member
+  gets `SFLOW_TASK_NODE_INDEX`, `SFLOW_TASK_NUM_NODES`, `SFLOW_LEADER_ADDRESS` (rank 0 =
+  first assigned host). Output is one merged, rank-labelled task log; the first member to
+  exit non-zero fails the task with its code and the peers are stopped. A task whose hosts
+  cannot all supply a rendezvous address is rejected at plan time. `--dry-run --verbose`
+  prints one `docker run` per member with the daemon it targets.
+- **Cleanup.** Containers are named `sflow-<machine>p<pid>-<task>-<node>` and removed on
+  completion, failure, signal and Ctrl-C; after a driver crash the next run reclaims its own
+  orphans on every host. A driver running *inside a container* (CI) should set
+  `SFLOW_DRIVER_ID` to a stable value so it can recognise them.
+- **No cross-host GPU lease.** Reservation is machine-local; on a pool sflow pins each
+  member to the planner's device slice for its host and warns. Own the hosts exclusively.
 
 ### kubernetes
 
 "Allocate-first" model: reserves real nodes with placeholder pods, discovers their names/IPs
 (`backends.<name>.nodes[*].ip_address`), then runs each task as scheduler-placed pod(s). The
 **workload image lives on the `k8s` operator, not the backend**. Cluster access is via CLI
-flags (`--kubeconfig` / `--kube-context` / `--kube-namespace`), never YAML.
+flags (`--kube-context` / `--kube-namespace`, plus a config-file override listed in
+`sflow run --help`), never YAML.
 
 ```yaml
 backends:
@@ -368,7 +429,7 @@ backends:
         claim: run-output-pvc
         mount_path: /sflow_output
         read_only: false
-        ensure_writable: true        # root initContainer mkdir+chmod 0777 the mounted subPath
+        ensure_writable: true        # root initContainer creates the subPath, writable by any user
       - name: cache                  # per-pod ephemeral scratch (JIT/kernel cache)
         empty_dir: { medium: "", size_limit: 50Gi }
         mount_path: /root/.cache
@@ -382,11 +443,11 @@ backends:
 | `mount_path`     | string (abs)    | Yes      | Absolute in-pod mount path                                                   |
 | `sub_path`       | string          | No       | `volumeMount.subPath` (mount a subdir of the volume)                         |
 | `read_only`      | bool            | No       | Default per source: **PVC `true`**, emptyDir `false`. Set explicitly to override |
-| `ensure_writable`| bool            | No       | PVC + `read_only: false` only: inject a root initContainer that `mkdir -p` + `chmod 0777` the mounted path, fixing the "subPath created root-owned → non-root pod can't write" gotcha. Rejected on an emptyDir or a read-only PVC |
+| `ensure_writable`| bool            | No       | PVC + `read_only: false` only: inject a root initContainer that creates the mounted path and makes it writable by any user, fixing the "subPath created root-owned → non-root pod can't write" gotcha. Rejected on an emptyDir or a read-only PVC |
 
 **PVC covers an `fs://` artifact.** When an `fs://` artifact path equals or sits under a declared
 PVC `mount_path`, the PVC serves it and sflow **skips the per-artifact hostPath fallback** — so
-`${{ artifacts.MODEL.path }}` resolves to the in-pod path on the PVC. That path matching governs
+``${{ artifacts.MODEL.path }}`` resolves to the in-pod path on the PVC. That path matching governs
 only the hostPath fallback, never whether the PVC mounts (it always does).
 
 **K8S output dirs are ephemeral.** `SFLOW_OUTPUT_DIR` (and its `WORKFLOW`/`TASK` subdirs) is a
@@ -435,12 +496,15 @@ See [operators](https://nvidia.github.io/nv-sflow/docs/user/operators) for the f
 
 | Field       | Type   | Required | Default | Description                              |
 |-------------|--------|----------|---------|------------------------------------------|
-| `image`     | string | Yes      |         | Docker image (defaults to backend `image` if set) |
+| `image`     | string | Yes      |         | Docker image. (A task with no `operator:` at all uses the backend `image` instead.) |
 | `workdir`   | string | No       | null    | Working dir inside the container         |
 | `mounts`    | list   | No       | []      | Bind mounts (`"/host:/ctr:rw"`)          |
-| `gpus`      | string | No       | null    | GPU spec (`all`, `device=0`); narrowed to the planned slice |
-| `pass_envs` | bool   | No       | true    | Forward host env vars                    |
+| `gpus`      | string | No       | null    | GPU spec (`all`, `device=0`); overridden by the planned slice when the task declares `resources.gpus` |
+| `pass_envs` | bool   | No       | true    | Forward host env vars (values go via `-e KEY`, not on the command line) |
 | `extra_args`| list   | No       | []      | Extra `docker run` args                  |
+| `rm`        | bool   | No       | true    | Pass `--rm`. `false` keeps the exited container for `docker logs` / `inspect`; teardown then stops rather than removes it, and the next `sflow run` on that host still reaps it as an orphan — inspect first |
+| `auto_mount_runtime_dirs` | bool | No | true | Bind-mount the `SFLOW_*` workspace/output dirs same-path. Forced off on any declared `hosts:` entry; artifacts are mounted regardless |
+| `log_to_file` | bool | No       | true    | Offload `<task>.log` to the container side (see the backend's `offload_task_logs`); skipped for multi-node tasks |
 
 ### python / ssh / bash
 
@@ -836,8 +900,8 @@ result:
   named `file`.
 - Runs after task success; a task is not `COMPLETED` until parsing finishes, so
   dependents can read the files below.
-- Writes `${SFLOW_TASK_OUTPUT_DIR}/result.json` and updates
-  `${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json`. Env vars `SFLOW_TASK_RESULT_FILE` and
+- Writes ``${SFLOW_TASK_OUTPUT_DIR}/result.json`` and updates
+  ``${SFLOW_WORKFLOW_OUTPUT_DIR}/results.json``. Env vars `SFLOW_TASK_RESULT_FILE` and
   `SFLOW_WORKFLOW_RESULT_FILE` point at these.
 - Best-effort: a missing `required` match sets `ok: false` but does not fail the
   workflow in this release.
@@ -867,7 +931,7 @@ workflow:
     report:                      # optional detailed per-consumer report
       enabled: true
       format: [csv, svg]         # default; both pure-stdlib. add `png` for raster
-                                 # (needs the optional `sflow[monitor]` / matplotlib extra)
+                                 # (needs the optional `nv-sflow[monitor]` / matplotlib extra)
   tasks:
     - name: aiperf
       script: [ ... ]
@@ -927,7 +991,7 @@ writes `window.json`).
   summary CSVs and an SVG
   timeline for each monitor unless `report.enabled: false` (`format` defaults to
   `[csv, svg]`, both pure-stdlib). Add `png` for a raster chart (needs the
-  optional `sflow[monitor]` / matplotlib extra; skipped gracefully if absent).
+  optional `nv-sflow[monitor]` / matplotlib extra; skipped gracefully if absent).
 
 ---
 
@@ -935,7 +999,7 @@ writes `window.json`).
 
 Post-execution upload of task files to cloud storage (S3 today). Declare named top-level
 `storage:` targets, then attach per-task `uploads:` (run on task `COMPLETED`) and/or
-`workflow.upload_all` (zip the whole run at the end). Requires the `sflow[s3]` extra.
+`workflow.upload_all` (zip the whole run at the end). Requires the `nv-sflow[s3]` extra.
 **Credentials come from the boto3 default credential chain — never put secrets in YAML.**
 
 ```yaml
@@ -985,8 +1049,8 @@ workflow:
 | Field      | Required | Description                                                        |
 |------------|----------|--------------------------------------------------------------------|
 | `target`   | Yes      | Name of a declared storage target                                  |
-| `from`     | Yes      | Local file path or glob; may contain `${{ }}` (resolved at task completion) |
-| `to`       | No       | Remote key relative to the target `prefix`; when `from` is a glob it must end in `/` or be omitted. For replicated tasks the basename is auto-suffixed with the replica name unless `to` references `${{ task.name }}` |
+| `from`     | Yes      | Local file path or glob; may contain ``${{ }}`` (resolved at task completion) |
+| `to`       | No       | Remote key relative to the target `prefix`; when `from` is a glob it must end in `/` or be omitted. For replicated tasks the basename is auto-suffixed with the replica name unless `to` references ``${{ task.name }}`` |
 | `on_error` | No       | `warn` (default; task stays `COMPLETED`) or `fail` (task → `FAILED`, triggers fail-fast). Uploads are not retried by `retries:` |
 
 `workflow.upload_all` uses `target`, `to` (optional, default `<run_id>.zip`), and `on_error`.
@@ -1004,7 +1068,7 @@ Multiple YAML files are merged with `sflow compose` or `sflow run -f`:
 Files are combined with a **recursive deep merge**. The only key that
 distinguishes entries in a collection is their `name`.
 
-1. `version` must match across all files (hard error on conflict)
+1. `version`, where declared, must match across files (hard error on conflict)
 2. `variables`, `artifacts`, `backends`, `operators`, `storage` merge **by name**; entries with the same name are deep-merged, so a definition can be *scattered* across files (e.g. an operator's `type` in one file, an override in another)
 3. `workflow.name` is no longer restricted: the last non-null name wins (a warning is logged if it changes)
 4. `workflow.tasks` merge **by name** (same-name tasks are deep-merged), preserving first-seen order — the same task can be defined in one file and extended in another
@@ -1066,12 +1130,28 @@ sflow run -f config.yaml --artifact LOCAL_MODEL_PATH=fs:///new/path
 - Extra backend args (de-duped by option, CLI wins): `--extra-args` / `-e` (generic — Slurm
   `salloc`, docker `docker run`, and every `kubectl` call), `--extra-salloc-args` (Slurm only),
   `--extra-docker-args` (docker only), `--extra-kubectl-args` (kubectl only).
-- Kubernetes access (keep out of YAML): `--kubeconfig`, `--kube-context`, `--kube-namespace`,
+- Kubernetes access (keep out of YAML): the config-file override (see `sflow run --help`),
+  `--kube-context`, `--kube-namespace`,
   `--kube-node-selector`, `--kube-compute-domain-channel`,
   `--kube-compute-domain-create` / `--no-kube-compute-domain-create`.
+- Kubernetes per-run overrides so shipped recipes stay generic: `--kube-rdma
+  auto|disable|<provider>` (force RDMA off on a cluster whose IB fabric is down),
+  `--kube-handoff auto|destroy_before_create|create_before_destroy` (placeholder → task pod
+  order; `destroy_before_create` on a GPU-quota cluster).
 - Kubernetes debug: `--kube-skip-pvc` drops every PVC-backed backend volume (`volumes:` with a
   `claim`) for the run (keeps `empty_dir`), so pods schedule on a cluster lacking the recipe's
   PVCs without editing the recipe. The PVC data is not mounted — quick plumbing checks only.
+- Run from a laptop: `--ssh 'user@login [ssh options]'` on `run` / `batch` / `compose` moves
+  the controller to that host (nothing to install there beyond Python 3.10+; sflow uploads
+  its own source, the YAML/CSV inputs and relative `file://`/`fs://` artifacts). Output lands
+  in `sflow_output/ssh-<timestamp>-<id>/` with a `receipt.json`; after a dropped connection
+  `sflow watch <receipt>` tails the remote logs and `sflow fetch <receipt> [--all]` copies
+  output back. Tunables: `--ssh-follow`, `--ssh-fetch logs|all|none`, `--ssh-remote-root`,
+  `--ssh-tty`. Never put passwords or tokens in `--ssh`.
+- Installing / upgrading: the distribution is **`nv-sflow`** on PyPI (`pip install nv-sflow`;
+  never `pip install sflow`, an unrelated project). `sflow upgrade` installs the latest
+  release; `--sflow-version` takes a PEP 440 version/specifier only, `--branch`/`--repo` a
+  git ref.
 
 ---
 

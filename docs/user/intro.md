@@ -5,7 +5,18 @@ sidebar_position: 1
 
 ## What is sflow
 
-A **declarative workflow descriptor for massive GPU clusters** that separates _what to deploy_ from _where to deploy it_.
+**Write the workload once. Run it on a workstation, Slurm or Kubernetes by swapping one file.**
+
+sflow splits a GPU workflow into a *workload* file (what runs, in what order, on how many GPUs, and how to tell it is healthy) and a *backend* file (how this platform launches it). The workload never mentions `srun`, `docker run` or a pod spec, so moving platforms means changing one `-f`:
+
+```bash
+cd examples/modular/backend_agnostic
+sflow run -f backends/docker.yaml -f workloads/vllm_serve.yaml -f benchmark.yaml   # one workstation
+sflow run -f backends/slurm.yaml  -f workloads/vllm_serve.yaml -f benchmark.yaml   # Slurm cluster
+sflow run -f backends/k8s.yaml    -f workloads/vllm_serve.yaml -f benchmark.yaml   # Kubernetes
+```
+
+New here? [Why sflow](/why-sflow) shows the two files side by side in two minutes.
 
 :::tip Find the right feature
 Not sure where to start? Open the [Feature Map](/feature-map) to choose a goal, see which sflow features apply, and jump to the relevant docs. Building with an AI coding agent? See [Agent Skills](/docs/agents/intro).
@@ -171,7 +182,7 @@ When multiple YAML files are provided, they are combined with a **recursive deep
 
 | Section | Merge Strategy |
 |---------|---------------|
-| `version` | Must match across all files |
+| `version` | Optional (defaults to `"0.1"`); where declared, must match across all files |
 | `variables` | Deep-merge by name (same-name entries merge; on a conflicting leaf value the last file wins, with a warning) |
 | `artifacts` | Deep-merge by name |
 | `backends` | Deep-merge by name |

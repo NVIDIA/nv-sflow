@@ -24,6 +24,12 @@ variables:
     description: "Number of nodes to reserve (>= 2 for cross-node MPI)"
     type: integer
     value: 2
+  MPI_LAUNCH:
+    description: >-
+      Launcher prefix for the TRT-LLM workloads, which run as ONE MPI world of SERVER_GPUS
+      ranks. Here mpirun starts the ranks itself; the k8s_mpi operator only injects its cross-node hostfile/SSH transport when the final command is `mpirun`, so this prefix is what makes a server span nodes. Fragments whose
+      operator already launches one task per rank (slurm_mpi) set this to "".
+    value: mpirun -np ${{ variables.SERVER_GPUS }} --allow-run-as-root
 
 backends:
   - name: cluster
@@ -61,3 +67,18 @@ operators:
   - name: client
     type: k8s
     image: ${{ variables.CLIENT_IMAGE }}
+
+artifacts:
+  # The model weights, declared HERE rather than in the workloads: getting the
+  # weights in front of the server is a backend concern (how a path becomes
+  # visible inside a container), while a workload only needs to name it. Every
+  # workload references it as `${{ artifacts.LOCAL_MODEL_PATH.path }}`.
+  #
+  # sflow mounts each fs:// artifact into the task container at the SAME path it
+  # has on the host (a hostPath volume, or the PVC that covers it), so the weights are actually
+  # present where the server looks for them -- a plain variable only NAMES a path.
+  #
+  # Point it at a real checkout per run:
+  #   -a LOCAL_MODEL_PATH=fs:///abs/path/to/model
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///models/Qwen3-0.6B

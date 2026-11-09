@@ -309,8 +309,6 @@ backends:
     # disaggregated KV transfer (NIXL/UCX) and NCCL run over RoCE instead of TCP.
     # Use 'disable' to turn RDMA off cleanly; or force a provider with
     # 'gke' | 'shared_device_plugin' | 'host_device' (default 'auto' detects).
-    node_selector:
-      tenant: your-node-tenant
     rdma: auto
     # Multi-Node NVLink (IMEX ComputeDomain) -- independent of GPU scheduling, so it
     # is a top-level block (not under `dra:`). Join an existing domain's channel.

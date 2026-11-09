@@ -8,15 +8,74 @@ sidebar_position: 11
 - `sflow run` – Run a workflow
 - `sflow compose` – Compose multiple YAML files into a single config
 - `sflow batch` – Generate sbatch script for Slurm batch mode
+- `sflow watch` – Follow logs from an `--ssh` receipt (Ctrl-C does not cancel the remote run)
+- `sflow fetch` – Fetch current logs or the complete output from an `--ssh` receipt
 - `sflow visualize` – Visualize workflow DAG
 - `sflow sample` – List and copy sample workflows
-- `sflow skill` – Copy bundled AI-agent skills for writing and debugging sflow YAML
+- `sflow skill` – Install bundled AI-agent skills for Claude Code, Cursor, and Codex
+- `sflow upgrade` – Upgrade sflow in the current environment (alias: `sflow update`)
 
 > Note: `--resume` / `--task` are currently marked as not implemented in code and will error immediately. (`--skip-dependencies` is a companion flag to `--task`, so it is inert until `--task` lands.)
 
 Global option:
 
 - `sflow --version` / `sflow -V`: print executable/runtime details, including package version, binary path, Python path, install mode, source label, repo path when known, and git branch/commit when available
+
+## Run through SSH
+
+`run`, `batch`, and `compose` can move the sflow controller to an SSH host:
+
+```bash
+sflow run workflow.yaml --ssh 'user@login -p 20 -i ~/.ssh/id_ed25519'
+sflow batch workflow.yaml --submit --ssh 'user@login -J bastion'
+sflow compose base.yaml tasks.yaml -o composed.yaml --ssh 'user@login'
+```
+
+The remote host needs Python 3.10 or newer, but does not need sflow or rsync. sflow uploads its current source (including local edits), caches a dependency venv remotely, and uploads only explicit YAML/CSV inputs plus relative `file://` or `fs://` artifacts contained by the workspace. Relative artifacts that escape `--workspace-dir` are rejected; absolute artifact paths keep their remote meaning. Undeclared files referenced only inside shell commands are not discovered automatically. Uploaded directories skip `.git`, `.venv`, `.sflow`, `sflow_output`, and `__pycache__`.
+
+Common SSH options:
+
+- `--ssh '<host> [ssh options]'`: connection and ordinary OpenSSH flags
+- `--ssh-follow auto|logs|status|none`: `auto` (the `run`/`batch` default; `compose` defaults to `none`) keeps exactly one writer on your terminal — with a remote PTY the remote process streams everything itself (so `--tui` renders cleanly), and without one it falls back to the 5-second tail of remote controller logs, which is where a PTY-less remote run offloads task logs. `logs`, `status`, and `none` force the tail, a heartbeat only, or raw output only
+- `--ssh-fetch logs|all|none`: `all` copies the complete remote output directory and `none` copies nothing, for every command. What `logs` copies is command-specific: for `run` it is the controller/task logs (`sflow_summary.log`, `sflow.log`, per-task `*.log`, `command_trace.jsonl`, monitor logs) plus the structured result contract (`result.json` per task, workflow-level `results.json`); for `batch` it is the sbatch script plus its `.out`/`.err`/`.json` and the generated `.yaml`/`.yml`/`.csv` config, not task logs; `compose` has no controller log to filter, so it ignores `--ssh-fetch` and always fetches the complete output directory. `logs` is the default for `run`/`batch`
+- `--ssh-remote-root <path>`: remote cache/work root; for `batch`, choose storage visible from compute nodes
+- `--ssh-tty auto|always|never`: allocate a remote PTY so the remote run keeps sflow's terminal formatting and colors. `auto` (default) does so when the local terminal is interactive, except for `compose`, whose stdout is YAML data. Only the remote run gets the PTY; the payload upload and the output fetch stay byte-clean, which is why `-t` inside `--ssh` is rejected
+
+Every SSH execution owns one local folder, `<output-dir>/ssh-<UTC timestamp>-<id>/` (default output dir: `<workspace>/sflow_output`), named exactly like its remote session. Fetched `run`/`batch` logs keep their existing layout inside that folder, and the recovery receipt is `receipt.json` next to them, so remote artifacts never interleave with local runs. An explicit path is still honored literally: `compose -o` is copied to that exact local path.
+
+sflow never deletes the remote run directory it creates under `--ssh-remote-root/runs/<session>/` (only the cached runtime venv is cleaned up on rebuild). Every `--ssh` execution leaves its full work/output tree on the remote host regardless of `--ssh-fetch`; clean up old sessions yourself if remote disk space matters.
+
+Progress is reported in four stages on stderr — connect, stage inputs, prepare the remote runtime, run — each followed by the remote facts it established (remote session/work/output dirs, where each input was staged, the receipt path, and the translated remote command). The first run on a host also reports whether the runtime is being built with `uv` or `pip`.
+
+Reconnect to that receipt after a network interruption or detached batch submission:
+
+```bash
+sflow watch sflow_output/ssh-<timestamp>-<id>/receipt.json
+sflow watch sflow_output/ssh-<timestamp>-<id>/receipt.json --once          # one snapshot, then exit
+sflow fetch sflow_output/ssh-<timestamp>-<id>/receipt.json
+sflow fetch sflow_output/ssh-<timestamp>-<id>/receipt.json --all           # complete remote output directory
+sflow fetch sflow_output/ssh-<timestamp>-<id>/receipt.json -o ./elsewhere  # --output-dir overrides the receipt destination
+```
+
+Ctrl-C on an attached SSH run cancels the remote work: sflow signals the remote controller (SIGINT, escalating to SIGTERM/SIGKILL if it does not stop), `scancel`s any Slurm job that run submitted, records `cancelled` in the receipt, and still fetches the partial logs. If the cancel cannot be confirmed the receipt keeps the state `unknown`. A dropped connection is not a cancel — the remote run keeps going, and the receipt is how you reconnect.
+
+`watch` reads the existing controller-side logs every five seconds until Ctrl-C; stopping it does not cancel the remote work. Interrupting an attached SSH run records its remote state as unknown because portable SSH cannot confirm cancellation. A successful `batch --submit` receipt records `submitted`, not workflow completion. `watch` deliberately does not query Slurm, Kubernetes, Docker, or another backend API. `fetch` can be repeated and copies whatever output exists at that time.
+
+SSH authentication remains OpenSSH's responsibility. Do not put passwords or tokens in the `--ssh` string; the complete connection settings are stored in the mode-`0600` recovery receipt. On MFA clusters, establish an approved multiplexed connection once and reuse it:
+
+```bash
+ssh -MNf -o ControlMaster=yes -o ControlPersist=24h \
+  -o ControlPath=%d/.ssh/sflow-%C user@login
+
+sflow run workflow.yaml \
+  --ssh 'user@login -o ControlMaster=auto -o ControlPersist=24h -o ControlPath=%d/.ssh/sflow-%C'
+```
+
+`ControlPersist=24h` is a client request; cluster policy may end the connection sooner. `batch --submit` keeps its normal detached behavior and returns after `sbatch` accepts the job.
+
+When SSH exits with status 255, sflow prints this ControlMaster guidance after the
+failed attempt. The same status can also indicate a network, DNS, host-key, or SSH
+configuration failure, so the original SSH error remains visible.
 
 ## sflow run
 
@@ -31,7 +90,7 @@ Common options:
 - `--tui`: enable Rich TUI (left: tasks + backends, right: auto-tail logs)
 - `--set, -s KEY=VALUE`: override variables (repeatable); variable must already exist in `variables`
 - `--artifact, -a NAME=URI`: override artifacts (repeatable); artifact must already exist in `artifacts`
-- `--skip-artifact-check`: do not fail when an `fs://` artifact path does not exist locally — warn and continue. For paths that only exist where the task runs (e.g. on the Slurm compute nodes). The path is also left alone rather than created as an empty directory. No effect under `--dry-run`, which already only warns; off-host backends (Kubernetes) already skip this check automatically.
+- `--skip-artifact-check`: do not fail when an `fs://` artifact path does not exist locally — warn and continue. For paths that only exist where the task runs (e.g. on the Slurm compute nodes). The path is also left alone rather than created as an empty directory. No effect under `--dry-run`, which already only warns; off-host backends (Kubernetes, a Docker backend with a `hosts:` pool) already skip this check automatically — the Docker pool's pre-flight checks the paths on each host instead.
 - `--missable-tasks, -M <pattern>`: task names or glob patterns (e.g. `prefill_*`) that may be absent when composing multiple files. Missing missable tasks are removed from `depends_on` and probes with a warning. Only valid with multiple input files. Repeatable.
 - `--extra-args, -e <arg>`: generic, backend-agnostic extra args. They are forwarded to whichever backend the recipe uses — merged into each **Slurm** backend's `salloc`, each **docker** backend's `docker run`, and every **kubectl** call's global flags. Deduplicated by option (CLI wins over the recipe; a more specific `--extra-salloc-args` / `--extra-docker-args` / `--extra-kubectl-args` wins over `--extra-args` on a conflicting option). Repeatable
 - `--extra-salloc-args <arg>`: like `--extra-args` but **Slurm only** — merged into each Slurm backend's `salloc` (e.g. `--gpus-per-node=4`). In a multi-backend recipe it applies to every Slurm backend's `salloc`
@@ -47,16 +106,18 @@ Common options:
 - `--kube-node-selector <k=v>`: node-selector label(s) merged into every kubernetes backend's nodeSelector; comma-separated and/or repeatable
 - `--kube-compute-domain-channel <name|auto|disable>`: override `compute_domain.channel` for all kubernetes backends (tune Multi-Node NVLink / IMEX per run without editing the recipe; legacy `off` still accepted)
 - `--kube-compute-domain-create / --no-kube-compute-domain-create`: override `compute_domain.create`; when on (and no channel is joined), sflow stands up its own ComputeDomain CR named after the run and injects the channel into every GPU pod
+- `--kube-rdma auto|disable|<provider>`: override the `rdma:` mode for all kubernetes backends this run: `auto` (detect and use IB/RoCE), `disable` (force RDMA off → NCCL on sockets/NVLink), or a provider key (`gke`, `shared_device_plugin`, `host_device`). Use `--kube-rdma disable` on a cluster whose IB fabric is down/absent so shipped recipes can keep `rdma: auto`. Unset by default (keeps the recipe value)
+- `--kube-handoff auto|destroy_before_create|create_before_destroy`: override `reservation.handoff` (GPU node handoff order) for all kubernetes backends this run: `auto` (destroy-before-create iff a GPU ResourceQuota is detected), `destroy_before_create` (delete the placeholder pod before applying the task pod — quota-safe, never double-counts placeholder+task GPU requests), or `create_before_destroy` (apply the task first, no node-loss gap, but double-counts under a GPU quota). Use `--kube-handoff destroy_before_create` on a quota-constrained cluster so shipped recipes can keep `auto`. Unset by default (keeps the recipe value)
 - `--kube-skip-pvc`: skip all PVC-backed volume mounts (a backend `volumes:` entry with a `claim`) in every kubernetes backend for this run, keeping `empty_dir` volumes. Debug aid for clusters that lack the recipe's PVCs — pods schedule without editing the recipe volume-by-volume. The PVC data (e.g. a model cache) is **not** mounted, so workloads that need it will fail; use for quick scheduling/plumbing checks
 - `--extra-kubectl-args <flag>`: extra global kubectl flag applied to every kubectl call (e.g. `--extra-kubectl-args=--insecure-skip-tls-verify`); repeatable
 - `--extra-kubectl-apply-args <flag>`: extra flag for the `kubectl apply` **subcommand** (e.g. `--extra-kubectl-apply-args=--validate=false`, `=--server-side`, `=--force-conflicts`); repeatable. kubectl takes global flags *before* the verb and subcommand flags *after* it, so an apply-only flag cannot go through `--extra-kubectl-args` (`kubectl --validate=false apply` is an unknown flag, and it would break every other kubectl call too). Applies to every apply sflow issues, including the allocate-time reservation objects
-- `--enable-workflow-monitor`: enable a default workflow-level hardware monitor (GPU/CPU utilization) for the run without editing the recipe
+- `--enable-workflow-monitor`: enable a default workflow-level hardware monitor (all scopes, whole pool, for the full run) without editing the recipe; no-op if the recipe already declares `workflow.monitor`
 - `--enable-task-monitor <names>`: enable a default hardware monitor bound to the named task(s); accepts a comma- or space-separated list and is repeatable (e.g. `--enable-task-monitor prefill_server,decode_server`)
 - `--offload-task-logs` / `--no-offload-task-logs`: force per-task log offload on or off, overriding each backend's `offload_task_logs`. On by default for local/docker/slurm when non-interactive (auto-falls back to streaming on a TTY/`--tui`); no effect on `k8s` (always offloads its pod log to file) or `ssh`/`python` (always stream through the driver). Use `--no-offload-task-logs` to force live streaming through the driver
 - `--wait-for-gpus <seconds>` (**docker backend only**): when the local docker backend can't reserve enough free GPUs, wait for them to free up instead of failing fast. The flag always takes a value: a positive number bounds the wait (e.g. `--wait-for-gpus 600`), while `0` or an empty value waits indefinitely (`--wait-for-gpus ""`) — the same meaning `0` has in the backend's `wait_for_gpus` field, which this flag overrides. Omit the flag entirely to fail fast. A non-numeric or negative value is rejected at parse time. The flag works by setting `SFLOW_WAIT_FOR_GPUS`, which you can also export directly — but note that *any* accepted value there (empty included) turns waiting on, so `unset` it to get fail-fast back, and a malformed exported value is only caught at the first GPU task rather than at parse time. No effect on other backends. See [Docker GPU reservation](backends.md#gpu-reservation-local-concurrent-runs)
 - `--tui-refresh <fps>`: TUI refresh rate in frames per second (default: `2`, minimum: `1`)
 - `--log-level <level>`: `debug|info|warning|error|critical` (default: `info`)
-- `--verbose, -v`: enable verbose output
+- `--verbose, -v`: show full per-task details in the `--dry-run` plan (default: one-line summary per task)
 
 #### `--extra-args` precedence
 
@@ -150,6 +211,7 @@ Common options:
 - `--missable-tasks, -M <pattern>`: task names or glob patterns that may be absent when composing multiple files (repeatable). Missing references are removed with a warning. Only valid with multiple input files or `--bulk-input`.
 - `--bulk-input, -b <csv>`: CSV file for bulk compose (one YAML per row). Supports a `missable_tasks` column for per-row missable task patterns.
 - `--row`: process specific CSV rows. Supports single rows, repeated flags, comma lists, Python-style slices with exclusive end (`--row 1:4` -> rows 1, 2, 3), open-ended slices, and negative row indices (`--row=-1`).
+- `--workspace-dir <dir>`: workspace root for `--ssh` delegation (resolves relative artifacts before staging; default: current working directory)
 - `--log-level`: logging level (default: `info`)
 - `--verbose, -v`: enable verbose output
 
@@ -198,7 +260,7 @@ Common options:
 - `--nodes, -N <count>`: number of nodes. If omitted, single-job and bulk-submit modes derive it from the config's Slurm backend `nodes` field. Bulk-input mode requires either this flag or a CSV node-count column (`SLURM_NODES`, `NUM_SLURM_NODES`, or `NUM_NODES`).
 
   **When the two node counts disagree.** `--nodes` sizes the *sbatch allocation*; the config's own number sizes the *workflow inside it* — the backend's node count and the `match_count` of readiness probes. The same number in both is the normal way to run, but two different numbers means the job is allocated one size and the recipe plans for another: probes wait on a node that was never allocated, or the job holds nodes nothing will ever use. `--bulk-input` **rejects** the run outright (the CSV states the size per row, so a disagreement is unambiguously a mistake) and names up to five offending rows; the config-driven single-job and `--bulk-submit` paths **warn**. A `--set` of the node variable counts as the row's value, since it overrides the CSV cell.
-- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. Config `gpus_per_node` wins when present. Applied to sflow validation and planning only, not as a Slurm directive. Use `-e '--gpus-per-node=N'` for `sflow batch`, or backend `extra_args` for `sflow run`, if your cluster requires the Slurm allocation flag.
+- `--gpus-per-node, -G <count>`: number of GPUs per node for cluster topology. When set it is applied to the slurm backend; when omitted, the config's backend `gpus_per_node` fills it in. Applied to sflow validation and planning only, not as a Slurm directive. Use `-e '--gpus-per-node=N'` for `sflow batch`, or backend `extra_args` for `sflow run`, if your cluster requires the Slurm allocation flag.
 - `--job-name, -J <name>`: Slurm job name (default: `sflow`)
 - `--set, -s KEY=VALUE`: override variables (repeatable)
 - `--artifact, -a NAME=URI`: override artifacts (repeatable)
@@ -206,9 +268,13 @@ Common options:
 - `--skip-artifact-check`: same as `sflow run`, and forwarded to the `sflow run` inside the submitted job — which is where the check actually runs, so this is the flag to use when an `fs://` path exists only on the compute nodes.
 - `--missable-tasks, -M <pattern>`: task names or glob patterns that may be absent when composing modular configs (repeatable). Missing references are removed with a warning. Only valid with multiple input files or `--bulk-input`/`--bulk-submit`.
 - `--include-nodes <names>` / `--exclude-nodes <names>`: same node-restriction flags as `sflow run` — unioned into every backend's `include_nodes` / `exclude_nodes`.
+- `--offload-task-logs` / `--no-offload-task-logs`: same as `sflow run`, forwarded to the `sflow run` inside the job
+- `--log-level <level>`: same as `sflow run` (logging level of the `sflow run` inside the job; default: `info`)
+- `--workspace-dir <dir>`: same as `sflow run` (default: current working directory)
+- `--output-dir <dir>`: same as `sflow run` (default: `<workspace-dir>/sflow_output`)
 - `--sflow-venv-path, -v <path>` (note the short alias `-v` — in `sflow batch`, `-v` means venv-path, **not** verbose): parent directory under which **each Slurm job creates its own fresh, disposable per-job venv** (`.sflow_venv-<job id>/`) and installs sflow into it, then removes it when the job exits. This is the venv *parent* dir, not an existing venv to reuse. The venv is built on the compute node with a resolved system `python3`, so it always matches the node architecture (x86/arm). Defaults to compute-node-local scratch resolved at run time (`${TMPDIR:-/tmp}/sflow_compute_node_venv`); pass a shared-filesystem path to override. The per-job dirs are auto-removed on normal exit and on Slurm cancel/timeout, but a hard `SIGKILL`/node crash can leave `.sflow_venv-<job id>`/`.sflow_src-<job id>` behind under a shared path (node-local scratch is reclaimed by the cluster).
 - `--sflow-version <ref>`: Git branch, tag, or ref to install in generated batch scripts. If omitted, scripts try to reuse the currently installed sflow git ref/version before falling back to `main`. Mutually exclusive with `--sflow-source-path`. When `--sflow-index-url` is set, this is instead interpreted as a **PyPI version specifier** (see below).
-- `--sflow-index-url <url>`: install sflow from a **private PyPI index** (e.g. an Artifactory registry such as `https://<host>/artifactory/api/pypi/<repo>/simple`) instead of from git. When set, `--sflow-version` becomes a PyPI version specifier: a bare version is pinned (`0.2.1` → `sflow==0.2.1`), an operator spec is passed through (`>=0.2,<0.3`), and omitting it installs the latest available. The index is added with uv's `--extra-index-url`, so sflow's dependencies still resolve from the default index. Credentials must be available on the compute node via `~/.netrc` or a credential helper; URLs containing embedded credentials are rejected. Mutually exclusive with `--sflow-source-path`.
+- `--sflow-index-url <url>`: install sflow from a **private PyPI index** (e.g. an Artifactory registry such as `https://<host>/artifactory/api/pypi/<repo>/simple`) instead of from git. When set, `--sflow-version` becomes a PyPI version specifier: a bare version is pinned (`0.3.2` → `nv-sflow==0.3.2`), an operator spec is passed through (`>=0.3,<0.4`), and omitting it installs the latest available. The index is added with uv's `--extra-index-url`, so sflow's dependencies still resolve from the default index. Credentials must be available on the compute node via `~/.netrc` or a credential helper; URLs containing embedded credentials are rejected. Mutually exclusive with `--sflow-source-path`. Wheels up to and including v0.3.1 were published under the old name `sflow`, so an index only serves the versions published after it; for v0.3.1 or earlier, drop `--sflow-index-url` and pass the git tag (`--sflow-version v0.3.1`).
 - `--sflow-source-path <path>`: local sflow source checkout to install **editable** (`uv pip install -e ".[dev]"`) into each job's per-job venv instead of from a git ref. Each job first copies the checkout into its own per-job source dir (via `rsync`, or `tar` when `rsync` is absent) so concurrent editable builds never race on setuptools-scm build artifacts. The path must be readable from the compute node. Mutually exclusive with `--sflow-version`.
 - `--sbatch-extra-args, -e <arg>`: additional `#SBATCH` directives (repeatable). Supports `${{ variables.X }}` and shorthand `${{ X }}` expressions resolved from config defaults, `--set`, and CSV row values.
 - `--sbatch-output, -O <pattern>`: Slurm stdout pattern (default: `sflow_output/%j-sflow-submit.out`)
@@ -227,7 +293,7 @@ Common options:
 
 ### Bulk-submit mode (`--bulk-submit`)
 
-- `--bulk-submit, -B <path>`: file paths, folder paths, or glob patterns. Folders are scanned for `*.yaml`/`*.yml` files with a `version` key.
+- `--bulk-submit, -B <path>`: file paths, folder paths, or glob patterns. Folders are scanned for `*.yaml`/`*.yml` files with a `workflow:` section (so a backends-only fragment is not submitted as a recipe).
 - Each YAML is processed as a self-contained workflow (no merging).
 - CLI flags (`--set`, `--artifact`, etc.) are applied to every config. Warns when `--set` overrides a variable already defined in a config.
 - Node count is auto-detected from the config's slurm backend.
@@ -290,26 +356,36 @@ Common options:
 
 ## sflow skill
 
-Copy bundled AI-agent skills into a project. These skills help coding agents write sflow YAML and diagnose workflow errors.
+Install bundled AI-agent skills for Claude Code, Cursor, and Codex. These skills help coding agents write sflow YAML and diagnose workflow errors. All three agents auto-discover skills from a per-tool folder (`.claude/skills`, `.cursor/skills`, `.codex/skills`), so installing there is enough.
 
 ```bash
 # List available skills
 sflow skill --list
 
-# Copy skills to ./skills
-sflow skill
+# Install into every agent's project skills folder (no prompt)
+sflow skill --target all
 
-# Copy to a custom skills directory
-sflow skill --output .cursor/skills
+# Just Claude Code + Cursor
+sflow skill -t claude -t cursor
+
+# Install into Claude Code's user-level folder (all projects)
+sflow skill -t claude --global
+
+# Copy to ./skills (or a custom directory) after a prompt
+sflow skill
+sflow skill --output vendor/skills
 
 # Overwrite existing bundled skill files
-sflow skill --force
+sflow skill --target all --force
 ```
 
 Common options:
 
-- `--output, -o <dir>`: output directory (default: `./skills`)
-- `--force, -f`: overwrite existing files when merging into an existing directory
+- `--target, -t claude|cursor|codex|all`: install straight into an agent's skills folder, no prompt (repeatable)
+- `--global, -g`: with `--target`, install into the user-level (`~`) skills dir instead of the project; Cursor is project-only
+- `--output, -o <dir>`: copy skills to a custom directory instead (prompts first; default: `./skills`)
+- `--yes, -y`: skip the confirmation prompt (implied by `--target`)
+- `--force, -f`: overwrite existing files when merging into an existing directory (the copy otherwise merges, keeping existing files and other skills)
 - `--list, -l`: list available bundled skills
 
 ## sflow upgrade
@@ -317,43 +393,43 @@ Common options:
 Upgrade sflow in the environment you are currently running it from. `sflow update` is
 an alias for the same command.
 
-With no flags it installs the **`main` branch of the public OSS GitHub repo**:
+With no flags it installs the **latest `nv-sflow` release from PyPI**:
 
 ```bash
 sflow upgrade
-# -> uv pip install ... 'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main'
+# -> uv pip install ... --upgrade-package nv-sflow --reinstall-package nv-sflow 'nv-sflow>=0.3.2'
 ```
 
-> This default differs from `sflow batch`, which installs whatever ref your *current*
-> environment came from. `sflow upgrade` is an explicit "get me the latest" action.
+With uv only `nv-sflow` itself is upgraded; the rest of the environment is left as it
+is. A dev build, whether a git checkout or a `.devN` wheel from a private index, is
+replaced by the release even if its version string is higher. The request is floored
+at 0.3.2, the first release published under the new name.
 
-Pick a different source with `--repo` / `--branch`:
+> This default differs from `sflow batch`, which installs whatever ref your *current*
+> environment came from. `sflow upgrade` is an explicit "get me the latest release" action.
+
+Pin a release, or add a private index that is searched alongside PyPI:
 
 ```bash
-# A different branch or tag of the public repo
-sflow upgrade --branch v0.3.0
+# A specific release, or a PEP 440 specifier
+sflow upgrade --sflow-version 0.3.1
+sflow upgrade --sflow-version '>=0.3,<0.4'
+
+# A release from a private PyPI index (e.g. an Artifactory repo), checked before PyPI
+sflow upgrade --sflow-index-url https://host/artifactory/api/pypi/repo/simple
+```
+
+Install a git checkout instead, for a branch that has not been released yet:
+
+```bash
+# A branch or tag of the public repo
+sflow upgrade --branch develop
 
 # A fork or an internal mirror (defaults to its main branch)
 sflow upgrade --repo https://git.example.com/team/sflow.git
 
 # Both together
 sflow upgrade --repo https://git.example.com/team/sflow.git --branch develop
-```
-
-The install-route flags are the same ones [`sflow batch`](#sflow-batch) uses to pin the
-version installed on a compute node, so a ref you trust in a batch job is written the
-same way here:
-
-```bash
-# Equivalent to --branch develop, in the batch spelling
-sflow upgrade --sflow-version develop
-
-# repo + ref in one value
-sflow upgrade --sflow-version https://git.example.com/team/sflow.git@develop
-
-# A released wheel from a private PyPI index
-sflow upgrade --sflow-index-url https://host/artifactory/api/pypi/repo/simple \
-              --sflow-version '>=0.2,<0.3'
 
 # Editable install from a local checkout
 sflow upgrade --sflow-source-path ~/src/sflow
@@ -361,13 +437,24 @@ sflow upgrade --sflow-source-path ~/src/sflow
 
 Options:
 
-- `--repo <url>`: git repository to install from (default: `https://github.com/NVIDIA/nv-sflow.git`)
-- `--branch <ref>`: git branch or tag (default: `main`)
-- `--sflow-version <ref|repo@ref|specifier>`: same syntax as `sflow batch --sflow-version`. Mutually exclusive with `--repo`/`--branch`, which encode the same thing
-- `--sflow-index-url <url>`: install from a private PyPI index; `--sflow-version` then means a PEP 440 specifier. URLs with embedded credentials are rejected — use `~/.netrc` or a credential helper
-- `--sflow-source-path <dir>`: editable install from a local checkout
+- `--sflow-version <version|specifier>`: PyPI version to install, e.g. `0.3.1` or `>=0.3,<0.4` (default: latest). Unlike `sflow batch --sflow-version`, this is never a git ref — use `--repo`/`--branch` for that
+- `--sflow-index-url <url>`: also search a private PyPI index (checked before PyPI). Only releases are picked unless `--sflow-version` pins a pre-release such as `0.3.3.dev5`. URLs with embedded credentials are rejected — use `~/.netrc` or a credential helper. Wheels up to and including v0.3.1 are named `sflow` there and are not found; install those with `--branch v0.3.1`
+- `--repo <url>`: install a git checkout from this repository instead of a PyPI release (default: `https://github.com/NVIDIA/nv-sflow.git`). Mutually exclusive with `--sflow-version`/`--sflow-index-url`
+- `--branch <ref>`: git branch or tag to install (default: `main`); implies the git route like `--repo`
+- `--sflow-source-path <dir>`: editable install from a local checkout. A wheel installed under either name (`nv-sflow` or `sflow`) is uninstalled first, because its files would otherwise shadow the checkout
 - `--force`: allow upgrading over an editable/dev install
 - `--dry-run`: print the resolved install command and exit
+
+### The two distribution names
+
+The `sflow` package is distributed as **`nv-sflow`** on PyPI and in every internal
+build, and as **`sflow`** in GitHub builds and in every release up to v0.3.1. sflow
+recognises either. If an environment ends up with both — `pip install nv-sflow` over an
+old git install, or `sflow upgrade --branch <ref>` over a release — the next `sflow`
+command keeps the record whose files are actually on disk and deletes only the other
+one's `*.dist-info` (no package files, no network). It prints one line when it does;
+set `SFLOW_NO_AUTO_MIGRATE=1` to turn it off. Never `pip install sflow`: that name on
+pypi.org is an unrelated project.
 
 Notes:
 
@@ -375,6 +462,6 @@ Notes:
   install, `sflow upgrade` refuses rather than silently replacing your working
   checkout with a released build. Pass `--force` to override.
 - `uv` is used when available (pinned to the interpreter running sflow) and `pip` is
-  the fallback. Because a branch head can move without the version string changing,
-  sflow is explicitly reinstalled rather than being skipped as "already satisfied".
+  the fallback. On the git route sflow is explicitly reinstalled, because a branch head
+  can move without the version string changing.
 - Run `sflow --version` afterwards to confirm what you ended up with.

@@ -192,8 +192,6 @@ backends:
     host_network: true
     host_ipc: true
     scheduling: device_plugin
-    node_selector:
-      tenant: your-node-tenant
     # Cross-node collectives ride RDMA (RoCE/IB) when usable; if unusable in-pod,
     # sflow auto-detects and uses the IB/RoCE fabric if present. On a GB300 NVL72 rack the
     # cross-node fast path is the MNNVL NVLink fabric via the IMEX ComputeDomain below, so IB
@@ -387,7 +385,7 @@ workflow:
           --extra-inputs "temperature: 0.0"
           --concurrency ${CONCURRENCY}
           --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
-          --warmup-request-count 10
+          --warmup-request-count ${CONCURRENCY}
           --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
           --random-seed 100
           -H 'Authorization: Bearer NOT USED'

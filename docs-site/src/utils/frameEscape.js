@@ -9,8 +9,9 @@
 //
 // Safe by construction:
 //   * No-op when not framed (local `npm run serve`, direct GitLab Pages) — top === self.
-//   * The site's own homepage / feature-map embed STATIC html (sflow_intro.html /
-//     feature-map-embed.html) in an iframe; those files never load this Docusaurus client module,
+//   * The site's own homepage, /intro and feature-map embed STATIC html (sflow_landing.html,
+//     sflow_intro.html, feature-map-embed.html) in an iframe; those files never load this
+//     Docusaurus client module,
 //     so this only ever fires when the Docusaurus APP itself is unexpectedly framed.
 //   * Uses location.replace so the wrapper URL is not left in the back/forward history.
 function createFrameEscaper({ window: windowObj } = {}) {

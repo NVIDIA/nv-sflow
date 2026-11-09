@@ -31,9 +31,11 @@ from sflow.config.schema import (
     SflowConfig,
 )
 from sflow.core.backend import Backend
+from sflow.core.command import Command
 from sflow.core.monitor import (
     CollectorKey,
     MonitorConsumer,
+    MonitorDelivery,
     MonitorRegistry,
     NodeCollector,
     TaskResourceView,
@@ -156,6 +158,12 @@ class _MonitorPlanner:
         # Backends whose monitor targets were skipped because they don't support
         # host-level monitoring yet (e.g. Kubernetes). Surfaced once in build().
         self._skipped_monitor_backends: set[str] = set()
+        # Whether the resolution in flight consulted an unmonitorable backend.
+        # Scoped to ONE monitor: the set above is cumulative, so reading it here
+        # would let an unrelated skipped backend silence a genuine "you excluded
+        # every node" warning for a healthy one. Pinned by
+        # test_unmonitorable_backend_does_not_mute_an_unrelated_broken_monitor.
+        self._resolution_skipped_backend = False
 
     # --- task / backend lookup -------------------------------------------------
 
@@ -201,6 +209,7 @@ class _MonitorPlanner:
             return False
         if not getattr(backend.capabilities, "supports_host_monitoring", True):
             self._skipped_monitor_backends.add(backend.name)
+            self._resolution_skipped_backend = True
             return False
         return True
 
@@ -210,6 +219,7 @@ class _MonitorPlanner:
         self, monitor: MonitorConfig, *, owner_task: Task | None
     ) -> tuple[list[CollectorKey], list[int] | None]:
         resources = monitor.resources
+        self._resolution_skipped_backend = False
 
         # used_by_tasks: union of referenced tasks' assigned nodes + GPUs.
         if resources is not None and resources.used_by_tasks:
@@ -334,10 +344,14 @@ class _MonitorPlanner:
         keys, gpus = self._resolve_keys_and_gpus(monitor, owner_task=owner_task)
         keys = _dedup_keys(keys)
         if not keys:
-            _logger.warning(
-                f"Monitor '{name}' resolved to no nodes; skipping. "
-                "Check the target backend allocation / used_by_tasks."
-            )
+            # When THIS monitor's backend was skipped for lacking host monitoring,
+            # that is the reason -- and build() explains it. Pointing at the
+            # allocation would send the user to debug a resolution that worked.
+            if not self._resolution_skipped_backend:
+                _logger.warning(
+                    f"Monitor '{name}' resolved to no nodes; skipping. "
+                    "Check the target backend allocation / used_by_tasks."
+                )
             return None
 
         scopes = _effective_builtin_scopes(monitor)
@@ -538,19 +552,54 @@ class _MonitorPlanner:
             node_name = key[1]
             collector_name = f"sflow_monitor_{node_name}"
             operator = self._build_bare_operator(backend, collector_name, node_name)
+            node_names = _backend_node_names(backend)
+            scopes = [s for s in MONITOR_BUILTIN_SCOPES if s in unit.scopes]
+            delivery = backend.monitor_delivery(node_name=node_name, scopes=scopes)
+            if not delivery.provides_gpus and "gpu" in scopes:
+                # The delivery knows this node's collector will have no GPU
+                # access, so asking for the scope anyway only yields a log of
+                # "nvidia-smi not found". Ask for what can actually be read.
+                _logger.info(
+                    f"Monitor: node '{node_name}' declares no GPUs; "
+                    "collecting the remaining scopes only."
+                )
+                scopes = [s for s in scopes if s != "gpu"]
             script = _build_collector_script(
-                hw_script_path,
+                script_path=hw_script_path,
+                delivery=delivery,
                 interval_ms=unit.interval_ms,
-                scopes=[s for s in MONITOR_BUILTIN_SCOPES if s in unit.scopes],
+                scopes=scopes,
                 gpu_fields=unit.gpu_fields,
                 custom=unit.custom,
             )
-            envs = {"SFLOW_TASK_OUTPUT_DIR": str(self.raw_dir)}
+            # Where the collector writes its own files -- meaningful only when it
+            # shares the driver's filesystem. An off-host collector streams its
+            # samples back on stdout, so this would just set a driver path in the
+            # driver's own shell and read as if the node were writing there.
+            envs = {} if delivery.offhost else {"SFLOW_TASK_OUTPUT_DIR": str(self.raw_dir)}
             command = operator.build_command(
                 task_name=collector_name, script=script, envs=envs
             )
             collectors[key] = NodeCollector(
-                key=key, name=collector_name, command=command, envs=envs
+                key=key,
+                name=collector_name,
+                command=command,
+                envs=envs,
+                # Filed under the node's index in its backend, matching the
+                # SLURM_NODEID the in-place collector uses.
+                stream_node_id=(
+                    str(node_names.index(node_name) if node_name in node_names else 0)
+                    if delivery.offhost
+                    else None
+                ),
+                stop_command=(
+                    Command(
+                        exec=delivery.stop_argv[0],
+                        args=list(delivery.stop_argv[1:]),
+                    )
+                    if delivery.stop_argv
+                    else None
+                ),
             )
         return collectors
 
@@ -598,16 +647,18 @@ class _MonitorPlanner:
                     task_consumers.append((rt, consumer))
                     consumers.append(consumer)
 
-        # Hint (once) when configured monitors were dropped for a backend that has
-        # no host-level monitoring yet (e.g. Kubernetes) -- so the absence of a
-        # sflow_monitor report is explained rather than silent.
-        if self._skipped_monitor_backends:
+        # Named one per line rather than joined, so the absence of a
+        # sflow_monitor report is explained against the backend it belongs to.
+        # Only `supports_host_monitoring=False` lands here, and Kubernetes is
+        # the only such backend -- when a second one appears with a different
+        # reason, that is the moment to make this per-backend, not before.
+        for backend_name in sorted(self._skipped_monitor_backends):
             _logger.warning(
-                "Hardware monitor skipped for backend(s) %s: node-level hardware "
+                "Hardware monitor skipped for backend '%s': node-level hardware "
                 "monitoring is not implemented for this backend yet (e.g. "
                 "Kubernetes needs a DCGM/DaemonSet collector). No sflow_monitor "
-                "samples or reports will be produced for their tasks.",
-                ", ".join(sorted(self._skipped_monitor_backends)),
+                "samples or reports will be produced for its tasks.",
+                backend_name,
             )
 
         if not self._units:
@@ -704,25 +755,47 @@ def _make_task_view(
 
 
 def _build_collector_script(
-    hw_script_path: Path,
     *,
+    script_path: Path,
+    delivery: MonitorDelivery,
     interval_ms: int,
     scopes: list[str],
     gpu_fields: str | None,
     custom: list[str],
 ) -> list[str]:
-    lines = ['echo "Starting hardware monitor"']
+    """The collector's shell script for one node.
+
+    Everything but ``delivery`` is the same on every backend.
+    """
+    # Off-host, stdout is the sample channel -- a banner printed there would be
+    # read back as a row.
+    banner = 'echo "Starting hardware monitor"'
+    lines = [f"{banner} >&2" if delivery.offhost else banner]
     # Custom commands run in the background alongside the built-in collector.
-    for cmd in custom:
-        lines.append(f"{cmd} &")
+    # Off-host, their stdout goes onto the sample channel, where the driver's
+    # demultiplexer drops every line that is not a `<scope>\t<row>` -- so the
+    # output would vanish entirely. Send it to stderr, which stays a log channel.
+    lines += [f"{cmd} >&2 &" if delivery.offhost else f"{cmd} &" for cmd in custom]
     if scopes:
-        main = (
-            f"python3 {shlex.quote(str(hw_script_path))} "
-            f"--interval-ms {int(interval_ms)} --scopes {','.join(scopes)}"
-        )
+        argv = ["--interval-ms", str(int(interval_ms)), "--scopes", ",".join(scopes)]
         if gpu_fields:
-            main += f" --gpu-fields {shlex.quote(gpu_fields)}"
-        lines.append(main)
+            argv += ["--gpu-fields", gpu_fields]
+        if delivery.offhost:
+            argv.append("--stdout")
+        # Quoted, not joined raw: these tokens carry user config (image,
+        # `docker_host`/`context`, host address), none of which is constrained
+        # to shell-safe characters, and any of which may be a `${{ }}` result.
+        # Ordinary values are unchanged by this; a value with a space or a `;`
+        # stops being a second command.
+        prefix = " ".join(shlex.quote(token) for token in delivery.launch_prefix)
+        path = shlex.quote(str(script_path))
+        args = " ".join(shlex.quote(a) for a in argv)
+        # Off-host reads the source here and pushes it through `docker run -i`
+        # to the container's stdin: the redirect is the DRIVER's, so nothing is
+        # copied to the node. A heredoc also worked, but put all 378 lines of
+        # the collector into the logged command once per node.
+        target = f"- {args} < {path}" if delivery.offhost else f"{path} {args}"
+        lines.append(f"{prefix + ' ' if prefix else ''}python3 {target}")
     elif custom:
         # Only custom commands -> keep the step alive until they finish.
         lines.append("wait")

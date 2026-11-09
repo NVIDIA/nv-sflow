@@ -23,8 +23,13 @@ _logger = get_logger(__name__)
 def preflight_validate_backends(state: SflowState) -> None:
     """Validate backend prerequisites before allocations/submissions."""
 
+    # Operators auto-mount local artifact paths, but they are built during
+    # planning -- after this runs. Hand the declared artifacts to every backend,
+    # so one that checks mount sources can name a path missing on a remote
+    # machine here instead of having it created as an empty directory at launch.
+    artifacts = list((state.artifacts or {}).values())
     for b in (state.backends or {}).values():
-        b.preflight_validate()
+        b.preflight_validate(artifacts=artifacts)
 
 
 def preflight_validate_container_images(

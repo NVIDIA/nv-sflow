@@ -15,15 +15,21 @@ import typer
 
 from sflow.app.sflow import SflowApp
 from sflow.cli import DOCS_URL, app
-from sflow.core.kubectl_config import KubectlConfig
 from sflow.cli._args import (
     EnableTaskMonitorOption,
     EnableWorkflowMonitorOption,
     ExcludeNodesOption,
     IncludeNodesOption,
+    SshFetchOption,
+    SshFollowOption,
+    SshOption,
+    SshRemoteRootOption,
+    SshTtyOption,
     parse_key_value_args,
+    reject_unhandled_ssh,
     split_list_arg,
 )
+from sflow.core.kubectl_config import KubectlConfig
 from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
 from sflow.logging import configure_logging, get_logger
 from sflow.resolution import enrich_error_with_location
@@ -164,7 +170,7 @@ def run(
         Optional[str],
         typer.Option(
             "--resume",
-            help="Resume a previously failed workflow by workflow ID",
+            help="Resume a previously failed workflow by workflow ID (not implemented yet; errors immediately)",
         ),
     ] = None,
     set_var: Annotated[
@@ -448,6 +454,11 @@ def run(
             "backend's wait_for_gpus field. Omit the flag to fail fast.",
         ),
     ] = None,
+    ssh: SshOption = None,
+    ssh_follow: SshFollowOption = "auto",
+    ssh_fetch: SshFetchOption = "logs",
+    ssh_remote_root: SshRemoteRootOption = None,
+    ssh_tty: SshTtyOption = "auto",
 ):
     """
     Run a workflow from one or more sflow YAML files.
@@ -484,6 +495,7 @@ def run(
         # Run a CSV row with additional CLI config files prepended
         sflow run -f common.yaml --bulk-input jobs.csv --row 1
     """
+    reject_unhandled_ssh(ssh)
     # Argument-shape validation, deliberately OUTSIDE the run try/except below so
     # a bad flag reads as a usage error rather than a workflow failure. A typo
     # like `--wait-for-gpus 600s` must not survive parsing and dry-run only to

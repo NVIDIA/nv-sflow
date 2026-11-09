@@ -3,7 +3,10 @@
 > Install these skills into a coding agent's auto-discovered folder with
 > `sflow skill --target all` (Claude Code → `.claude/skills`, Cursor → `.cursor/skills`,
 > Codex → `.codex/skills`); use `-t claude`/`-t cursor`/`-t codex` for one, `--global` for
-> the user-level dir.
+> the user-level dir (`~/.claude/skills`, `~/.codex/skills`; Cursor is project-only).
+> `sflow skill --list` shows the three skills: `writing-sflow-yaml`, `sflow-error-analysis`,
+> `sflow-code-review`. sflow itself installs as `pip install nv-sflow` (never `pip install
+> sflow`, an unrelated project) and upgrades with `sflow upgrade`.
 
 ## Skill & Doc References
 
@@ -65,7 +68,9 @@ backend-specific details (do not assume defaults):
 - **kubernetes**: namespace, node count, `scheduling` mode (`dra` vs `device_plugin`); cluster
   access is passed at run time via `--kubeconfig` / `--kube-context` / `--kube-namespace` (not
   YAML). The workload image goes on the `k8s` operator, not the backend.
-- **docker**: image, GPU availability (NVIDIA container toolkit), and any remote `hosts:`.
+- **docker**: image, GPU availability (NVIDIA container toolkit); for several machines, each
+  host's `address` (IP, hostname or `~/.ssh/config` alias) and SSH user — ssh from the driver
+  must already work, and sflow pre-flights every host before launching.
 
 ### Step 2: Write a Minimal Plain-Text Config
 
@@ -88,7 +93,12 @@ Fix everything it flags first. The individual steps (`validate_sflow_yaml.py`,
 
 ```bash
 sflow run -f config.yaml --tui
+sflow run -f config.yaml --ssh 'user@login'      # drive a cluster from a laptop; nothing to install there
 ```
+
+An `--ssh` run leaves its logs under `sflow_output/ssh-<timestamp>-<id>/` with a
+`receipt.json`; after a dropped connection `sflow watch <receipt>` tails it and
+`sflow fetch <receipt> --all` copies the output back.
 
 If a task fails, triage the whole run dir in one command — task status, plus the orchestrator
 (`sflow.log`) and each failed `<task>/<task>.log` categorized into a single root cause + fix:
@@ -113,16 +123,25 @@ Ask about variance needs. Split into modular files if needed:
 
 - Use `file://` artifacts with `content` for helper scripts (never heredocs/`python3 -c`)
 - Use `container_name` + `--container-image` in `extra_args` for container reuse (srun/Slurm)
+- `version: "0.1"` is optional (omit it or use exactly that). Slurm `time: 10:00:00` needs no
+  quotes — but every `H:MM`-shaped value is now a string, so write `DURATION: 90`, not `1:30`.
 - Backends: `local` / `slurm` / `docker` / `kubernetes`. Default operator per backend:
   local→`bash`, slurm→`srun`, docker→`docker_run`, kubernetes→none (declare a `k8s` operator).
   For Docker, the launch operator is `type: docker_run` (the backend is `type: docker`).
+- Docker across machines: declare them under the backend's `hosts:` with one `address` each
+  (`user`, `gpus_per_node`, `mounts`, `extra_args` per host as needed); `hosts:` is the node
+  list, so `nodes: N>1` without it is rejected. Set `rendezvous_address` only when peers
+  cannot dial `address` (`ip_address` is a deprecated alias). The backend `image` is
+  optional once every task names a `docker_run` operator.
+- Slurm `gpus_per_node` is planning-only: on a GRES partition also pass
+  `--gpus-per-node=N` (backend `extra_args` or `--extra-salloc-args`).
 - Kubernetes: the workload `image` goes on the `k8s` operator, not the backend; pass cluster
   access via `--kubeconfig` / `--kube-context` / `--kube-namespace`; `resources.gpus.count` is a
   per-task total split across nodes (must be a multiple of the node count).
 - Add `probes.readiness` on long-running server tasks and `probes.failure.log_watch` for
   `"Traceback (most recent call last)"`. `log_watch` matches **literally** unless prefixed
   with `re:` / `regex:`. `readiness`/`failure` may be a list (multi-probe).
-- For post-execution uploads to S3, declare a `storage:` block with `type: s3` and per-task `uploads:` specs (needs the `sflow[s3]` extra); credentials come from the boto3 default chain — never in YAML. Use `on_error: fail` only when the upload IS the deliverable.
+- For post-execution uploads to S3, declare a `storage:` block with `type: s3` and per-task `uploads:` specs (needs the `nv-sflow[s3]` extra); credentials come from the boto3 default chain — never in YAML. Use `on_error: fail` only when the upload IS the deliverable.
 - `--extra-args` / `-e` is backend-agnostic (Slurm/docker/kubectl), de-duped by option (CLI
   wins); use `--extra-salloc-args` / `--extra-docker-args` / `--extra-kubectl-args` to target one.
 - Run validation and `--dry-run` before every actual run

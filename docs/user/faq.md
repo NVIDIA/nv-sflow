@@ -22,7 +22,7 @@ No. Dry-run computes planned output paths but does not `mkdir` or write log file
 
 ## Do artifacts automatically download from HuggingFace / pull Docker images?
 
-In v0.1, only `fs://` / `file://` are resolved to real local paths. Other schemes are kept as strings (no download/pull behavior yet).
+Currently, only `fs://` / `file://` are resolved to real local paths. Other schemes are kept as strings (no download/pull behavior yet).
 
 ## Visualization to `png/svg/pdf` fails: `dot` not found?
 
@@ -35,6 +35,19 @@ That output format depends on Graphviz. You can:
 
 Run `sflow --version` (or `sflow -V`). It prints the package version plus runtime/build details — binary path, Python path, install mode, source label, repo path, and git branch/commit when available. Each `sflow run` logs the same details, which helps confirm whether a local editable checkout, a branch build, or a released package is running.
 
+## I ran `pip uninstall sflow` and now `sflow` is broken
+
+Before v0.3.2 the distribution was named `sflow`; it is now `nv-sflow`, and both install
+the same files. Uninstalling the old name before `sflow` had a chance to tidy up deleted
+those shared files. Put them back with:
+
+```bash
+pip install --force-reinstall nv-sflow
+```
+
+From then on `pip uninstall sflow` is a no-op. See
+[The two distribution names](./cli.md#the-two-distribution-names).
+
 ## How do I restrict a run to (or away from) specific nodes?
 
 Use `--include-nodes` to pin a run to a set of hosts, or `--exclude-nodes` to keep it off flaky ones. Both work on `sflow run` and `sflow batch`, accept comma-separated and/or repeated values, and apply to whatever backend the recipe uses. You can also set `include_nodes` / `exclude_nodes` on a backend in YAML; CLI values are unioned with the recipe's. See [Backends](./backends.md#selecting-or-excluding-nodes-all-backends).
@@ -45,11 +58,11 @@ Use the generic `--extra-args` / `-e` to forward a flag to whichever backend the
 
 ## How do I connect to a Kubernetes cluster?
 
-Kube access is provided by CLI flags, so the recipe stays cluster-agnostic: `--kubeconfig`, `--kube-context`, and `--kube-namespace` select the cluster and namespace, while `--kube-node-selector`, `--kube-compute-domain-channel`, and `--kube-compute-domain-create` / `--no-kube-compute-domain-create` tune placement and Multi-Node NVLink. Credentials always live in the kubeconfig, never in YAML. See [Backends](./backends.md#connecting-to-the-cluster).
+Kube access is provided by CLI flags, so the recipe stays cluster-agnostic: `--kubeconfig`, `--kube-context`, and `--kube-namespace` select the cluster and namespace, while `--kube-node-selector`, `--kube-compute-domain-channel`, and `--kube-compute-domain-create` / `--no-kube-compute-domain-create` tune placement and Multi-Node NVLink. `--kube-rdma auto|disable|<provider>` overrides the `rdma:` mode for every kubernetes backend (`disable` forces RDMA off so NCCL falls back to sockets/NVLink on a cluster whose IB fabric is down or absent), and `--kube-handoff auto|destroy_before_create|create_before_destroy` overrides `reservation.handoff` (use `destroy_before_create` on a quota-constrained cluster so placeholder and task GPU requests are never double-counted); both are unset by default and keep the recipe value. Credentials always live in the kubeconfig, never in YAML. See [Backends](./backends.md#connecting-to-the-cluster).
 
 ## How do I install sflow from a private PyPI index in batch mode?
 
-Pass `--sflow-index-url <url>` to `sflow batch` (e.g. an Artifactory registry). When it's set, `--sflow-version` is interpreted as a PyPI version specifier: a bare version is pinned (`0.3.0` → `sflow==0.3.0`), an operator spec (`>=0.3,<0.4`) is passed through, and omitting it installs the latest available. Credentials must be available on the compute node via `~/.netrc` or a credential helper (URLs with embedded credentials are rejected).
+Pass `--sflow-index-url <url>` to `sflow batch` (e.g. an Artifactory registry). When it's set, `--sflow-version` is interpreted as a PyPI version specifier: a bare version is pinned (`0.3.2` → `nv-sflow==0.3.2`), an operator spec (`>=0.3,<0.4`) is passed through, and omitting it installs the latest available. Only releases published as `nv-sflow` (v0.3.2 onward) resolve this way; for v0.3.1 or earlier, drop `--sflow-index-url` and pass the git tag (`--sflow-version v0.3.1`). Credentials must be available on the compute node via `~/.netrc` or a credential helper (URLs with embedded credentials are rejected).
 
 ## What does `--sflow-venv-path` do in `sflow batch`?
 
@@ -57,9 +70,9 @@ It's the *parent* directory under which each Slurm job builds its own fresh, dis
 
 ## Which optional extras can I install?
 
-- `pip install 'sflow[s3]'` — S3 artifact/result uploads (credentials from the boto3 default chain).
-- `pip install 'sflow[monitor]'` — PNG charts for the hardware monitor.
+- `pip install 'nv-sflow[s3]'` — S3 artifact/result uploads (credentials from the boto3 default chain).
+- `pip install 'nv-sflow[monitor]'` — PNG charts for the hardware monitor.
 
 ## How do I get the AI-agent skills for writing sflow YAML?
 
-Run `sflow skill` to copy the bundled agent skills into your project (`sflow skill --list` to see them, `-o <dir>` to choose the output directory). These teach coding agents how to author sflow YAML and diagnose failed runs.
+Run `sflow skill --target claude|cursor|codex|all` (`-t`) to install the bundled agent skills straight into that agent's project skills folder, or add `--global` (`-g`) for the user-level folder (Claude Code and Codex only). Plain `sflow skill` copies them to `./skills` after a prompt (`-o <dir>` to choose the directory, `-y` to skip the prompt); `sflow skill --list` shows what is bundled. These teach coding agents how to author sflow YAML and diagnose failed runs.

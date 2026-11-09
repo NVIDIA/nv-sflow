@@ -57,7 +57,7 @@ When multiple YAML files are passed to `sflow compose` or `sflow run`, they are 
 
 | Section | Merge key | Conflict rule |
 |---------|-----------|---------------|
-| `version` | — | Must be consistent across all files |
+| `version` | — | Optional (defaults to `"0.1"`); where declared, must be consistent across all files |
 | `variables` · `artifacts` · `backends` · `operators` · `storage` | `name` | Same-name entries deep-merge (e.g. a backend's `type` in one file, `host_network` in another) |
 | `workflow.variables` | `name` | Deep-merge by name |
 | `workflow.tasks` | `name` | Same-name tasks deep-merge, **first-seen order** preserved (e.g. `script` in one file, `operator` override in another) |

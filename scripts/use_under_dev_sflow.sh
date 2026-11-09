@@ -40,9 +40,14 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 repo_dir = Path(sys.argv[1]).resolve()
-try:
-    dist = metadata.distribution("sflow")
-except metadata.PackageNotFoundError:
+# Either name: nv-sflow (PyPI, internal builds) or sflow (GitHub checkouts).
+for name in ("nv-sflow", "sflow"):
+    try:
+        dist = metadata.distribution(name)
+        break
+    except metadata.PackageNotFoundError:
+        dist = None
+if dist is None:
     sys.exit(f"ERROR: sflow is not installed in {sys.executable}.")
 
 url = json.loads(dist.read_text("direct_url.json") or "{}").get("url") or ""
@@ -57,6 +62,29 @@ if src != repo_dir:
         f"       Fix with        : {sys.executable} -m pip install -e {repo_dir}"
     )
 SFLOW_INSTALL_CHECK
+}
+
+assert_sflow_is_published_version() {
+    # Release-gate counterpart of assert_sflow_installed_from: the suite must run
+    # the wheel users get from the index -- that exact version, and no
+    # direct_url.json, which every checkout/path/VCS install records. Without it a
+    # stale editable install would pass the gate as the release.
+    PYTHONPATH= "$SFLOW_TEST_PYTHON" - "$1" <<'SFLOW_PUBLISHED_CHECK'
+import sys
+from importlib import metadata
+
+want = sys.argv[1]
+try:
+    dist = metadata.distribution("nv-sflow")
+except metadata.PackageNotFoundError:
+    sys.exit(f"ERROR: nv-sflow is not installed in {sys.executable}.")
+origin = dist.read_text("direct_url.json")
+if dist.version != want or origin:
+    sys.exit(
+        f"ERROR: expected the published nv-sflow {want} from the index, "
+        f"found {dist.version} installed from {origin or 'an index'}."
+    )
+SFLOW_PUBLISHED_CHECK
 }
 
 setup_under_dev_sflow() {
@@ -92,7 +120,11 @@ setup_under_dev_sflow() {
     export SFLOW_UNDER_DEV_REPO="$repo_dir"
     export SFLOW_UNDER_DEV_SRC="$repo_dir/src"
     export SFLOW_UNDER_DEV_REF
-    export PYTHONPATH="$SFLOW_UNDER_DEV_SRC${PYTHONPATH:+:$PYTHONPATH}"
+    # SFLOW_E2E_INSTALL_VERSION (the release gate): test the installed published
+    # wheel, so src/ must not shadow it.
+    if [ -z "${SFLOW_E2E_INSTALL_VERSION:-}" ]; then
+        export PYTHONPATH="$SFLOW_UNDER_DEV_SRC${PYTHONPATH:+:$PYTHONPATH}"
+    fi
 
     SFLOW_WRAPPER_DIR="$(mktemp -d)"
     export SFLOW_WRAPPER_DIR
@@ -114,16 +146,30 @@ has_sflow_install_override() {
 # Under-dev runs install the local checkout editable into each job's fresh
 # per-job venv via --sflow-source-path, so submitted Slurm jobs run the exact
 # working tree (no git push / remotely reachable ref required).
+# The release gate (SFLOW_E2E_INSTALL_VERSION) tests the published wheel
+# instead: jobs install that same version from the index, as a user's would.
 if [ "${1:-}" = "batch" ] && ! has_sflow_install_override "$@"; then
-    set -- "$@" --sflow-source-path "$SFLOW_UNDER_DEV_REPO"
+    if [ -n "${SFLOW_E2E_INSTALL_VERSION:-}" ]; then
+        set -- "$@" --sflow-index-url "$SFLOW_E2E_INDEX_URL" --sflow-version "${SFLOW_E2E_INSTALL_VERSION#[vV]}"
+    else
+        set -- "$@" --sflow-source-path "$SFLOW_UNDER_DEV_REPO"
+    fi
 fi
 
-export PYTHONPATH="$SFLOW_UNDER_DEV_SRC${PYTHONPATH:+:$PYTHONPATH}"
+if [ -z "${SFLOW_E2E_INSTALL_VERSION:-}" ]; then
+    export PYTHONPATH="$SFLOW_UNDER_DEV_SRC${PYTHONPATH:+:$PYTHONPATH}"
+fi
 exec "$SFLOW_TEST_PYTHON" -m sflow "$@"
 EOF
     chmod +x "$SFLOW_WRAPPER_DIR/sflow"
     export PATH="$SFLOW_WRAPPER_DIR:$PATH"
 
+    if [ -n "${SFLOW_E2E_INSTALL_VERSION:-}" ]; then
+        echo "Release gate: testing the published nv-sflow ${SFLOW_E2E_INSTALL_VERSION#[vV]} from $SFLOW_E2E_INDEX_URL, not this checkout"
+        sflow --version
+        assert_sflow_is_published_version "${SFLOW_E2E_INSTALL_VERSION#[vV]}"
+        return
+    fi
     echo "Using under-dev sflow from $SFLOW_UNDER_DEV_REPO (ref: $SFLOW_UNDER_DEV_REF)"
     echo "Submitted Slurm jobs install this checkout editable (--sflow-source-path), so uncommitted working-tree changes are included."
     sflow --version

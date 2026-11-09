@@ -1,0 +1,609 @@
+version: "0.1"
+
+# Cross-node prefill/decode disaggregation on a Docker host pool.
+#
+# Prefill runs on one machine and decode on another, so the KV transfer between
+# them is a real network hop -- which is the point of the recipe. The Slurm
+# equivalent is examples/self_contained/slurm/dynamo_vllm_disagg.yaml; the
+# differences that matter are called out inline.
+#
+# Prerequisites:
+#   - ssh from this driver to each `address` already works (sflow pre-flights it)
+#   - NVIDIA Container Toolkit on both hosts
+#   - the MODEL_CACHE directory exists on both hosts (it is the mount source):
+#         ssh <host> mkdir -p /opt/sflow/models
+#     or point the artifact at one you already have:
+#         sflow run -f ... -a MODEL_CACHE=fs:///data/models
+#   - the two hosts can reach each other on the etcd/NATS/frontend/NIXL ports
+#
+# ON WHICH NIC: the KV cache crosses the network once per request, so this recipe
+# is only as fast as the link the workers dial each other on. sflow uses a host's
+# `address` for BOTH the ssh docker endpoint and the address peers dial, which on
+# most machines is the 1GbE management NIC -- enough for ssh, nowhere near enough
+# for KV. If the hosts have a faster fabric, give it its own address and leave ssh
+# where it is:
+#
+#     hosts:
+#       - name: node-0
+#         address: 10.0.0.11             # ssh / docker control plane
+#         rendezvous_address: 192.168.1.11  # what the peer dials for KV
+#
+# Check before blaming the GPU: an interface whose /sys/class/net/<dev>/speed is
+# 1000, or an mlx5 port in state DOWN, means the KV path is the bottleneck and no
+# vLLM flag will help.
+#
+# The MODEL ITSELF need not exist: download_model runs on both hosts and fetches
+# it into the cache on the first run only. Because the cache is a host directory
+# bound into the container, the weights outlive the container, every later run
+# skips the download, and other models land beside it under the same mount.
+
+variables:
+  # --- Host pool -----------------------------------------------------------
+  HOST_0_ADDRESS:
+    description: "Machine running etcd/NATS/frontend and the prefill worker"
+    value: 10.0.0.11
+  HOST_1_ADDRESS:
+    description: "Machine running the decode worker"
+    value: 10.0.0.12
+  SSH_USER:
+    description: "SSH login for both hosts; omit to use your own"
+    value: ""
+  GPUS_PER_NODE:
+    type: integer
+    value: 8
+
+  # --- Model ---------------------------------------------------------------
+  SERVED_MODEL_NAME:
+    value: Qwen3-0.6B
+  HF_MODEL_ID:
+    description: "Hugging Face repo to fetch on first run"
+    value: Qwen/Qwen3-0.6B
+  MODEL_PATH:
+    description: "This model inside the cache; same path on the host and in the container"
+    value: ${{ artifacts.MODEL_CACHE.path }}/${{ variables.SERVED_MODEL_NAME }}
+
+  # --- Prefill (context) worker -------------------------------------------
+  NUM_PREFILL_WORKERS:
+    description: >-
+      Prefill workers on the prefill host. Each is an independent vLLM process
+      holding its own CTX_TP_SIZE GPUs and registering itself with etcd, so the
+      frontend load-balances across them without any further configuration.
+      Raise this when prefill is the bottleneck; the host needs
+      NUM_PREFILL_WORKERS x CTX_TP_SIZE GPUs.
+    type: integer
+    value: 1
+  CTX_TP_SIZE:
+    description: "1 is enough for a 0.6B model; raise for larger ones"
+    type: integer
+    value: 1
+  CTX_BATCH_SIZE:
+    type: integer
+    value: 128
+  CTX_MAX_NUM_TOKENS:
+    type: integer
+    value: 4096
+
+  # --- Decode (generation) worker -----------------------------------------
+  NUM_DECODE_WORKERS:
+    description: >-
+      Decode workers on the decode host, same idea as NUM_PREFILL_WORKERS.
+      Prefill and decode scale independently, which is the point of
+      disaggregation: a prefill-heavy trace wants more of the former.
+    type: integer
+    value: 1
+  GEN_TP_SIZE:
+    type: integer
+    value: 1
+  GEN_BATCH_SIZE:
+    type: integer
+    value: 128
+  GEN_MAX_NUM_TOKENS:
+    type: integer
+    value: 4096
+
+  KV_CACHE_DTYPE:
+    description: "auto matches the checkpoint; Qwen3-0.6B is not an FP8 build"
+    value: auto
+
+  EXTRA_FRONTEND_ARGS:
+    value: ""
+  EXTRA_PREFILL_ARGS:
+    value: ""
+  EXTRA_DECODE_ARGS:
+    value: ""
+
+  SERVER_LOG_LEVEL:
+    description: >
+      INFO (default) | DEBUG | TRACE.
+
+      DEBUG adds UCX/NIXL transport tracing and the dynamo Rust runtime's log.
+      That is the pair worth having: UCX_PROTO_INFO names the transport actually
+      chosen for the KV handoff (cuda_ipc / rc / tcp) rather than the one you
+      assumed, and it prints ~100 lines at startup, not per request.
+
+      vLLM stays at INFO on purpose even here -- its periodic engine line
+      ("Avg prompt throughput / Running / Waiting / GPU KV cache usage") is
+      already INFO, so you get the throughput signal without the volume.
+
+      TRACE adds VLLM_LOGGING_LEVEL=DEBUG. Only when you need per-request
+      scheduler state: it logs one line PER REQUEST PER SCHEDULER STEP, which on
+      a stalled run means a request blocked for 60s emits thousands of
+      "is still in WAITING_FOR_REMOTE_KVS" lines. A 128-request run produced a
+      15 MB log and slowed the run it was measuring.
+    value: INFO
+
+  # --- Benchmark -----------------------------------------------------------
+  #
+  # Sized to finish in a couple of minutes, because in THIS recipe the network
+  # between the hosts -- not the GPU -- is usually the limit. Every request's KV
+  # cache is shipped prefill -> decode, and for a model with L layers, K KV heads
+  # and head_dim D that is:
+  #
+  #     2 (K and V) * K * D * 2 bytes (bf16) * L  per token
+  #
+  # Qwen3-0.6B (L=28, K=8, D=128) is 112 KiB/token, so ISL=1024 moves 112 MiB per
+  # request. At CONCURRENCY=128 that is 14 GiB per round -- ~20 minutes on a 1GbE
+  # management NIC, versus seconds on a 100GbE/IB fabric. Check what the hosts
+  # actually have before raising these, and prefer to raise CONCURRENCY only once
+  # the KV path is on the fast link.
+  ISL:
+    value: 1024
+  OSL:
+    description: "Drives decode time; ISL drives how much KV crosses the network"
+    value: 256
+  MULTI_ROUND:
+    value: 2
+  CONCURRENCY:
+    value: 16
+    domain: [16]
+
+  # --- Images --------------------------------------------------------------
+  DYNAMO_IMAGE:
+    value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+  DOWNLOADER_IMAGE:
+    description: "Fetching weights needs a network and pip, not CUDA -- keep it thin"
+    value: python:3.12-slim
+  AIPERF_IMAGE:
+    value: python:3.12-slim
+
+artifacts:
+  # The model CACHE directory, shared by every model this pool ever downloads.
+  # sflow bind-mounts an `fs://` artifact into every container at the same path
+  # inside and out, so mounting the parent means a second model costs nothing:
+  # no new mount, no config change, and weights already there are reused.
+  #
+  # Point it at your own directory without editing this file:
+  #     sflow run -f ... -a MODEL_CACHE=fs:///data/models
+  - name: MODEL_CACHE
+    uri: fs:///opt/sflow/models
+
+backends:
+  - name: docker_cluster
+    type: docker
+    default: true
+    # No backend `image:`: every task below names an operator with its own, and
+    # every host has an ssh address, so nothing would use it.
+    # No `mounts:` for the model: the MODEL_CACHE artifact above is bind-mounted
+    # automatically, at the same path inside and out, so the path means one
+    # thing everywhere.
+    hosts:
+      # `address` is the machine: sflow derives the ssh:// docker endpoint AND
+      # the address peers dial. An ssh alias works too.
+      - name: node-0
+        address: ${{ variables.HOST_0_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+      - name: node-1
+        address: ${{ variables.HOST_1_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: dynamo
+    type: docker_run
+    image: ${{ variables.DYNAMO_IMAGE }}
+    extra_args:
+      # The image ships an entrypoint; sflow launches through bash.
+      - --entrypoint=
+      # Docker builds no cross-host network. Host networking is what makes etcd,
+      # NATS, the frontend and the NIXL side channel reachable from the other
+      # machine at the addresses declared above.
+      - --network=host
+      - --ipc=host
+      - --shm-size=16g
+  - name: downloader
+    type: docker_run
+    # Deliberately NOT the dynamo image. Downloading weights needs a network and
+    # `pip`, not CUDA, so a ~50MB image starts in a second instead of pulling
+    # tens of gigabytes on a host that has not run the workload before.
+    #
+    # It also avoids a trap in the dynamo image: it sets HOME=/home/dynamo, whose
+    # stock ~/.bash_logout ends in `[ -x /usr/bin/clear_console ] && clear_console -q`.
+    # sflow runs scripts through `bash -lc`, a LOGIN shell, which executes that
+    # file on exit; clear_console fails without a TTY, and under `set -e` bash
+    # then exits 1 -- so the `exit 0` in the skip-download branch below was
+    # reported as a task failure. This image has no ~/.bash_logout.
+    image: ${{ variables.DOWNLOADER_IMAGE }}
+    extra_args:
+      - --network=host
+      # This image already runs as root, which is what writing into the cache
+      # needs: docker auto-creates a missing bind source as root, so a cache
+      # directory left by an earlier run is not writable by anyone else. Only
+      # this task writes; the servers below just read, and downloaded files are
+      # world-readable.
+
+  - name: aiperf
+    type: docker_run
+    image: ${{ variables.AIPERF_IMAGE }}
+    extra_args:
+      - --network=host
+
+workflow:
+  name: dynamo_vllm_disagg_docker
+  variables:
+    HEAD_NODE_IP:
+      value: "${{ backends.docker_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      value: "${{ backends.docker_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      value: "nats://${{ backends.docker_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: download_model
+      operator: downloader
+      # Runs on BOTH hosts. They share no filesystem, so a download on node 0
+      # would leave node 1 without the model -- this is the plain CPU fan-out
+      # case of multi-node: one container per host, no GPUs involved.
+      resources:
+        nodes:
+          count: 2
+      script:
+        - set -euo pipefail
+        - echo "node=${SFLOW_TASK_NODE_INDEX}/${SFLOW_TASK_NUM_NODES} host=$(hostname) user=$(id -un 2>/dev/null || id -u)"
+        # Fail here, naming the directory, rather than 40 lines into a
+        # huggingface traceback: this is the usual cause of a failed first run.
+        - >
+          if ! touch "$(dirname "${MODEL_PATH}")/.sflow-write-probe" 2>/dev/null; then
+            echo "ERROR: $(dirname "${MODEL_PATH}") is not writable as $(id -u):$(id -g)." >&2
+            echo "Fix the ownership on this host, or point -a MODEL_CACHE at a writable directory." >&2
+            exit 1
+          fi
+        - rm -f "$(dirname "${MODEL_PATH}")/.sflow-write-probe"
+        # MODEL_PATH is a workflow variable, so it arrives as an env var here --
+        # no need to restate it.
+        # Idempotent: the cache dir is a host path bound into the container, so a
+        # model fetched by an earlier run is still here and is reused.
+        #
+        # `if/else` rather than an early `exit 0`: sflow runs this through
+        # `bash -lc`, and a login shell executes ~/.bash_logout on exit. The
+        # stock Ubuntu one ends in a command that fails without a TTY, which
+        # under `set -e` rewrites the status to 1 -- an early `exit 0` would be
+        # reported as a task failure in any image that ships that file.
+        #
+        # snapshot_download rather than the CLI: the entry point was renamed
+        # (huggingface-cli -> hf) across versions, the Python API was not.
+        - >
+          if [ -s "${MODEL_PATH}/config.json" ]; then
+            echo "Model already present at ${MODEL_PATH}; skipping download"
+          else
+            echo "Downloading ${HF_MODEL_ID} to ${MODEL_PATH}..."
+            pip install -q "huggingface_hub>=0.34"
+            python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${HF_MODEL_ID}', local_dir='${MODEL_PATH}')"
+            test -s "${MODEL_PATH}/config.json"
+            echo "Model ready at ${MODEL_PATH}"
+          fi
+
+    - name: nats_server
+      operator: dynamo
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 300
+          interval: 2
+
+    - name: etcd_server
+      operator: dynamo
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://${HEAD_NODE_IP}:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 300
+          interval: 2
+
+    - name: frontend_server
+      operator: dynamo
+      script:
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 300
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: prefill_server
+      operator: dynamo
+      # Pinned to node 0. Decode is pinned to node 1, which is what makes the KV
+      # handoff cross the network instead of staying on one box. The pin is
+      # load-bearing: a bare GPU claim packs onto the first host with room, and
+      # with 8 GPUs free on node 0 that put prefill AND decode on the same
+      # machine -- a disagg recipe whose KV never left the box.
+      resources:
+        nodes:
+          indices: [0]
+        gpus:
+          count: ${{ variables.CTX_TP_SIZE }}
+      # Every replica lands on node 0 and takes its own CTX_TP_SIZE GPUs, so the
+      # KV handoff still crosses the wire to the decode host -- which is the
+      # point of this recipe. `parallel` because the workers serve together.
+      replicas:
+        count: ${{ variables.NUM_PREFILL_WORKERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        # Unlike the Slurm recipe, do NOT derive the NIXL port from the first
+        # visible device. A docker_run container is given a carved device set and
+        # sees CUDA_VISIBLE_DEVICES renumbered from 0, so that arithmetic would
+        # produce the same port on every worker.
+        #
+        # Offset by the replica index instead: replicas DO share a host, so a
+        # fixed port would have the second worker fail to bind. sflow sets
+        # SFLOW_REPLICA_INDEX per replica (0 when there is only one).
+        # Verbosity, one knob (SERVER_LOG_LEVEL=DEBUG). Off by default because
+        # it adds ~100 startup lines of UCX/NIXL transport tracing per worker.
+        #
+        # vLLM's periodic engine line ("Avg prompt throughput / Running /
+        # Waiting / GPU KV cache usage") is the one that says whether prefill is
+        # compute-bound or stalled -- without it a slow run leaves no trace at
+        # all between startup and the final aiperf table.
+        - |
+          case "${SERVER_LOG_LEVEL}" in
+            DEBUG|TRACE)
+              export DYN_LOG=debug
+              export NIXL_LOG_LEVEL=DEBUG
+              # Names the transport UCX actually selected. On one box a GPU->GPU
+              # handoff should pick cuda_ipc; seeing tcp here is the answer to
+              # "why is the GPU idle". Startup-only, so it is cheap.
+              export UCX_LOG_LEVEL=info
+              export UCX_PROTO_INFO=y
+              ;;
+          esac
+          # Separate, because this one floods: one line per request per
+          # scheduler step. See SERVER_LOG_LEVEL.
+          if [ "${SERVER_LOG_LEVEL}" = "TRACE" ]; then
+            export VLLM_LOGGING_LEVEL=DEBUG
+          fi
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0}))
+        # The peer dials this address, so it has to be the host's real IP rather
+        # than a container-local one. For a single-node task the assigned list
+        # holds exactly this node.
+        - export VLLM_NIXL_SIDE_CHANNEL_HOST=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          python3 -m dynamo.vllm --model ${{ variables.MODEL_PATH }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --tensor-parallel-size ${CTX_TP_SIZE}
+          --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }}
+          --is-prefill-worker
+          --no-enable-prefix-caching
+          --block-size 128
+          --max-num-seqs ${CTX_BATCH_SIZE}
+          --max-num-batched-tokens ${CTX_MAX_NUM_TOKENS}
+          ${EXTRA_PREFILL_ARGS}
+      depends_on:
+        - frontend_server
+        - download_model
+      probes:
+        # BOTH must trigger -- sflow holds a task RUNNING until every readiness
+        # probe has fired. Neither alone is enough:
+        #
+        # * http_post asks "can the frontend serve end to end". True as soon as
+        #   the FIRST worker registers, so on its own every replica flips ready
+        #   at once -- and here that could mean starting with only prefill
+        #   registered and no decode worker at all.
+        # * log_watch asks "is THIS worker serving", from its own log. True per
+        #   replica, but blind to whether the frontend has discovered it.
+        #
+        # Together, and with `depends_on` waiting for every replica, the
+        # benchmark starts only once every prefill and decode worker is up and
+        # the frontend is routing.
+        readiness:
+          - http_post:
+              url: "http://${{ variables.HEAD_NODE_IP }}:8000/v1/chat/completions"
+              headers:
+                Content-Type: "application/json"
+              body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+            timeout: 1200
+            each_check_timeout: 20
+            interval: 20
+          # "this worker has published its generate endpoint", i.e. it can now
+          # take requests. NOT the model-registration line the modular recipes
+          # watch for: a `--is-prefill-worker` registers no servable model, so
+          # that line never appears in a prefill log and the probe would hang
+          # until timeout. This one is logged once by EVERY role -- verified
+          # across 4 prefill and 4 decode workers -- and in a decode worker it
+          # comes AFTER model registration, so it is the stricter of the two.
+          - log_watch:
+              match_pattern: "request plane server endpoint=generate transport"
+              match_count: 1
+            timeout: 1200
+            interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: decode_server
+      operator: dynamo
+      # Node 1: the other machine. See prefill_server.
+      resources:
+        nodes:
+          indices: [1]
+        gpus:
+          count: ${{ variables.GEN_TP_SIZE }}
+      replicas:
+        count: ${{ variables.NUM_DECODE_WORKERS }}
+        policy: "parallel"
+      script:
+        - set -x
+        # Replica-offset for the same reason as prefill. Decode is on its own
+        # host, so its ports never collide with prefill's -- only with its own
+        # siblings.
+        # Verbosity, one knob (SERVER_LOG_LEVEL=DEBUG). Off by default because
+        # it adds ~100 startup lines of UCX/NIXL transport tracing per worker.
+        #
+        # vLLM's periodic engine line ("Avg prompt throughput / Running /
+        # Waiting / GPU KV cache usage") is the one that says whether decode is
+        # compute-bound or stalled -- without it a slow run leaves no trace at
+        # all between startup and the final aiperf table.
+        - |
+          case "${SERVER_LOG_LEVEL}" in
+            DEBUG|TRACE)
+              export DYN_LOG=debug
+              export NIXL_LOG_LEVEL=DEBUG
+              # Names the transport UCX actually selected. On one box a GPU->GPU
+              # handoff should pick cuda_ipc; seeing tcp here is the answer to
+              # "why is the GPU idle". Startup-only, so it is cheap.
+              export UCX_LOG_LEVEL=info
+              export UCX_PROTO_INFO=y
+              ;;
+          esac
+          # Separate, because this one floods: one line per request per
+          # scheduler step. See SERVER_LOG_LEVEL.
+          if [ "${SERVER_LOG_LEVEL}" = "TRACE" ]; then
+            export VLLM_LOGGING_LEVEL=DEBUG
+          fi
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((6557 + ${SFLOW_REPLICA_INDEX:-0}))
+        - export VLLM_NIXL_SIDE_CHANNEL_HOST=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - >
+          python3 -m dynamo.vllm --model ${{ variables.MODEL_PATH }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --tensor-parallel-size ${GEN_TP_SIZE}
+          --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }}
+          --no-enable-prefix-caching
+          --block-size 128
+          --max-num-seqs ${GEN_BATCH_SIZE}
+          --max-num-batched-tokens ${GEN_MAX_NUM_TOKENS}
+          ${EXTRA_DECODE_ARGS}
+      depends_on:
+        - frontend_server
+        - download_model
+      probes:
+        # BOTH must trigger -- sflow holds a task RUNNING until every readiness
+        # probe has fired. Neither alone is enough:
+        #
+        # * http_post asks "can the frontend serve end to end". True as soon as
+        #   the FIRST worker registers, so on its own every replica flips ready
+        #   at once -- and here that could mean starting with only prefill
+        #   registered and no decode worker at all.
+        # * log_watch asks "is THIS worker serving", from its own log. True per
+        #   replica, but blind to whether the frontend has discovered it.
+        #
+        # Together, and with `depends_on` waiting for every replica, the
+        # benchmark starts only once every prefill and decode worker is up and
+        # the frontend is routing.
+        readiness:
+          - http_post:
+              url: "http://${{ variables.HEAD_NODE_IP }}:8000/v1/chat/completions"
+              headers:
+                Content-Type: "application/json"
+              body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+            timeout: 1200
+            each_check_timeout: 20
+            interval: 20
+          # "this worker has published its generate endpoint", i.e. it can now
+          # take requests. NOT the model-registration line the modular recipes
+          # watch for: a `--is-prefill-worker` registers no servable model, so
+          # that line never appears in a prefill log and the probe would hang
+          # until timeout. This one is logged once by EVERY role -- verified
+          # across 4 prefill and 4 decode workers -- and in a decode worker it
+          # comes AFTER model registration, so it is the stricter of the two.
+          - log_watch:
+              match_pattern: "request plane server endpoint=generate transport"
+              match_count: 1
+            timeout: 1200
+            interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: benchmark
+      operator: aiperf
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        # On a declared host pool this container runs on node 0, where the
+        # controller's output dir is not mounted: --artifact-dir lands inside
+        # the container and goes with it. The results table aiperf prints is
+        # captured in this task's log, and that is the record of the run.
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ variables.MODEL_PATH }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      # Sample the SERVERS' hardware over the benchmark window, not the client's.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
+      depends_on:
+        - prefill_server
+        - decode_server
+        - frontend_server

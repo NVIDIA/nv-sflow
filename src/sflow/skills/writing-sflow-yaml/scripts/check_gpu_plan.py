@@ -4,15 +4,26 @@
 Usage:
     python check_gpu_plan.py <yaml_file> [<yaml_file> ...]
 
-Shows:
+Arguments:
+    One or more recipe files, merged in order (later files override earlier ones).
+
+Output:
+    A plan on stdout showing:
     - Per-task GPU allocation (count, replicas, total)
     - Backend capacity (nodes * gpus_per_node)
     - Oversubscription warnings
     - Node-pinned tasks vs floating tasks
+
+Exit codes:
+    0  plan printed (advisory: oversubscription is reported, not failed)
+    1  no valid config could be loaded
+    2  usage error (no file given)
 """
 
 from __future__ import annotations
 
+import ast
+import operator
 import re
 import sys
 from pathlib import Path
@@ -115,10 +126,32 @@ def _resolve_value(val, variables: dict) -> int | str | None:
         resolved_expr = resolved_expr.replace(f"variables.{vname}", str(vval))
 
     try:
-        result = eval(resolved_expr, {"__builtins__": {}}, {})  # noqa: S307
-        return int(result)
-    except Exception:
+        return int(_arith(ast.parse(resolved_expr, mode="eval").body))
+    except (SyntaxError, ValueError, TypeError, ZeroDivisionError, OverflowError):
         return None
+
+
+_ARITH_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _arith(node: ast.AST) -> int | float:
+    """Evaluate a numeric literal expression (+ - * / // %). Anything else raises ValueError."""
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _ARITH_OPS:
+        return _ARITH_OPS[type(node.op)](_arith(node.left), _arith(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ARITH_OPS:
+        return _ARITH_OPS[type(node.op)](_arith(node.operand))
+    raise ValueError(f"unsupported expression: {ast.dump(node)}")
 
 
 def _get_backend_capacity(config: dict, variables: dict) -> list[dict]:
@@ -132,8 +165,24 @@ def _get_backend_capacity(config: dict, variables: dict) -> list[dict]:
             continue
         name = b.get("name", "<unnamed>")
         btype = b.get("type", "local")
-        nodes = _resolve_value(b.get("nodes", 1), variables)
-        gpn = _resolve_value(b.get("gpus_per_node", 0), variables)
+        hosts = b.get("hosts")
+        if isinstance(hosts, list) and hosts:
+            # A declared docker `hosts:` pool IS the node list; capacity is the sum of
+            # per-host gpus_per_node (each falls back to the backend-level value).
+            nodes = len(hosts)
+            per_host = [
+                _resolve_value(
+                    (h if isinstance(h, dict) else {}).get("gpus_per_node", b.get("gpus_per_node", 0)),
+                    variables,
+                )
+                for h in hosts
+            ]
+            gpn = per_host[0] if len(set(per_host)) == 1 else None  # None = heterogeneous
+            total = sum(per_host) if all(isinstance(g, int) for g in per_host) else None
+        else:
+            nodes = _resolve_value(b.get("nodes", 1), variables)
+            gpn = _resolve_value(b.get("gpus_per_node", 0), variables)
+            total = (nodes or 0) * (gpn or 0) if nodes and gpn else None
         is_default = b.get("default", False)
         results.append(
             {
@@ -141,7 +190,7 @@ def _get_backend_capacity(config: dict, variables: dict) -> list[dict]:
                 "type": btype,
                 "nodes": nodes,
                 "gpus_per_node": gpn,
-                "total_gpus": (nodes or 0) * (gpn or 0) if nodes and gpn else None,
+                "total_gpus": total,
                 "default": is_default,
             }
         )

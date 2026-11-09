@@ -10,6 +10,10 @@ sidebar_position: 3
 
 All resolved variables are injected into every task environment by default.
 
+:::note
+YAML snippets on this page are fragments: add `workflow.name` (and any `variables:` they reference) before running them.
+:::
+
 ## Why sflow Variables vs Regular Environment Variables?
 
 sflow variables offer significant advantages over traditional environment variables:
@@ -336,6 +340,8 @@ Each task automatically receives environment variables with its assigned node in
 |----------|-------------|---------|
 | `SFLOW_TASK_ASSIGNED_NODE_NAMES` | Comma-separated list of assigned node hostnames | `node0,node1` |
 | `SFLOW_TASK_ASSIGNED_NODE_IPS` | Comma-separated list of assigned node IP addresses | `10.0.0.1,10.0.0.2` |
+| `SFLOW_TASK_NUM_NODES` | Number of nodes assigned to this task | `2` |
+| `SFLOW_LEADER_ADDRESS` | Rank 0's address, for peers to rendezvous against. Set only when the task spans more than one node | `10.0.0.1` |
 
 These are useful in scripts when you need to iterate over assigned nodes or use them for distributed computing:
 

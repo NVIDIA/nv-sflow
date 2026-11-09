@@ -5,6 +5,7 @@
 SFLOW CLI - Command Line Interface for the sflow workflow orchestrator
 """
 
+import sys
 from typing import Optional
 
 import typer
@@ -59,8 +60,31 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+class _SflowTyper(typer.Typer):
+    def __call__(self, *args, **kwargs):
+        from sflow.ssh.delegate import predispatch
+        from sflow.utils.distribution import reconcile
+
+        # The console-script entry, not import time: library users and tests never
+        # have their environment edited by importing sflow.
+        reconcile()
+
+        # click's own argv: an explicit list wins, exactly as it does for the
+        # parse that follows, so --ssh cannot be honored by one and missed by
+        # the other.
+        argv = kwargs.get("args", args[0] if args else None)
+        try:
+            predispatch(list(argv) if argv is not None else sys.argv[1:])
+        except typer.Exit as exc:
+            raise SystemExit(exc.exit_code) from None
+        except (typer.BadParameter, FileNotFoundError) as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise SystemExit(2) from None
+        return super().__call__(*args, **kwargs)
+
+
 # Create the main CLI app
-app = typer.Typer(
+app = _SflowTyper(
     name="sflow",
     help="SFLOW - Workflow Orchestrator with Pluggable Backends",
     add_completion=False,
@@ -87,13 +111,14 @@ def _register_commands() -> None:
     # Import commands to register them with the app (import side-effects).
     # Keep this in a function to avoid "module level import not at top of file" warnings.
     from . import (
-        run,  # noqa: F401
         batch,  # noqa: F401
-        visualize,  # noqa: F401
-        sample,  # noqa: F401
         compose,  # noqa: F401
+        remote,  # noqa: F401
+        run,  # noqa: F401
+        sample,  # noqa: F401
         skill,  # noqa: F401
         upgrade,  # noqa: F401
+        visualize,  # noqa: F401
     )
 
 

@@ -249,7 +249,7 @@ def test_resolve_backends_instantiates_docker_backend_with_resolved_fields():
                 "type": "docker",
                 "default": True,
                 "image": "${{ variables.IMAGE }}",
-                "nodes": 2,
+                "nodes": 1,
                 "gpus_per_node": 4,
             }
         ],
@@ -263,7 +263,7 @@ def test_resolve_backends_instantiates_docker_backend_with_resolved_fields():
     backend = state.backends["docker"]
     assert isinstance(backend, DockerBackend)
     assert backend._image == "ubuntu:22.04"
-    assert backend._nodes == 2
+    assert backend._nodes == 1
     assert backend._gpu_per_node == 4
 
 

@@ -1,5 +1,7 @@
 ---
 name: sflow-error-analysis
+metadata:
+  author: Roger Liu <rogliu@nvidia.com>
 description: >-
   Diagnose and troubleshoot sflow workflow errors from log output, error messages, and
   task failures. Covers config validation errors, expression resolution failures, backend
@@ -21,6 +23,10 @@ The first move depends on *when* it broke:
 
 Figure out which you have, then follow that path below.
 
+## Instructions
+
+Work through Steps 1–5 in order; don't propose a fix before Step 3 has located the evidence.
+
 ## Step 1 — Capture the failure
 
 - **A task ran and failed (you have a run dir)** → start with the one-shot triage. It walks
@@ -40,6 +46,12 @@ Figure out which you have, then follow that path below.
 
 - **Only have a pasted error?** Match its marker in Step 2 to pick the path.
 
+- **The run went through `--ssh`?** The run dir is on the remote host; what came back is
+  under `sflow_output/ssh-<timestamp>-<id>/` next to a `receipt.json`. `sflow fetch
+  <receipt> --all` copies the complete remote output dir (then triage it as above);
+  `sflow watch <receipt>` tails a run that is still going. A dropped connection did not
+  cancel the remote run.
+
 ## Step 2 — Classify (marker → where to look)
 
 | Category            | Marker in the output                                     | Path    | Where to look             |
@@ -51,12 +63,15 @@ Figure out which you have, then follow that path below.
 | Schema              | `type 'docker' is not valid` (use `docker_run`), `mutually exclusive` | launch | CLI output (validation) |
 | Merge conflict      | `Version conflict` (name/dup-task now warn+merge)        | launch  | CLI output (multi-file)   |
 | Batch / CSV         | `CSV file`, `sflow_config_file column`                   | launch  | CLI output                |
-| SLURM               | `salloc failed`, `sbatch failed`                         | runtime | CLI / sbatch stderr       |
+| Docker plan/pre-flight | `asks for N nodes but declares no 'hosts:'`, `docker host '<h>' needs an 'address'`, `Pre-flight validation failed for Docker backend` | launch | CLI output (names the host) |
+| Install / upgrade   | `is not a valid PyPI version specifier`, `(development) install`, `install failed with exit code` | launch | `sflow upgrade` / batch bootstrap output |
+| SLURM               | `salloc failed`, `sbatch failed`, `salloc: error:`, `srun: error:`, `No devices were found` | runtime | CLI / sbatch stderr / `<task>.log` |
 | Kubernetes          | `kubectl`, RBAC/preflight, pod `Pending`/`ImagePullBackOff` | runtime | CLI / sflow.log / `kubectl describe` |
 | Docker              | `docker run` errors, remote host, NVIDIA toolkit         | runtime | `<task>/<task>.log`       |
 | Storage / uploads   | `requires boto3`, `No AWS credentials`, upload failures  | runtime | CLI / dry-run / sflow.log |
 | Probe timeout       | Task stuck waiting                                       | runtime | `<task>/<task>.log`       |
 | Task failure        | `Traceback`, non-zero exit                              | runtime | `<task>/<task>.log`       |
+| Green but empty     | aiperf `Processed 0 valid requests`, empty CSV            | runtime | `<task>/<task>.log`, the CSV |
 
 ## Step 3 — Locate the evidence
 
@@ -139,26 +154,39 @@ Two consequences that cost real debugging time:
 | `Operator type 'docker' is not valid`                    | Use `type: docker_run` for the operator (backend is `type: docker`) |
 | `Variable '<key>' ... is not defined`                    | Declare the variable in YAML before `--set`-ing it         |
 | `Undefined variable in expression`                       | Fix spelling; ensure the variable is declared              |
-| `Invalid expression syntax`                              | Fix the `${{ }}` Jinja2 syntax                             |
+| `Invalid expression syntax`                              | Fix the ``${{ }}`` Jinja2 syntax                             |
 | `Artifact path validation failed`                        | Fix the `fs://` path, create it, or `--skip-artifact-check` |
-| `Version conflict`                                       | Every file must use `version: "0.1"`                       |
+| `Version conflict`                                       | Use `"0.1"` wherever `version` is declared, or omit it     |
 | `CSV file must contain a 'sflow_config_file' column`     | Add the required column to the CSV                         |
+| `Docker backend '<b>' asks for N nodes but declares no 'hosts:'` | Several machines → list them under `hosts:`; one machine → `nodes: 1` |
+| `declares H host(s) but asks for nodes: N`               | `hosts:` is the node list — drop `nodes:` or match the pool size |
+| `docker host '<h>' needs an 'address'` / `has address '<v>': drop the scheme` | One bare `address` per machine; login in `user`; `docker_host`/`context` only as overrides |
+| `Pre-flight validation failed for Docker backend '<b>':` + per-host lines | `unreachable:` → fix non-interactive ssh / the daemon on that host; `mount source(s) not found on that machine` → create the path or fix `mounts:` there (catalog 11.1) |
+| `--sflow-version '<x>' is not a valid PyPI version specifier` | Git ref → `sflow upgrade --branch <ref>` (`--repo` for a fork); `--sflow-version` is PEP 440 only |
 
 ### 4b. Runtime — read the logs (backend launch, then task crash)
 
 | Symptom                                                  | Fix                                                        |
 |----------------------------------------------------------|------------------------------------------------------------|
 | `salloc failed` / `sbatch failed`                        | Check partition/account/availability (`sinfo`, `sacctmgr`) |
+| `nvidia-smi: No devices were found` / `No CUDA GPUs are available`, `sflow_gpus.log` says `visible_gpu_count=0` | GRES partition, no GPUs requested: `--extra-salloc-args '--gpus-per-node=N'` (sflow `gpus_per_node` is planning-only) |
+| `salloc: error: Job allocation N has been revoked` / `Nodes … are still not ready` | Node prolog/boot failure, node drained — re-run, `--exclude-nodes` it |
+| `srun: error: Unable to confirm allocation for job N` / `Expired or invalid job` | One backend's `time:` ran out while the partner was queued — raise `time:` |
+| `enroot-mount: failed to mount: /dev/nvidia-caps-imex-channels` + `couldn't start container` | Cold enroot cache race; retry, or pre-import once per node (`srun -N<n> --ntasks-per-node=1 --container-image=<img> true`) |
+| `ptxas fatal : Value 'sm_103a' is not defined` / `no kernel image is available` | Image toolchain older than the GPU — CUDA 13 image for GB300 (`DYNAMO_IMAGE`) |
 | kube preflight: missing permission / namespace           | Fix RBAC or `--kube-namespace`; `SFLOW_SKIP_K8S_PREFLIGHT=1` to bypass |
 | pod stuck `Pending`                                      | `kubectl describe pod`: no node has the GPUs — check `gpus_per_node`, `scheduling` mode, node-selector/tolerations, and that `gpus.count` is a multiple of the node count |
 | pod `ImagePullBackOff` / container not found             | Wrong `image` or missing `image_pull_secrets`; verify registry access |
+| k8s readiness timeout after `OOM during general warmup` / `ncclMemAlloc … unhandled cuda error`, right after another run's pods were deleted | GPU memory not released yet on that node — wait a minute or two, or `--include-nodes` another |
 | Docker GPU task fails                                    | Install the NVIDIA container toolkit on the host; set `gpus_per_node` |
+| Docker multi-node task `FAILED` with one member's exit code | First non-zero member fails the task, peers are stopped; find the rank label in the merged `<task>.log` |
+| aiperf `Processed 0 valid requests and N errors` (task still `COMPLETED`) | aiperf exits 0 regardless; the CSV is empty — read its error breakdown (404 → endpoint/model name; refused → frontend) |
 | Probe timeout (task hangs waiting)                       | Read the **Probe Traces (last attempt)** section of `sflow_summary.log` — it shows what each probe last saw (the last log line for `log_watch`, the endpoint result for `tcp_port`/`http`). Then compare server output to `log_watch` — it matches **literally** unless prefixed `re:`/`regex:`; adjust the pattern or `timeout` |
 | `Traceback` in `<task>.log`                              | Read the traceback for the real cause (below are the usual ones) |
 | CUDA OOM                                                 | Reduce batch size, TP/DP, or model size                    |
 | `Address already in use` / port conflict                | Kill stale processes or offset the port                    |
 | NCCL / communication errors                              | Set `NCCL_SOCKET_IFNAME`; check the inter-node network     |
-| `S3 storage requires boto3` / `no AWS credentials` / upload fails | `pip install 'sflow[s3]'`; provide creds via the boto3 chain (`AWS_*` / `~/.aws/credentials` / IAM — never in YAML); verify bucket/region |
+| `S3 storage requires boto3` / `no AWS credentials` / upload fails | `pip install 'nv-sflow[s3]'`; provide creds via the boto3 chain (`AWS_*` env vars / AWS shared credentials file / IAM — never in YAML); verify bucket/region |
 
 For a pattern-by-pattern catalog (exact message, cause, and fix per error), see
 [error-catalog.md](error-catalog.md).
@@ -181,9 +209,24 @@ python scripts/triage.py <output_dir>/<run_id>/          # one-shot: summary + l
 python scripts/summarize_run.py <output_dir>/<run_id>/   #   per-task status + tracebacks only
 python scripts/parse_sflow_errors.py <run_id>/sflow.log  #   categorize an orchestrator log
 sinfo -p <partition>; sacctmgr show account <name>       # Slurm environment
+sinfo -R                                                 # drained nodes + reason (Prolog error)
 kubectl -n <ns> get pods && kubectl -n <ns> describe pod <pod>   # Kubernetes scheduling/image
 kubectl -n <ns> get events --sort-by=.lastTimestamp
+ssh <address> docker version                             # what Docker pre-flight does per host
+sflow watch <receipt.json>; sflow fetch <receipt.json> --all     # --ssh runs: tail / copy back
 ```
+
+## Examples
+
+- Dry-run prints `Operator type 'docker' is not valid` → config error; the operator is
+  `type: docker_run`, the backend is `type: docker` (Step 4 table).
+- `Configuration file not found: <path>` → check the `-f` path (Step 4 table).
+- Task log ends in `RuntimeError: No CUDA GPUs are available` and `<task>/sflow_gpus.log`
+  has `visible_gpu_count=0`, `nvidia_visible_devices_inherited=all` → GRES partition with no
+  GPU request; add `--gpus-per-node=N` via `--extra-salloc-args` (catalog 5.4).
+- `Pre-flight validation failed for Docker backend 'pool':` / `- host 'dgx-b' (ssh://dgx-b)
+  unreachable: Host key verification failed` → ssh to it once by hand so the key is known;
+  pre-flight runs with `BatchMode=yes` (catalog 11.1).
 
 ## Additional resources
 

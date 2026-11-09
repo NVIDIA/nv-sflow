@@ -130,6 +130,34 @@ def test_host_prefixer_omits_rank_when_no_slurm_procid(monkeypatch):
     assert line.endswith("INFO - hi")  # no "<rank>: " prefix
 
 
+def test_host_prefixer_strips_ansi_like_stream_mode(monkeypatch):
+    """<task>.log must carry no escapes on ANY write path.
+
+    Stream mode strips at write time and k8s at pod-terminal; the offload
+    prefixer did neither, so a dynamo worker's coloured `endpoint=generate` --
+    stored as `\\e[3mendpoint\\e[0m\\e[2m=\\e[0mgenerate` -- never matched the
+    literal log_watch pattern and a healthy worker sat in its readiness probe
+    until the timeout. The real 0.8.0 line, driven through the helper exactly
+    as the container runs it.
+    """
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+    coloured = (
+        "\x1b[2m2026-10-28T05:26:47Z\x1b[0m \x1b[32m INFO\x1b[0m Registering endpoint "
+        "with request plane server \x1b[3mendpoint\x1b[0m\x1b[2m=\x1b[0mgenerate "
+        "\x1b[3mtransport\x1b[0m\x1b[2m=\x1b[0m\"tcp\"\n"
+    )
+    namespace: dict = {}
+    exec(compile(LOG_PREFIX_HELPER_SRC, "log_prefix.py", "exec"), namespace)
+    monkeypatch.setattr("sys.stdin", io.StringIO(coloured))
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    monkeypatch.setattr("sys.argv", ["log_prefix.py", "sflow.task.t"])
+    namespace["main"]()
+    line = out.getvalue().splitlines()[0]
+    assert "\x1b" not in line, line
+    assert line.endswith('request plane server endpoint=generate transport="tcp"'), line
+
+
 # --- docker -----------------------------------------------------------------
 
 
@@ -168,9 +196,14 @@ def test_docker_offload_wraps_docker_run(tmp_path, monkeypatch):
     assert op.writes_own_task_log() is True
 
 
-def test_docker_offload_wraps_multi_node_bash_wrapper(tmp_path, monkeypatch):
-    """The multi-node launcher itself is a `bash -lc` wrapper; offload must wrap
-    that whole wrapper (both containers) and redirect to <task>.log."""
+def test_docker_offload_is_skipped_for_multi_node(tmp_path, monkeypatch):
+    """Multi-node members stream through the launcher, so offload must not apply.
+
+    The launcher already owns member output and labels it per rank. A host-side
+    redirect on top would be a second writer on the same <task>.log, and
+    `writes_own_task_log` would suppress sflow's own handler for a file nothing
+    is writing -- losing the task log entirely.
+    """
     _clear_env(monkeypatch)
     _force_non_tty(monkeypatch)
     op = DockerRunOperator(
@@ -184,12 +217,9 @@ def test_docker_offload_wraps_multi_node_bash_wrapper(tmp_path, monkeypatch):
         task_name="t", script=["echo hi"], envs=envs
     ).as_list()
 
-    assert parts[0] == "bash" and parts[1] == "-c"
-    wrapped = parts[-1]
+    # A plain docker command, not a bash offload wrapper.
+    assert parts[:2] == ["docker", "run"]
     log_path = os.path.join(envs["SFLOW_TASK_OUTPUT_DIR"], "t.log")
-    assert wrapped.startswith("{")
-    # both containers survive inside the offloaded wrapper (names carry the pid)
-    assert f"sflow-p{os.getpid()}-t-localhost" in wrapped
-    assert f"sflow-p{os.getpid()}-t-localhost-1" in wrapped
-    assert f"> {log_path}" in wrapped
-    assert wrapped.rstrip().endswith('exit "${PIPESTATUS[0]}"')
+    assert not any(str(log_path) in part for part in parts)
+    # sflow keeps ownership of <task>.log, since nothing else is writing it.
+    assert op.writes_own_task_log() is False

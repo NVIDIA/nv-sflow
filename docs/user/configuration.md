@@ -17,6 +17,8 @@ workflow: ...
 
 This page follows the **current schema in code** (`src/sflow/config/schema.py`).
 
+Most sections are strict — an unknown key is rejected at load time — but `backends:` entries, non-`k8s*` `operators:` entries, and `storage.s3` are not: unknown keys there are silently ignored, so `--dry-run` will not catch a typo in those blocks.
+
 :::tip
 Looking for a quick lookup of all config fields? See the [Quick Reference](./quick-reference.md) table.
 :::
@@ -158,8 +160,9 @@ This skips `salloc` and attempts to infer node info from the current environment
 ### docker backend
 
 The `docker` backend runs each task in a container via the `docker_run` operator. Set
-`image` and `gpus_per_node`; an optional `hosts:` pool spreads tasks across remote Docker
-daemons. See [Backends](./backends.md#docker-backend).
+`gpus_per_node`, and `image` for tasks that declare no operator of their own; an optional
+`hosts:` pool — one `address` per machine — lets a task span several Docker hosts. See
+[Backends](./backends.md#docker-backend).
 
 ### kubernetes backend
 
@@ -213,7 +216,7 @@ operators:
 
 Optional. Declares named post-execution upload targets (S3 today). Each task can then attach
 `uploads:` specs, and `workflow.upload_all` can zip and ship the whole run. Credentials come
-from the boto3 default chain — never put secrets in YAML (needs the `sflow[s3]` extra).
+from the boto3 default chain — never put secrets in YAML (needs the `nv-sflow[s3]` extra).
 
 ```yaml
 storage:

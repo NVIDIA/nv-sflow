@@ -18,6 +18,20 @@ variables:
     description: "Frontend / OpenAI HTTP port"
     type: integer
     value: 8000
+  # Declared rather than hard-coded so the endpoint URL a client connects to and
+  # the readiness probe that says "it is up" can never name different ports.
+  ETCD_PORT:
+    description: "etcd client port"
+    type: integer
+    value: 2379
+  ETCD_PEER_PORT:
+    description: "etcd peer port (single-member cluster, but etcd still needs it)"
+    type: integer
+    value: 2380
+  NATS_PORT:
+    description: "NATS client port"
+    type: integer
+    value: 4222
 
 workflow:
   name: modular_inference
@@ -27,31 +41,52 @@ workflow:
     HEAD_NODE_IP:
       description: "Head node IP (resolved after allocation)"
       value: "${{ backends.cluster.nodes[0].ip_address }}"
+    # Dynamo discovers NATS and etcd from the ENVIRONMENT, not from CLI flags:
+    # every `python3 -m dynamo.*` process (the frontend here, and the workers in
+    # the dynamo_* workload fragments) reads ETCD_ENDPOINTS and NATS_SERVER.
+    # sflow exports workflow variables into each task's environment, so declaring
+    # them here is what wires the whole Dynamo mesh together.
+    #
+    # Without them Dynamo falls back to localhost, which only works while every
+    # task happens to share one network namespace -- so a single-node run appears
+    # fine and the same recipe silently fails to register its workers the moment
+    # a task lands on another node.
+    #
+    # Node 0 is the head: nats_server and etcd_server both pin to indices: [0].
+    ETCD_ENDPOINTS:
+      description: "etcd client endpoint the frontend and workers register with"
+      value: "${{ backends.cluster.nodes[0].ip_address }}:${{ variables.ETCD_PORT }}"
+    NATS_SERVER:
+      description: "NATS URL the frontend and workers connect to"
+      value: "nats://${{ backends.cluster.nodes[0].ip_address }}:${{ variables.NATS_PORT }}"
 
   tasks:
     - name: nats_server
       operator: helper
       script:
-        - nats-server -js
+        - nats-server -js --port ${{ variables.NATS_PORT }}
       resources:
         nodes:
           indices: [0]
       probes:
         readiness:
           tcp_port:
-            port: 4222
-          timeout: 300
+            port: ${{ variables.NATS_PORT }}
+          timeout: 600
           interval: 2
 
     - name: etcd_server
       operator: helper
       script:
+        # Client URLs bind and advertise 0.0.0.0 (matching the shipped Slurm and
+        # K8s Dynamo recipes); clients reach etcd through ETCD_ENDPOINTS, which
+        # carries the head node IP. Only the PEER URLs need the routable address.
         - >
-          etcd --listen-client-urls "http://0.0.0.0:2379"
-          --advertise-client-urls "http://0.0.0.0:2379"
-          --listen-peer-urls "http://0.0.0.0:2380"
-          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
-          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          etcd --listen-client-urls "http://0.0.0.0:${{ variables.ETCD_PORT }}"
+          --advertise-client-urls "http://0.0.0.0:${{ variables.ETCD_PORT }}"
+          --listen-peer-urls "http://0.0.0.0:${{ variables.ETCD_PEER_PORT }}"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:${{ variables.ETCD_PEER_PORT }}"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:${{ variables.ETCD_PEER_PORT }}"
           --data-dir /tmp/etcd
       resources:
         nodes:
@@ -59,8 +94,8 @@ workflow:
       probes:
         readiness:
           tcp_port:
-            port: 2379
-          timeout: 300
+            port: ${{ variables.ETCD_PORT }}
+          timeout: 600
           interval: 2
 
     - name: frontend_server

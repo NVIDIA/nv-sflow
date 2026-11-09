@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,83 @@ if TYPE_CHECKING:
 _logger = get_logger(__name__)
 
 CollectorKey = tuple[str, str]  # (backend_name, node_name)
+
+# Scope tags a streaming collector may prefix its rows with. Mirrors
+# hardware_monitor.ALL_SCOPES, kept as a literal here so this module does not
+# import the standalone collector script.
+MONITOR_STREAM_SCOPES = frozenset({"cpu", "gpu", "memory", "disk", "network"})
+
+# Ceiling on a collector's teardown command (see MonitorDelivery.stop_argv).
+# Generous enough for a `docker rm -f` over ssh, short enough that an
+# unreachable host delays shutdown rather than hanging it.
+_COLLECTOR_STOP_TIMEOUT_S = 30.0
+
+
+@dataclass(frozen=True)
+class MonitorDelivery:
+    """HOW a backend puts the collector on a node and gets its samples back.
+
+    Defaults describe a node that shares the driver's filesystem (Slurm, local,
+    single-machine Docker): reference the materialized script by path and let it
+    write its own files.
+    """
+
+    # Tokens before ``python3`` -- e.g. a ``docker run`` that lands the collector
+    # on another machine. Empty means run it right here.
+    launch_prefix: tuple[str, ...] = ()
+    # The node shares no filesystem with the driver. One flag, because the two
+    # consequences are inseparable: the source must go in on stdin (redirected
+    # by the DRIVER's shell, so nothing is copied to the node and a `context:`
+    # host with no ssh endpoint still works) and the samples must come back on
+    # stdout. A delivery that did one without the other could not work.
+    offhost: bool = False
+    # Whether the collector will be able to see GPUs where it lands. False when
+    # a container is deliberately started without them, so the gpu scope is
+    # dropped rather than filling a log with "nvidia-smi not found" rows.
+    # Host deliveries leave this True: nvidia-smi is simply there, or it is not.
+    provides_gpus: bool = True
+    # Teardown for transports where killing the launched process is not enough.
+    # A `docker run` is only a client: kill it and the container keeps sampling
+    # on the daemon. Empty when the collector dies with its own process.
+    stop_argv: tuple[str, ...] = ()
+
+
+class StreamedSampleWriter:
+    """Reassembles a streaming collector's stdout into raw sample files.
+
+    Collectors on nodes the driver shares no filesystem with stream
+    ``<scope>\\t<row>`` instead of writing files themselves. This writes the very
+    layout ``hardware_monitor.py`` would have written locally, so the
+    post-processor is unaware of which transport delivered the samples.
+
+    ``node_name`` is the PLAN-TIME node name, not the machine's own hostname:
+    the post-processor matches that field against a consumer's node list, and a
+    mismatch makes it silently widen a per-task report to every node.
+    """
+
+    def __init__(self, raw_dir: Path, *, node_id: str, node_name: str) -> None:
+        self._raw_dir = Path(raw_dir)
+        self._name = f"{{}}_monitor_node_{node_id}_{node_name}.log"
+        self._handles: dict[str, Any] = {}
+
+    def __call__(self, line: str) -> None:
+        scope, separator, payload = line.partition("\t")
+        # Startup banners and any other untagged chatter are not samples.
+        if not separator or scope not in MONITOR_STREAM_SCOPES:
+            return
+        handle = self._handles.get(scope)
+        if handle is None:
+            self._raw_dir.mkdir(parents=True, exist_ok=True)
+            handle = (self._raw_dir / self._name.format(scope)).open("a", buffering=1)
+            self._handles[scope] = handle
+        handle.write(payload + "\n")
+        handle.flush()
+
+    def close(self) -> None:
+        for handle in self._handles.values():
+            with contextlib.suppress(Exception):
+                handle.close()
+        self._handles.clear()
 
 
 @dataclass
@@ -127,6 +205,13 @@ class NodeCollector:
     name: str
     command: "Command"
     envs: dict[str, str] = field(default_factory=dict)
+    # Set when this collector streams tagged samples on stdout because its node
+    # shares no filesystem with the driver. Carries the node id the driver files
+    # the demultiplexed rows under; None means the collector writes its own files.
+    stream_node_id: str | None = None
+    # Teardown run after the launched process is cancelled, for transports the
+    # cancel alone does not stop (see MonitorDelivery.stop_argv).
+    stop_command: "Command | None" = None
 
 
 class MonitorRegistry:
@@ -153,6 +238,8 @@ class MonitorRegistry:
         self._launcher = launcher or SubprocessLauncher()
         self._refcount: dict[CollectorKey, int] = {}
         self._running: dict[CollectorKey, asyncio.Task[Any]] = {}
+        # Open demultiplexers for streaming collectors, by node.
+        self._writers: dict[CollectorKey, StreamedSampleWriter] = {}
         self._lock = asyncio.Lock()
         self._consumers: list[MonitorConsumer] = []
         # Per-task / per-replica report views (resource-scoped), built at plan time.
@@ -219,20 +306,29 @@ class MonitorRegistry:
             return
         consumer.end_ts = time.time()
         async with self._lock:
+            finished: list[CollectorKey] = []
             for key in consumer.keys:
                 if key not in self._refcount:
                     continue
                 self._refcount[key] -= 1
                 if self._refcount[key] <= 0:
                     self._refcount.pop(key, None)
-                    await self._stop_collector(key)
+                    finished.append(key)
+            # Together, not one after another: stopping a node can mean a
+            # `docker rm -f` across the network, so serially this cost the SUM
+            # of the pool -- ~12s per node of dead time after the workflow had
+            # already finished.
+            await self._stop_collectors(finished)
 
     async def shutdown(self) -> None:
         """Force-cancel any still-running collectors (defensive teardown)."""
         async with self._lock:
             self._refcount.clear()
-            for key in list(self._running):
-                await self._stop_collector(key)
+            await self._stop_collectors(list(self._running))
+
+    async def _stop_collectors(self, keys: "Sequence[CollectorKey]") -> None:
+        """Stop every given collector concurrently."""
+        await asyncio.gather(*(self._stop_collector(key) for key in keys))
 
     def _start_collector(self, key: CollectorKey) -> None:
         collector = self._collectors.get(key)
@@ -240,14 +336,61 @@ class MonitorRegistry:
             return
         logger = get_logger(f"sflow.monitor.{collector.name}")
         _logger.info(f"Starting hardware monitor collector on node '{key[1]}'")
-        self._running[key] = asyncio.create_task(
+        sink = None
+        if collector.stream_node_id is not None:
+            writer = StreamedSampleWriter(
+                self.raw_dir,
+                node_id=collector.stream_node_id,
+                node_name=key[1],
+            )
+            self._writers[key] = writer
+            sink = writer
+        task = asyncio.create_task(
             self._launcher.run_async(
                 collector.command,
                 output_logger=logger,
                 env=collector.envs,
                 task_name=collector.name,
+                stdout_sink=sink,
             )
         )
+        task.add_done_callback(
+            lambda finished, node=key[1], name=collector.name: (
+                self._warn_if_collector_died(finished, node=node, name=name)
+            )
+        )
+        self._running[key] = task
+
+    @staticmethod
+    def _warn_if_collector_died(task: "asyncio.Task[Any]", *, node: str, name: str) -> None:
+        """Say so when a collector stops on its own rather than being released.
+
+        Monitoring is passive and must never fail a good run, so this only warns
+        -- but it must not be SILENT. The collector's own output goes to a
+        per-task logger at INFO, so a container that cannot start (no `python3`
+        in the image, no NVIDIA runtime, unreachable daemon) used to leave
+        nothing above INFO anywhere, and the run finished "successfully" with an
+        empty monitor report.
+        """
+        if task.cancelled():
+            return  # The ordinary path: released by its last consumer.
+        exception = task.exception()
+        if exception is not None:
+            _logger.warning(
+                f"Hardware monitor collector on node '{node}' failed: {exception}. "
+                f"No samples will be collected for this node."
+            )
+            return
+        code = task.result()
+        # Positive only. A negative code is "killed by signal", which is what
+        # stopping a collector looks like to a launcher that reports the code
+        # instead of propagating the cancellation -- normal teardown, not a fault.
+        if isinstance(code, int) and code > 0:
+            _logger.warning(
+                f"Hardware monitor collector on node '{node}' exited early "
+                f"(code {code}); no samples will be collected for this node. "
+                f"Its output is logged under '{name}'."
+            )
 
     async def _stop_collector(self, key: CollectorKey) -> None:
         task = self._running.pop(key, None)
@@ -258,6 +401,26 @@ class MonitorRegistry:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+        collector = self._collectors.get(key)
+        if collector is not None and collector.stop_command is not None:
+            # Bounded on purpose. This teardown can reach across the network (a
+            # `docker rm -f` against an unreachable host's daemon), and an
+            # unbounded await here would wedge the whole workflow's shutdown
+            # with no output. Best effort otherwise: a teardown that fails
+            # because the container is already gone is a success, not an error.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    self._launcher.run_async(
+                        collector.stop_command,
+                        task_name=f"{collector.name}_stop",
+                    ),
+                    timeout=_COLLECTOR_STOP_TIMEOUT_S,
+                )
+        # After the task is awaited, so any row the collector emitted on its way
+        # out has already been written.
+        writer = self._writers.pop(key, None)
+        if writer is not None:
+            writer.close()
 
     def report_spec(self) -> dict[str, Any]:
         """Build the JSON-able spec for ``postprocess_monitor_timeline``."""

@@ -24,10 +24,15 @@ variables:
     description: "Concurrent request count"
     type: integer
     value: 64
+  MULTI_ROUND:
+    description: "Number of benchmark rounds; request count is MULTI_ROUND * CONCURRENCY"
+    type: integer
+    value: 8
   TOKENIZER:
-    description: "Tokenizer for aiperf: a HuggingFace name OR a local model dir. Defaults to the
-      served model name; point it at a local path to avoid a HuggingFace download on offline clusters."
-    value: ${{ variables.SERVED_MODEL_NAME }}
+    description: "Tokenizer for aiperf: a local model dir OR a HuggingFace name. Defaults to the
+      mounted weights, which is what works on an offline cluster; set it to a HuggingFace id only
+      if the benchmark client can actually reach huggingface.co."
+    value: ${{ artifacts.LOCAL_MODEL_PATH.path }}
 
 workflow:
   name: modular_inference
@@ -42,8 +47,10 @@ workflow:
         # Throughput (tokens/sec)" -> "Output Token"), unpredictably per run, which breaks any
         # log-scraping consumer (the k8s e2e verify perf check). Matches the self-contained recipes.
         - export COLUMNS=200
+        - export AIPERF_DIR="${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${{ variables.CONCURRENCY }}"
         - >
           aiperf profile
+          --artifact-dir "${AIPERF_DIR}"
           --model ${{ variables.SERVED_MODEL_NAME }}
           --tokenizer ${{ variables.TOKENIZER }}
           --endpoint-type chat
@@ -51,10 +58,46 @@ workflow:
           --streaming
           --url http://${{ backends.cluster.nodes[0].ip_address }}:8000
           --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
           --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
           --concurrency ${{ variables.CONCURRENCY }}
-          --request-count ${{ variables.CONCURRENCY * 8 }}
+          --request-count ${{ variables.MULTI_ROUND * variables.CONCURRENCY }}
           --warmup-request-count ${{ variables.CONCURRENCY }}
+          --num-dataset-entries ${{ variables.MULTI_ROUND * variables.CONCURRENCY }}
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          -H 'Connection: close'
+          --record-processors 8
+          --ui simple
+        # aiperf EXITS 0 EVEN WHEN IT MEASURED NOTHING, so gate on its output.
+        # Two distinct ways it "succeeds" with no benchmark:
+        #   1. it never starts (bad --tokenizer) and writes no CSV at all;
+        #   2. it starts, every request returns 200, but the server streams back
+        #      no tokens -- then aiperf still reports "N valid requests and 0
+        #      errors" and still writes the AGGREGATE rows (duration, request
+        #      count), while the per-request latency section is empty. Counting
+        #      rows cannot tell that apart from a real run, so require a metric
+        #      that only exists once tokens were actually generated.
+        - |
+          csv="${AIPERF_DIR}/profile_export_aiperf.csv"
+          if [ ! -s "$csv" ]; then
+            echo "aiperf produced no results: $csv is missing or empty." >&2
+            echo "Read the AIPerf errors above -- aiperf exits 0 even when it measures nothing." >&2
+            exit 1
+          fi
+          if ! grep -q "Time to First Token" "$csv"; then
+            echo "aiperf measured no generation: $csv has no per-request latency" >&2
+            echo "metrics, so the server accepted the requests but returned no tokens." >&2
+            echo "Check the server logs for KV-transfer / handshake errors." >&2
+            exit 1
+          fi
+          echo "aiperf wrote $(($(wc -l < "$csv") - 1)) metric rows to $csv"
         - echo "Benchmarking finished"
       resources:
         nodes:

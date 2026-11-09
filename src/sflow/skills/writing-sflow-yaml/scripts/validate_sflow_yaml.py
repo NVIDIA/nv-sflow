@@ -15,6 +15,17 @@ Checks performed:
     - Artifact expression references match declared artifacts
     - GPU resource math consistency (TP * DP * PP vs declared gpus)
     - Common mistake warnings (missing probes, missing depends_on, etc.)
+
+Arguments:
+    One or more recipe files; each is validated on its own.
+
+Output:
+    One report per file on stdout (errors, warnings, OK checks).
+
+Exit codes:
+    0  no file has errors (warnings allowed)
+    1  at least one file has errors
+    2  usage error (no file given)
 """
 
 from __future__ import annotations

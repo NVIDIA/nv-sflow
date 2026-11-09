@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Why sflow: write the workload once</title>
+<meta name="description" content="Write a GPU workload once and run it on a workstation, Slurm or Kubernetes by swapping one file.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=JetBrains+Mono:wght@500;700&display=swap">
+<style>
+/* ===========================================
+   THEME: RAW GRID
+   White canvas, black 3px borders as the layout, two pastel surfaces (pink, sage),
+   hard 6px/4px offset shadows. Deliberately unlike the dark homepage intro deck:
+   this deck is the short "why", that one is the full tour.
+   =========================================== */
+:root {
+  --stage-bg: #0a0a0a;
+  --slide-bg: #ffffff;
+  --ink: #0a0a0a;
+  --white: #ffffff;
+  --pink: #f2d4cf;
+  --sage: #e5edd6;
+  --gray: #f5f5f5;
+  --border: 3px solid var(--ink);
+  --shadow: 6px 6px 0 var(--ink);
+  --shadow-sm: 4px 4px 0 var(--ink);
+  --display: 'Bricolage Grotesque', sans-serif;
+  --mono: 'JetBrains Mono', monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* ===========================================
+   FIXED 16:9 STAGE: MANDATORY BASE STYLES
+   Slides are authored at 1920×1080 and scaled as a whole.
+   =========================================== */
+html,
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: var(--stage-bg, #000);
+}
+.deck-viewport {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    background: var(--stage-bg, #000);
+}
+.deck-stage {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    transform-origin: 0 0;
+    background: var(--slide-bg, #fff);
+}
+.slide {
+    position: absolute;
+    inset: 0;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    display: block;
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+    background: var(--slide-bg, #fff);
+}
+.slide.active,
+.slide.visible {
+    visibility: visible;
+    opacity: 1;
+    pointer-events: auto;
+    z-index: 1;
+}
+img,
+video,
+canvas,
+svg {
+    max-width: 100%;
+    max-height: 100%;
+}
+.deck-controls {
+    position: fixed;
+    left: 50%;
+    bottom: 22px;
+    transform: translateX(-50%);
+    z-index: 1000;
+}
+@media print {
+    html,
+    body {
+        width: 1920px;
+        height: auto;
+        overflow: visible;
+        background: #fff;
+    }
+    .deck-viewport {
+        position: static;
+        overflow: visible;
+        background: #fff;
+    }
+    .deck-stage {
+        position: static;
+        width: auto;
+        height: auto;
+        transform: none !important;
+        background: none;
+    }
+    .slide {
+        position: relative;
+        display: block !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        pointer-events: auto !important;
+        width: 1920px;
+        height: 1080px;
+        break-after: page;
+        page-break-after: always;
+    }
+    .slide:last-child {
+        break-after: auto;
+        page-break-after: auto;
+    }
+    .deck-controls {
+        display: none !important;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.2s !important;
+    }
+}
+
+/* ===========================================
+   SHARED GRID FRAME
+   Every slide is one bordered frame; regions inside it meet on 3px black lines,
+   never on gaps. .top is the header band each slide carries.
+   =========================================== */
+.slide { font-family: var(--display); color: var(--ink); }
+.frame { position: absolute; inset: 56px; border: var(--border); display: grid; }
+.frame > * { border: 0 solid var(--ink); position: relative; overflow: hidden; }
+.top { display: flex; align-items: center; justify-content: space-between; padding: 0 48px; border-bottom-width: 3px !important; height: 100px; }
+.top .mark { font: 800 30px var(--display); letter-spacing: 0.06em; }
+.top .mark span { font: 700 22px var(--mono); margin-left: 18px; }
+.pill { background: var(--ink); color: var(--white); font: 700 22px var(--mono); letter-spacing: 0.1em; padding: 10px 18px; text-transform: uppercase; }
+.head { padding: 44px 56px 0; }
+h1, h2 { font-weight: 800; text-transform: uppercase; letter-spacing: -0.02em; line-height: 0.95; }
+h1 { font-size: 116px; }
+h2 { font-size: 80px; }
+h3 { font: 800 40px/1.05 var(--display); text-transform: uppercase; letter-spacing: -0.01em; }
+p { font: 500 30px/1.45 var(--display); }
+.cap { font: 700 20px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; }
+.mono { font-family: var(--mono); }
+.pink { background: var(--pink); } .sage { background: var(--sage); } .gray { background: var(--gray); }
+.ink { background: var(--ink); color: var(--white); }
+.num { position: absolute; font: 800 300px/1 var(--display); letter-spacing: -0.04em; opacity: 0.12; pointer-events: none; }
+.chip { display: inline-block; background: var(--white); border: var(--border); box-shadow: var(--shadow); font: 700 30px var(--mono); padding: 12px 22px; }
+.node { position: absolute; width: 56px; height: 56px; background: var(--ink); color: var(--white); display: grid; place-items: center; font: 800 32px var(--display); z-index: 2; }
+
+/* ===========================================
+   SLIDE CHANGE + REVEAL ANIMATION
+   Slides crossfade (no blank frame between them); regions then slide in from a
+   small offset with a slight overshoot, so they "snap" into the grid. Keep the
+   whole sequence under ~0.6s: longer staggers read as lag, not polish.
+   =========================================== */
+.slide { transition: opacity 0.22s ease, visibility 0s linear 0.22s; }
+.slide.active { transition: opacity 0.22s ease, visibility 0s; }
+.r { opacity: 0; transform: translate(-10px, -10px); transition: opacity 0.28s ease-out, transform 0.36s cubic-bezier(0.2, 0.9, 0.3, 1.25); }
+.visible .r { opacity: 1; transform: none; }
+.visible .d1 { transition-delay: 0.04s; } .visible .d2 { transition-delay: 0.08s; }
+.visible .d3 { transition-delay: 0.12s; } .visible .d4 { transition-delay: 0.17s; }
+.visible .d5 { transition-delay: 0.22s; } .visible .d6 { transition-delay: 0.28s; }
+
+/* ===========================================
+   CODE BLOCKS
+   <pre class="code" data-source=...> holds plain YAML copied verbatim from the
+   repo (a unit test checks it). The highlighter script colours it at load time
+   with attribute-free tags, styled here to stay inside the Raw Grid rules
+   (weight contrast and pastel fills, no italics, no underline).
+   =========================================== */
+pre.code { font: 500 27px/1.55 var(--mono); white-space: pre; }
+pre.code b { font-weight: 700; }                                  /* keys */
+pre.code i { font-style: normal; background: var(--sage); padding: 0 4px; } /* ${{ expressions }} */
+pre.code u { text-decoration: none; }                              /* strings */
+pre.code s { text-decoration: none; opacity: 0.5; }                /* comments */
+pre.code mark { background: var(--pink); color: inherit; box-shadow: 0 0 0 5px var(--pink); }
+
+/* === SLIDE 1: COVER === */
+.s1 .frame { grid-template-columns: 1.35fr 1fr; grid-template-rows: 100px 1fr 210px; }
+.s1 .top { grid-column: 1 / 3; }
+.s1 .title { border-right-width: 3px; padding: 64px 60px; }
+.s1 .title .num { right: -20px; bottom: -110px; font-size: 520px; opacity: 0.06; }
+.s1 .side { display: grid; grid-template-rows: 1fr 1fr; }
+.s1 .wl { border-bottom: var(--border); padding: 44px 50px; }
+.s1 .wl b { display: block; font: 700 40px var(--mono); margin-bottom: 14px; }
+.s1 .bes { padding: 34px 50px; display: flex; flex-direction: column; gap: 16px; }
+.s1 .bes .chip { width: 380px; font-size: 28px; padding: 8px 20px; }
+.s1 .foot { grid-column: 1 / 3; border-top-width: 3px; display: flex; align-items: center; padding: 0 60px; }
+.s1 .foot p { font-size: 44px; }
+.s1 .foot b { font-weight: 800; }
+
+/* === SLIDE 2: WHAT A REWRITE COSTS ===
+   Left: a concern × platform matrix where every cell is a rewrite.
+   Right: what that matrix does to a team over time. */
+.s2 .frame { grid-template-columns: 1fr 560px; grid-template-rows: 100px 220px 1fr 130px; }
+.s2 .top, .s2 .head, .s2 .band { grid-column: 1 / 3; }
+.s2 .matrix { border-top-width: 3px; border-right-width: 3px; display: grid; grid-template-columns: 1fr repeat(3, 190px); grid-auto-rows: 1fr; }
+.s2 .matrix > div { border: 0 solid var(--ink); border-bottom-width: 3px; display: flex; align-items: center; padding: 0 22px; }
+.s2 .matrix > div:nth-last-child(-n + 4) { border-bottom-width: 0; }
+.s2 .matrix > div:not(:nth-child(4n + 1)) { border-left-width: 3px; justify-content: center; }
+.s2 .matrix .hd { background: var(--ink); color: var(--white); font: 700 19px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; }
+.s2 .matrix .concern { font: 700 26px/1.2 var(--display); }
+.s2 .matrix .redo { background: var(--pink); font: 700 22px var(--mono); }
+.s2 .matrix .redo::before { content: "✎\00a0"; }
+.s2 .why { border-top-width: 3px; display: grid; grid-template-rows: repeat(3, 1fr); }
+.s2 .why > div { padding: 22px 40px; display: flex; flex-direction: column; justify-content: center; }
+.s2 .why > div + div { border-top: var(--border); }
+.s2 .why h3 { font-size: 34px; margin-bottom: 8px; }
+.s2 .why p { font-size: 24px; line-height: 1.35; }
+.s2 .band { border-top-width: 3px; display: flex; align-items: center; padding: 0 56px; }
+.s2 .band p { font-size: 40px; font-weight: 700; }
+.s2 .band b { font-weight: 800; background: var(--white); color: var(--ink); padding: 0 12px; margin: 0 6px; }
+
+/* === SLIDE 3: TWO FILES === */
+.s3 .frame { grid-template-columns: 1fr 1fr; grid-template-rows: 100px 250px 1fr; }
+.s3 .top, .s3 .head { grid-column: 1 / 3; }
+.s3 .head p { margin-top: 18px; font-size: 32px; }
+.s3 .half { border-top-width: 3px; padding: 46px 60px; }
+.s3 .half + .half { border-left-width: 3px; }
+.s3 .half .cap { margin-bottom: 18px; }
+.s3 .file { font: 700 50px var(--mono); margin-bottom: 22px; }
+.s3 ul { list-style: none; display: grid; gap: 12px; }
+.s3 li { font: 500 32px var(--display); }
+.s3 li::before { content: "→\00a0"; font-weight: 800; }
+.s3 li.auto { opacity: 0.6; }
+.s3 .stamp { position: absolute; left: 60px; bottom: 40px; }
+.s3 .chips { display: flex; flex-direction: column; gap: 16px; margin-bottom: 26px; }
+.s3 .chips .chip { width: 420px; font-size: 30px; }
+.s3 .node { left: calc(50% - 28px); top: 600px; }
+
+/* === SLIDE 4: ROLES === */
+.s4 .frame { grid-template-columns: 1fr 600px; grid-template-rows: 100px 220px 1fr; }
+.s4 pre.code { font-size: 24px; }
+.s4 .top, .s4 .head { grid-column: 1 / 3; }
+.s4 .src { border-top-width: 3px; border-right-width: 3px; padding: 34px 48px; }
+.s4 .src .cap { margin-bottom: 18px; }
+.s4 .notes { border-top-width: 3px; display: grid; grid-template-rows: repeat(3, 1fr); }
+.s4 .notes > div { padding: 26px 40px; display: flex; flex-direction: column; justify-content: center; }
+.s4 .notes > div + div { border-top: var(--border); }
+.s4 .notes code { font: 700 28px var(--mono); }
+.s4 .notes p { font-size: 28px; line-height: 1.35; margin-top: 8px; }
+
+/* === SLIDE 5: WHAT `server` MEANS ===
+   One role at the top fans out to three real backend definitions. */
+.s5 .frame { grid-template-columns: 1fr 1.3fr 1fr; grid-template-rows: 100px 220px 110px 1fr; }
+.s5 .top, .s5 .head, .s5 .role { grid-column: 1 / 4; }
+.s5 .role { border-top-width: 3px; display: flex; align-items: center; justify-content: center; gap: 24px; background: var(--pink); }
+.s5 .role code { font: 700 40px var(--mono); background: var(--white); border: var(--border); box-shadow: var(--shadow); padding: 6px 20px; }
+.s5 .role span { font: 700 26px var(--display); }
+.s5 .be { border-top-width: 3px; padding: 34px 40px; display: flex; flex-direction: column; }
+.s5 .be + .be { border-left-width: 3px; }
+.s5 .be h3 { margin-bottom: 4px; }
+.s5 .be .cap { margin-bottom: 20px; }
+.s5 .be pre.code { font-size: 20px; flex: 1; }
+.s5 .be .means { border-top: var(--border); margin: 0 -40px -34px; padding: 18px 40px 0; height: 150px; background: var(--sage); }
+.s5 .be .means .cap { display: block; margin-bottom: 8px; }
+.s5 .be .means code { display: block; font: 700 19px/1.45 var(--mono); white-space: pre; }
+
+/* === SLIDE 6: PROOF === */
+.s6 .frame { grid-template-columns: repeat(3, 1fr); grid-template-rows: 100px 190px 220px 1fr 110px; }
+.s6 .top, .s6 .head, .s6 .cmds, .s6 .foot { grid-column: 1 / 4; }
+.s6 .stat { border-top-width: 3px; padding: 26px 48px; display: flex; align-items: center; gap: 28px; }
+.s6 .stat + .stat { border-left-width: 3px; }
+.s6 .stat b { font: 800 140px/1 var(--display); letter-spacing: -0.04em; }
+.s6 .stat .cap { line-height: 1.4; }
+.s6 .cmds { border-top-width: 3px; display: grid; grid-template-rows: repeat(3, 1fr); }
+.s6 .row { display: grid; grid-template-columns: 300px 1fr; align-items: center; }
+.s6 .row + .row { border-top: var(--border); }
+.s6 .row .cap { padding-left: 48px; }
+.s6 .row pre { font: 500 27px var(--mono); white-space: pre; }
+.s6 .row pre em { font-style: normal; font-weight: 700; background: var(--sage); border: var(--border); box-shadow: var(--shadow-sm); padding: 2px 10px; }
+.s6 .foot { border-top-width: 3px; display: flex; align-items: center; padding: 0 48px; }
+.s6 .foot p { font-size: 32px; }
+.s6 .foot code { font: 700 30px var(--mono); background: var(--ink); color: var(--white); padding: 2px 10px; }
+
+/* === SLIDE 7: GAINS === */
+.s7 .frame { grid-template-columns: 1fr 1fr; grid-template-rows: 100px 190px 1fr 1fr; }
+.s7 .top, .s7 .head { grid-column: 1 / 3; }
+.s7 .gain { border-top-width: 3px; padding: 40px 56px; }
+.s7 .gain:nth-of-type(even) { border-left-width: 3px; }
+.s7 .gain .num { right: 24px; bottom: -90px; font-size: 280px; opacity: 0.16; }
+.s7 .gain h3 { font-size: 48px; margin-bottom: 18px; max-width: 700px; }
+.s7 .gain p { max-width: 720px; }
+
+/* === SLIDE 8: TRY IT === */
+.s8 .frame { grid-template-columns: 1fr 1fr; grid-template-rows: 100px 190px 1fr 140px; }
+.s8 .top, .s8 .head, .s8 .links { grid-column: 1 / 3; }
+.s8 .box { border-top-width: 3px; padding: 44px 56px; }
+.s8 .box + .box { border-left-width: 3px; }
+.s8 .box .cap { margin-bottom: 26px; }
+.s8 pre { font: 500 26px/1.9 var(--mono); white-space: pre; }
+.s8 pre span { opacity: 0.45; }
+.s8 .prompt { font-size: 28px; }
+.s8 .prompt code { display: block; margin: 14px 0; font: 700 22px/1.45 var(--mono); overflow-wrap: anywhere; background: var(--white); border: var(--border); padding: 10px 14px; }
+.s8 .links { border-top-width: 3px; display: flex; align-items: center; gap: 30px; padding: 0 56px; }
+.s8 .links a { font: 800 30px var(--display); color: var(--ink); text-decoration: none; text-transform: uppercase; border: var(--border); padding: 12px 24px; background: var(--white); box-shadow: var(--shadow); }
+.s8 .links a::before { content: "→\00a0"; }
+.s8 .links a.primary { background: var(--ink); color: var(--white); }
+.s8 .links a:hover { background: var(--sage); color: var(--ink); }
+
+/* ===========================================
+   DECK CHROME (outside the stage, never scaled)
+   =========================================== */
+.progress { position: fixed; left: 0; top: 0; height: 6px; background: var(--ink); z-index: 1000; transition: width 0.3s ease; }
+/* Bottom-right corner, in the slide's outer margin, so it never covers a region. */
+.deck-controls { left: auto; right: 10px; bottom: 8px; transform: none; display: flex; align-items: center; gap: 6px; font: 700 11px 'JetBrains Mono', monospace; color: var(--ink); background: var(--white); border: 2px solid var(--ink); padding: 2px 4px; opacity: 0.9; }
+.deck-controls:hover { opacity: 1; }
+.deck-controls button { width: 22px; height: 22px; border: 2px solid var(--ink); background: var(--white); color: var(--ink); font: 800 15px 'JetBrains Mono', monospace; cursor: pointer; }
+.deck-controls button:hover { background: var(--sage); }
+.deck-controls button:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+
+/* Author-only inline editing (open the deck with ?edit): never shown to visitors. */
+.edit-hotzone { position: fixed; top: 0; left: 0; width: 80px; height: 80px; z-index: 10000; cursor: pointer; }
+.edit-toggle { position: fixed; top: 18px; left: 18px; z-index: 10001; opacity: 0; pointer-events: none; transition: opacity 0.3s; border: 2px solid var(--ink); background: var(--white); color: var(--ink); padding: 8px 12px; font: 700 13px 'JetBrains Mono', monospace; cursor: pointer; box-shadow: 3px 3px 0 var(--ink); }
+.edit-toggle.show, .edit-toggle.active { opacity: 1; pointer-events: auto; }
+[contenteditable="true"] { outline: 2px dashed var(--ink); }
+</style>
+</head>
+<body>
+<div class="progress" id="progress"></div>
+<div class="deck-viewport">
+<main class="deck-stage" id="deckStage" aria-live="polite">
+
+<!-- =========================================== SLIDE 1: COVER -->
+<section class="slide s1" aria-label="Write the workload once, run it anywhere">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW</span><span class="pill">Why sflow</span></div>
+    <div class="title r d1"><h1>Write the workload once.<br>Run it anywhere.</h1><div class="num">1</div></div>
+    <div class="side">
+      <div class="wl pink r d2"><b>workload.yaml</b><p>Unchanged. Tasks, GPUs, health checks.</p></div>
+      <div class="bes sage r d3"><span class="chip">docker.yaml</span><span class="chip">slurm.yaml</span><span class="chip">k8s.yaml</span></div>
+    </div>
+    <div class="foot gray r d4"><p>Workstation, Slurm or Kubernetes: <b>swap one file.</b></p></div>
+  </div>
+</section>
+
+<!-- =========================================== SLIDE 2: WHAT A REWRITE COSTS -->
+<section class="slide s2" aria-label="What a rewrite really costs">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW<span>02</span></span><span class="pill">The cost of a rewrite</span></div>
+    <div class="head r d1"><h2>Porting one job means<br>rewriting all of this.</h2></div>
+    <div class="matrix r d2">
+      <div class="hd">Every launch script has to handle</div><div class="hd">Workstation</div><div class="hd">Slurm</div><div class="hd">Kubernetes</div>
+      <div class="concern">Launch command, container flags</div><div class="redo">rewrite</div><div class="redo">rewrite</div><div class="redo">rewrite</div>
+      <div class="concern">Which GPUs each task gets</div><div class="redo">rewrite</div><div class="redo">rewrite</div><div class="redo">rewrite</div>
+      <div class="concern">Start order, wait until ready</div><div class="redo">rewrite</div><div class="redo">rewrite</div><div class="redo">rewrite</div>
+      <div class="concern">Spot a crashed task</div><div class="redo">rewrite</div><div class="redo">rewrite</div><div class="redo">rewrite</div>
+      <div class="concern">Clean up on success, failure, Ctrl-C</div><div class="redo">rewrite</div><div class="redo">rewrite</div><div class="redo">rewrite</div>
+      <div class="concern">Collect logs and results</div><div class="redo">rewrite</div><div class="redo">rewrite</div><div class="redo">rewrite</div>
+    </div>
+    <div class="why">
+      <div class="r d3"><h3>Every fix, three times</h3><p>A timeout bumped on Slurm stays wrong on Kubernetes until someone remembers.</p></div>
+      <div class="sage r d4"><h3>Copies drift apart</h3><p>Three scripts evolve separately; the "same" job quietly stops being the same.</p></div>
+      <div class="pink r d5"><h3>Numbers stop comparing</h3><p>Different launch glue on each platform: benchmark results are no longer like for like.</p></div>
+    </div>
+    <div class="band ink r d6"><p>6 concerns × 3 platforms = <b>18</b> pieces of glue to write, debug and keep in sync.</p></div>
+  </div>
+</section>
+
+<!-- =========================================== SLIDE 3: TWO FILES -->
+<section class="slide s3" aria-label="Two files, only one of them changes">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW<span>03</span></span><span class="pill">The idea</span></div>
+    <div class="head r d1"><h2>Two files. Only one of them changes.</h2><p>Those six concerns are written once. Only how to launch changes per platform.</p></div>
+    <div class="half pink r d2">
+      <div class="cap">The workload</div>
+      <div class="file">workload.yaml</div>
+      <ul><li>commands and start order</li><li>GPUs per task</li><li>readiness and failure checks</li><li class="auto">cleanup, logs, results: sflow does these</li></ul>
+      <span class="pill stamp">Written once</span>
+    </div>
+    <div class="half sage r d3">
+      <div class="cap">The backend</div>
+      <div class="chips"><span class="chip">docker.yaml</span><span class="chip">slurm.yaml</span><span class="chip">k8s.yaml</span></div>
+      <p>How this platform launches it.</p>
+      <span class="pill stamp">One per platform, shared</span>
+    </div>
+    <div class="node r d4" aria-hidden="true">⇄</div>
+  </div>
+</section>
+
+<!-- =========================================== SLIDE 4: ROLES -->
+<section class="slide s4" aria-label="The workload names roles, never platforms">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW<span>04</span></span><span class="pill">Real file, unchanged</span></div>
+    <div class="head r d1"><h2>The workload names roles,<br>never platforms.</h2></div>
+    <div class="src r d2">
+      <div class="cap">workloads/vllm_serve.yaml</div>
+<pre class="code" data-mark="operator: server|count:" data-source="examples/modular/backend_agnostic/workloads/vllm_serve.yaml">- name: server
+  operator: server
+  script:
+    - set -x
+    - &gt;
+      vllm serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
+      --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+      --host 0.0.0.0 --port 8000
+      --tensor-parallel-size ${{ variables.SERVER_GPUS }}
+      --trust-remote-code
+  resources:
+    gpus:
+      count: ${{ variables.SERVER_GPUS }}</pre>
+    </div>
+    <div class="notes">
+      <div class="pink r d3"><code>operator: server</code><p>A role. The backend decides what launches it.</p></div>
+      <div class="pink r d4"><code>gpus: count</code><p>How many GPUs, never which node or device.</p></div>
+      <div class="sage r d5"><code>no srun · no docker · no pod</code><p>Nothing in this file ties it to a platform.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- =========================================== SLIDE 5: WHAT server MEANS -->
+<section class="slide s5" aria-label="Each backend says what server means">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW<span>05</span></span><span class="pill">Real files, one per platform</span></div>
+    <div class="head r d1"><h2>You write the role.<br>sflow writes the launch.</h2></div>
+    <div class="role r d2"><span>The workload asks for</span><code>operator: server</code><span>and from each backend file sflow generates the native launch command:</span></div>
+    <div class="be r d3"><h3>Workstation</h3><div class="cap">You write · backends/docker.yaml</div>
+<pre class="code" data-mark="type:" data-source="examples/modular/backend_agnostic/backends/docker.yaml">- name: server
+  type: docker_run
+  image: ${{ variables.SERVER_IMAGE }}</pre>
+      <div class="means"><span class="cap">sflow generates this</span><code>docker run --rm \
+  --gpus "device=0,1,2,3" -v … \
+  nvcr.io/…/vllm-runtime:1.0.0 …</code></div></div>
+    <div class="be r d4"><h3>Slurm</h3><div class="cap">You write · backends/slurm.yaml</div>
+<pre class="code" data-mark="type:" data-source="examples/modular/backend_agnostic/backends/slurm.yaml">- name: server
+  type: srun
+  container_image: ${{ variables.SERVER_IMAGE }}
+  container_writable: true
+  mpi: pmix
+  ntasks_per_node: 1</pre>
+      <div class="means"><span class="cap">sflow generates this</span><code>srun --nodes 1 --nodelist cluster-node0 \
+  --ntasks-per-node 1 --mpi pmix \
+  --container-image nvcr.io/…/vllm-runtime:1.0.0 …</code></div></div>
+    <div class="be r d5"><h3>Kubernetes</h3><div class="cap">You write · backends/k8s.yaml</div>
+<pre class="code" data-mark="type:" data-source="examples/modular/backend_agnostic/backends/k8s.yaml">- name: server
+  type: k8s
+  image: ${{ variables.SERVER_IMAGE }}</pre>
+      <div class="means"><span class="cap">sflow generates this</span><code>kubectl apply -f server.k8s.yaml
+  # Pod · nvidia.com/gpu: 4
+  # pinned to the reserved node</code></div></div>
+  </div>
+</section>
+
+<!-- =========================================== SLIDE 6: PROOF -->
+<section class="slide s6" aria-label="The same file on three platforms">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW<span>06</span></span><span class="pill">Proof, from the repo</span></div>
+    <div class="head r d1"><h2>The same file. Three platforms.</h2></div>
+    <div class="stat r d2"><b data-lines-of="examples/modular/backend_agnostic/workloads/vllm_serve.yaml">54</b><span class="cap">lines of workload,<br>never edited</span></div>
+    <div class="stat pink r d3"><b>3</b><span class="cap">platforms it<br>runs on</span></div>
+    <div class="stat sage r d4"><b>1</b><span class="cap">flag that<br>changes</span></div>
+    <div class="cmds r d5">
+      <div class="row"><span class="cap">Workstation</span><pre>sflow run -f <em>backends/docker.yaml</em> -f workloads/vllm_serve.yaml -f benchmark.yaml</pre></div>
+      <div class="row"><span class="cap">Slurm</span><pre>sflow run -f <em>backends/slurm.yaml</em>  -f workloads/vllm_serve.yaml -f benchmark.yaml</pre></div>
+      <div class="row"><span class="cap">Kubernetes</span><pre>sflow run -f <em>backends/k8s.yaml</em>    -f workloads/vllm_serve.yaml -f benchmark.yaml</pre></div>
+    </div>
+    <div class="foot gray r d6"><p>Add <code>--dry-run</code> to any of them: the whole plan, without touching a cluster.</p></div>
+  </div>
+</section>
+
+<!-- =========================================== SLIDE 7: GAINS -->
+<section class="slide s7" aria-label="What you gain">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW<span>07</span></span><span class="pill">What you gain</span></div>
+    <div class="head r d1"><h2>What you gain.</h2></div>
+    <div class="gain pink r d2"><div class="num">1</div><h3>Debug small, submit big</h3><p>Prove it on a workstation with Docker, then submit the identical workload to the cluster.</p></div>
+    <div class="gain sage r d3"><div class="num">2</div><h3>Platform glue, written once</h3><p>One person writes the Slurm or Kubernetes backend file. Everyone else reuses it.</p></div>
+    <div class="gain sage r d4"><div class="num">3</div><h3>Fair platform comparisons</h3><p>Same workload, same benchmark, different backend: the comparison is like for like.</p></div>
+    <div class="gain pink r d5"><div class="num">4</div><h3>Scale by numbers, not rewrites</h3><p>More nodes, GPUs or replicas is a value change. Multi-node disaggregated LLM serving ships as ordinary recipes.</p></div>
+  </div>
+</section>
+
+<!-- =========================================== SLIDE 8: TRY IT -->
+<section class="slide s8" aria-label="Try it in a minute">
+  <div class="frame">
+    <div class="top r"><span class="mark">SFLOW<span>08</span></span><span class="pill">Get started</span></div>
+    <div class="head r d1"><h2>Try it in a minute.</h2></div>
+    <div class="box r d2"><div class="cap">In your terminal</div>
+<pre><span>$</span> uv tool install nv-sflow
+<span>$</span> sflow sample self_contained/local/hello_world \
+    -o hello.yaml
+<span>$</span> sflow run -f hello.yaml</pre></div>
+    <div class="box pink r d3"><div class="cap">Or ask your AI agent</div>
+      <p class="prompt">“Set up sflow for me by following<code>https://raw.githubusercontent.com/NVIDIA/nv-sflow/main/docs-site/agents-src/setup.md</code>step by step, then tell me what you installed and where.”</p></div>
+    <div class="links r d4">
+      <a class="primary" href="https://nvidia.github.io/nv-sflow/docs/user/quickstart" target="_top">Quickstart</a>
+      <a href="https://github.com/NVIDIA/nv-sflow/tree/main/examples/modular/backend_agnostic" target="_top">The example</a>
+      <a href="https://github.com/NVIDIA/nv-sflow" target="_top">GitHub</a>
+    </div>
+  </div>
+</section>
+
+</main>
+</div>
+
+<nav class="deck-controls" aria-label="Slide navigation">
+  <button id="prevBtn" aria-label="Previous slide">‹</button>
+  <span id="counter">01 / 08</span>
+  <button id="nextBtn" aria-label="Next slide">›</button>
+</nav>
+
+<script>
+/* ===========================================
+   YAML HIGHLIGHTER
+   Code blocks hold plain text so a unit test can compare them with the example
+   files; formatting is added here. Lines matching the block's data-mark regex
+   are highlighted as the point of the slide.
+   =========================================== */
+(function highlight() {
+  const esc = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  document.querySelectorAll('pre.code').forEach((pre) => {
+    const mark = pre.dataset.mark ? new RegExp(pre.dataset.mark) : null;
+    pre.innerHTML = pre.textContent.split('\n').map((line) => {
+      const hash = line.search(/\s#\s/);
+      let code = hash >= 0 ? line.slice(0, hash) : line;
+      const comment = hash >= 0 ? '<s>' + esc(line.slice(hash)) + '</s>' : '';
+      code = esc(code)
+        .replace(/"[^"]*"/g, '<u>$&</u>')
+        .replace(/\$\{\{.*?\}\}/g, '<i>$&</i>')
+        .replace(/^(\s*(?:- )?)([A-Za-z_][\w-]*)(:)/, '$1<b>$2</b>$3');
+      const out = code + comment;
+      return mark && mark.test(line) ? '<mark>' + out + '</mark>' : out;
+    }).join('\n');
+  });
+})();
+
+/* ===========================================
+   SLIDE PRESENTATION CONTROLLER
+   Fixed-stage scaling, keyboard / wheel / swipe navigation, #sN deep links.
+   =========================================== */
+class SlidePresentation {
+  constructor() {
+    this.slides = [...document.querySelectorAll('.slide')];
+    this.stage = document.getElementById('deckStage');
+    this.counter = document.getElementById('counter');
+    this.progress = document.getElementById('progress');
+    this.current = 0;
+    this.setupStageScale();
+    this.setupKeyboardNav();
+    this.setupWheelNav();
+    this.setupTouchNav();
+    document.getElementById('prevBtn').onclick = () => this.go(this.current - 1);
+    document.getElementById('nextBtn').onclick = () => this.go(this.current + 1);
+    const m = /^#s(\d+)$/.exec(location.hash);
+    this.go(m ? Number(m[1]) - 1 : 0);
+  }
+
+  setupStageScale() {
+    const fit = () => {
+      const f = Math.min(innerWidth / 1920, innerHeight / 1080);
+      this.stage.style.transform =
+        `translate(${(innerWidth - 1920 * f) / 2}px, ${(innerHeight - 1080 * f) / 2}px) scale(${f})`;
+    };
+    fit();
+    addEventListener('resize', fit);
+  }
+
+  setupKeyboardNav() {
+    document.addEventListener('keydown', (e) => {
+      if (e.target.isContentEditable) return;
+      if (['ArrowRight', 'ArrowDown', ' ', 'PageDown'].includes(e.key)) { e.preventDefault(); this.go(this.current + 1); }
+      else if (['ArrowLeft', 'ArrowUp', 'PageUp'].includes(e.key)) { e.preventDefault(); this.go(this.current - 1); }
+      else if (e.key === 'Home') this.go(0);
+      else if (e.key === 'End') this.go(this.slides.length - 1);
+    });
+  }
+
+  setupWheelNav() {
+    // Embedded in the /why-sflow page the wheel must scroll that page, not flip slides.
+    if (window.top !== window.self) return;
+    let lock = false;
+    addEventListener('wheel', (e) => {
+      if (lock || Math.abs(e.deltaY) < 30) return;
+      lock = true;
+      this.go(this.current + (e.deltaY > 0 ? 1 : -1));
+      setTimeout(() => { lock = false; }, 700);
+    }, { passive: true });
+  }
+
+  setupTouchNav() {
+    let x0 = null;
+    addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; }, { passive: true });
+    addEventListener('touchend', (e) => {
+      if (x0 === null) return;
+      const dx = e.changedTouches[0].clientX - x0;
+      if (Math.abs(dx) > 50) this.go(this.current + (dx < 0 ? 1 : -1));
+      x0 = null;
+    }, { passive: true });
+  }
+
+  go(i) {
+    this.current = Math.max(0, Math.min(i, this.slides.length - 1));
+    this.slides.forEach((s, n) => {
+      s.classList.toggle('active', n === this.current);
+      // Re-trigger the reveal on every visit, not just the first.
+      s.classList.remove('visible');
+    });
+    requestAnimationFrame(() => requestAnimationFrame(() => this.slides[this.current].classList.add('visible')));
+    const pad = (n) => String(n).padStart(2, '0');
+    this.counter.textContent = `${pad(this.current + 1)} / ${pad(this.slides.length)}`;
+    this.progress.style.width = `${((this.current + 1) / this.slides.length) * 100}%`;
+    history.replaceState(null, '', `#s${this.current + 1}`);
+  }
+}
+new SlidePresentation();
+
+/* ===========================================
+   AUTHOR-ONLY INLINE EDITING
+   Visitors never see it: it exists only when the deck is opened with ?edit.
+   Hover the top-left corner or press E, edit any text, Ctrl+S downloads the HTML.
+   =========================================== */
+if (new URLSearchParams(location.search).has('edit')) {
+  const zone = Object.assign(document.createElement('div'), { className: 'edit-hotzone' });
+  const btn = Object.assign(document.createElement('button'), { className: 'edit-toggle', textContent: 'edit (E)' });
+  document.body.append(zone, btn);
+  const editor = {
+    isActive: false,
+    toggle() {
+      this.isActive = !this.isActive;
+      btn.classList.toggle('active', this.isActive);
+      document.querySelectorAll('.slide h1, .slide h2, .slide h3, .slide p, .slide li, .slide td, .slide th')
+        .forEach((el) => { el.contentEditable = String(this.isActive); });
+    },
+  };
+  let hide = null;
+  const show = () => { clearTimeout(hide); btn.classList.add('show'); };
+  const later = () => { hide = setTimeout(() => { if (!editor.isActive) btn.classList.remove('show'); }, 400); };
+  zone.addEventListener('mouseenter', show); zone.addEventListener('mouseleave', later);
+  btn.addEventListener('mouseenter', show); btn.addEventListener('mouseleave', later);
+  zone.addEventListener('click', () => editor.toggle()); btn.addEventListener('click', () => editor.toggle());
+  document.addEventListener('keydown', (e) => {
+    if ((e.key === 'e' || e.key === 'E') && !e.target.isContentEditable) editor.toggle();
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      e.preventDefault();
+      const a = Object.assign(document.createElement('a'), {
+        href: URL.createObjectURL(new Blob(['<!DOCTYPE html>\n' + document.documentElement.outerHTML], { type: 'text/html' })),
+        download: 'why_sflow.html',
+      });
+      a.click();
+    }
+  });
+}
+</script>
+</body>
+</html>

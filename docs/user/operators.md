@@ -35,8 +35,11 @@ backend configs still use `type: docker`.
 **Log offload** (bash/srun/docker_run) writes each task's `<task>.log` on the compute
 side and reproduces sflow's log format, keeping large log volumes off the driver. It is on
 by default (backend field `offload_task_logs: true`, or per-operator `log_to_file`) and
-auto-falls back to live streaming on an interactive TTY or under `--tui`. `ssh` and
-`python` do not support offload — they always stream through the driver.
+auto-falls back to live streaming on an interactive TTY or under `--tui`. The offloaded
+file carries no ANSI escapes — colour and cursor codes are stripped at write time, as in
+stream mode — so `log_watch` patterns and `results:`/`outputs:` regexes match coloured
+container output. `ssh` and `python` do not support offload — they always stream through
+the driver.
 
 :::caution `python` runs source, not a shell
 The `python` operator passes your `script:` lines to `python -c` as Python source, so
@@ -127,10 +130,11 @@ Runs the task in a container via `docker run`. It is the default operator for th
 | `workdir` | — | Working directory inside the container. |
 | `mounts` | — | Extra bind mounts (`host:container[:ro]`). |
 | `gpus` | — | GPU request (`all`, `device=0,1`, ...). **Overridden** by the backend's planned CUDA slice when the task declares `resources.gpus` (sflow sets `gpus=device=<assigned>`). |
-| `pass_envs` | — | Environment variables to forward into the container. |
+| `pass_envs` | `true` | Forward the host environment into the container. |
 | `extra_args` | — | Extra raw `docker run` args. |
-| `auto_mount_runtime_dirs` | `true` | Auto-mount the workspace/output dirs into the container. Automatically disabled for remote `docker_host`/`context` hosts (the paths don't exist there). |
-| `log_to_file` | `true` | Offload this task's log to `<task>.log` on the container side (see the [Operator matrix](#operator-matrix)). |
+| `rm` | `true` | Pass `--rm` so the container is discarded when it exits. Set to `false` to keep it for `docker logs`/`inspect`; teardown then only stops the container instead of force-removing it. Note a later `sflow run` on the same host still reaps kept containers as orphans, so inspect them before the next run. |
+| `auto_mount_runtime_dirs` | `true` | Auto-mount the workspace/output dirs into the container. Automatically disabled on any declared `hosts:` entry (the controller's paths may not exist on that machine). Local `fs://`/`file://` artifacts are always bind-mounted at their own path, independent of this flag. |
+| `log_to_file` | `true` | Offload this task's log to `<task>.log` on the container side (see the [Operator matrix](#operator-matrix)). Skipped, with a warning, for a multi-node task: its members stream through the shared launcher and are merged into one rank-labelled task log. |
 
 ```yaml
 operators:

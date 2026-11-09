@@ -20,7 +20,7 @@ Column layouts (the post-processor depends on these):
     cpu     : ts,cpu_pct,load1,load5,load15
     memory  : ts,mem_total,mem_available,mem_used,mem_pct,swap_total,swap_free
     disk    : ts,mount,total_bytes,used_bytes,free_bytes,used_pct
-    network : ts,rx_bytes,tx_bytes,rx_bytes_per_s,tx_bytes_per_s,rx_packets_per_s,tx_packets_per_s
+    network : ts,rx_bytes,tx_bytes,rx_bytes_per_s,tx_bytes_per_s,rx_packets_per_s,tx_packets_per_s,loopback_bytes_per_s
 """
 
 from __future__ import annotations
@@ -67,17 +67,59 @@ def _read_meminfo() -> dict[str, int]:
 
 
 def _read_network_totals() -> dict[str, int]:
-    totals = {"rx_bytes": 0, "rx_packets": 0, "tx_bytes": 0, "tx_packets": 0}
+    """Byte/packet counters, with loopback kept apart rather than dropped.
+
+    `lo` stays out of rx/tx because it would double-count (every loopback byte
+    is both sent and received on the same interface) and because those metrics
+    mean "traffic that left this machine".
+
+    It is reported separately instead of ignored: two processes on one host talk
+    over `lo`, so a transfer that never touches a NIC is invisible in rx/tx. A
+    disaggregated inference run co-located on one machine moved ~112 GiB of KV
+    cache that way and every network metric read zero -- the run looked idle
+    while it was entirely transfer-bound. One counter suffices: on loopback rx
+    and tx are the same bytes.
+    """
+    totals = {"rx_bytes": 0, "rx_packets": 0, "tx_bytes": 0, "tx_packets": 0, "loopback_bytes": 0}
     for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
         iface, raw_values = [part.strip() for part in line.split(":", 1)]
-        if iface == "lo":
-            continue
         fields = raw_values.split()
+        if iface == "lo":
+            totals["loopback_bytes"] += int(fields[0])
+            continue
         totals["rx_bytes"] += int(fields[0])
         totals["rx_packets"] += int(fields[1])
         totals["tx_bytes"] += int(fields[8])
         totals["tx_packets"] += int(fields[9])
     return totals
+
+
+class _TaggedStream:
+    """A write-only file stand-in that tags each line with its scope.
+
+    Lets the sampling loop stay identical whether a scope's rows land in a file
+    on this machine or stream back to a driver that cannot see this filesystem
+    (a container on a remote Docker host). The separator is a TAB because every
+    payload -- CSV rows and the ``#fields=`` header alike -- contains commas.
+    """
+
+    SEPARATOR = "\t"
+
+    def __init__(self, scope: str, stream) -> None:
+        self._prefix = f"{scope}{self.SEPARATOR}"
+        self._stream = stream
+
+    def write(self, text: str) -> None:
+        for line in text.splitlines():
+            self._stream.write(f"{self._prefix}{line}\n")
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def close(self) -> None:
+        # The underlying stream is the process's stdout; closing it here would
+        # cut the channel the remaining scopes still write to.
+        pass
 
 
 def _append_lines(handle, lines: list[str]) -> None:
@@ -195,7 +237,10 @@ def _sample_once(
         handles["memory"].flush()
 
     if "disk" in handles:
-        statvfs = os.statvfs("/")
+        # A collector in a container would otherwise measure its own image
+        # overlay and file it as the node's "/". Whoever puts it there binds the
+        # real root somewhere and names it here; on a bare host this is unset.
+        statvfs = os.statvfs(os.environ.get("SFLOW_MONITOR_DISK_ROOT") or "/")
         total_bytes = statvfs.f_blocks * statvfs.f_frsize
         free_bytes = statvfs.f_bavail * statvfs.f_frsize
         used_bytes = max(total_bytes - free_bytes, 0)
@@ -221,10 +266,17 @@ def _sample_once(
         tx_packets_per_s = (
             current_network["tx_packets"] - previous_network.get("tx_packets", current_network["tx_packets"])
         ) / elapsed_s
+        loopback_bytes_per_s = (
+            current_network["loopback_bytes"]
+            - previous_network.get("loopback_bytes", current_network["loopback_bytes"])
+        ) / elapsed_s
+        # Trailing column on purpose: the post-processor maps these positionally,
+        # so appending keeps it able to read logs written before this existed.
         handles["network"].write(
             f"{ts},{current_network['rx_bytes']},{current_network['tx_bytes']},"
             f"{rx_bytes_per_s:.2f},{tx_bytes_per_s:.2f},"
-            f"{rx_packets_per_s:.2f},{tx_packets_per_s:.2f}\n"
+            f"{rx_packets_per_s:.2f},{tx_packets_per_s:.2f},"
+            f"{loopback_bytes_per_s:.2f}\n"
         )
         handles["network"].flush()
         previous_network = current_network
@@ -251,6 +303,15 @@ def main() -> None:
         default=DEFAULT_GPU_QUERY_FIELDS,
         help="nvidia-smi --query-gpu fields for the gpu scope.",
     )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help=(
+            "Stream samples as '<scope>\\t<row>' on stdout instead of writing "
+            "per-scope files. For backends whose nodes share no filesystem with "
+            "the driver; the driver demultiplexes the stream back into files."
+        ),
+    )
     args = parser.parse_args()
 
     scopes = _parse_scopes(args.scopes)
@@ -269,25 +330,40 @@ def main() -> None:
     log_paths = _build_log_paths(output_dir, node_id, hostname, scopes)
 
     handles: dict = {}
-    try:
-        if not output_dir_env:
-            raise KeyError("SFLOW_TASK_OUTPUT_DIR")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        for name, path in log_paths.items():
-            handles[name] = path.open("a", buffering=1)
-        # Record the GPU field layout as a header so the post-processor maps each
-        # column to a metric even when --gpu-fields overrides the default set.
+    if args.stdout:
+        # Streaming: stdout is the data channel, so every status line goes to
+        # stderr -- printed on stdout it would be read back as a sample row.
+        handles = {scope: _TaggedStream(scope, sys.stdout) for scope in scopes}
         if "gpu" in handles:
             handles["gpu"].write(f"#fields={args.gpu_fields}\n")
             handles["gpu"].flush()
-    except Exception as error:
-        # Close any handles opened before the failure so we don't leak fds.
-        for handle in handles.values():
-            handle.close()
-        _log_startup_failure(output_dir, log_paths, error)
-        raise
+        print(
+            f"Hardware monitor started successfully: interval_ms={interval_ms} "
+            f"streaming scopes={','.join(scopes)} to stdout.",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        try:
+            if not output_dir_env:
+                raise KeyError("SFLOW_TASK_OUTPUT_DIR")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for name, path in log_paths.items():
+                handles[name] = path.open("a", buffering=1)
+            # Record the GPU field layout as a header so the post-processor maps
+            # each column to a metric even when --gpu-fields overrides the
+            # default set.
+            if "gpu" in handles:
+                handles["gpu"].write(f"#fields={args.gpu_fields}\n")
+                handles["gpu"].flush()
+        except Exception as error:
+            # Close any handles opened before the failure so we don't leak fds.
+            for handle in handles.values():
+                handle.close()
+            _log_startup_failure(output_dir, log_paths, error)
+            raise
 
-    _log_startup_success(output_dir, interval_ms, log_paths)
+        _log_startup_success(output_dir, interval_ms, log_paths)
 
     previous_cpu = _read_cpu_totals() if "cpu" in handles else (0, 0)
     previous_network = _read_network_totals() if "network" in handles else {}

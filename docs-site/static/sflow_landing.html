@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<base target="_top">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Describe once. Run anywhere</title>
+<meta name="description" content="A looping feature video for sflow v0.3.2: one workload on any backend, Docker across hosts, runs over SSH, an install from PyPI, Kubernetes, merge-pod, results and run summaries.">
+<script>document.documentElement.classList.add('js');</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Geist:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Hallmark · shape: one 16:9 stage playing chapters in a loop, by request (a feature video) · genre: atmospheric · theme: Lumen (deal 3/3, seed animated-release-explainer-sflow-376a·59c5e0fe·2026-11-06·r0) · job: sign up · draw: e42583
+ * hero: the stage; its intro chapter carries the head, the strip beneath carries the action · nav: masthead · footer: colophon block · imagery: diagrams of the real system, the product (sflow TUI capture, 1) · signature: one workload.yaml landing on four backends as backend.yaml swaps
+ * axes: dark/mono/warm · fonts: JetBrains Mono display and figures by request, Geist body · posture: restrained · contrast: pass · fold: pass · lumen: night · motion: a looping chapter sequence by request, overriding Lumen's still rule; pauses on hover, focus and its button, starts paused on rest frames under reduced motion · v2.0.0 */
+/* Hallmark · pre-emit critique: P4 H4 E4 S5 R3 V4 · weakest: R, six looping scenes; each is one diagram of a real sflow mechanism, nothing loops off screen, and the no-script page is the finished frames */
+/* Hallmark · waive 38iii · the rose verb Run appears once, in the intro head · Lumen names its one accented verb as the theme signature */
+/* Hallmark · waive 79 · the 2:1 stage is the whole page, centred under the nav · this copy exists to be captured as an email GIF, not read as a page */
+/* Hallmark · waive 44c · the first screen is a 16:9 stage with its controls and install strip beneath · a feature video page has no hero band to fill, by request */
+/* Hallmark · dismissed 58 · the page total counts all fifteen chapters, but the stage shows one chapter at a time, each well under the 80-word screen */
+/* Hallmark · dismissed 77 · one stage of eleven chapters is the requested shape, each chapter a 16:9 section of its own */
+/* Hallmark · answered F1 · the straight quotes are JSON and regex inside code, where curly quotes would be wrong */
+/* Hallmark · waive 47c · the blueprint grid sits only in the diagram wells, under drawn sflow systems · it is the measuring ground for the diagrams of pods, nodes and files */
+:root {
+  color-scheme: dark;
+  --space-3xs: 2px; --space-2xs: 4px; --space-xs: 8px; --space-sm: 12px; --space-md: 16px; --space-lg: 24px; --space-xl: 40px; --space-2xl: 64px; --space-3xl: 96px; --space-4xl: 144px;
+  --text-xs: 0.8125rem; --text-sm: 0.875rem; --text-md: 1rem; --text-lg: 1.25rem; --text-xl: 1.5625rem; --text-2xl: 1.953rem; --text-3xl: 2.441rem;
+  --text-display-s: clamp(2.25rem, 4vw + 0.5rem, 3.75rem); --text-display: clamp(2.75rem, 5vw + 1rem, 5.25rem);
+  --text-section: clamp(2rem, 2.5vw + 1rem, 3.5rem); --text-title: clamp(1.25rem, 0.75vw + 0.875rem, 1.625rem); --text-lead: clamp(1.125rem, 0.35vw + 1rem, 1.375rem);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1); --ease-in: cubic-bezier(0.7, 0, 0.84, 0); --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms; --dur-short: 220ms; --dur-long: 420ms;
+  --color-error: oklch(72% 0.15 27); --color-success: oklch(76% 0.13 150);
+  --container: 1440px; --gutter: 64px; --gap-columns: 32px; --section-gap-s: 120px; --section-gap: 144px; --section-gap-l: 176px;
+  --z-base: 1; --z-raised: 10; --z-dropdown: 100; --z-sticky: 200; --z-sticky-nav: 300; --z-modal: 400; --z-toast: 500; --z-tooltip: 600;
+  --color-paper: oklch(12.5% 0.027 290); --color-paper-2: oklch(16% 0.03 290); --color-paper-3: oklch(20% 0.032 290);
+  --color-ink: oklch(96% 0.01 300); --color-ink-2: oklch(85% 0.017 298); --color-muted: oklch(69% 0.026 295);
+  --color-rule: oklch(27% 0.034 290); --color-rule-2: oklch(36% 0.04 292); --rule-blueprint: oklch(96% 0.01 300 / 0.05);
+  --color-accent: oklch(80% 0.15 62); --color-accent-2: oklch(72% 0.15 12); --color-accent-ink: oklch(14% 0.028 290);
+  --color-live: oklch(80% 0.13 155); --color-focus: oklch(80% 0.15 62);
+  --font-display: "JetBrains Mono", ui-monospace, monospace; --font-body: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-outlier: "JetBrains Mono", ui-monospace, monospace;
+  --radius-card: 10px; --radius-pill: 999px; --rule-hair: 1px;
+  --shadow-card: 0 28px 64px -30px oklch(4% 0.02 290 / 0.8);
+  --tracking-display: -0.02em; --display-weight: 600;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html, body { overflow-x: clip; }
+html { scrollbar-color: var(--color-muted) var(--color-paper); scroll-padding-top: var(--space-3xl); }
+body { margin: 0; background: var(--color-paper); color: var(--color-ink); font-family: var(--font-body); font-size: var(--text-md); line-height: 1.55; -webkit-font-smoothing: antialiased; caret-color: var(--color-accent); }
+::selection { background: color-mix(in oklab, var(--color-accent) 22%, transparent); color: var(--color-ink); }
+:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 0.16em; }
+h1, h2, h3 { margin: 0; font-family: var(--font-display); font-weight: var(--display-weight, 700); font-synthesis: none; letter-spacing: var(--tracking-display); line-height: 1.05; overflow-wrap: break-word; min-width: 0; text-wrap: balance; }
+h1 { max-width: 20ch; font-size: var(--text-display); } h2 { max-width: 30ch; font-size: var(--text-section); } h3 { max-width: 40ch; font-size: var(--text-title); line-height: 1.2; }
+.lead { font-size: var(--text-lead); line-height: 1.45; max-width: 52ch; }
+p { margin: 0; text-wrap: pretty; }
+p:not([class]) { max-width: 65ch; }
+img, video { max-width: 100%; height: auto; display: block; }
+svg { display: block; }
+[hidden] { display: none !important; }
+button, input, select, textarea { font: inherit; }
+.container { width: 100%; max-width: var(--container); margin-inline: auto; padding-inline: var(--gutter); box-sizing: border-box; }
+.num, .figure, td.num { font-variant-numeric: tabular-nums; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+[data-slot] { position: relative; overflow: hidden; background: linear-gradient(160deg, var(--color-paper-2, var(--color-paper)), var(--color-paper-3, var(--color-paper))); }
+[data-slot] > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; }
+[data-slot]:has(> img) > :not(img):not([data-keep]) { display: none !important; }
+@media (max-width: 60rem) { :root { --gutter: 24px; --section-gap-s: 80px; --section-gap: 96px; --section-gap-l: 120px; } }
+@media (max-width: 40rem) { :root { --gutter: 16px; --section-gap-s: 56px; --section-gap: 72px; --section-gap-l: 96px; --gap-columns: 16px; } }
+@media (prefers-reduced-motion: reduce) { *:not(.keep-motion), *:not(.keep-motion)::before, *:not(.keep-motion)::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; } }
+/* photographs: duotone paper ink-2 */
+[data-slot]:has(> img) { isolation: isolate; background: var(--color-ink-2); outline: 1px solid color-mix(in oklab, var(--color-ink) 8%, transparent); outline-offset: -1px; }
+[data-slot] > img { z-index: 0; filter: grayscale(1) contrast(1.08); mix-blend-mode: multiply; }
+[data-slot]:has(> img)::before { content: ""; position: absolute; inset: 0; z-index: 1; background: var(--color-paper); mix-blend-mode: lighten; pointer-events: none; }
+
+:root { --nav-h: 72px; }
+body { font-variant-numeric: tabular-nums; }
+h1, h2, h3, nav, label, figcaption, .btn { text-transform: lowercase; }
+h1, h2, h3 { font-weight: var(--display-weight); }
+h1 { font-size: clamp(3rem, 5.4vw + 0.5rem, 6rem); line-height: 0.98; max-width: 16ch; }
+h2 { font-size: var(--text-display-s); line-height: 0.98; max-width: 24ch; }
+h3 { font-size: var(--text-title); }
+.verb { display: inline-block; color: var(--color-accent-2); }
+.verb::after { content: ""; display: block; height: var(--rule-hair); background: currentColor; transform-origin: left; animation: draw var(--dur-long) var(--ease-out) both; }
+@keyframes draw { from { transform: scaleX(0); } }
+.lead { color: var(--color-ink-2); }
+.muted { color: var(--color-muted); }
+
+/* controls, eight states */
+.btn { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 var(--space-lg); border: 0; border-radius: var(--radius-pill); font-weight: 500; font-size: var(--text-md); text-decoration: none; white-space: nowrap; cursor: pointer; transition: background-color var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out), transform var(--dur-micro) var(--ease-out); }
+.btn--primary { background: var(--color-accent); color: var(--color-accent-ink); }
+.btn--primary:hover { background: var(--color-ink); color: var(--color-accent-ink); }
+.btn--secondary { background: transparent; color: var(--color-ink); box-shadow: inset 0 0 0 var(--rule-hair) var(--color-rule-2); }
+.btn--secondary:hover { background: var(--color-paper-2); }
+.btn--quiet { min-height: 44px; padding: 0 var(--space-md); font-size: var(--text-sm); background: transparent; color: var(--color-ink-2); box-shadow: inset 0 0 0 var(--rule-hair) var(--color-rule-2); }
+.btn--quiet:hover { background: var(--color-paper-3); color: var(--color-ink); }
+.btn:active { transform: translateY(1px); }
+.btn:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 3px; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+html:not(.js) [data-copy] { display: none; }
+
+/* nav: masthead */
+.mast { border-bottom: var(--rule-hair) solid var(--color-rule); }
+.mast .container { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; min-height: var(--nav-h); gap: var(--space-md); }
+.mast a { color: var(--color-ink-2); text-decoration: none; font-size: var(--text-sm); padding-block: var(--space-sm); }
+.mast a:hover { color: var(--color-ink); text-decoration: underline; text-decoration-color: var(--color-accent); }
+.mast .links { display: flex; gap: var(--space-lg); justify-content: flex-end; }
+.mast .wordmark, .wordmark { font-family: var(--font-display); font-size: var(--text-2xl); color: var(--color-ink) !important; letter-spacing: var(--tracking-display); }
+.skip { position: absolute; left: var(--space-md); top: calc(-1 * var(--space-3xl)); z-index: var(--z-toast); padding: var(--space-xs) var(--space-md); background: var(--color-ink); color: var(--color-paper); }
+.skip:focus-visible { top: var(--space-md); }
+
+/* hero: Stage */
+.hero { min-height: calc(100dvh - var(--nav-h)); display: grid; align-items: center; padding-block: var(--space-xl) var(--space-2xl); }
+.hero__grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: var(--space-3xl); align-items: center; }
+.hero__text { display: grid; gap: var(--space-lg); }
+.install { display: grid; gap: var(--space-sm); justify-items: start; margin-top: var(--space-xs); }
+.cmd { display: inline-flex; align-items: center; min-height: 48px; padding: 0 var(--space-md); border-radius: var(--radius-card); background: var(--color-paper-2); box-shadow: inset 0 0 0 var(--rule-hair) var(--color-rule); font: 400 0.9375rem/1 var(--font-outlier); color: var(--color-ink); white-space: nowrap; }
+.cmd::before { content: "$ "; color: var(--color-muted); white-space: pre; }
+
+/* diagram wells */
+.well { background: var(--color-paper-2); border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-card); }
+.blueprint { background-image: linear-gradient(var(--rule-blueprint) 1px, transparent 1px), linear-gradient(90deg, var(--rule-blueprint) 1px, transparent 1px); background-size: 48px 48px; }
+figure { margin: 0; }
+.scene { padding: var(--space-lg); display: grid; gap: var(--space-md); }
+.scene figcaption { display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); font-size: var(--text-sm); color: var(--color-muted); }
+.scene figcaption code { font: 400 0.8125rem/1.5 var(--font-outlier); color: var(--color-ink-2); text-transform: none; }
+.scroll-x { overflow-x: auto; }
+
+/* svg diagrams */
+.dg { width: 100%; height: auto; overflow: visible; }
+.dg text { font-family: var(--font-outlier); font-size: 13px; fill: var(--color-ink-2); }
+.dg .t-ink { fill: var(--color-ink); } .dg .t-muted { fill: var(--color-muted); } .dg .t-acc { fill: var(--color-accent); } .dg .t-live { fill: var(--color-live); }
+.dg .t-small { font-size: 12px; }
+.dg .card { fill: var(--color-paper-3); stroke: var(--color-rule-2); }
+.dg .card-acc { fill: var(--color-paper-3); stroke: var(--color-accent); }
+.dg .frame { fill: var(--color-paper); stroke: var(--color-rule); }
+.dg .unit { fill: var(--color-paper); stroke: var(--color-rule-2); }
+.dg .box { fill: var(--color-paper-2); stroke: var(--color-rule-2); }
+.dg .pod { fill: none; stroke: var(--color-muted); stroke-dasharray: 3 4; }
+.dg .pod-acc { fill: none; stroke: var(--color-accent); }
+.dg .pill-acc { fill: var(--color-paper-3); stroke: var(--color-accent); }
+.dg .on { fill: color-mix(in oklab, var(--color-live) 14%, transparent); stroke: var(--color-live); }
+.dg .gpu { fill: var(--color-paper-3); stroke: var(--color-rule-2); }
+.dg .gpu-on { fill: color-mix(in oklab, var(--color-accent) 16%, transparent); stroke: var(--color-accent); }
+.dg .edge { stroke: var(--color-rule-2); fill: none; }
+.dg .edge-acc { stroke: var(--color-accent); fill: none; stroke-width: 1.5; }
+.dg .edge-slow { stroke: var(--color-muted); fill: none; stroke-dasharray: 4 6; }
+.dg .dashed { stroke-dasharray: 5 5; stroke-width: 1; }
+.dg .dot-acc { fill: var(--color-accent); } .dg .dot-muted { fill: var(--color-muted); }
+.dg .rail { fill: var(--color-paper-3); }
+.dg .bar { fill: var(--color-ink-2); transform-box: fill-box; transform-origin: left center; }
+.dg .line { fill: none; stroke: var(--color-ink-2); stroke-width: 1.5; stroke-linejoin: round; }
+.dg .wipe { fill: var(--color-paper-2); transform-box: fill-box; transform-origin: right center; transform: scaleX(0); }
+.dg .hl { fill: color-mix(in oklab, var(--color-accent) 22%, transparent); }
+.dg .strike-l { fill: var(--color-ink-2); transform-box: fill-box; transform-origin: left center; }
+/* rest frames: what shows with no script and under reduced motion */
+.dg .st { opacity: 0; } .dg .st--rest { opacity: 1; }
+.dg .phA { opacity: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .a, .verb::after { animation: none !important; }
+}
+@keyframes swap4 { 0% { opacity: 0; } 1.5%, 23% { opacity: 1; } 24.5%, 100% { opacity: 0; } }
+@keyframes lit4 { 0%, 2% { opacity: 0; } 5%, 22% { opacity: 1; } 25%, 100% { opacity: 0; } }
+@keyframes travel { 0% { transform: translateX(0); opacity: 0; } 15% { opacity: 1; } 70% { transform: translateX(var(--dx)); opacity: 1; } 85%, 100% { transform: translateX(var(--dx)); opacity: 0; } }
+@keyframes fall { 0% { transform: translateY(0); opacity: 0; } 10% { opacity: 1; } 85% { transform: translateY(var(--dy)); opacity: 1; } 100% { transform: translateY(var(--dy)); opacity: 0; } }
+@keyframes dash { 0% { transform: translateX(0); opacity: 0; } 10% { opacity: 1; } 85% { transform: translateX(var(--dx)); opacity: 1; } 100% { transform: translateX(var(--dx)); opacity: 0; } }
+@keyframes probe { 0%, 2% { opacity: 0; } 6%, 14% { opacity: 1; } 18%, 100% { opacity: 0.25; } }
+@keyframes dim { 0%, 40% { opacity: 1; } 48%, 92% { opacity: 0.2; } 98%, 100% { opacity: 1; } }
+@keyframes phaseA { 0%, 40% { opacity: 1; } 45%, 95% { opacity: 0; } 100% { opacity: 1; } }
+@keyframes phaseB { 0%, 45% { opacity: 0; } 52%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes kvslow { 0% { transform: translate(0, 0); opacity: 0; } 6% { opacity: 1; } 25% { transform: translate(0, 108px); } 75% { transform: translate(352px, 108px); } 94% { transform: translate(352px, 0); opacity: 1; } 100% { transform: translate(352px, 0); opacity: 0; } }
+@keyframes wipe { 0%, 8% { transform: scaleX(1); } 60%, 90% { transform: scaleX(0); } 96%, 100% { transform: scaleX(1); } }
+@keyframes fold { 0%, 15% { transform: translate(0, 0); opacity: 1; } 42% { transform: translate(var(--dx), var(--dy)); opacity: 0; } 92% { transform: translate(var(--dx), var(--dy)); opacity: 0; } 93% { transform: translate(0, 0); opacity: 0; } 100% { transform: translate(0, 0); opacity: 1; } }
+@keyframes mvA { 0%, 20% { transform: translate(0, 0); opacity: 0; } 22% { opacity: 1; } 32% { transform: translate(var(--dx), var(--dy)); opacity: 1; } 34%, 100% { transform: translate(var(--dx), var(--dy)); opacity: 0; } }
+@keyframes mvB { 0%, 46% { transform: translate(0, 0); opacity: 0; } 48% { opacity: 1; } 60% { transform: translate(var(--dx), var(--dy)); opacity: 1; } 62%, 100% { transform: translate(var(--dx), var(--dy)); opacity: 0; } }
+@keyframes s0 { 0%, 4% { transform: scaleX(0); } 9%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r0 { 0%, 8% { opacity: 0; transform: translateX(-12px); } 13%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes s1 { 0%, 20% { transform: scaleX(0); } 25%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r1 { 0%, 24% { opacity: 0; transform: translateX(-12px); } 29%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes s2 { 0%, 36% { transform: scaleX(0); } 41%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r2 { 0%, 40% { opacity: 0; transform: translateX(-12px); } 45%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes s3 { 0%, 52% { transform: scaleX(0); } 57%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r3 { 0%, 56% { opacity: 0; transform: translateX(-12px); } 61%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes on10 { 0%, 10% { opacity: 0; } 16%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on15 { 0%, 15% { opacity: 0; } 21%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on18 { 0%, 18% { opacity: 0; } 24%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on25 { 0%, 25% { opacity: 0; } 31%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on32 { 0%, 32% { opacity: 0; } 38%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on39 { 0%, 39% { opacity: 0; } 45%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on46 { 0%, 46% { opacity: 0; } 52%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on48 { 0%, 48% { opacity: 0; } 54%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on50 { 0%, 50% { opacity: 0; } 56%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on60 { 0%, 60% { opacity: 0; } 66%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on62 { 0%, 62% { opacity: 0; } 68%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes g0 { 0%, 5% { transform: scaleX(0); } 15%, 90% { transform: scaleX(1); } 96%, 100% { transform: scaleX(0); } }
+@keyframes g1 { 0%, 5% { transform: scaleX(0); } 50%, 90% { transform: scaleX(1); } 96%, 100% { transform: scaleX(0); } }
+@keyframes g2 { 0%, 50% { transform: scaleX(0); } 60%, 90% { transform: scaleX(1); } 96%, 100% { transform: scaleX(0); } }
+@keyframes x3a { 0%, 30% { opacity: 0; } 34%, 46% { opacity: 1; } 50%, 100% { opacity: 0; } }
+@keyframes x3b { 0%, 50% { opacity: 0; } 54%, 66% { opacity: 1; } 70%, 100% { opacity: 0; } }
+@keyframes x3c { 0%, 70% { opacity: 0; } 74%, 86% { opacity: 1; } 90%, 100% { opacity: 0; } }
+
+/* sections */
+.section { padding-block: var(--section-gap) 0; }
+.section--l { padding-block: var(--section-gap-l) 0; }
+.head { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: var(--gap-columns); align-items: end; margin-bottom: var(--space-2xl); }
+.head .lead { justify-self: start; }
+.head--stack { grid-template-columns: minmax(0, 1fr); gap: var(--space-md); }
+
+/* bash -> yaml rows */
+.swaps { list-style: none; margin: 0; padding: 0; border-top: var(--rule-hair) solid var(--color-rule); }
+.swap-row { display: grid; grid-template-columns: minmax(0, 6fr) var(--space-2xl) minmax(0, 5fr); align-items: center; min-height: 96px; border-bottom: var(--rule-hair) solid var(--color-rule); gap: var(--space-md); }
+.swap-row code { font: 400 1rem/1.4 var(--font-outlier); overflow-wrap: anywhere; }
+.bash { position: relative; color: var(--color-muted); justify-self: start; }
+.strike { position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: var(--color-ink-2); transform-origin: left center; }
+.yaml { color: var(--color-accent); }
+.arrow { height: var(--rule-hair); background: var(--color-rule-2); }
+.rows-foot { display: flex; justify-content: flex-end; padding-top: var(--space-md); }
+
+/* band */
+.band { color: var(--color-ink); background: var(--color-paper-2); margin-top: var(--section-gap); padding-block: var(--section-gap-s); }
+.band .well { color: var(--color-ink); background: var(--color-paper); }
+
+/* bento */
+.bento { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: var(--gap-columns); }
+.tile { padding: var(--space-xl); display: grid; gap: var(--space-lg); align-content: start; }
+.tile .scene { padding: 0; }
+.span-7 { grid-column: span 7; } .span-5 { grid-column: span 5; }
+
+/* close */
+.close { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: var(--space-3xl); align-items: center; }
+.close__text { display: grid; gap: var(--space-lg); }
+.code { margin: 0; padding: var(--space-lg); border-radius: var(--radius-card); background: var(--color-paper); box-shadow: inset 0 0 0 var(--rule-hair) var(--color-rule); font: 400 0.875rem/1.7 var(--font-outlier); color: var(--color-ink); overflow-x: auto; white-space: pre; }
+.code .c { color: var(--color-muted); }
+.shot { aspect-ratio: 1600 / 720; border-radius: var(--radius-card); }
+.shot > img { mix-blend-mode: normal !important; filter: none !important; }
+.shot::before { display: none !important; }
+.actions { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
+
+/* footer: colophon block */
+.colophon { margin-top: var(--section-gap); padding-block: var(--space-3xl); border-top: var(--rule-hair) solid var(--color-rule); }
+.colophon .container { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: var(--gap-columns); align-items: start; }
+.colophon p { color: var(--color-muted); font-size: var(--text-sm); max-width: 60ch; }
+.colophon a { color: var(--color-ink-2); }
+.colophon a:hover { color: var(--color-ink); text-decoration-color: var(--color-accent); }
+
+@media (max-width: 60rem) {
+  .hero { min-height: 0; }
+  .hero__grid, .close, .head, .colophon .container { grid-template-columns: minmax(0, 1fr); gap: var(--space-xl); }
+  .span-7, .span-5 { grid-column: 1 / -1; }
+  .swap-row { grid-template-columns: minmax(0, 1fr); gap: var(--space-xs); padding-block: var(--space-md); }
+  .arrow { display: none; }
+  .scroll-x .dg { min-width: 960px; }
+  .strike { display: none; }
+  .bash span { text-decoration: line-through; text-decoration-color: var(--color-ink-2); }
+  .scroll-x--hero .dg { min-width: 600px; }
+  .mast .links { gap: var(--space-md); }
+}
+@media (max-width: 40rem) {
+  .mast .container { grid-template-columns: auto minmax(0, 1fr); }
+  .mast .notes { display: none; }
+  .tile { padding: var(--space-lg); }
+}
+
+@keyframes drop { 0%, 60% { opacity: 1; } 62%, 74% { opacity: 0.15; } 77%, 100% { opacity: 1; } }
+@keyframes logwin { 0%, 45% { opacity: 0; } 48%, 60% { opacity: 1; } 62%, 76% { opacity: 0; } 79%, 94% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes crash { 0%, 5% { opacity: 1; } 10%, 40% { opacity: 0.3; } 45%, 100% { opacity: 1; } }
+@keyframes leftover { 0%, 55% { opacity: 1; } 62%, 94% { opacity: 0; } 98%, 100% { opacity: 1; } }
+@keyframes on76 { 0%, 76% { opacity: 0; } 82%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes w05_40 { 0%, 5% { opacity: 0; } 8%, 40% { opacity: 1; } 43%, 100% { opacity: 0; } }
+@keyframes w62_74 { 0%, 62% { opacity: 0; } 65%, 74% { opacity: 1; } 77%, 100% { opacity: 0; } }
+@keyframes on12 { 0%, 12% { opacity: 0; } 18%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on22 { 0%, 22% { opacity: 0; } 28%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on32 { 0%, 32% { opacity: 0; } 38%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on40 { 0%, 40% { opacity: 0; } 46%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes w04_30 { 0%, 4% { opacity: 0; } 7%, 30% { opacity: 1; } 33%, 100% { opacity: 0; } }
+@keyframes on38 { 0%, 38% { opacity: 0; } 44%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on42 { 0%, 42% { opacity: 0; } 48%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on18 { 0%, 18% { opacity: 0; } 24%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on50 { 0%, 50% { opacity: 0; } 56%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on56 { 0%, 56% { opacity: 0; } 62%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on30 { 0%, 30% { opacity: 0; } 36%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on36 { 0%, 36% { opacity: 0; } 42%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes w08_40 { 0%, 8% { opacity: 0; } 11%, 40% { opacity: 1; } 43%, 100% { opacity: 0; } }
+@keyframes on62 { 0%, 62% { opacity: 0; } 68%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on46 { 0%, 46% { opacity: 0; } 52%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes on52 { 0%, 52% { opacity: 0; } 58%, 90% { opacity: 1; } 96%, 100% { opacity: 0; } }
+
+/* calmer pacing: overrides the faster ramps above */
+@keyframes on10 { 0%, 10% { opacity: 0; } 19%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on12 { 0%, 12% { opacity: 0; } 21%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on15 { 0%, 15% { opacity: 0; } 24%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on18 { 0%, 18% { opacity: 0; } 27%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on22 { 0%, 22% { opacity: 0; } 31%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on25 { 0%, 25% { opacity: 0; } 34%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on30 { 0%, 30% { opacity: 0; } 39%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on32 { 0%, 32% { opacity: 0; } 41%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on36 { 0%, 36% { opacity: 0; } 45%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on38 { 0%, 38% { opacity: 0; } 47%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on39 { 0%, 39% { opacity: 0; } 48%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on40 { 0%, 40% { opacity: 0; } 49%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on42 { 0%, 42% { opacity: 0; } 51%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on46 { 0%, 46% { opacity: 0; } 55%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on48 { 0%, 48% { opacity: 0; } 57%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on50 { 0%, 50% { opacity: 0; } 59%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on52 { 0%, 52% { opacity: 0; } 61%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on56 { 0%, 56% { opacity: 0; } 65%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on60 { 0%, 60% { opacity: 0; } 69%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on62 { 0%, 62% { opacity: 0; } 71%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on76 { 0%, 76% { opacity: 0; } 85%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes s0 { 0%, 4% { transform: scaleX(0); } 12%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r0 { 0%, 8% { opacity: 0; transform: translateX(-12px); } 16%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes s1 { 0%, 20% { transform: scaleX(0); } 28%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r1 { 0%, 24% { opacity: 0; transform: translateX(-12px); } 32%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes s2 { 0%, 36% { transform: scaleX(0); } 44%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r2 { 0%, 40% { opacity: 0; transform: translateX(-12px); } 48%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes s3 { 0%, 52% { transform: scaleX(0); } 60%, 88% { transform: scaleX(1); } 94%, 100% { transform: scaleX(0); } }
+@keyframes r3 { 0%, 56% { opacity: 0; transform: translateX(-12px); } 64%, 88% { opacity: 1; transform: none; } 94%, 100% { opacity: 0; transform: none; } }
+@keyframes swap4 { 0% { opacity: 0; } 3%, 22.5% { opacity: 1; } 24.5%, 100% { opacity: 0; } }
+
+/* the video stage */
+:root { --ease-scene: cubic-bezier(0.37, 0, 0.63, 1); }
+.player { padding-block: var(--space-lg) var(--space-xl); }
+.stage { position: relative; width: min(100%, 1152px); margin-inline: auto; container-type: inline-size; }
+.play .stage { width: min(100%, calc((100dvh - var(--nav-h) - 196px) * 16 / 9)); min-width: min(100%, 640px); }
+.scene { position: relative; aspect-ratio: 16 / 9; overflow: hidden; color: var(--color-ink); }
+.scene + .scene { margin-top: var(--space-lg); }
+.play .stage { aspect-ratio: 16 / 9; }
+.play .scene + .scene { margin-top: 0; }
+.play .scene { position: absolute; inset: 0; visibility: hidden; opacity: 0; transition: opacity var(--dur-long) var(--ease-out), visibility 0s linear var(--dur-long); }
+.play .scene.is-on { visibility: visible; opacity: 1; transition-delay: 0s; }
+.scene__cap { position: absolute; left: 4cqw; top: 3.4cqw; right: 20cqw; font-size: 2.7cqw; line-height: 1.1; max-width: none; }
+.scene__tag { position: absolute; right: 4cqw; top: 3.9cqw; font: 400 1.3cqw/1 var(--font-outlier); color: var(--color-accent); }
+.scene__body { position: absolute; inset: 11cqw 5cqw 4cqw; display: grid; place-items: center; }
+.scene__body > svg, .scene__body > video { position: absolute; inset: 0; width: 100%; height: 100%; }
+.scene__body > video { object-fit: contain; }
+.scene--tui .scene__body { inset: 9cqw 4cqw 3cqw 4cqw; }
+.tui-dag { position: absolute; left: 0; top: 0; bottom: 0; width: 38cqw; }
+.tui-vid { position: absolute; left: 42cqw; right: 0; top: -6cqw; bottom: 0; }
+.tui-dag > svg, .tui-vid > video { display: block; width: 100%; height: 100%; }
+.tui-vid > video { object-fit: contain; }
+.scene--tui .scene__cap { right: 60cqw; }
+.scene--intro .scene__body, .scene--end .scene__body { inset: 0 8cqw; place-items: center start; align-content: center; gap: 2cqw; }
+.scene--intro .scene__body { inset: 0 4cqw; place-items: center; }
+.intro-hero { display: grid; justify-items: center; gap: 1.1cqw; width: 100%; text-align: center; }
+.intro-hero .brand { font-size: 6.4cqw; line-height: 1; max-width: none; text-transform: none; }
+.intro-hero .desc { font-size: 2cqw; color: var(--color-ink-2); max-width: none; }
+.intro-hero .slogan { display: block; margin-top: 1.4cqw; font-size: 2.6cqw; line-height: 1.2; }
+.intro-hero .flow { width: 76cqw; height: auto; margin-top: 0.8cqw; }
+.dg .flow-lbl { font-size: 17px; }
+.dg .flowline { fill: none; stroke: var(--color-rule-2); stroke-width: 1.5; stroke-dasharray: 100; stroke-dashoffset: 0; }
+.dg .flowpulse { fill: none; stroke: var(--color-accent); stroke-width: 2.5; stroke-linecap: round; stroke-dasharray: 10 90; }
+.dg .dot-live { fill: var(--color-live); }
+.dg .hub-bg { fill: var(--color-paper); }
+.dg .hub-ring { fill: none; stroke: var(--color-accent); stroke-width: 2; }
+@keyframes drawin { 0%, 4% { stroke-dashoffset: 100; } 18%, 100% { stroke-dashoffset: 0; } }
+@keyframes drawout { 0%, 28% { stroke-dashoffset: 100; } 42%, 100% { stroke-dashoffset: 0; } }
+/* intro-only reveals: names, hub, pulses in, outputs, pulses out; all hold until the hand-over */
+@keyframes inlbl { 0% { opacity: 0; } 8%, 100% { opacity: 1; } }
+@keyframes inhub { 0%, 6% { opacity: 0; } 14%, 100% { opacity: 1; } }
+@keyframes inpulse { 0%, 20% { opacity: 0; } 26%, 100% { opacity: 1; } }
+@keyframes inout { 0%, 36% { opacity: 0; } 44%, 100% { opacity: 1; } }
+@keyframes inpulse2 { 0%, 42% { opacity: 0; } 48%, 100% { opacity: 1; } }
+@keyframes pulse { from { stroke-dashoffset: 100; } to { stroke-dashoffset: 0; } }
+@keyframes on08 { 0%, 8% { opacity: 0; } 17%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+@keyframes on34 { 0%, 34% { opacity: 0; } 43%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+.scene--intro h1 { font-size: 6.6cqw; line-height: 1.08; max-width: none; text-transform: none; }
+.scene--intro .lead, .scene--end .lead { font-size: 2.1cqw; max-width: 46ch; }
+.scene--end .slogan { font: var(--display-weight) 5.2cqw/1.12 var(--font-display); letter-spacing: var(--tracking-display); color: var(--color-ink); text-wrap: balance; }
+.scene--end .big { font: 400 3.2cqw/1.1 var(--font-outlier); color: var(--color-accent); }
+.scene--end .big::before { content: "$ "; color: var(--color-muted); }
+/* the .a engine: a chapter's animations start when it comes on, and freeze while paused */
+.play .scene.is-on .a, .play .scene.is-out .a { animation-name: var(--k); animation-duration: var(--T, 8s); animation-timing-function: var(--ease-scene); animation-iteration-count: infinite; animation-fill-mode: both; animation-delay: calc(var(--d, 0s) + var(--i, 0) * 0.25s); }
+.play .stage.is-paused .a, .play .stage.is-paused .verb::after, .play .scene.is-out .a { animation-play-state: paused; }
+.play .scene.is-on .pulse { --T: 3s; }
+/* bash rows inside a chapter */
+.stage .swaps { width: 100%; }
+.stage .swap-row { grid-template-columns: minmax(0, 6fr) 4cqw minmax(0, 5fr); min-height: 0; padding-block: 2.4cqw; gap: 1.5cqw; }
+.stage .swap-row code { font-size: 1.6cqw; white-space: nowrap; overflow-wrap: normal; }
+.stage .strike { display: block; }
+.stage .bash span { text-decoration: none; }
+.stage .arrow { display: block; }
+/* backend shape language */
+.dg .ico { fill: none; stroke: var(--color-ink-2); stroke-width: 1.5; stroke-linejoin: round; }
+.dg .ico .ico-fill { fill: var(--color-ink-2); stroke: none; }
+.dg .machine { fill: var(--color-paper); stroke: var(--color-ink-2); stroke-width: 1.5; }
+.dg .ctr { fill: var(--color-paper-2); stroke: var(--color-muted); }
+.dg .ctr-lid { fill: var(--color-muted); }
+.dg .rack-head { fill: var(--color-paper-3); }
+.dg .led { fill: var(--color-live); }
+.dg .bracket { fill: none; stroke: var(--color-ink-2); stroke-width: 2; }
+/* backends: the swap reads as cause (backend.yaml) then effect (the panel) */
+.dg .card-flash { fill: none; stroke: var(--color-accent); stroke-width: 2; opacity: 0; }
+.dg .t-big { font-size: 16px; }
+.play .scene.is-on .sync4, .play .scene.is-out .sync4 { animation-duration: calc(var(--T) / 4); }
+@keyframes flash { 0% { opacity: 0; } 4%, 34% { opacity: 1; } 60%, 100% { opacity: 0; } }
+@keyframes valin { 0% { opacity: 0; transform: translateY(10px); } 10%, 100% { opacity: 1; transform: none; } }
+@keyframes hop { 0%, 6% { transform: translateX(0); opacity: 0; } 9% { opacity: 1; } 22% { transform: translateX(var(--dx)); opacity: 1; } 26%, 100% { transform: translateX(var(--dx)); opacity: 0; } }
+@keyframes lag { 0%, 28% { opacity: 0; } 38%, 100% { opacity: 1; } }
+@keyframes hopA { 0%, 3% { transform: translate(0, 0); opacity: 0; } 5% { opacity: 1; } 16% { transform: translate(var(--dx), var(--dy)); opacity: 1; } 18%, 100% { transform: translate(var(--dx), var(--dy)); opacity: 0; } }
+@keyframes hopB { 0%, 17% { transform: translateX(0); opacity: 0; } 19% { opacity: 1; } 28% { transform: translateX(var(--dx)); opacity: 1; } 30%, 100% { transform: translateX(var(--dx)); opacity: 0; } }
+.dg .hopdot { opacity: 0; }
+.dg .dim { opacity: 0.55; }
+.dg .card-act { fill: var(--color-paper-3); stroke: var(--color-accent); stroke-width: 1.5; }
+.dg .t-ink-2 { fill: var(--color-ink-2); }
+/* 2:1 stage for email: flatter, with the caption band tightened so diagrams keep their height */
+.stage--wide .scene { aspect-ratio: 2 / 1; }
+.play .stage--wide { aspect-ratio: 2 / 1; width: min(100%, calc((100dvh - var(--nav-h) - 196px) * 2)); }
+.stage--wide .scene__cap { top: 2.6cqw; font-size: 2.5cqw; }
+.stage--wide .scene__tag { top: 3cqw; }
+.stage--wide .scene__body { inset: 7.6cqw 4cqw 2.6cqw; }
+.stage--wide .scene--tui .scene__body { inset: 7.6cqw 4cqw 2.4cqw; }
+.stage--wide .tui-vid { top: -5.4cqw; }
+.stage--wide .scene--end .scene__body { inset: 0 8cqw; }
+.stage--wide .scene--intro .scene__body { inset: 0 4cqw; }
+.stage--wide .intro-hero { gap: 0.8cqw; }
+.stage--wide .intro-hero .flow { width: 72cqw; }
+/* the agent prompt button keeps the user's own casing */
+.btn--agent { text-transform: none; }
+html:not(.js) [data-copy-text] { display: none; }
+/* controls */
+.controls { display: none; }
+.play .controls { display: flex; align-items: center; gap: var(--space-md); width: min(100%, var(--stage-w, 100%)); margin: var(--space-md) auto 0; }
+.chapters { display: flex; gap: var(--space-2xs); flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.chap { flex: 1 0 auto; display: grid; gap: var(--space-2xs); min-height: 44px; align-content: center; padding: 0 var(--space-xs); border: 0; border-radius: var(--radius-card); background: transparent; color: var(--color-muted); font-size: var(--text-sm); text-transform: lowercase; white-space: nowrap; cursor: pointer; transition: color var(--dur-short) var(--ease-out), background-color var(--dur-short) var(--ease-out); }
+.chap:hover { color: var(--color-ink); background: var(--color-paper-2); }
+.chap:active { transform: translateY(1px); }
+.chap:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.chap:disabled { opacity: 0.55; cursor: not-allowed; }
+.chap[aria-current] { color: var(--color-ink); }
+.track { display: block; height: 2px; background: var(--color-rule-2); overflow: hidden; }
+.fill { display: block; height: 100%; background: var(--color-accent); transform-origin: left center; transform: scaleX(0); }
+.strip { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: var(--space-sm); margin-top: var(--space-lg); }
+.colophon { margin-top: var(--space-xl); padding-block: var(--space-xl); }
+@media (max-width: 40rem) { .stage { min-width: 0; } .chap { flex: 0 0 auto; } }
+
+.dg .s-run { fill: color-mix(in oklab, var(--color-accent) 20%, transparent); stroke: var(--color-accent); opacity: 0; }
+.dg .s-ready { fill: color-mix(in oklab, var(--color-live) 10%, transparent); stroke: var(--color-live); opacity: 0; }
+.dg .s-done { fill: color-mix(in oklab, var(--color-live) 32%, transparent); stroke: var(--color-live); opacity: 0; }
+.dg .s-rest { opacity: 1; }
+.dg .t-tiny { font-size: 11px; }
+@keyframes tuis0 { 0%, 100% { opacity: 1; } }
+@keyframes tuis1 { 0%, 5.0% { opacity: 1; } 6.0%, 100% { opacity: 0; } }
+@keyframes tuis2 { 0%, 5.0% { opacity: 0; } 6.0%, 100% { opacity: 1; } }
+@keyframes tuis3 { 0%, 6.0% { opacity: 0; } 7.0%, 44.0% { opacity: 1; } 45.0%, 100% { opacity: 0; } }
+@keyframes tuis4 { 0%, 44.0% { opacity: 0; } 45.0%, 100% { opacity: 1; } }
+@keyframes tuis5 { 0%, 6.2% { opacity: 0; } 7.2%, 44.2% { opacity: 1; } 45.2%, 100% { opacity: 0; } }
+@keyframes tuis6 { 0%, 44.2% { opacity: 0; } 45.2%, 100% { opacity: 1; } }
+@keyframes tuis7 { 0%, 6.3% { opacity: 0; } 7.3%, 44.3% { opacity: 1; } 45.3%, 100% { opacity: 0; } }
+@keyframes tuis8 { 0%, 44.3% { opacity: 0; } 45.3%, 100% { opacity: 1; } }
+@keyframes tuis9 { 0%, 6.5% { opacity: 0; } 7.5%, 44.5% { opacity: 1; } 45.5%, 100% { opacity: 0; } }
+@keyframes tuis10 { 0%, 44.5% { opacity: 0; } 45.5%, 100% { opacity: 1; } }
+@keyframes tuis11 { 0%, 6.6% { opacity: 0; } 7.6%, 44.6% { opacity: 1; } 45.6%, 100% { opacity: 0; } }
+@keyframes tuis12 { 0%, 44.6% { opacity: 0; } 45.6%, 100% { opacity: 1; } }
+@keyframes tuis13 { 0%, 6.8% { opacity: 0; } 7.8%, 44.8% { opacity: 1; } 45.8%, 100% { opacity: 0; } }
+@keyframes tuis14 { 0%, 44.8% { opacity: 0; } 45.8%, 100% { opacity: 1; } }
+@keyframes tuis15 { 0%, 7.0% { opacity: 0; } 8.0%, 45.0% { opacity: 1; } 46.0%, 100% { opacity: 0; } }
+@keyframes tuis16 { 0%, 45.0% { opacity: 0; } 46.0%, 100% { opacity: 1; } }
+@keyframes tuis17 { 0%, 7.1% { opacity: 0; } 8.1%, 45.1% { opacity: 1; } 46.1%, 100% { opacity: 0; } }
+@keyframes tuis18 { 0%, 45.1% { opacity: 0; } 46.1%, 100% { opacity: 1; } }
+@keyframes tuis19 { 0%, 44.8% { opacity: 0; } 45.8%, 45.6% { opacity: 1; } 46.6%, 100% { opacity: 0; } }
+@keyframes tuis20 { 0%, 45.6% { opacity: 0; } 46.6%, 100% { opacity: 1; } }
+@keyframes tuis21 { 0%, 45.6% { opacity: 0; } 46.6%, 46.4% { opacity: 1; } 47.4%, 100% { opacity: 0; } }
+@keyframes tuis22 { 0%, 46.4% { opacity: 0; } 47.4%, 100% { opacity: 1; } }
+@keyframes tuis23 { 0%, 46.4% { opacity: 0; } 47.4%, 47.0% { opacity: 1; } 48.0%, 100% { opacity: 0; } }
+@keyframes tuis24 { 0%, 47.0% { opacity: 0; } 48.0%, 100% { opacity: 1; } }
+@keyframes tuis25 { 0%, 47.2% { opacity: 0; } 48.2%, 57.0% { opacity: 1; } 58.0%, 100% { opacity: 0; } }
+@keyframes tuis26 { 0%, 57.0% { opacity: 0; } 58.0%, 100% { opacity: 1; } }
+@keyframes tuis27 { 0%, 47.4% { opacity: 0; } 48.4%, 57.2% { opacity: 1; } 58.2%, 100% { opacity: 0; } }
+@keyframes tuis28 { 0%, 57.2% { opacity: 0; } 58.2%, 100% { opacity: 1; } }
+@keyframes tuis29 { 0%, 47.5% { opacity: 0; } 48.5%, 57.3% { opacity: 1; } 58.3%, 100% { opacity: 0; } }
+@keyframes tuis30 { 0%, 57.3% { opacity: 0; } 58.3%, 100% { opacity: 1; } }
+@keyframes tuis31 { 0%, 47.2% { opacity: 0; } 48.2%, 51.0% { opacity: 1; } 52.0%, 100% { opacity: 0; } }
+@keyframes tuis32 { 0%, 51.0% { opacity: 0; } 52.0%, 100% { opacity: 1; } }
+@keyframes tuis33 { 0%, 47.4% { opacity: 0; } 48.4%, 51.2% { opacity: 1; } 52.2%, 100% { opacity: 0; } }
+@keyframes tuis34 { 0%, 51.2% { opacity: 0; } 52.2%, 100% { opacity: 1; } }
+@keyframes tuis35 { 0%, 47.5% { opacity: 0; } 48.5%, 51.3% { opacity: 1; } 52.3%, 100% { opacity: 0; } }
+@keyframes tuis36 { 0%, 51.3% { opacity: 0; } 52.3%, 100% { opacity: 1; } }
+@keyframes tuis37 { 0%, 58.0% { opacity: 0; } 59.0%, 76.0% { opacity: 1; } 77.0%, 100% { opacity: 0; } }
+@keyframes tuis38 { 0%, 76.0% { opacity: 0; } 77.0%, 100% { opacity: 1; } }
+@keyframes tuis39 { 0%, 76.0% { opacity: 0; } 77.0%, 91.0% { opacity: 1; } 92.0%, 100% { opacity: 0; } }
+@keyframes tuis40 { 0%, 91.0% { opacity: 0; } 92.0%, 100% { opacity: 1; } }
+@keyframes tuis41 { 0%, 91.0% { opacity: 0; } 92.0%, 92.4% { opacity: 1; } 93.4%, 100% { opacity: 0; } }
+@keyframes tuis42 { 0%, 92.4% { opacity: 0; } 93.4%, 100% { opacity: 1; } }
+@keyframes tuis43 { 0%, 93.0% { opacity: 0; } 94.0%, 100% { opacity: 1; } }
+
+</style>
+</head>
+<body>
+<a class="skip" href="#main" target="_self">skip to content</a>
+<header class="mast">
+  <nav class="container" aria-label="primary">
+    <a class="notes" href="docs/release_notes/RELEASE_NOTES_v0.3.2">release notes</a>
+    <a class="wordmark" href="./" aria-label="nv-sflow home">nv-sflow</a>
+    <span class="links"><a href="intro">introduction</a><a href="docs/user/intro">docs</a><a href="https://github.com/NVIDIA/nv-sflow">github</a></span>
+  </nav>
+</header>
+<main id="main" class="player">
+  <div class="container">
+    <div class="stage stage--wide" aria-roledescription="feature video" aria-label="sflow v0.3.2 features, one chapter at a time">
+<section class="scene well blueprint scene--intro" data-t="5.56" data-end="0.9" style="--T:5.56s" aria-label="intro"><div class="scene__body"><div class="intro-hero"><h1 class="brand">NV-sflow<span class="slogan">Describe once. <span class="verb">Run</span> anywhere</span></h1><p class="desc">Workflow orchestrator for large-scale GPU clusters of any kind</p><svg class="dg flow" viewBox="95 0 700 230" role="img" aria-label="diagram: vLLM, SGLang, TensorRT-LLM, Dynamo, PyTorch and more flow into sflow, which runs them on Kubernetes, Slurm or Docker"><defs><clipPath id="hubclip"><rect x="400" y="65" width="100" height="100" rx="20"/></clipPath></defs><g class="a" style="--k:inlbl;--i:0.0"><text x="232" y="31" text-anchor="end" class="t-ink flow-lbl">vLLM</text><circle cx="245" cy="25" r="3.5" class="dot-acc"/></g><path d="M245 25 C320 25, 330 115, 400 115" pathLength="100" class="flowline a" style="--k:drawin;--i:0.0"/><g class="a" style="--k:inpulse"><path d="M245 25 C320 25, 330 115, 400 115" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:0.0s"/></g><g class="a" style="--k:inlbl;--i:0.3"><text x="232" y="67" text-anchor="end" class="t-ink flow-lbl">SGLang</text><circle cx="245" cy="61" r="3.5" class="dot-acc"/></g><path d="M245 61 C320 61, 330 115, 400 115" pathLength="100" class="flowline a" style="--k:drawin;--i:0.3"/><g class="a" style="--k:inpulse"><path d="M245 61 C320 61, 330 115, 400 115" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:-0.2s"/></g><g class="a" style="--k:inlbl;--i:0.6"><text x="232" y="103" text-anchor="end" class="t-ink flow-lbl">TensorRT-LLM</text><circle cx="245" cy="97" r="3.5" class="dot-acc"/></g><path d="M245 97 C320 97, 330 115, 400 115" pathLength="100" class="flowline a" style="--k:drawin;--i:0.6"/><g class="a" style="--k:inpulse"><path d="M245 97 C320 97, 330 115, 400 115" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:-0.4s"/></g><g class="a" style="--k:inlbl;--i:0.9"><text x="232" y="139" text-anchor="end" class="t-ink flow-lbl">Dynamo</text><circle cx="245" cy="133" r="3.5" class="dot-acc"/></g><path d="M245 133 C320 133, 330 115, 400 115" pathLength="100" class="flowline a" style="--k:drawin;--i:0.9"/><g class="a" style="--k:inpulse"><path d="M245 133 C320 133, 330 115, 400 115" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:-0.6s"/></g><g class="a" style="--k:inlbl;--i:1.2"><text x="232" y="175" text-anchor="end" class="t-ink flow-lbl">PyTorch</text><circle cx="245" cy="169" r="3.5" class="dot-acc"/></g><path d="M245 169 C320 169, 330 115, 400 115" pathLength="100" class="flowline a" style="--k:drawin;--i:1.2"/><g class="a" style="--k:inpulse"><path d="M245 169 C320 169, 330 115, 400 115" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:-0.8s"/></g><g class="a" style="--k:inlbl;--i:1.5"><text x="232" y="211" text-anchor="end" class="t-ink flow-lbl">…</text><circle cx="245" cy="205" r="3.5" class="dot-acc"/></g><path d="M245 205 C320 205, 330 115, 400 115" pathLength="100" class="flowline a" style="--k:drawin;--i:1.5"/><g class="a" style="--k:inpulse"><path d="M245 205 C320 205, 330 115, 400 115" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:-1.0s"/></g><g class="a hub" style="--k:inhub"><rect x="400" y="65" width="100" height="100" rx="20" class="hub-bg"/><image href="img/sflow-logo.jpg" x="400" y="65" width="100" height="100" clip-path="url(#hubclip)" preserveAspectRatio="xMidYMid slice"/><rect x="400" y="65" width="100" height="100" rx="20" class="hub-ring"/></g><path d="M500 115 C575 115, 585 55, 650 55" pathLength="100" class="flowline a" style="--k:drawout;--i:0.0"/><g class="a" style="--k:inpulse2"><path d="M500 115 C575 115, 585 55, 650 55" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:0.0s"/></g><g class="a" style="--k:inout;--i:0.0"><circle cx="650" cy="55" r="6" class="dot-live"/><text x="666" y="61" class="t-ink flow-lbl">Kubernetes</text></g><path d="M500 115 C575 115, 585 115, 650 115" pathLength="100" class="flowline a" style="--k:drawout;--i:0.3"/><g class="a" style="--k:inpulse2"><path d="M500 115 C575 115, 585 115, 650 115" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:-0.3s"/></g><g class="a" style="--k:inout;--i:0.3"><circle cx="650" cy="115" r="6" class="dot-live"/><text x="666" y="121" class="t-ink flow-lbl">Slurm</text></g><path d="M500 115 C575 115, 585 175, 650 175" pathLength="100" class="flowline a" style="--k:drawout;--i:0.6"/><g class="a" style="--k:inpulse2"><path d="M500 115 C575 115, 585 175, 650 175" pathLength="100" class="flowpulse a" style="--k:pulse;--T:1.2s;--d:-0.6s"/></g><g class="a" style="--k:inout;--i:0.6"><circle cx="650" cy="175" r="6" class="dot-live"/><text x="666" y="181" class="t-ink flow-lbl">Docker</text></g></svg></div></div></section>
+<section class="scene well blueprint " data-t="13.33" data-end="0.97" style="--T:13.33s" aria-label="backends"><h2 class="scene__cap">same workload, four backends</h2><div class="scene__body"><svg class="dg dg--hero" viewBox="0 0 880 456" role="img" aria-label="diagram in three columns: the workload on the left, four backend files stacked in the middle (local, docker, slurm, kubernetes), the compute layout on the right; as each backend file is picked in turn, the same workload, etcd, nats, frontend, two prefill replicas of 2 gpus and one decode of 4 gpus, is laid out on one workstation, docker containers on two hosts, two slurm rack nodes, or kubernetes pods on two nodes"><g transform="translate(0 70)"><rect x="16" y="24" width="240" height="268" rx="10" class="card"/><text x="28" y="52" class="t-ink">workload.yaml</text><text x="244" y="52" text-anchor="end" class="t-live">unchanged</text><line x1="80" y1="100" x2="80" y2="128" class="edge"/><line x1="80" y1="156" x2="80" y2="184" class="edge"/><line x1="192" y1="100" x2="192" y2="128" class="edge"/><line x1="192" y1="156" x2="192" y2="184" class="edge"/><rect x="28" y="72" width="104" height="28" rx="6" class="box"/><text x="38" y="91">etcd</text><rect x="140" y="72" width="104" height="28" rx="6" class="box"/><text x="150" y="91">nats</text><rect x="28" y="128" width="216" height="28" rx="6" class="box"/><text x="38" y="147">frontend</text><rect x="28" y="184" width="104" height="28" rx="6" class="box"/><text x="38" y="203">prefill</text><rect x="140" y="184" width="104" height="28" rx="6" class="box"/><text x="150" y="203">decode</text><text x="28" y="232" class="t-acc">2 gpu x 2</text><text x="140" y="232" class="t-acc">4 gpu x 1</text><text x="28" y="272" class="t-muted">2 nodes, 4 gpus each</text></g><path d="M256 228 C276 228, 276 72, 296 72" class="edge"/><line x1="506" y1="72" x2="546" y2="72" class="edge"/><path d="M256 228 C276 228, 276 180, 296 180" class="edge"/><line x1="506" y1="180" x2="546" y2="180" class="edge"/><path d="M256 228 C276 228, 276 288, 296 288" class="edge"/><line x1="506" y1="288" x2="546" y2="288" class="edge"/><path d="M256 228 C276 228, 276 396, 296 396" class="edge"/><line x1="506" y1="396" x2="546" y2="396" class="edge"/><g class="dim"><rect x="296" y="24" width="210" height="96" rx="10" class="card"/><g class="ico"><rect x="310" y="38" width="18" height="12" rx="2"/><path d="M316 54 H322 M319 50 V54"/></g><text x="336" y="51" class="t-muted">backends/local.yaml</text><text x="310" y="82" class="t-muted">type:</text><text x="358" y="82" class="t-muted">local</text><text x="310" y="106" class="t-muted"># no scheduler</text><rect x="296" y="132" width="210" height="96" rx="10" class="card"/><g class="ico"><path class="ico-fill" transform="translate(310 145) scale(0.75)" d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.184-.186h-2.12a.186.186 0 00-.186.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z"/></g><text x="336" y="159" class="t-muted">backends/docker.yaml</text><text x="310" y="190" class="t-muted">type:</text><text x="358" y="190" class="t-muted">docker</text><text x="310" y="214" class="t-muted">hosts: [node-0, node-1]</text><rect x="296" y="240" width="210" height="96" rx="10" class="card"/><g class="ico"><rect x="310" y="253" width="18" height="5" rx="1"/><rect x="310" y="259.5" width="18" height="5" rx="1"/><rect x="310" y="266" width="18" height="5" rx="1"/></g><text x="336" y="267" class="t-muted">backends/slurm.yaml</text><text x="310" y="298" class="t-muted">type:</text><text x="358" y="298" class="t-muted">slurm</text><text x="310" y="322" class="t-muted">partition: gpu</text><rect x="296" y="348" width="210" height="96" rx="10" class="card"/><g class="ico"><path d="M319 361 L326.5 364.6 L328 372.8 L323 379 H315 L310 372.8 L311.5 364.6 Z"/><circle cx="319" cy="370.5" r="3"/></g><text x="336" y="375" class="t-muted">backends/k8s.yaml</text><text x="310" y="406" class="t-muted">type:</text><text x="358" y="406" class="t-muted">kubernetes</text><text x="310" y="430" class="t-muted">namespace: inference</text></g><g transform="translate(234 0)"><rect x="312" y="24" width="312" height="420" rx="10" class="frame"/></g><g class="st a" style="--k:swap4;--d:0s"><rect x="296" y="24" width="210" height="96" rx="10" class="card-act"/><g class="ico"><rect x="310" y="38" width="18" height="12" rx="2"/><path d="M316 54 H322 M319 50 V54"/></g><text x="336" y="51" class="t-ink">backends/local.yaml</text><text x="310" y="82" class="t-muted">type:</text><text x="358" y="82" class="t-acc">local</text><text x="310" y="106" class="t-ink-2"># no scheduler</text><path d="M256 228 C276 228, 276 72, 296 72" class="edge-acc"/><line x1="506" y1="72" x2="546" y2="72" class="edge-acc"/><circle cx="256" cy="228" r="5" class="dot-acc hopdot a sync4" style="--k:hopA;--dx:40px;--dy:-156px"/><circle cx="506" cy="72" r="5" class="dot-acc hopdot a sync4" style="--k:hopB;--dx:40px"/><g class="a sync4" style="--k:lag"><g transform="translate(234 0)"><g class="ico"><rect x="328" y="32" width="18" height="12" rx="2"/><path d="M334 48 H340 M337 44 V48"/></g><text x="354" y="44" class="t-ink">workstation</text><rect x="322" y="58" width="292" height="374" rx="14" class="machine"/><line x1="334" y1="243" x2="602" y2="243" class="edge-slow"/><text x="340" y="84" class="t-muted">gpu 0-3</text><text x="596" y="84" text-anchor="end" class="t-muted t-small">one machine</text><g><rect x="340" y="104" width="77" height="28" rx="6" class="box"/><rect x="340" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="350" y="123">etcd</text></g><g><rect x="429" y="104" width="77" height="28" rx="6" class="box"/><rect x="429" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="439" y="123">nats</text></g><g><rect x="519" y="104" width="77" height="28" rx="6" class="box"/><rect x="519" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:1"/><text x="529" y="123">frontend</text></g><g><rect x="340" y="154" width="122" height="28" rx="6" class="box"/><rect x="340" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="173">prefill_0</text></g><g><rect x="474" y="154" width="122" height="28" rx="6" class="box"/><rect x="474" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="484" y="173">prefill_1</text></g><rect x="340" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="213" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="213" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="213" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="213" text-anchor="middle" class="t-muted t-small">gpu 3</text><text x="340" y="274" class="t-muted">gpu 4-7</text><text x="596" y="274" text-anchor="end" class="t-muted t-small">8 gpus</text><g><rect x="340" y="344" width="256" height="28" rx="6" class="box"/><rect x="340" y="344" width="256" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="363">decode_0</text></g><rect x="340" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="403" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="403" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="403" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="403" text-anchor="middle" class="t-muted t-small">gpu 3</text></g></g></g><g class="st a st--rest" style="--k:swap4;--d:calc(var(--T) * -0.75)"><rect x="296" y="132" width="210" height="96" rx="10" class="card-act"/><g class="ico"><path class="ico-fill" transform="translate(310 145) scale(0.75)" d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.184-.186h-2.12a.186.186 0 00-.186.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z"/></g><text x="336" y="159" class="t-ink">backends/docker.yaml</text><text x="310" y="190" class="t-muted">type:</text><text x="358" y="190" class="t-acc">docker</text><text x="310" y="214" class="t-ink-2">hosts: [node-0, node-1]</text><path d="M256 228 C276 228, 276 180, 296 180" class="edge-acc"/><line x1="506" y1="180" x2="546" y2="180" class="edge-acc"/><circle cx="256" cy="228" r="5" class="dot-acc hopdot a sync4" style="--k:hopA;--dx:40px;--dy:-48px"/><circle cx="506" cy="180" r="5" class="dot-acc hopdot a sync4" style="--k:hopB;--dx:40px"/><g class="a sync4" style="--k:lag"><g transform="translate(234 0)"><g class="ico"><path class="ico-fill" transform="translate(328 31) scale(0.75)" d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.184-.186h-2.12a.186.186 0 00-.186.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z"/></g><text x="354" y="44" class="t-ink">docker host pool</text><text x="608" y="44" text-anchor="end" class="t-acc">new in v0.3.2</text><rect x="328" y="62" width="280" height="176" rx="8" class="unit"/><text x="340" y="84" class="t-muted">host 0</text><text x="596" y="84" text-anchor="end" class="t-muted t-small">docker run</text><rect x="337" y="95" width="83" height="40" rx="4" class="ctr"/><rect x="337" y="95" width="83" height="5" rx="2" class="ctr-lid"/><g><rect x="340" y="104" width="77" height="28" rx="6" class="box"/><rect x="340" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="350" y="123">etcd</text></g><rect x="426" y="95" width="83" height="40" rx="4" class="ctr"/><rect x="426" y="95" width="83" height="5" rx="2" class="ctr-lid"/><g><rect x="429" y="104" width="77" height="28" rx="6" class="box"/><rect x="429" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="439" y="123">nats</text></g><rect x="516" y="95" width="83" height="40" rx="4" class="ctr"/><rect x="516" y="95" width="83" height="5" rx="2" class="ctr-lid"/><g><rect x="519" y="104" width="77" height="28" rx="6" class="box"/><rect x="519" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:1"/><text x="529" y="123">frontend</text></g><rect x="337" y="145" width="128" height="84" rx="4" class="ctr"/><rect x="337" y="145" width="128" height="5" rx="2" class="ctr-lid"/><g><rect x="340" y="154" width="122" height="28" rx="6" class="box"/><rect x="340" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="173">prefill_0</text></g><rect x="471" y="145" width="128" height="84" rx="4" class="ctr"/><rect x="471" y="145" width="128" height="5" rx="2" class="ctr-lid"/><g><rect x="474" y="154" width="122" height="28" rx="6" class="box"/><rect x="474" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="484" y="173">prefill_1</text></g><rect x="340" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="213" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="213" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="213" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="213" text-anchor="middle" class="t-muted t-small">gpu 3</text><rect x="328" y="252" width="280" height="176" rx="8" class="unit"/><text x="340" y="274" class="t-muted">host 1</text><text x="596" y="274" text-anchor="end" class="t-muted t-small">docker run</text><rect x="337" y="335" width="262" height="84" rx="4" class="ctr"/><rect x="337" y="335" width="262" height="5" rx="2" class="ctr-lid"/><g><rect x="340" y="344" width="256" height="28" rx="6" class="box"/><rect x="340" y="344" width="256" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="363">decode_0</text></g><rect x="340" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="403" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="403" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="403" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="403" text-anchor="middle" class="t-muted t-small">gpu 3</text></g></g></g><g class="st a" style="--k:swap4;--d:calc(var(--T) * -0.5)"><rect x="296" y="240" width="210" height="96" rx="10" class="card-act"/><g class="ico"><rect x="310" y="253" width="18" height="5" rx="1"/><rect x="310" y="259.5" width="18" height="5" rx="1"/><rect x="310" y="266" width="18" height="5" rx="1"/></g><text x="336" y="267" class="t-ink">backends/slurm.yaml</text><text x="310" y="298" class="t-muted">type:</text><text x="358" y="298" class="t-acc">slurm</text><text x="310" y="322" class="t-ink-2">partition: gpu</text><path d="M256 228 C276 228, 276 288, 296 288" class="edge-acc"/><line x1="506" y1="288" x2="546" y2="288" class="edge-acc"/><circle cx="256" cy="228" r="5" class="dot-acc hopdot a sync4" style="--k:hopA;--dx:40px;--dy:60px"/><circle cx="506" cy="288" r="5" class="dot-acc hopdot a sync4" style="--k:hopB;--dx:40px"/><g class="a sync4" style="--k:lag"><g transform="translate(234 0)"><g class="ico"><rect x="328" y="31" width="18" height="5" rx="1"/><rect x="328" y="37.5" width="18" height="5" rx="1"/><rect x="328" y="44" width="18" height="5" rx="1"/></g><text x="354" y="44" class="t-ink">slurm allocation</text><path d="M320 68 V56 H332 M604 56 H616 V68 M616 422 V434 H604 M332 434 H320 V422" class="bracket"/><rect x="328" y="62" width="280" height="176" rx="6" class="unit"/><rect x="328" y="62" width="280" height="32" rx="6" class="rack-head"/><circle cx="588" cy="78" r="3" class="led"/><circle cx="598" cy="78" r="3" class="led"/><text x="340" y="84" class="t-ink">node 0</text><text x="576" y="84" text-anchor="end" class="t-muted t-small">srun</text><g><rect x="340" y="104" width="77" height="28" rx="6" class="box"/><rect x="340" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="350" y="123">etcd</text></g><g><rect x="429" y="104" width="77" height="28" rx="6" class="box"/><rect x="429" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="439" y="123">nats</text></g><g><rect x="519" y="104" width="77" height="28" rx="6" class="box"/><rect x="519" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:1"/><text x="529" y="123">frontend</text></g><g><rect x="340" y="154" width="122" height="28" rx="6" class="box"/><rect x="340" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="173">prefill_0</text></g><g><rect x="474" y="154" width="122" height="28" rx="6" class="box"/><rect x="474" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="484" y="173">prefill_1</text></g><rect x="340" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="213" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="213" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="213" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="213" text-anchor="middle" class="t-muted t-small">gpu 3</text><rect x="328" y="252" width="280" height="176" rx="6" class="unit"/><rect x="328" y="252" width="280" height="32" rx="6" class="rack-head"/><circle cx="588" cy="268" r="3" class="led"/><circle cx="598" cy="268" r="3" class="led"/><text x="340" y="274" class="t-ink">node 1</text><text x="576" y="274" text-anchor="end" class="t-muted t-small">srun</text><g><rect x="340" y="344" width="256" height="28" rx="6" class="box"/><rect x="340" y="344" width="256" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="363">decode_0</text></g><rect x="340" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="403" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="403" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="403" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="403" text-anchor="middle" class="t-muted t-small">gpu 3</text></g></g></g><g class="st a" style="--k:swap4;--d:calc(var(--T) * -0.25)"><rect x="296" y="348" width="210" height="96" rx="10" class="card-act"/><g class="ico"><path d="M319 361 L326.5 364.6 L328 372.8 L323 379 H315 L310 372.8 L311.5 364.6 Z"/><circle cx="319" cy="370.5" r="3"/></g><text x="336" y="375" class="t-ink">backends/k8s.yaml</text><text x="310" y="406" class="t-muted">type:</text><text x="358" y="406" class="t-acc">kubernetes</text><text x="310" y="430" class="t-ink-2">namespace: inference</text><path d="M256 228 C276 228, 276 396, 296 396" class="edge-acc"/><line x1="506" y1="396" x2="546" y2="396" class="edge-acc"/><circle cx="256" cy="228" r="5" class="dot-acc hopdot a sync4" style="--k:hopA;--dx:40px;--dy:168px"/><circle cx="506" cy="396" r="5" class="dot-acc hopdot a sync4" style="--k:hopB;--dx:40px"/><g class="a sync4" style="--k:lag"><g transform="translate(234 0)"><g class="ico"><path d="M337 31 L344.5 34.6 L346 42.8 L341 49 H333 L328 42.8 L329.5 34.6 Z"/><circle cx="337" cy="40.5" r="3"/></g><text x="354" y="44" class="t-ink">kubernetes cluster</text><rect x="328" y="62" width="280" height="176" rx="8" class="unit"/><g class="ico"><path d="M349 71 L356.5 74.6 L358 82.8 L353 89 H345 L340 82.8 L341.5 74.6 Z"/><circle cx="349" cy="80.5" r="3"/></g><text x="366" y="84" class="t-muted">node 0</text><text x="596" y="84" text-anchor="end" class="t-acc t-small">merged pod</text><rect x="337" y="101" width="83" height="34" rx="17" class="pod"/><g><rect x="340" y="104" width="77" height="28" rx="6" class="box"/><rect x="340" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="350" y="123">etcd</text></g><rect x="426" y="101" width="83" height="34" rx="17" class="pod"/><g><rect x="429" y="104" width="77" height="28" rx="6" class="box"/><rect x="429" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:0"/><text x="439" y="123">nats</text></g><rect x="516" y="101" width="83" height="34" rx="17" class="pod"/><g><rect x="519" y="104" width="77" height="28" rx="6" class="box"/><rect x="519" y="104" width="77" height="28" rx="6" class="on a" style="--k:lit4;--i:1"/><text x="529" y="123">frontend</text></g><g><rect x="340" y="154" width="122" height="28" rx="6" class="box"/><rect x="340" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="173">prefill_0</text></g><g><rect x="474" y="154" width="122" height="28" rx="6" class="box"/><rect x="474" y="154" width="122" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="484" y="173">prefill_1</text></g><rect x="335" y="149" width="266" height="82" rx="18" class="pod-acc"/><rect x="340" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="213" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="213" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="213" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="190" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="190" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="213" text-anchor="middle" class="t-muted t-small">gpu 3</text><rect x="328" y="252" width="280" height="176" rx="8" class="unit"/><g class="ico"><path d="M349 261 L356.5 264.6 L358 272.8 L353 279 H345 L340 272.8 L341.5 264.6 Z"/><circle cx="349" cy="270.5" r="3"/></g><text x="366" y="274" class="t-muted">node 1</text><text x="596" y="274" text-anchor="end" class="t-muted t-small">pod</text><rect x="337" y="341" width="262" height="78" rx="18" class="pod"/><g><rect x="340" y="344" width="256" height="28" rx="6" class="box"/><rect x="340" y="344" width="256" height="28" rx="6" class="on a" style="--k:lit4;--i:2"/><text x="350" y="363">decode_0</text></g><rect x="340" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="340" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="368" y="403" text-anchor="middle" class="t-muted t-small">gpu 0</text><rect x="407" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="407" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="434" y="403" text-anchor="middle" class="t-muted t-small">gpu 1</text><rect x="474" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="474" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="502" y="403" text-anchor="middle" class="t-muted t-small">gpu 2</text><rect x="541" y="380" width="55" height="36" rx="4" class="gpu"/><rect x="541" y="380" width="55" height="36" rx="4" class="gpu-on a" style="--k:lit4;--i:2"/><text x="568" y="403" text-anchor="middle" class="t-muted t-small">gpu 3</text></g></g></g></svg></div></section>
+<section class="scene well blueprint scene--tui" data-t="7.0" data-end="0.99" style="--T:7.0s" aria-label="tui"><h2 class="scene__cap">watch every task live</h2><div class="scene__body"><div class="tui-dag"><svg class="dg" viewBox="0 0 420 480" role="img" aria-label="the task graph of the recorded run: nats and etcd, then frontend, then four prefill and four decode workers, await_workers, nim_endpoint, discover_model, six accuracy jobs, two perf runs, aggregate and gate; each task turns running, ready or completed at the same moment as in the terminal recording beside it"><path d="M115 30 C115 38.0, 210.0 38.0, 210.0 46" class="edge"/><path d="M305 30 C305 38.0, 210.0 38.0, 210.0 46" class="edge"/><path d="M210.0 76 C210.0 84.0, 102 84.0, 102 92" class="edge"/><path d="M102 122 C102 130.0, 210.0 130.0, 210.0 138" class="edge"/><path d="M210.0 76 C210.0 84.0, 317 84.0, 317 92" class="edge"/><path d="M317 122 C317 130.0, 210.0 130.0, 210.0 138" class="edge"/><path d="M210.0 168 C210.0 176.0, 210.0 176.0, 210.0 184" class="edge"/><path d="M210.0 214 C210.0 222.0, 210.0 222.0, 210.0 230" class="edge"/><path d="M210.0 260 C210.0 268.0, 102 268.0, 102 276" class="edge"/><path d="M102 306 C102 314.0, 210.0 314.0, 210.0 322" class="edge"/><path d="M210.0 260 C210.0 268.0, 317 268.0, 317 276" class="edge"/><path d="M317 306 C317 314.0, 210.0 314.0, 210.0 322" class="edge"/><path d="M210.0 352 C210.0 360.0, 210.0 360.0, 210.0 368" class="edge"/><path d="M210.0 398 C210.0 406.0, 210.0 406.0, 210.0 414" class="edge"/><rect x="40" y="0" width="150" height="30" rx="6" class="box"/><rect x="40" y="0" width="150" height="30" rx="6" class="s-ready s-rest a" style="--k:tuis0"/><text x="115.0" y="20" text-anchor="middle" class="t-ink">nats</text><rect x="230" y="0" width="150" height="30" rx="6" class="box"/><rect x="230" y="0" width="150" height="30" rx="6" class="s-ready s-rest a" style="--k:tuis0"/><text x="305.0" y="20" text-anchor="middle" class="t-ink">etcd</text><rect x="125" y="46" width="170" height="30" rx="6" class="box"/><rect x="125" y="46" width="170" height="30" rx="6" class="s-run a" style="--k:tuis1"/><rect x="125" y="46" width="170" height="30" rx="6" class="s-ready s-rest a" style="--k:tuis2"/><text x="210.0" y="66" text-anchor="middle" class="t-ink">frontend</text><rect x="0" y="92" width="205" height="30" rx="6" class="box"/><text x="10" y="112" class="t-ink">prefill</text><rect x="75" y="98" width="26" height="18" rx="3" class="box"/><rect x="75" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis3"/><rect x="75" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis4"/><text x="88.0" y="111" text-anchor="middle" class="t-muted t-tiny">0</text><rect x="107" y="98" width="26" height="18" rx="3" class="box"/><rect x="107" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis5"/><rect x="107" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis6"/><text x="120.0" y="111" text-anchor="middle" class="t-muted t-tiny">1</text><rect x="139" y="98" width="26" height="18" rx="3" class="box"/><rect x="139" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis7"/><rect x="139" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis8"/><text x="152.0" y="111" text-anchor="middle" class="t-muted t-tiny">2</text><rect x="171" y="98" width="26" height="18" rx="3" class="box"/><rect x="171" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis9"/><rect x="171" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis10"/><text x="184.0" y="111" text-anchor="middle" class="t-muted t-tiny">3</text><rect x="215" y="92" width="205" height="30" rx="6" class="box"/><text x="225" y="112" class="t-ink">decode</text><rect x="290" y="98" width="26" height="18" rx="3" class="box"/><rect x="290" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis11"/><rect x="290" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis12"/><text x="303.0" y="111" text-anchor="middle" class="t-muted t-tiny">0</text><rect x="322" y="98" width="26" height="18" rx="3" class="box"/><rect x="322" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis13"/><rect x="322" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis14"/><text x="335.0" y="111" text-anchor="middle" class="t-muted t-tiny">1</text><rect x="354" y="98" width="26" height="18" rx="3" class="box"/><rect x="354" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis15"/><rect x="354" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis16"/><text x="367.0" y="111" text-anchor="middle" class="t-muted t-tiny">2</text><rect x="386" y="98" width="26" height="18" rx="3" class="box"/><rect x="386" y="98" width="26" height="18" rx="3" class="s-run a" style="--k:tuis17"/><rect x="386" y="98" width="26" height="18" rx="3" class="s-ready s-rest a" style="--k:tuis18"/><text x="399.0" y="111" text-anchor="middle" class="t-muted t-tiny">3</text><rect x="125" y="138" width="170" height="30" rx="6" class="box"/><rect x="125" y="138" width="170" height="30" rx="6" class="s-run a" style="--k:tuis19"/><rect x="125" y="138" width="170" height="30" rx="6" class="s-done s-rest a" style="--k:tuis20"/><text x="210.0" y="158" text-anchor="middle" class="t-ink">await_workers</text><rect x="125" y="184" width="170" height="30" rx="6" class="box"/><rect x="125" y="184" width="170" height="30" rx="6" class="s-run a" style="--k:tuis21"/><rect x="125" y="184" width="170" height="30" rx="6" class="s-ready s-rest a" style="--k:tuis22"/><text x="210.0" y="204" text-anchor="middle" class="t-ink">nim_endpoint</text><rect x="125" y="230" width="170" height="30" rx="6" class="box"/><rect x="125" y="230" width="170" height="30" rx="6" class="s-run a" style="--k:tuis23"/><rect x="125" y="230" width="170" height="30" rx="6" class="s-done s-rest a" style="--k:tuis24"/><text x="210.0" y="250" text-anchor="middle" class="t-ink">discover_model</text><rect x="0" y="276" width="205" height="30" rx="6" class="box"/><text x="10" y="296" class="t-ink">acc_math</text><rect x="107" y="282" width="26" height="18" rx="3" class="box"/><rect x="107" y="282" width="26" height="18" rx="3" class="s-run a" style="--k:tuis25"/><rect x="107" y="282" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis26"/><text x="120.0" y="295" text-anchor="middle" class="t-muted t-tiny">0</text><rect x="139" y="282" width="26" height="18" rx="3" class="box"/><rect x="139" y="282" width="26" height="18" rx="3" class="s-run a" style="--k:tuis27"/><rect x="139" y="282" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis28"/><text x="152.0" y="295" text-anchor="middle" class="t-muted t-tiny">2</text><rect x="171" y="282" width="26" height="18" rx="3" class="box"/><rect x="171" y="282" width="26" height="18" rx="3" class="s-run a" style="--k:tuis29"/><rect x="171" y="282" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis30"/><text x="184.0" y="295" text-anchor="middle" class="t-muted t-tiny">5</text><rect x="215" y="276" width="205" height="30" rx="6" class="box"/><text x="225" y="296" class="t-ink">acc_mcq</text><rect x="322" y="282" width="26" height="18" rx="3" class="box"/><rect x="322" y="282" width="26" height="18" rx="3" class="s-run a" style="--k:tuis31"/><rect x="322" y="282" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis32"/><text x="335.0" y="295" text-anchor="middle" class="t-muted t-tiny">0</text><rect x="354" y="282" width="26" height="18" rx="3" class="box"/><rect x="354" y="282" width="26" height="18" rx="3" class="s-run a" style="--k:tuis33"/><rect x="354" y="282" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis34"/><text x="367.0" y="295" text-anchor="middle" class="t-muted t-tiny">2</text><rect x="386" y="282" width="26" height="18" rx="3" class="box"/><rect x="386" y="282" width="26" height="18" rx="3" class="s-run a" style="--k:tuis35"/><rect x="386" y="282" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis36"/><text x="399.0" y="295" text-anchor="middle" class="t-muted t-tiny">5</text><rect x="125" y="322" width="170" height="30" rx="6" class="box"/><text x="135" y="342" class="t-ink">perf</text><rect x="229" y="328" width="26" height="18" rx="3" class="box"/><rect x="229" y="328" width="26" height="18" rx="3" class="s-run a" style="--k:tuis37"/><rect x="229" y="328" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis38"/><text x="242.0" y="341" text-anchor="middle" class="t-muted t-tiny">1</text><rect x="261" y="328" width="26" height="18" rx="3" class="box"/><rect x="261" y="328" width="26" height="18" rx="3" class="s-run a" style="--k:tuis39"/><rect x="261" y="328" width="26" height="18" rx="3" class="s-done s-rest a" style="--k:tuis40"/><text x="274.0" y="341" text-anchor="middle" class="t-muted t-tiny">4</text><rect x="125" y="368" width="170" height="30" rx="6" class="box"/><rect x="125" y="368" width="170" height="30" rx="6" class="s-run a" style="--k:tuis41"/><rect x="125" y="368" width="170" height="30" rx="6" class="s-done s-rest a" style="--k:tuis42"/><text x="210.0" y="388" text-anchor="middle" class="t-ink">aggregate</text><rect x="125" y="414" width="170" height="30" rx="6" class="box"/><rect x="125" y="414" width="170" height="30" rx="6" class="s-run s-rest a" style="--k:tuis43"/><text x="210.0" y="434" text-anchor="middle" class="t-ink">gate</text><rect x="16" y="459" width="14" height="14" rx="3" class="box"/><rect x="16" y="459" width="14" height="14" rx="3" class="box"/><text x="38" y="470" class="t-muted t-small">initiated</text><rect x="120" y="459" width="14" height="14" rx="3" class="box"/><rect x="120" y="459" width="14" height="14" rx="3" class="s-run s-rest"/><text x="142" y="470" class="t-muted t-small">running</text><rect x="224" y="459" width="14" height="14" rx="3" class="box"/><rect x="224" y="459" width="14" height="14" rx="3" class="s-ready s-rest"/><text x="246" y="470" class="t-muted t-small">ready</text><rect x="328" y="459" width="14" height="14" rx="3" class="box"/><rect x="328" y="459" width="14" height="14" rx="3" class="s-done s-rest"/><text x="350" y="470" class="t-muted t-small">completed</text></svg></div><div class="tui-vid"><video src="img/sflow_tui_run.mp4" poster="img/sflow_tui_run.jpg" muted playsinline preload="metadata" width="560" height="880" aria-label="the sflow terminal ui during a real 24-task run, statuses moving from initiated to ready to completed, sped up 20 times"></video></div></div></section>
+<section class="scene well blueprint " data-t="10.0" data-end="0.86" style="--T:10.0s" aria-label="ssh"><h2 class="scene__cap">drive the cluster from your laptop</h2><span class="scene__tag">new in v0.3.2</span><div class="scene__body"><svg class="dg" viewBox="0 0 1200 400" role="img" aria-label="diagram: sflow run with --ssh uploads its source to a login node that only has python, starts the controller there, the gpu nodes run, logs stream back, and when the connection drops the run keeps going until sflow watch reconnects"><rect x="24" y="110" width="280" height="180" rx="10" class="card"/><text x="44" y="140" class="t-muted">your laptop</text><text x="44" y="180" class="t-ink">$ sflow run wf.yaml</text><text x="60" y="206" class="t-acc">--ssh 'user@login'</text><text x="44" y="258" class="t-ink a" style="--k:on76">$ sflow watch receipt.json</text><g class="a" style="--k:drop"><line x1="304" y1="170" x2="470" y2="170" class="edge-acc"/><text x="387" y="158" text-anchor="middle" class="t-muted">ssh</text></g><g class="a" style="--k:w05_40"><circle cx="308" cy="170" r="4" class="dot-acc a" style="--k:dash;--T:1.85s;--dx:156px;--d:0.00s"/><circle cx="308" cy="170" r="4" class="dot-acc a" style="--k:dash;--T:1.85s;--dx:156px;--d:-0.62s"/><circle cx="308" cy="170" r="4" class="dot-acc a" style="--k:dash;--T:1.85s;--dx:156px;--d:-1.23s"/></g><line x1="470" y1="232" x2="304" y2="232" class="edge"/><text x="387" y="254" text-anchor="middle" class="t-muted">logs</text><g class="a" style="--k:logwin"><circle cx="466" cy="232" r="4" class="dot-muted a" style="--k:dash;--T:1.85s;--dx:-156px;--d:0.00s"/><circle cx="466" cy="232" r="4" class="dot-muted a" style="--k:dash;--T:1.85s;--dx:-156px;--d:-0.62s"/><circle cx="466" cy="232" r="4" class="dot-muted a" style="--k:dash;--T:1.85s;--dx:-156px;--d:-1.23s"/></g><text x="387" y="210" text-anchor="middle" class="t-muted a" style="--k:w62_74">dropped</text><rect x="470" y="70" width="300" height="270" rx="10" class="unit"/><text x="490" y="100" class="t-muted">login node</text><text x="490" y="134" class="t-ink">python 3.10</text><g class="a" style="--k:on12"><rect x="490" y="156" width="260" height="36" rx="6" class="box"/><text x="506" y="179" class="t-ink">sflow source, uploaded</text></g><g class="a" style="--k:on22"><rect x="490" y="208" width="260" height="36" rx="6" class="box"/><text x="506" y="231" class="t-ink">venv, cached</text></g><g class="a" style="--k:on32"><rect x="490" y="260" width="260" height="36" rx="6" class="box"/><text x="506" y="283" class="t-live">controller running</text></g><line x1="770" y1="205" x2="860" y2="125" class="edge"/><line x1="770" y1="205" x2="860" y2="295" class="edge"/><rect x="860" y="60" width="212" height="130" rx="10" class="unit"/><text x="880" y="88" class="t-muted">node 0</text><rect x="880" y="112" width="32" height="32" rx="4" class="gpu"/><rect x="880" y="112" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:0"/><text x="896" y="132" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="924" y="112" width="32" height="32" rx="4" class="gpu"/><rect x="924" y="112" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:1"/><text x="940" y="132" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="968" y="112" width="32" height="32" rx="4" class="gpu"/><rect x="968" y="112" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:2"/><text x="984" y="132" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1012" y="112" width="32" height="32" rx="4" class="gpu"/><rect x="1012" y="112" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:3"/><text x="1028" y="132" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="860" y="230" width="212" height="130" rx="10" class="unit"/><text x="880" y="258" class="t-muted">node 1</text><rect x="880" y="282" width="32" height="32" rx="4" class="gpu"/><rect x="880" y="282" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:0"/><text x="896" y="302" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="924" y="282" width="32" height="32" rx="4" class="gpu"/><rect x="924" y="282" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:1"/><text x="940" y="302" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="968" y="282" width="32" height="32" rx="4" class="gpu"/><rect x="968" y="282" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:2"/><text x="984" y="302" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1012" y="282" width="32" height="32" rx="4" class="gpu"/><rect x="1012" y="282" width="32" height="32" rx="4" class="gpu-on a" style="--k:on40;--i:3"/><text x="1028" y="302" text-anchor="middle" class="t-muted t-small">gpu</text><text x="966" y="384" text-anchor="middle" class="t-live a" style="--k:w62_74">still running</text></svg></div></section>
+<section class="scene well blueprint " data-t="10.0" data-end="0.86" style="--T:10.0s" aria-label="docker pool"><h2 class="scene__cap">docker across machines, no scheduler</h2><span class="scene__tag">new in v0.3.2</span><div class="scene__body"><svg class="dg" viewBox="0 0 1200 410" role="img" aria-label="diagram: a hosts list with two addresses; the sflow driver pre-flights both hosts, starts one docker run per host as rank 0 and rank 1, and streams one merged log"><rect x="24" y="32" width="300" height="200" rx="10" class="card"/><text x="44" y="66" class="t-muted">hosts:</text><text x="44" y="100" class="t-ink">- name: node-0</text><text x="60" y="134" class="t-acc">address: 10.0.0.11</text><text x="44" y="168" class="t-ink">- name: node-1</text><text x="60" y="202" class="t-acc">address: 10.0.0.12</text><line x1="324" y1="136" x2="380" y2="136" class="edge"/><rect x="380" y="104" width="160" height="64" rx="32" class="pill-acc"/><text x="460" y="141" text-anchor="middle" class="t-ink">sflow driver</text><g class="a" style="--k:w04_30"><path d="M540 136 C600 136, 600 115, 660 115" class="edge-slow"/><path d="M540 136 C600 136, 600 315, 660 315" class="edge-slow"/><text x="460" y="88" text-anchor="middle" class="t-muted">pre-flight, in parallel</text></g><g class="a" style="--k:on32"><path d="M540 136 C600 136, 600 115, 660 115" class="edge-acc"/><path d="M540 136 C600 136, 600 315, 660 315" class="edge-acc"/><text x="460" y="206" text-anchor="middle" class="t-acc">one docker run per host</text></g><rect x="660" y="40" width="516" height="150" rx="10" class="unit"/><text x="680" y="68" class="t-muted">node-0  ssh://10.0.0.11</text><text x="1156" y="68" text-anchor="end" class="t-live a" style="--k:on12">pre-flight ok</text><g class="a" style="--k:on38"><rect x="680" y="88" width="300" height="84" rx="12" class="pod-acc"/><text x="696" y="120" class="t-ink">container, rank 0</text><text x="696" y="150" class="t-muted">leader: node-0</text></g><rect x="1000" y="114" width="32" height="32" rx="4" class="gpu"/><rect x="1000" y="114" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:0"/><text x="1016" y="134" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1040" y="114" width="32" height="32" rx="4" class="gpu"/><rect x="1040" y="114" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:1"/><text x="1056" y="134" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1080" y="114" width="32" height="32" rx="4" class="gpu"/><rect x="1080" y="114" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:2"/><text x="1096" y="134" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1120" y="114" width="32" height="32" rx="4" class="gpu"/><rect x="1120" y="114" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:3"/><text x="1136" y="134" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="660" y="240" width="516" height="150" rx="10" class="unit"/><text x="680" y="268" class="t-muted">node-1  ssh://10.0.0.12</text><text x="1156" y="268" text-anchor="end" class="t-live a" style="--k:on18">pre-flight ok</text><g class="a" style="--k:on38"><rect x="680" y="288" width="300" height="84" rx="12" class="pod-acc"/><text x="696" y="320" class="t-ink">container, rank 1</text><text x="696" y="350" class="t-muted">leader: node-0</text></g><rect x="1000" y="314" width="32" height="32" rx="4" class="gpu"/><rect x="1000" y="314" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:0"/><text x="1016" y="334" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1040" y="314" width="32" height="32" rx="4" class="gpu"/><rect x="1040" y="314" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:1"/><text x="1056" y="334" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1080" y="314" width="32" height="32" rx="4" class="gpu"/><rect x="1080" y="314" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:2"/><text x="1096" y="334" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="1120" y="314" width="32" height="32" rx="4" class="gpu"/><rect x="1120" y="314" width="32" height="32" rx="4" class="gpu-on a" style="--k:on42;--i:3"/><text x="1136" y="334" text-anchor="middle" class="t-muted t-small">gpu</text><rect x="24" y="262" width="516" height="128" rx="10" class="card"/><text x="44" y="290" class="t-muted">one merged log</text><text x="44" y="318" class="t-ink a" style="--k:on50">[node-0 r0] process group up</text><text x="44" y="342" class="t-ink a" style="--k:on56">[node-1 r1] process group up</text></svg></div></section>
+<section class="scene well blueprint " data-t="8.33" data-end="0.86" style="--T:8.33s" aria-label="kubernetes"><h2 class="scene__cap">kubernetes pods on the fast fabric</h2><div class="scene__body"><svg class="dg" viewBox="0 0 1200 430" role="img" aria-label="diagram: sflow probes the kubernetes nodes, renders gpu, rdma, imex and nccl settings into the pod spec, and traffic between nodes moves from tcp to infiniband or multi-node nvlink"><rect x="24" y="112" width="260" height="196" rx="10" class="card"/><text x="44" y="144" class="t-muted">workload + backends/k8s.yaml</text><text x="44" y="184" class="t-ink">backends:</text><text x="60" y="212" class="t-ink">- type: kubernetes</text><text x="44" y="240" class="t-ink">resources:</text><text x="60" y="268" class="t-ink">gpus: 4</text><line x1="284" y1="210" x2="344" y2="210" class="edge"/><rect x="344" y="178" width="140" height="64" rx="32" class="pill-acc"/><text x="414" y="216" text-anchor="middle" class="t-ink">sflow</text><path d="M414 178 C414 40, 1010 24, 1010 48" class="edge-slow a" style="--k:probe"/><path d="M414 242 C414 404, 1010 412, 1010 388" class="edge-slow a" style="--k:probe"/><text x="700" y="40" text-anchor="middle" class="t-muted a" style="--k:probe">probe nodes</text><g class="a ren" style="--k:on18"><line x1="484" y1="210" x2="548" y2="130" class="edge"/><rect x="548" y="112" width="272" height="36" rx="6" class="box"/><text x="564" y="135" class="t-ink">nvidia.com/gpu: 4</text></g><g class="a ren" style="--k:on25"><line x1="484" y1="210" x2="548" y2="182" class="edge"/><rect x="548" y="164" width="272" height="36" rx="6" class="box"/><text x="564" y="187" class="t-ink">rdma resource + IPC_LOCK</text></g><g class="a ren" style="--k:on32"><line x1="484" y1="210" x2="548" y2="234" class="edge"/><rect x="548" y="216" width="272" height="36" rx="6" class="box"/><text x="564" y="239" class="t-ink">computedomain (imex) claim</text></g><g class="a ren" style="--k:on39"><line x1="484" y1="210" x2="548" y2="286" class="edge"/><rect x="548" y="268" width="272" height="36" rx="6" class="box"/><text x="564" y="291" class="t-ink">NCCL / UCX transport env</text></g><text x="548" y="336" class="t-muted">into the pod spec</text><rect x="880" y="48" width="296" height="120" rx="10" class="unit"/><text x="896" y="74" class="t-muted">node a</text><rect x="896" y="88" width="264" height="64" rx="14" class="pod"/><text x="912" y="126" class="t-muted">pod</text><rect x="968" y="104" width="32" height="32" rx="4" class="gpu"/><rect x="1010" y="104" width="32" height="32" rx="4" class="gpu"/><rect x="1052" y="104" width="32" height="32" rx="4" class="gpu"/><rect x="1094" y="104" width="32" height="32" rx="4" class="gpu"/><rect x="880" y="268" width="296" height="120" rx="10" class="unit"/><text x="896" y="294" class="t-muted">node b</text><rect x="896" y="308" width="264" height="64" rx="14" class="pod"/><text x="912" y="346" class="t-muted">pod</text><rect x="968" y="324" width="32" height="32" rx="4" class="gpu"/><rect x="1010" y="324" width="32" height="32" rx="4" class="gpu"/><rect x="1052" y="324" width="32" height="32" rx="4" class="gpu"/><rect x="1094" y="324" width="32" height="32" rx="4" class="gpu"/><g class="a" style="--k:dim"><line x1="964" y1="168" x2="964" y2="268" class="edge-slow"/><text x="948" y="222" text-anchor="end" class="t-muted">tcp</text><circle cx="964" cy="172" r="4" class="dot-muted a" style="--k:fall;--T:4.62s;--dy:92px"/></g><g class="a" style="--k:on48"><line x1="1100" y1="168" x2="1100" y2="268" class="edge-acc"/><text x="1116" y="222" class="t-acc">ib / mnnvl</text><circle cx="1100" cy="172" r="4" class="dot-acc a" style="--k:fall;--T:1.85s;--dy:92px;--d:0.00s"/><circle cx="1100" cy="172" r="4" class="dot-acc a" style="--k:fall;--T:1.85s;--dy:92px;--d:-0.62s"/><circle cx="1100" cy="172" r="4" class="dot-acc a" style="--k:fall;--T:1.85s;--dy:92px;--d:-1.23s"/></g></svg></div></section>
+<section class="scene well blueprint " data-t="6.67" data-end="0.86" style="--T:6.67s" aria-label="merge-pod"><h2 class="scene__cap">two tasks, one pod, nvlink between</h2><div class="scene__body"><svg class="dg" viewBox="0 0 1200 380" role="img" aria-label="diagram: prefill and decode in two pods send kv cache out through the nic; merged into one pod they use cuda ipc over nvlink directly"><rect x="24" y="24" width="1152" height="332" rx="12" class="unit"/><text x="44" y="54" class="t-muted">one node, 8 gpus</text><text x="104" y="112" class="t-ink">prefill</text><rect x="104" y="136" width="64" height="64" rx="6" class="gpu"/><rect x="184" y="136" width="64" height="64" rx="6" class="gpu"/><rect x="264" y="136" width="64" height="64" rx="6" class="gpu"/><rect x="344" y="136" width="64" height="64" rx="6" class="gpu"/><text x="696" y="112" class="t-ink">decode</text><rect x="696" y="136" width="64" height="64" rx="6" class="gpu"/><rect x="776" y="136" width="64" height="64" rx="6" class="gpu"/><rect x="856" y="136" width="64" height="64" rx="6" class="gpu"/><rect x="936" y="136" width="64" height="64" rx="6" class="gpu"/><g class="a phA" style="--k:phaseA"><rect x="84" y="80" width="440" height="176" rx="16" class="pod"/><rect x="676" y="80" width="440" height="176" rx="16" class="pod"/><text x="504" y="112" text-anchor="end" class="t-muted">pod 1</text><text x="1096" y="112" text-anchor="end" class="t-muted">pod 2</text><rect x="552" y="292" width="96" height="40" rx="6" class="box"/><text x="600" y="317" text-anchor="middle" class="t-ink">nic</text><path d="M376 200 V312 H552 M648 312 H728 V200" class="edge-slow"/><text x="600" y="280" text-anchor="middle" class="t-muted">kv over ib or tcp</text><circle cx="376" cy="204" r="5" class="dot-muted a" style="--k:kvslow;--T:4.62s"/></g><g class="a phB" style="--k:phaseB"><rect x="84" y="80" width="1032" height="176" rx="16" class="pod-acc"/><text x="1096" y="112" text-anchor="end" class="t-acc">one pod</text><line x1="408" y1="168" x2="696" y2="168" class="edge-acc"/><text x="552" y="236" text-anchor="middle" class="t-acc">cuda ipc / nvlink</text><circle cx="412" cy="168" r="5" class="dot-acc a" style="--k:dash;--T:1.39s;--dx:280px;--d:0.00s"/><circle cx="412" cy="168" r="5" class="dot-acc a" style="--k:dash;--T:1.39s;--dx:280px;--d:-0.46s"/><circle cx="412" cy="168" r="5" class="dot-acc a" style="--k:dash;--T:1.39s;--dx:280px;--d:-0.93s"/></g></svg></div></section>
+<section class="scene well blueprint " data-t="3.75" data-end="0.86" style="--T:3.75s" aria-label="compose"><h2 class="scene__cap">fragments merge by name</h2><div class="scene__body"><svg class="dg" viewBox="0 0 480 280" role="img" aria-label="diagram: three files each define task worker with one field; sflow merges them by name into one task with all three fields"><g class="a" style="--k:fold;--dx:260px;--dy:80px"><rect x="0" y="16" width="200" height="72" rx="8" class="card"/><text x="14" y="38" class="t-muted">a.yaml</text><text x="14" y="60" class="t-ink">name: worker</text><text x="14" y="80" class="t-acc">image: vllm</text></g><g class="a" style="--k:fold;--dx:260px;--dy:-8px"><rect x="0" y="104" width="200" height="72" rx="8" class="card"/><text x="14" y="126" class="t-muted">b.yaml</text><text x="14" y="148" class="t-ink">name: worker</text><text x="14" y="168" class="t-acc">gpus: 4</text></g><g class="a" style="--k:fold;--dx:260px;--dy:-96px"><rect x="0" y="192" width="200" height="72" rx="8" class="card"/><text x="14" y="214" class="t-muted">c.yaml</text><text x="14" y="236" class="t-ink">name: worker</text><text x="14" y="256" class="t-acc">host_network: true</text></g><line x1="200" y1="140" x2="252" y2="140" class="edge"/><g class="a" style="--k:on48"><rect x="260" y="56" width="220" height="168" rx="8" class="card-acc"/><text x="276" y="84" class="t-muted">composed</text><text x="276" y="116" class="t-ink">name: worker</text><text x="276" y="142" class="t-ink">image: vllm</text><text x="276" y="168" class="t-ink">gpus: 4</text><text x="276" y="194" class="t-ink">host_network: true</text></g></svg></div></section>
+<section class="scene well blueprint " data-t="5.0" data-end="0.86" style="--T:5.0s" aria-label="results"><h2 class="scene__cap">results parsed, then shipped to s3</h2><div class="scene__body"><svg class="dg" viewBox="0 0 480 280" role="img" aria-label="diagram: a regex in result pulls 42.5 from the task log into result.json, which is uploaded to an s3 bucket"><rect x="0" y="16" width="220" height="112" rx="8" class="card"/><text x="16" y="44" class="t-muted">serve.log</text><text x="16" y="76" class="t-ink">TTFT: 42.5 ms</text><text x="16" y="104" class="t-ink">p99 latency: 88 ms</text><rect x="66" y="62" width="40" height="20" rx="3" class="hl a" style="--k:on10"/><rect x="268" y="16" width="212" height="112" rx="8" class="card"/><text x="284" y="44" class="t-muted">result.json</text><text x="284" y="76" class="t-ink a" style="--k:on32">{"ttft": 42.5}</text><line x1="220" y1="72" x2="268" y2="72" class="edge"/><circle cx="222" cy="72" r="4" class="dot-acc a" style="--k:mvA;--dx:44px;--dy:0px"/><rect x="268" y="184" width="212" height="88" rx="8" class="card"/><text x="284" y="212" class="t-muted">s3 bucket</text><text x="284" y="244" class="t-ink a" style="--k:on62">main/results.json</text><line x1="374" y1="128" x2="374" y2="184" class="edge"/><circle cx="374" cy="130" r="4" class="dot-acc a" style="--k:mvB;--dx:0px;--dy:52px"/><text x="0" y="212" class="t-muted">result:</text><text x="16" y="240" class="t-ink">ttft: 'TTFT:\s*([0-9.]+)'</text><text x="0" y="268" class="t-muted">uploads: results_bucket</text></svg></div></section>
+<section class="scene well blueprint " data-t="3.33" data-end="0.86" style="--T:3.33s" aria-label="pypi"><h2 class="scene__cap">on pypi as nv-sflow</h2><span class="scene__tag">new in v0.3.2</span><div class="scene__body"><svg class="dg" viewBox="0 0 640 190" role="img" aria-label="diagram: the git install line is replaced by pip install nv-sflow, and sflow upgrade moves to the latest release"><text x="0" y="30" class="t-muted">v0.3.1</text><text x="96" y="30" class="t-ink">pip install "sflow @ git+https://…"</text><rect x="94" y="25" width="270" height="1.5" rx="0" class="strike-l a" style="--k:s0"/><text x="0" y="74" class="t-muted">v0.3.2</text><text x="96" y="74" class="t-acc a" style="--k:on12">pip install nv-sflow</text><text x="0" y="118" class="t-muted">later</text><text x="96" y="118" class="t-ink a" style="--k:on30">sflow upgrade</text><g class="a" style="--k:on36"><line x1="214" y1="114" x2="300" y2="114" class="edge"/><rect x="308" y="96" width="236" height="36" rx="6" class="box"/><text x="320" y="119" class="t-ink">nv-sflow, latest release</text></g><text x="0" y="172" class="t-muted">never</text><text x="96" y="172" class="t-muted">pip install sflow</text><rect x="94" y="167" width="134" height="1.5" rx="0" class="strike-l"/></svg></div></section>
+<section class="scene well blueprint " data-t="4.17" data-end="0.86" style="--T:4.17s" aria-label="monitor"><h2 class="scene__cap">a monitor on every host</h2><span class="scene__tag">new in v0.3.2</span><div class="scene__body"><svg class="dg" viewBox="0 0 480 280" role="img" aria-label="diagram: the driver sends the monitor collector over stdin to each host, and each host draws its own gpu utilisation"><rect x="0" y="112" width="120" height="56" rx="28" class="pill-acc"/><text x="60" y="145" text-anchor="middle" class="t-ink">driver</text><text x="0" y="206" class="t-muted">collector</text><text x="0" y="226" class="t-muted">over stdin</text><rect x="220" y="16" width="260" height="112" rx="8" class="unit"/><text x="236" y="42" class="t-muted">node-0</text><text x="464" y="42" text-anchor="end" class="t-muted">gpu %</text><polyline points="240,104 260,90 280,70 300,66 320,62 340,68 360,63 380,60 400,64 420,61 440,67 460,63" class="line"/><rect x="236" y="52" width="236" height="70" rx="0" class="wipe a" style="--k:wipe"/><circle cx="124" cy="140" r="4" class="dot-acc a" style="--k:mvA;--dx:92px;--dy:-68px"/><rect x="220" y="152" width="260" height="112" rx="8" class="unit"/><text x="236" y="178" class="t-muted">node-1</text><text x="464" y="178" text-anchor="end" class="t-muted">gpu %</text><polyline points="240,246 260,235 280,216 300,209 320,204 340,202 360,205 380,199 400,204 420,198 440,200 460,204" class="line"/><rect x="236" y="188" width="236" height="70" rx="0" class="wipe a" style="--k:wipe"/><circle cx="124" cy="140" r="4" class="dot-acc a" style="--k:mvA;--dx:92px;--dy:68px"/><line x1="120" y1="140" x2="220" y2="72" class="edge"/><line x1="120" y1="140" x2="220" y2="208" class="edge"/></svg></div></section>
+<section class="scene well blueprint " data-t="5.0" data-end="0.86" style="--T:5.0s" aria-label="summary"><h2 class="scene__cap">a run summary you can read</h2><div class="scene__body"><svg class="dg" viewBox="0 0 640 290" role="img" aria-label="chart: sample run summary, task duration bars for prefill, decode and benchmark and a gpu utilisation line"><text x="0" y="39" class="t-ink">prefill</text><rect x="104" y="26" width="320" height="16" rx="3" class="rail"/><rect x="104" y="26" width="44" height="16" rx="3" class="bar a" style="--k:g0"/><text x="440" y="39" class="t-ink">58.412s</text><text x="536" y="39" class="t-live a" style="--k:on15">ready</text><text x="0" y="83" class="t-ink">decode</text><rect x="104" y="70" width="320" height="16" rx="3" class="rail"/><rect x="104" y="70" width="284" height="16" rx="3" class="bar a" style="--k:g1"/><text x="440" y="83" class="t-ink">6m14.882s</text><text x="536" y="83" class="t-live a" style="--k:on50">ready</text><text x="0" y="127" class="t-ink">benchmark</text><rect x="104" y="114" width="320" height="16" rx="3" class="rail"/><rect x="388" y="114" width="36" height="16" rx="3" class="bar a" style="--k:g2"/><text x="440" y="127" class="t-ink">47.906s</text><text x="536" y="127" class="t-live a" style="--k:on60">completed</text><text x="0" y="196" class="t-muted">gpu util %</text><text x="0" y="282" class="t-muted">min 42</text><line x1="104" y1="204.8" x2="424" y2="204.8" class="edge-acc dashed"/><text x="440" y="209.8" class="t-acc">avg 87</text><polyline points="104.0,251.2 117.9,276.8 131.8,246.4 145.7,220.8 159.6,203.2 173.5,196.8 187.4,192.0 201.3,200.0 215.2,193.6 229.1,188.8 243.0,185.6 256.9,195.2 270.8,198.4 284.7,190.4 298.6,201.6 312.5,193.6 326.4,187.2 340.3,196.8 354.2,203.2 368.1,192.0 382.0,200.0 395.9,206.4 409.8,195.2 423.7,200.0" class="line"/><rect x="100" y="176" width="330" height="110" rx="0" class="wipe a" style="--k:wipe"/></svg></div></section>
+<section class="scene well blueprint scene--end" data-t="3.75" data-end="1" style="--T:3.75s" aria-label="install"><div class="scene__body"><p class="slogan">Command any cluster<br> from your laptop.</p><p class="big">pip install nv-sflow</p></div></section>
+    </div>
+    <div class="controls">
+      <button class="btn btn--quiet" type="button" data-play>pause</button>
+      <div class="chapters" role="group" aria-label="chapters"><button class="chap" type="button">intro<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">backends<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">tui<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">ssh<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">docker pool<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">kubernetes<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">merge-pod<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">compose<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">results<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">pypi<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">monitor<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">summary<span class="track"><span class="fill"></span></span></button><button class="chap" type="button">install<span class="track"><span class="fill"></span></span></button></div>
+    </div>
+    <div class="strip">
+      <code class="cmd" id="cmd">pip install nv-sflow</code>
+      <button class="btn btn--primary" type="button" data-copy="#cmd">copy</button>
+      <button class="btn btn--secondary btn--agent" type="button" data-copy-text="Set up sflow for me by following https://raw.githubusercontent.com/NVIDIA/nv-sflow/main/docs-site/agents-src/setup.md step by step, then tell me what you installed and where." title="Set up sflow for me by following https://raw.githubusercontent.com/NVIDIA/nv-sflow/main/docs-site/agents-src/setup.md step by step, then tell me what you installed and where.">Copy for agent</button>
+      <a class="btn btn--secondary" href="docs/user/intro">read the docs</a>
+    </div>
+  </div>
+</main>
+<footer class="colophon">
+  <div class="container">
+    <a class="wordmark" href="docs/user/intro" aria-label="nv-sflow docs">nv-sflow</a>
+    <p>An NVIDIA project, Apache 2.0. Source at <a href="https://github.com/NVIDIA/nv-sflow">github.com/NVIDIA/nv-sflow</a>. Hosts, logs and the run summary in the chapters are samples.</p>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const stage = document.querySelector('.stage');
+  const scenes = [...stage.querySelectorAll('.scene')];
+  const chaps = [...document.querySelectorAll('.chap')];
+  const btn = document.querySelector('[data-play]');
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const SPEED = 1.2;
+  if (reduce) return; // reduced motion keeps the static storyboard: every chapter stacked, rest frames
+  document.documentElement.classList.add('play');
+  const s = { i: 0, el: 0, held: false, hover: false, focus: false, seen: true };
+  const running = () => !s.held && !s.hover && !s.focus && s.seen;
+  const fill = (k, v) => { chaps[k].querySelector('.fill').style.transform = `scaleX(${v})`; };
+  const gifs = () => scenes.forEach((sc, k) => sc.querySelectorAll('video').forEach((v) => {
+    // the clip fills its chapter exactly, so the task graph beside it stays in step
+    const rate = v.duration ? v.duration / parseFloat(sc.dataset.t) : SPEED;
+    v.playbackRate = v.defaultPlaybackRate = rate;
+    if (k === s.i && running()) v.play().catch(() => {}); else v.pause();
+  }));
+  const show = (n) => {
+    const out = scenes[s.i];
+    out.classList.add('is-out'); out.classList.remove('is-on'); chaps[s.i].removeAttribute('aria-current');
+    setTimeout(() => out.classList.remove('is-out'), 450);
+    s.i = (n + scenes.length) % scenes.length; s.el = 0;
+    scenes[s.i].querySelectorAll('video').forEach((v) => { v.currentTime = 0; });
+    scenes[s.i].classList.add('is-on'); chaps[s.i].setAttribute('aria-current', 'step');
+    chaps.forEach((_, k) => fill(k, k < s.i ? 1 : 0)); gifs();
+  };
+  const sync = () => {
+    stage.classList.toggle('is-paused', !running());
+    btn.textContent = s.held ? 'play' : 'pause'; gifs();
+  };
+  let last = performance.now();
+  const tick = (now) => {
+    const dt = now - last; last = now;
+    if (running()) {
+      const d = parseFloat(scenes[s.i].dataset.t) * 1000 * parseFloat(scenes[s.i].dataset.end || 0.86);
+      s.el += dt; fill(s.i, Math.min(s.el / d, 1));
+      if (s.el >= d) show(s.i + 1);
+    }
+    requestAnimationFrame(tick);
+  };
+  btn.addEventListener('click', () => { s.held = !s.held; sync(); });
+  chaps.forEach((c, k) => c.addEventListener('click', () => { show(k); }));
+  [['pointerenter', 'hover', true], ['pointerleave', 'hover', false], ['focusin', 'focus', true], ['focusout', 'focus', false]]
+    .forEach(([t, k, v]) => stage.addEventListener(t, () => { s[k] = v; sync(); }));
+  new IntersectionObserver(([e]) => { s.seen = e.isIntersecting; sync(); }).observe(stage);
+  const fit = () => document.documentElement.style.setProperty('--stage-w', stage.offsetWidth + 'px');
+  addEventListener('resize', fit); fit();
+  show(0); sync(); requestAnimationFrame(tick);
+})();
+// Copy buttons: data-copy names an element whose text to copy, data-copy-text carries the text itself.
+// The page is often framed (the docs-site homepage), where the async clipboard API can be refused,
+// so fall back to a selected textarea + execCommand before giving up.
+const copyText = async (text) => {
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  const ta = Object.assign(document.createElement('textarea'), { value: text });
+  ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.append(ta); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch {}
+  ta.remove(); return ok;
+};
+document.querySelectorAll('[data-copy], [data-copy-text]').forEach((b) => {
+  const label = b.textContent;
+  b.addEventListener('click', async () => {
+    const text = b.dataset.copyText || document.querySelector(b.dataset.copy).textContent;
+    b.textContent = (await copyText(text)) ? 'copied' : 'copy failed';
+    setTimeout(() => { b.textContent = label; }, 1600);
+  });
+});
+</script>
+
+</body>
+</html>

@@ -3,18 +3,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import math
 import os
 import re
 import shlex
+import socket
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator
 
 from sflow.core.command import Command
+from sflow.core.command_log import record_active_command
 from sflow.core.log_offload import offload_enabled, task_log_path, wrap_with_prefixer
 from sflow.core.operator import Operator, OperatorConfig, ResourcesUnavailable
 from sflow.core.operator_registry import register_operator
@@ -22,6 +27,7 @@ from sflow.logging import get_logger
 from sflow.utils import gpu_reservation as gpu_res
 from sflow.utils.container import (
     append_runtime_mounts as append_runtime_mount_specs,
+    local_artifact_mounts,
     validate_container_image_reference,
 )
 from sflow.utils.extra_args import normalize_extra_args
@@ -54,30 +60,121 @@ _DEVICE_FLAGS = ("--device", "-e", "--env")
 # -- a task that is merely behind a long-running neighbour should not trip it.
 _STALLED_WAIT_WARN_S = 600.0
 
-# Reaps orphaned sflow containers: every `sflow-p<pid>-*` whose owning driver
-# process is gone. Defined here, as data, because `.gitlab-ci.yml` runs the exact
-# same sweep in its after_script -- two hand-maintained copies of a predicate this
-# sharp (it force-removes containers) will drift, and the drift is only visible
-# when it wrongly kills a live co-tenant's run. CI executes it via:
+def _host_args(host: Any | None) -> list[str]:
+    """Client flags selecting ``host``'s daemon -- empty for the local one.
+
+    One definition because launch, teardown and the orphan sweep must all reach
+    the *same* daemon; a second copy that drifts reaps on one host what it
+    launched on another. The host config owns the derivation (address, user, and
+    the endpoint overrides); this only adapts it for a ``Command``.
+    """
+    if host is None:
+        return []
+    return list(host.control_args())
+
+
+def _docker_cmd(host: Any | None, *args: str) -> Command:
+    """``docker [--host …|--context …] <args>`` for ``host``'s daemon.
+
+    Every docker client sflow runs goes through here, so launch, teardown and
+    the orphan sweep cannot drift onto different daemons -- reaping on one host
+    what was launched on another is the failure this prevents.
+    """
+    cmd = Command(exec="docker")
+    for arg in (*_host_args(host), *args):
+        cmd.add_arg(arg)
+    return cmd
+
+
+def _daemon_label(host: Any | None) -> str:
+    """Which Docker daemon a member targets, for human review.
+
+    ``control_args()`` is ``["--host", "ssh://..."]`` or ``["--context", name]``.
+    """
+    return " ".join(_host_args(host)[1:]) or "local daemon"
+
+
+def _driver_host_token() -> str:
+    """Short, stable id for the machine this driver runs on.
+
+    A PID identifies an owner only *within* one machine, but a remote daemon is
+    routinely shared by several drivers -- so two machines can both produce
+    `sflow-p1234-*`, and a reaper checking its own /proc would judge a
+    co-tenant's live container dead. Tagging the name with the driver's machine
+    identity makes ownership decidable from the name alone, which is what lets
+    the sweep run against remote daemons at all.
+
+    machine-id is preferred over the hostname because it survives renames and is
+    actually unique; the hostname is only a fallback for hosts without one.
+
+    ``SFLOW_DRIVER_ID`` overrides both. A driver running *inside a container*
+    gets a fresh machine-id and hostname per run, so its token would change every
+    time and it could never reclaim the previous run's orphans -- exactly the
+    containerised-CI case the sweep is most needed for. Setting a stable value
+    there restores it.
+    """
+    override = os.environ.get("SFLOW_DRIVER_ID", "").strip()
+    if override:
+        return hashlib.blake2s(override.encode(), digest_size=3).hexdigest()
+    seed = ""
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path) as handle:
+                seed = handle.read().strip()
+        except OSError:
+            continue
+        if seed:
+            break
+    return hashlib.blake2s(
+        (seed or socket.gethostname()).encode(), digest_size=3
+    ).hexdigest()
+
+
+# Names of containers owned by a driver on THIS machine. Everything after this
+# prefix up to the next '-' is the owning PID.
+_OWNER_PREFIX = f"{_CONTAINER_PREFIX}-{_driver_host_token()}p"
+
+
+def orphan_reap_script(host: Any | None = None) -> str:
+    """The sweep reclaiming containers left by *crashed* drivers on ``host``.
+
+    Safe against a shared daemon: the name filter restricts it to containers this
+    machine created, so the /proc and `kill -0` checks below are asking about
+    local PIDs -- the only process table this script can actually read.
+
+    Liveness must also be user-agnostic: `kill -0 <pid>` fails with EPERM for a
+    process owned by ANOTHER user, so on its own it would classify a co-tenant's
+    live `sflow run` as dead and force-remove its running containers. /proc/<pid>
+    exists regardless of ownership, so check that first and keep kill -0 as the
+    fallback for non-procfs systems.
+
+    ``*-kept-*`` is exempt. Those are the containers `rm: false` deliberately
+    preserved for `docker logs`/`inspect`; their owning driver is *expected* to
+    be gone by the time anyone looks, so the dead-owner rule would have the very
+    next run on that host delete the evidence the flag exists to keep.
+    """
+    docker = " ".join(shlex.quote(p) for p in ("docker", *_host_args(host)))
+    return (
+        f'for c in $({docker} ps -a --filter name={_OWNER_PREFIX} '
+        '--format "{{.Names}}" 2>/dev/null); do '
+        'case "$c" in *-kept-*) continue;; esac; '
+        f'pid=${{c#{_OWNER_PREFIX}}}; pid=${{pid%%-*}}; '
+        'case "$pid" in ""|*[!0-9]*) continue;; esac; '
+        '[ -d "/proc/$pid" ] && continue; '
+        'kill -0 "$pid" 2>/dev/null && continue; '
+        f'{docker} rm -f "$c" >/dev/null 2>&1 || true; '
+        'done; true'
+    )
+
+
+# The local-daemon sweep, as a constant because `.gitlab-ci.yml` runs the exact
+# same predicate in its after_script -- two hand-maintained copies of something
+# this sharp (it force-removes containers) will drift, and the drift is only
+# visible when it wrongly kills a live co-tenant's run. CI executes it via:
 #
 #     python -c "from sflow.plugins.operators.docker_run import ORPHAN_REAP_SCRIPT
 #                print(ORPHAN_REAP_SCRIPT)" | bash
-#
-# Liveness must be user-agnostic: `kill -0 <pid>` fails with EPERM for a process
-# owned by ANOTHER user, so on its own it would classify a co-tenant's live
-# `sflow run` as dead and force-remove its running containers. /proc/<pid> exists
-# regardless of ownership, so check it first and keep kill -0 as the fallback for
-# non-procfs systems.
-ORPHAN_REAP_SCRIPT = (
-    f'for c in $(docker ps -a --filter name={_CONTAINER_PREFIX}-p '
-    '--format "{{.Names}}" 2>/dev/null); do '
-    'pid=${c#' + _CONTAINER_PREFIX + '-p}; pid=${pid%%-*}; '
-    'case "$pid" in ""|*[!0-9]*) continue;; esac; '
-    '[ -d "/proc/$pid" ] && continue; '
-    'kill -0 "$pid" 2>/dev/null && continue; '
-    'docker rm -f "$c" >/dev/null 2>&1 || true; '
-    'done; true'
-)
+ORPHAN_REAP_SCRIPT = orphan_reap_script()
 
 
 def _safe_container_name(*parts: str) -> str:
@@ -86,10 +183,21 @@ def _safe_container_name(*parts: str) -> str:
     return (sanitized or "sflow-task")[:128]
 
 
-def _container_name(task_name: str, node_name: str) -> str:
-    """``sflow-p<pid>-<task>-<node>`` -- unique per driver process, reap-parseable."""
+def make_container_name(task_name: str, node_name: str) -> str:
+    """``sflow-<machine>p<pid>-<task>-<node>`` -- reap-parseable, globally unique.
+
+    The machine token is part of the prefix because a PID identifies an owner
+    only WITHIN one machine, and a remote daemon is routinely shared by several
+    drivers -- two of which can produce the same PID.
+
+    Public because the docker BACKEND names its monitor container with it too:
+    that container must be parseable by this module's orphan sweep, so the two
+    cannot use different conventions. Named ``make_`` rather than
+    ``container_name`` so it does not shadow the local of that name that several
+    functions here already bind.
+    """
     return _safe_container_name(
-        _CONTAINER_PREFIX, f"p{os.getpid()}", task_name, node_name
+        f"{_OWNER_PREFIX}{os.getpid()}", task_name, node_name
     )
 
 
@@ -122,6 +230,44 @@ def _quoted_gpus_arg(value: str) -> str:
     return f'"{spec}"'
 
 
+@dataclass(frozen=True)
+class _Member:
+    """One container of a task: its rank, its node, and the daemon it runs on.
+
+    ``index`` is carried rather than recomputed downstream: deriving the rank a
+    second time is only correct while two functions happen to agree on ordering,
+    and a rank that disagrees with the leader assignment is a wedged collective
+    rather than an error.
+    """
+
+    index: int
+    node_name: str
+    host: Any | None
+    container_name: str
+
+
+class _NodeLogger:
+    """The task's logger with member identity prefixed onto every line.
+
+    ``info`` and ``handlers`` are the whole surface -- that is all the launcher
+    uses of an ``output_logger``.
+    """
+
+    def __init__(self, logger: Any, node_name: str, node_index: int):
+        self._logger = logger
+        # A newline in a node name would forge extra log lines and break the
+        # one-record-per-line shape the `[node rank=N]` label depends on.
+        # Substituted outside the f-string: a backslash inside an f-string
+        # expression is a syntax error before Python 3.12, and this package
+        # supports 3.10.
+        safe_name = re.sub(r"[\r\n]", "?", node_name)
+        self._prefix = f"[{safe_name} rank={node_index}] "
+        self.handlers = getattr(logger, "handlers", [])
+
+    def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._logger.info(f"{self._prefix}{message}", *args, **kwargs)
+
+
 def _grants_gpus(extra_args: Sequence[str]) -> bool:
     """Whether raw docker args already expose GPUs to the container.
 
@@ -151,6 +297,10 @@ class DockerRunOperatorConfig(OperatorConfig):
     mounts: list[str] = Field(default_factory=list)  # e.g. ["/host:/ctr:rw"]
     gpus: str | None = None  # e.g. "all" or "device=0"
     extra_args: list[str] = Field(default_factory=list)
+    # Pass `--rm` so the daemon discards the container once it exits. Turning this
+    # off also downgrades teardown from `docker rm -f` to `docker stop`, because
+    # otherwise the driver would delete the very container this flag preserves.
+    rm: bool = True
     pass_envs: bool = True
     auto_mount_runtime_dirs: bool = True
     # Per-task log offload, ON by default. When enabled (also via the
@@ -160,6 +310,13 @@ class DockerRunOperatorConfig(OperatorConfig):
     # sflow driver's pump. Auto-falls back to streaming on an interactive
     # TTY / --tui session.
     log_to_file: bool = True
+    # Accumulated rather than derived, unlike the srun operator's: these depend
+    # on the *placement* (how many nodes this task got), which the config cannot
+    # see -- so the operator appends them once the assignment is known.
+    _runtime_warnings: list[str] = PrivateAttr(default_factory=list)
+
+    def runtime_warnings(self) -> list[str]:
+        return list(dict.fromkeys(self._runtime_warnings))
 
     def container_images(self) -> list[str]:
         return [self.image] if self.image else []
@@ -210,7 +367,10 @@ class DockerRunOperator(Operator):
         self._warned_wait_stalled: bool = False
 
     def _offload_enabled(self) -> bool:
-        return offload_enabled(self.config.log_to_file)
+        # Multi-node members already stream through the shared launcher, which
+        # owns their output and labels it per rank; a second host-side redirect
+        # would be a competing writer on the same <task>.log.
+        return offload_enabled(self.config.log_to_file) and len(self._assigned_nodes) <= 1
 
     def writes_own_task_log(self) -> bool:
         # In offload mode the host-side redirect owns <task>.log, so sflow must
@@ -257,13 +417,66 @@ class DockerRunOperator(Operator):
             for node_name in self._assigned_nodes
             if callable(host_for_node)
         }
+        # Any declared host is a daemon reached over the network; only the
+        # synthetic local node has no host entry at all.
         self._targets_remote_host = any(
-            host is not None
-            and (getattr(host, "docker_host", None) or getattr(host, "context", None))
-            for host in self._node_hosts.values()
+            host is not None for host in self._node_hosts.values()
         )
+        # Capture the user's own setting first: the flag is also flipped below
+        # for remote hosts, and that is sflow's decision about workspace/output
+        # dirs, not an instruction to drop the recipe's artifacts.
+        opted_out_of_auto_mounts = not self.config.auto_mount_runtime_dirs
         if self._targets_remote_host:
             self.config.auto_mount_runtime_dirs = False
+
+        # `fs://`/`file://` artifacts become same-path bind mounts, so a task can
+        # read ${{ artifacts.X.path }} without the recipe repeating the path
+        # under `mounts:`. srun has always done this; docker_run accepted the
+        # artifacts and ignored them, so the same recipe worked on Slurm and
+        # failed here with a missing file.
+        #
+        # Applied to remote hosts too, bypassing the runtime-dirs flag above.
+        # The path does have to exist on those machines -- but that is
+        # pre-flight's job: it checks every mount source on every host and names
+        # the ones missing. Refusing to mount would instead leave the recipe
+        # working on Slurm and quietly broken here.
+        auto_mounts = local_artifact_mounts(artifacts)
+        if auto_mounts and not opted_out_of_auto_mounts:
+            self.config.mounts = append_runtime_mount_specs(
+                list(self.config.mounts or []), auto_mounts
+            )
+        if len(self._assigned_nodes) > 1:
+            # Every member is handed the leader's address, so one host that
+            # cannot supply one makes the whole assignment unusable. Failing here
+            # names the host; launching anyway spends the job's wall clock in a
+            # rendezvous that never completes and reports nothing.
+            # Only declared hosts can fail this. Synthetic local nodes have no
+            # host entry at all and every container lands on this machine, so
+            # they rendezvous over loopback and need nothing declared.
+            unaddressed = [
+                node_name
+                for node_name, host in self._node_hosts.items()
+                if host is not None and not host.rendezvous()
+            ]
+            if offload_enabled(self.config.log_to_file):
+                message = (
+                    "Docker multi-node members stream through the shared "
+                    "launcher, so log_to_file offload is skipped; member output "
+                    "is labelled by node and merged into the task log instead."
+                )
+                # Both surfaces on purpose: runtime_warnings() is only collected
+                # on --dry-run, so on a real run the log line is the only thing
+                # that tells the user their setting was not applied.
+                self.config._runtime_warnings.append(message)
+                _logger.warning(f"Task uses {len(self._assigned_nodes)} nodes: {message}")
+            if unaddressed:
+                raise ValueError(
+                    f"Docker backend '{getattr(backend, 'name', '?')}': "
+                    f"multi-node task cannot resolve a rendezvous address for "
+                    f"host(s) {', '.join(sorted(unaddressed))}. Give each host an "
+                    "'address' (or 'rendezvous_address'); peers need it to find "
+                    "the leader."
+                )
         # How many GPUs this task needs. The actual physical GPUs are reserved at
         # launch (acquire_resources), so a task holds them only while it runs
         # rather than for the whole run. The container still sees them as
@@ -282,8 +495,8 @@ class DockerRunOperator(Operator):
 
         # Pin to the planner's device slice up front for *every* placement. A
         # launch-time reservation (acquire_resources) overwrites it with the
-        # physical GPUs it claimed; when there is none -- remote hosts, synthetic
-        # multi-node, SFLOW_GPU_RESERVATION=0, or no readable nvidia-smi -- this
+        # physical GPUs it claimed; when there is none -- declared hosts,
+        # SFLOW_GPU_RESERVATION=0, or no readable nvidia-smi -- this
         # numeric slice stays as the fallback. Setting it here (rather than only
         # at launch) also keeps `--dry-run` honest: the plan shows the GPU pinning
         # a real run would apply instead of omitting --gpus entirely.
@@ -299,9 +512,9 @@ class DockerRunOperator(Operator):
 
         Returns the reserved *physical* device indices (for run reporting), or
         ``None`` when no reservation was made. Local single-node docker only:
-        remote hosts (can't read this host's nvidia-smi), synthetic multi-node
-        placements, and reservation-disabled runs skip it and keep the plan-time
-        device slice set in :meth:`apply_backend_context`.
+        declared hosts (can't read this host's nvidia-smi) and
+        reservation-disabled runs skip it and keep the plan-time device slice
+        set in :meth:`apply_backend_context`.
 
         Makes exactly ONE attempt. When the board is full and this task is allowed
         to wait, it raises :class:`ResourcesUnavailable` so the orchestrator can
@@ -310,27 +523,21 @@ class DockerRunOperator(Operator):
         """
         if self._gpu_count <= 0 or not gpu_res.reservation_enabled():
             return None
-        if self._targets_remote_host or len(self._assigned_nodes) > 1:
-            # Multi-container placements pin every container to the SAME plan-time
-            # device slice (`--gpus` is one operator-config value shared by all
-            # launch specs), so there is no per-container claim to make here.
-            # Remote hosts additionally can't be judged from this host's
-            # nvidia-smi. Worth saying out loud rather than silently returning:
-            # with synthetic `nodes: > 1` on the LOCAL daemon every container runs
-            # on this very host, so the user reasonably expects the reservation
-            # they read about in the docs, and gets none.
+        if self._targets_remote_host:
+            # The registry describes this machine's devices, so it cannot speak
+            # for a container placed on another one. (Multi-node requires a
+            # declared pool, so it is covered by the same test.)
+            #
+            # Said out loud rather than silently returned: the user read about
+            # the reservation in the docs and is not getting it.
             if not self._warned_reservation_skipped:
                 self._warned_reservation_skipped = True
-                why = (
-                    "it targets a remote Docker host"
-                    if self._targets_remote_host
-                    else f"it spans {len(self._assigned_nodes)} nodes"
-                )
                 _logger.warning(
-                    f"Task '{task_name}': GPU reservation skipped because {why}; "
-                    f"launching on the planned device slice ({self.config.gpus}) "
-                    f"without a cross-process claim. A concurrent sflow run on the "
-                    f"same host can pick the same devices."
+                    f"Task '{task_name}': GPU reservation skipped because it runs "
+                    f"on declared Docker host(s) whose devices this machine's "
+                    f"registry does not track; launching on the planned device "
+                    f"slice ({self.config.gpus}) without a cross-process claim. "
+                    f"Another run on those hosts can pick the same devices."
                 )
             return None
         wait, timeout = gpu_res.wait_options(self._wait_for_gpus)
@@ -477,19 +684,15 @@ class DockerRunOperator(Operator):
         script: Sequence[str],
         envs: Mapping[str, str],
         container_name: str | None = None,
+        per_node_envs: Mapping[str, str] | None = None,
     ) -> Command:
         c = self.config
-        cmd = Command(exec="docker")
-        if host is not None:
-            if getattr(host, "docker_host", None):
-                cmd.add_arg("--host")
-                cmd.add_arg(str(host.docker_host))
-            elif getattr(host, "context", None):
-                cmd.add_arg("--context")
-                cmd.add_arg(str(host.context))
+        gpus = c.gpus
+        cmd = _docker_cmd(host)
 
         cmd.add_arg("run")
-        cmd.add_arg("--rm")
+        if c.rm:
+            cmd.add_arg("--rm")
         if container_name:
             cmd.add_arg("--name")
             cmd.add_arg(container_name)
@@ -497,7 +700,7 @@ class DockerRunOperator(Operator):
         host_extra_args = list(getattr(host, "extra_args", None) or []) if host else []
         merged_extra_args = normalize_extra_args([*c.extra_args, *host_extra_args])
 
-        if c.gpus is not None:
+        if gpus is not None:
             # A `--gpus` (or NVIDIA_VISIBLE_DEVICES / --device=/dev/nvidia*) in
             # extra_args is appended AFTER this pin, and docker *accumulates*
             # device requests rather than letting the last one win -- so a raw
@@ -511,13 +714,13 @@ class DockerRunOperator(Operator):
                 _logger.warning(
                     f"Task '{task_name}': extra_args grant GPUs directly "
                     f"({list(merged_extra_args)}) "
-                    f"while sflow pinned this task to {c.gpus}. Docker ADDS both "
+                    f"while sflow pinned this task to {gpus}. Docker ADDS both "
                     f"requests, so the container will see more GPUs than were "
                     f"reserved and may collide with another task. Drop the raw GPU "
                     f"arg and use resources.gpus instead."
                 )
             cmd.add_arg("--gpus")
-            cmd.add_arg(_quoted_gpus_arg(c.gpus))
+            cmd.add_arg(_quoted_gpus_arg(gpus))
         elif not _grants_gpus(merged_extra_args):
             # No GPUs requested: hide all devices. Many CUDA images bake
             # NVIDIA_VISIBLE_DEVICES=all, so without a --gpus flag the container
@@ -536,9 +739,15 @@ class DockerRunOperator(Operator):
             cmd.add_arg(m)
 
         if c.pass_envs:
-            for k in dict(envs).keys():
+            for k in dict(envs):
                 cmd.add_arg("-e")
                 cmd.add_arg(str(k))
+
+        # Passed by value, not by name: these differ per member and so are not in
+        # the driver's own environment for a bare `-e NAME` to inherit.
+        for key, value in (per_node_envs or {}).items():
+            cmd.add_arg("-e")
+            cmd.add_arg(f"{key}={value}")
 
         for a in merged_extra_args:
             cmd.add_arg(a)
@@ -549,18 +758,8 @@ class DockerRunOperator(Operator):
         cmd.add_arg("\n".join(list(script)))
         return cmd
 
-    def _cleanup_command(self, host: Any | None, container_name: str) -> str:
-        parts = ["docker"]
-        if host is not None:
-            if getattr(host, "docker_host", None):
-                parts.extend(["--host", str(host.docker_host)])
-            elif getattr(host, "context", None):
-                parts.extend(["--context", str(host.context)])
-        parts.extend(["rm", "-f", container_name])
-        return shlex.join(parts)
-
-    def _launch_specs(self, task_name: str) -> list[tuple[str, Any | None, str]]:
-        """``(node_name, host, container_name)`` for every container this task runs.
+    def _launch_specs(self, task_name: str) -> list[_Member]:
+        """Every container this task runs, in rank order.
 
         ``build_command`` and :meth:`teardown_commands` both derive container names
         from here so the driver can always reap a container by its ``--name`` even
@@ -569,12 +768,45 @@ class DockerRunOperator(Operator):
         """
         launch_nodes = self._assigned_nodes or [""]
         return [
-            (
-                node_name,
-                self._node_hosts.get(node_name),
-                _container_name(task_name, node_name),
+            _Member(
+                index=index,
+                node_name=node_name,
+                host=self._node_hosts.get(node_name),
+                container_name=make_container_name(task_name, node_name),
             )
-            for node_name in launch_nodes
+            for index, node_name in enumerate(launch_nodes)
+        ]
+
+    def dry_run_launch_preview(
+        self,
+        *,
+        task_name: str,
+        script: Sequence[str],
+        envs: Mapping[str, str],
+    ) -> list[tuple[str, Command]]:
+        """One entry per member, so the whole fan-out is reviewable before launch.
+
+        ``build_command`` returns rank 0 alone as a representative, and the
+        command log only exists once commands are actually issued -- so without
+        this a dry run shows one machine's worth of a job that spans several,
+        and never shows which daemon any of them targets.
+
+        Deliberately NOT via ``build_command``: that records every member into
+        the active command log, which on a dry run would fabricate a record of
+        commands nothing ran.
+        """
+        members = self._launch_specs(task_name)
+        if len(members) <= 1:
+            return []
+        return [
+            (
+                f"node {member.node_name} (rank {member.index}) "
+                f"-> {_daemon_label(member.host)}",
+                command,
+            )
+            for member, command in self._multi_node_commands(
+                task_name=task_name, script=script, envs=envs
+            )
         ]
 
     def teardown_commands(self, *, task_name: str) -> list[Command]:
@@ -585,20 +817,132 @@ class DockerRunOperator(Operator):
         exits (and before relaunch) to guarantee no container outlives the run.
         """
         commands: list[Command] = []
-        for _node_name, host, container_name in self._launch_specs(task_name):
-            cmd = Command(exec="docker")
-            if host is not None:
-                if getattr(host, "docker_host", None):
-                    cmd.add_arg("--host")
-                    cmd.add_arg(str(host.docker_host))
-                elif getattr(host, "context", None):
-                    cmd.add_arg("--context")
-                    cmd.add_arg(str(host.context))
-            cmd.add_arg("rm")
-            cmd.add_arg("-f")
-            cmd.add_arg(container_name)
+        for member in self._launch_specs(task_name):
+            cmd = _docker_cmd(member.host)
+            if self.config.rm:
+                cmd.add_arg("rm")
+                cmd.add_arg("-f")
+                cmd.add_arg(member.container_name)
+                commands.append(cmd)
+                continue
+
+            # Stopped, never deleted: the point of `rm: false` is to leave the
+            # container for `docker logs`/`inspect`, which a force-remove here
+            # would undo. Stopping still happens, so a READY service cannot
+            # outlive the workflow.
+            cmd.add_arg("stop")
+            cmd.add_arg(member.container_name)
             commands.append(cmd)
+
+            # Then free the name. `docker run --name X` refuses while ANY
+            # container called X exists, in any state -- so a kept container
+            # would make every retry of this task die with "name already in
+            # use" instead of re-running. Renaming keeps the evidence and
+            # unblocks the next attempt.
+            rename = _docker_cmd(
+                member.host, "rename", member.container_name
+            )
+            # Nanoseconds, not seconds: two retries of the same task inside one
+            # second would otherwise pick the same suffix, `docker rename` would
+            # fail with "name already in use", and the stale container would go
+            # on blocking the next `--name` -- the exact failure this rename is
+            # here to prevent.
+            rename.add_arg(f"{member.container_name}-kept-{time.time_ns()}")
+            commands.append(rename)
         return commands
+
+    def _multi_node_commands(
+        self,
+        *,
+        task_name: str,
+        script: Sequence[str],
+        envs: Mapping[str, str],
+    ) -> list[tuple[_Member, Command]]:
+        """One `docker run` per assigned host, each carrying its own identity.
+
+        Only the rank is per-member. ``SFLOW_TASK_NUM_NODES`` and
+        ``SFLOW_LEADER_ADDRESS`` are the same for every member, so they arrive
+        with the rest of the task env (assembly sets them for every backend)
+        and are forwarded by name like any other variable.
+        """
+        members = self._launch_specs(task_name)
+        commands: list[tuple[_Member, Command]] = []
+        for member in members:
+            per_node_envs = {"SFLOW_TASK_NODE_INDEX": str(member.index)}
+            commands.append(
+                (
+                    member,
+                    self._build_docker_command(
+                        task_name=task_name,
+                        node_name=member.node_name,
+                        host=member.host,
+                        script=script,
+                        envs=envs,
+                        container_name=member.container_name,
+                        per_node_envs=per_node_envs,
+                    ),
+                )
+            )
+        return commands
+
+    def manages_own_execution(self) -> bool:
+        # One container is an ordinary subprocess the orchestrator can launch;
+        # several need supervising together, which is what execute() does.
+        return len(self._assigned_nodes) > 1
+
+    async def execute(
+        self,
+        *,
+        launcher: Any,
+        output_logger: Any,
+        env: Mapping[str, str],
+        task_name: str,
+        script: Sequence[str],
+        status_note: Any = None,
+    ) -> int:
+        """Run every member concurrently; the first failure ends the task.
+
+        Peers are cancelled rather than left running: a job whose rank 1 died is
+        not going to finish, and the remaining containers would otherwise hold
+        their GPUs on every other machine until someone noticed.
+        """
+        commands = self._multi_node_commands(
+            task_name=task_name, script=script, envs=env
+        )
+        members = {
+            asyncio.ensure_future(
+                launcher.run_async(
+                    command,
+                    output_logger=_NodeLogger(
+                        output_logger, member.node_name, member.index
+                    ),
+                    env=env,
+                    task_name=f"{task_name}:{member.node_name}",
+                )
+            ): member
+            for member, command in commands
+        }
+        pending = set(members)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for finished in done:
+                    rc = finished.result()
+                    if rc != 0:
+                        member = members[finished]
+                        output_logger.info(
+                            f"sflow: Docker node '{member.node_name}' exited with "
+                            f"status {rc}; stopping peer containers."
+                        )
+                        return rc
+            return 0
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     def stale_reap_commands(self, *, task_name: str) -> list[Command]:
         """Reap *orphaned* sflow containers -- ones whose owning driver PID is
@@ -611,24 +955,31 @@ class DockerRunOperator(Operator):
         the name, and force-removes only those whose PID is no longer alive --
         the same dead-owner reclaim the GPU reservation registry uses.
 
-        Local daemon only: the ``kill -0`` check reads *this* driver host's
-        process table, so on a shared *remote* daemon it could wrongly judge
-        another machine's live container dead and reap it. Remote containers still
-        get their exact-name teardown after each task.
+        Remote daemons are swept too, once each. That is only sound because the
+        name carries the driver's machine identity: without it a PID read off a
+        co-tenant's container would be checked against *this* host's process
+        table and a live container reaped. Exact-name teardown cannot cover this
+        case -- a SIGKILLed driver never runs teardown at all, leaving remote
+        containers with no other route back.
         """
-        has_local = any(
-            host is None for _node, host, _c in self._launch_specs(task_name)
-        )
-        return [self._orphan_reap_command()] if has_local else []
+        commands: list[Command] = []
+        swept: set[tuple[str, ...]] = set()
+        for member in self._launch_specs(task_name):
+            key = tuple(_host_args(member.host))
+            if key in swept:
+                continue
+            swept.add(key)
+            commands.append(self._orphan_reap_command(member.host))
+        return commands
 
-    def _orphan_reap_command(self) -> Command:
-        # For each local sflow-p<pid>-* container: strip the prefix, take the pid
-        # up to the next '-', and rm -f only when its owning driver is really gone.
-        # The script itself is ORPHAN_REAP_SCRIPT so CI's after_script sweep and
-        # this one cannot drift apart.
+    def _orphan_reap_command(self, host: Any | None = None) -> Command:
+        # For each of this machine's containers on `host`: strip the owner prefix,
+        # take the pid up to the next '-', and rm -f only when the owning driver
+        # is really gone. Built by orphan_reap_script so CI's after_script sweep
+        # (which imports ORPHAN_REAP_SCRIPT) cannot drift from this one.
         cmd = Command(exec="bash")
         cmd.add_arg("-c")
-        cmd.add_arg(ORPHAN_REAP_SCRIPT)
+        cmd.add_arg(orphan_reap_script(host))
         return cmd
 
     def build_command(
@@ -641,54 +992,32 @@ class DockerRunOperator(Operator):
         launch_specs = self._launch_specs(task_name)
 
         if len(launch_specs) == 1:
-            node_name, host, container_name = launch_specs[0]
+            member = launch_specs[0]
             # Name the container so the driver can force-remove it on teardown:
             # killing the foreground `docker run` client does not stop the
             # daemon-managed container, so `--rm` alone can leak it.
             cmd = self._build_docker_command(
                 task_name=task_name,
-                node_name=node_name or None,
-                host=host,
+                node_name=member.node_name or None,
+                host=member.host,
                 script=script,
                 envs=envs,
-                container_name=container_name,
+                container_name=member.container_name,
             )
             return self._maybe_offload(cmd, task_name=task_name, envs=envs)
 
-        lines = [
-            "set -euo pipefail",
-            "status=0",
-            "pids=\"\"",
-            "cleanup() {",
-        ]
-        run_lines: list[str] = []
-        for node_name, host, container_name in launch_specs:
-            lines.append(
-                f"  {self._cleanup_command(host, container_name)} >/dev/null 2>&1 || true"
-            )
-            docker_cmd = self._build_docker_command(
-                task_name=task_name,
-                node_name=node_name,
-                host=host,
-                script=script,
-                envs=envs,
-                container_name=container_name,
-            )
-            run_lines.append(f"{shlex.join(docker_cmd.as_list())} &")
-            run_lines.append('pids="$pids $!"')
-        lines.extend(
-            [
-                "}",
-                "trap cleanup EXIT",
-                "trap 'cleanup; exit 143' HUP INT TERM",
-                *run_lines,
-                "for pid in $pids; do",
-                "  if ! wait \"$pid\"; then status=1; fi",
-                "done",
-                "exit \"$status\"",
-            ]
+        # Multi-node runs through execute(), not this command: a generated shell
+        # supervisor could only report a generic failure, could not name the rank
+        # that died, and had no way to label output per member. Every member's
+        # command is recorded to the command log, so the fan-out stays reviewable;
+        # this returns rank 0 as the representative for single-command callers.
+        commands = self._multi_node_commands(
+            task_name=task_name, script=script, envs=envs
         )
-        cmd = Command(exec="bash")
-        cmd.add_arg("-lc")
-        cmd.add_arg("\n".join(lines))
-        return self._maybe_offload(cmd, task_name=task_name, envs=envs)
+        for member, command in commands:
+            record_active_command(
+                command,
+                task_name=f"{task_name}:{member.node_name}",
+                shell=False,
+            )
+        return commands[0][1]

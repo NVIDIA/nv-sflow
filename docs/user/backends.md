@@ -5,6 +5,10 @@ sidebar_position: 5
 
 A `backend` provides compute resources for task execution. **v0.1 ships with** `local`, `slurm`, `docker`, and `kubernetes` backends.
 
+:::note
+YAML snippets on this page are fragments: add `workflow.name` (and any `variables:` they reference) before running them.
+:::
+
 ## Default behavior (simplest)
 
 If you omit `backends:` entirely, `sflow` creates a default local backend:
@@ -267,8 +271,9 @@ take plain hostnames.
 
 ## Docker backend
 
-The Docker backend uses a synthetic local allocation for planning and launches tasks
-through the `docker_run` operator, which invokes `docker run`:
+The Docker backend launches tasks through the `docker_run` operator, which invokes
+`docker run`. Without a `hosts:` pool it plans against a single local node; a pool
+is what makes a task span machines (see [Multi-node Docker hosts](#multi-node-docker-hosts)):
 
 ```yaml
 version: "0.1"
@@ -297,14 +302,15 @@ sflow reserves that many physical GPUs and launches the container with
 `NVIDIA_VISIBLE_DEVICES=void` and sees none. See
 [GPU reservation](#gpu-reservation-local-concurrent-runs) below.
 
-Docker backend fields beyond `image`/`nodes`/`gpus_per_node`:
+Docker backend fields beyond `nodes`/`gpus_per_node`:
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `image` | — | Default image for tasks that declare no `operator:` (and for the monitor collector's container on a host with no ssh endpoint). Optional: a recipe whose tasks all name a `docker_run` operator does not need it. |
 | `mounts` | — | Bind mounts (`host:container[:ro]`) applied to **every** container this backend runs. |
 | `workdir` | — | Working directory inside every container. |
 | `extra_args` | — | Extra raw `docker run` args for every container. |
-| `offload_task_logs` | `true` | Write each task's `<task>.log` on the container side instead of streaming through the driver (auto-streams on a TTY / `--tui`). |
+| `offload_task_logs` | `true` | Write each task's `<task>.log` on the container side instead of streaming through the driver (auto-streams on a TTY / `--tui`). Not applied to a multi-node task: its members stream through the shared launcher, labelled by node and rank and merged into one task log, and sflow warns that the setting was skipped. |
 | `wait_for_gpus` | — | Wait for free GPUs at reserve time instead of failing fast: `0` = forever, `N` = up to N seconds. Overridden by `--wait-for-gpus`. See [GPU reservation](#gpu-reservation-local-concurrent-runs). |
 
 ### GPU reservation (local, concurrent runs)
@@ -325,9 +331,7 @@ Tasks on one Docker host reserve **disjoint** physical GPUs, so concurrent tasks
   to the planner's numeric device slice, as does a host where the driver cannot run
   `nvidia-smi` and any run with `SFLOW_GPU_RESERVATION=0`. In every one of those
   cases the container is still pinned to a device slice; only the cross-process
-  reservation is skipped, and a warning names which case you hit. Note that
-  synthetic `nodes: > 1` counts as multi-node even though every container runs on
-  this same daemon — a concurrent run can then pick the same devices.
+  reservation is skipped, and a warning names which case you hit.
 - A raw `--gpus` (or `NVIDIA_VISIBLE_DEVICES` / `--device=/dev/nvidia*`) in
   `extra_args` is passed through untouched, but docker *adds* it to sflow's pin
   rather than replacing it, so the container ends up with more GPUs than were
@@ -373,11 +377,23 @@ Two things to know about `SFLOW_WAIT_FOR_GPUS`:
 
 Reservation requires POSIX file locking and is inert on Windows.
 
-> **Changed behavior.** Container names gained a driver-PID segment
-> (`sflow-<task>-<node>` → `sflow-p<pid>-<task>-<node>`) so concurrent runs on one
-> host never collide; scripts matching the old name must be updated. A task that
-> declares **no** GPUs now gets `NVIDIA_VISIBLE_DEVICES=void` and sees none, unless
-> `extra_args` already grant GPUs (e.g. a raw `--gpus all`), which is left untouched.
+> **Changed behavior.** Container names are
+> `sflow-<machine>p<pid>-<task>-<node>`, where `<machine>` is a short hash of the
+> driver's machine identity (v0.3.1 used `sflow-p<pid>-<task>-<node>`, earlier
+> releases `sflow-<task>-<node>`). A PID identifies an owner only within one
+> machine, and a remote daemon is routinely shared by several drivers, so the
+> machine token lets the orphan sweep decide ownership from the name alone.
+> Scripts matching the old names must be updated. A task that declares **no**
+> GPUs gets `NVIDIA_VISIBLE_DEVICES=void` and sees none, unless `extra_args`
+> already grant GPUs (e.g. a raw `--gpus all`), which is left untouched.
+
+Containers are removed on completion, failure, signal and Ctrl-C. After a driver
+crash, the next run reclaims the containers it left behind on **every** host it
+targets, never a colleague's live ones. If the driver itself runs **inside a
+container** (CI), set `SFLOW_DRIVER_ID` to a stable value: otherwise it gets a
+fresh machine identity per run and can never recognise its own previous orphans.
+Containers left by a pre-v0.3.2 sflow do not match the sweep's filter and need
+one manual cleanup.
 
 ### Multi-node Docker hosts
 
@@ -392,32 +408,119 @@ backends:
     image: nvcr.io/example/app:1.0
     hosts:
       - name: dgx-a
-        docker_host: ssh://dgx-a
-        ip_address: 10.0.0.11
+        address: 10.0.0.11
         gpus_per_node: 8
       - name: dgx-b
-        context: dgx-b-context
-        ip_address: 10.0.0.12
+        address: 10.0.0.12
+        user: ubuntu
         gpus_per_node: 8
 ```
 
-Each host entry accepts `name`, `docker_host` (or `context`), `ip_address`,
-`gpus_per_node`, and — per host — `mounts` and `extra_args` (merged with the
-backend-wide `mounts`/`extra_args`).
+A host is identified by **`address`** — the machine. sflow derives both the
+Docker endpoint (`ssh://<address>`, or `ssh://<user>@<address>`) and the address
+peer containers dial to rendezvous. SSH must already work from the driver to
+that address; port, key and proxy settings stay in `~/.ssh/config`.
+
+A pool need not be uniform. Besides `gpus_per_node` above, a host may carry its
+own **`mounts`** and **`extra_args`**, which are *added to* the backend-level
+ones for that host's containers only — for a machine that keeps the model cache
+somewhere else, or needs a flag the others do not:
+
+```yaml
+    hosts:
+      - name: dgx-a
+        address: 10.0.0.11
+        mounts:
+          - /mnt/fast/models:/models:ro   # this box only
+        extra_args: ["--shm-size=32g"]
+```
+
+Note that `hosts:` **is** the node list: with a pool declared, a backend-level
+`nodes:` that asks for a different count is rejected rather than quietly
+ignored. Add or remove hosts to change the node count.
+
+### Pre-flight
+
+Before a workflow starts, a backend with a declared `hosts:` pool checks each
+host once:
+
+- **the daemon answers** — a bounded `docker version` over the host's endpoint,
+  which exercises ssh auth, the tunnel and the daemon in a single call;
+- **bind-mount sources exist on that machine** — docker *creates* a missing
+  bind source as an empty directory rather than failing, so a typo'd or
+  unmounted path would otherwise become an empty mount and the workload would
+  report missing data instead of a bad config.
+
+Every problem across the pool is reported together, naming the host, so a
+misconfigured pool takes one fix rather than one run per host. Path checks need
+a shell and so apply to ssh endpoints; a `context:` host is skipped. Set
+`SFLOW_SKIP_DOCKER_PREFLIGHT=1` to bypass the host-touching checks.
+
+### Reuse your `~/.ssh/config`
+
+`address` may be an **ssh alias**, and that is usually the least duplication.
+Given:
+
+```
+Host dgx-a
+  HostName 10.0.0.11
+  User ubuntu
+  Port 2222
+  IdentityFile ~/.ssh/lab
+  ProxyJump bastion
+```
+
+`address: dgx-a` is enough. The Docker endpoint becomes `ssh://dgx-a` and the
+local ssh client applies the user, port, key and jump host itself — sflow
+deliberately has no fields for those, so there is only one place to change them.
+
+Peers, however, cannot resolve an alias from inside a container on another
+machine. sflow does not read your `~/.ssh/config` to guess one: the alias is
+used verbatim as the rendezvous address. **Set `rendezvous_address` whenever the
+alias is not something peers can dial** — that is what the field is for, and it
+is also what you want for a bastion-internal name or a separate fast fabric.
+
+Override either side only when they genuinely differ:
+
+| Field | Overrides | Use when |
+|-------|-----------|----------|
+| `docker_host` | the derived `ssh://` endpoint | a jump host, or a non-SSH endpoint (`tcp://…`) |
+| `context` | the endpoint, via a Docker context | you already manage the daemon as a context |
+| `rendezvous_address` | the peer-facing address | peers talk over a separate fabric (e.g. InfiniBand) |
+
+Each entry also accepts `gpus_per_node` and — per host — `mounts` and
+`extra_args` (merged with the backend-wide values).
+
+:::note `ip_address` is deprecated
+It is accepted as an alias for `rendezvous_address`. Prefer `address` alone when
+the machine is reachable at one address; sflow rejects an `address` and an
+`ip_address` that disagree rather than silently picking one.
+:::
 
 With `resources.nodes.count: 2`, one sflow task launches one container on each
-assigned Docker host and waits for all containers. The task fails if any host
-container exits non-zero. Environment values are forwarded with `-e KEY` so
-secrets are not embedded in the Docker command line.
+assigned Docker host, supervised from the driver. Each member receives
+`SFLOW_TASK_NODE_INDEX`, `SFLOW_TASK_NUM_NODES` and `SFLOW_LEADER_ADDRESS`
+(rank 0 is the first assigned host). The first member to exit non-zero fails the
+task with its exit code and its peers are stopped immediately. A multi-node task
+whose hosts cannot all supply a rendezvous address is rejected at planning time,
+rather than hanging in rendezvous. Environment values are forwarded with `-e KEY`
+so secrets are not embedded in the Docker command line. `--dry-run --verbose`
+prints the whole fan-out — one `docker run` per member, labelled with its rank
+and the daemon it targets — so a misplaced member is visible before anything
+launches.
 
-**Local daemon vs. remote host — implicit mounts differ:**
+**Local daemon vs. declared hosts — implicit mounts differ:**
 
 | Target | Implicit workspace/output mounts | Node filtering (`include_nodes`/`exclude_nodes`) |
 |--------|----------------------------------|--------------------------------------------------|
-| Local daemon (no `docker_host`/`context`) | Auto-mounted at the same paths (`auto_mount_runtime_dirs`, on by default) | Ignored with a warning (single machine) |
-| Remote (`docker_host` / `context`) | **Not** added — a controller-local path may not exist remotely | Applied against the declared `hosts:` pool |
+| Local daemon (no `hosts:`) | Auto-mounted at the same paths (`auto_mount_runtime_dirs`, on by default) | Ignored with a warning (single machine) |
+| Any declared `hosts:` entry | **Not** added — a controller-local path may not exist on that machine | Applied against the declared `hosts:` pool |
 
-If a task needs workspace or output files on remote Docker hosts, provide explicit
+Local `fs://` / `file://` artifacts are bind-mounted at the same path into every
+container, on both rows, as `srun` has always done — so a task can read
+`${{ artifacts.X.path }}` without repeating the path under `mounts:`. On a
+declared host that path must exist on that machine; pre-flight checks it. If a
+task needs workspace or output files on remote Docker hosts, provide explicit
 backend, host, or operator mounts that point at a shared filesystem available at
 the same path on every Docker host.
 
@@ -480,8 +583,8 @@ For each task it:
 
 The rest of this section is the detail behind each of these steps.
 
-:::note Kubernetes support status (v0.3.0)
-Kubernetes support is new in v0.3.0. Current scope and limitations:
+:::note Kubernetes support status
+Current scope and limitations:
 
 - **Interactive `sflow run` only.** Every task runs as a plain pod managed by the live
   `sflow run` driver process (it reserves nodes, streams logs, and collects outputs via
@@ -903,6 +1006,8 @@ workflow:
 | `forward_env_prefixes` | `[]` | Extra env-namespace prefixes forwarded to remote ranks (additive to sflow's defaults). |
 | `omp_num_threads` | `8` | Injected `OMP_NUM_THREADS` per rank; `null`/`0` keeps the image default. |
 | `cpu_bind` | `core` | Per-rank CPU binding, injected **only when several ranks share a pod** (and never over a binding the recipe already passes). `core` gives each rank an isolated core slice — the tightest cap on the LLVM/OpenMP thread pools that `OMP_NUM_THREADS` alone doesn't reach; `numa` binds one rank per NUMA domain (only partitions when the cpuset spans >1 domain); `none` injects nothing. |
+| `worker_setup_timeout_seconds` | `900` | Operator route: how long a worker's per-node setup (image apt-install, weight staging) may take before its readiness probe (tcpSocket on the ssh port, which `WaitForWorkersReady` gates on) reaps it. Raise it for a large first-time weight download over slow storage. Accepts a `${{ }}` expression. |
+| `launcher_discovery_timeout` | `600` | Operator route: seconds to wait for the mpi-operator controller to create the launcher pod after the MPIJob CR is applied. Raise it in lockstep with `worker_setup_timeout_seconds`. Accepts a `${{ }}` expression. |
 | `cpu_bind_cores_per_rank` | `8` | Upper bound on the cores bound to each rank under `cpu_bind: core`. The launch-time value is `min(cores-in-cpuset / ranks-per-pod, this)`, so a small cpuset still gets a smaller slice, and if the cpuset has fewer cores than ranks the binding is skipped rather than failing the launch. Raise it for CPU-heavy workloads; `0` = no cap. |
 
 > The `pods` route consumes the curated/override operator fields (base render); the

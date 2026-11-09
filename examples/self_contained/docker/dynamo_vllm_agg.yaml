@@ -1,0 +1,619 @@
+version: "0.1"
+
+# One aggregated vLLM worker at TP16, spanning two Docker hosts.
+#
+# This is the other shape of multi-node: the disagg recipe next door
+# (dynamo_vllm_disagg.yaml) runs two INDEPENDENT workers, one per machine, that
+# talk over NIXL. Here a SINGLE worker is larger than one machine, so its 16
+# ranks have to act as one process group across the two hosts. vLLM does that
+# with Ray, so the task's job is to stand a Ray cluster up across the containers
+# first and only then launch vLLM on the leader.
+#
+# The Slurm equivalent is examples/self_contained/slurm/dynamo_vllm_agg.yaml. It
+# uses SLURM_NODEID and srun's own fan-out; here sflow starts one container per
+# assigned host and injects SFLOW_TASK_NODE_INDEX / SFLOW_TASK_NUM_NODES /
+# SFLOW_LEADER_ADDRESS to the same effect.
+#
+# Prerequisites:
+#   - ssh from this driver to each `address` already works (sflow pre-flights it)
+#   - NVIDIA Container Toolkit on both hosts, GPUS_PER_NODE GPUs on each
+#   - the MODEL_CACHE directory exists on both hosts (it is the mount source):
+#         ssh <host> mkdir -p /opt/sflow/models
+#     or point the artifact at one you already have:
+#         sflow run -f ... -a MODEL_CACHE=fs:///data/models
+#   - the hosts can reach each other on the etcd/NATS/frontend and Ray ports
+#     (6379 plus the ephemeral range Ray negotiates)
+#
+# ON WHICH NIC -- read this before judging the numbers. A TP group does an
+# all-reduce across all 16 ranks at EVERY layer of EVERY forward pass, so half of
+# those all-reduces cross the wire. That is far more traffic, and far more
+# latency-sensitive, than the once-per-request KV hop in the disagg recipe next
+# door. On a 1GbE management NIC this recipe will run, and it will be unusably
+# slow; it wants NVLink-class or at minimum 100GbE/IB between the hosts.
+#
+# sflow uses a host's `address` for BOTH the ssh docker endpoint and the address
+# peers dial. If the fast fabric is a different interface, name it separately and
+# leave ssh on the management NIC:
+#
+#     hosts:
+#       - name: node-0
+#         address: 10.0.0.11               # ssh / docker control plane
+#         rendezvous_address: 192.168.1.11  # what Ray and NCCL use
+#
+# Also set NCCL_SOCKET_IFNAME (below) to that interface, or NCCL may pick the
+# slow one on its own.
+
+variables:
+  # --- Host pool -----------------------------------------------------------
+  HOST_0_ADDRESS:
+    description: "Leader: etcd/NATS/frontend, Ray head, and vLLM rank 0"
+    value: 10.0.0.11
+  HOST_1_ADDRESS:
+    description: "Ray worker contributing the other half of the TP group"
+    value: 10.0.0.12
+  SSH_USER:
+    description: "SSH login for both hosts; omit to use your own"
+    value: ""
+  GPUS_PER_NODE:
+    type: integer
+    value: 8
+
+  # --- Model ---------------------------------------------------------------
+  SERVED_MODEL_NAME:
+    value: Qwen3-0.6B
+  HF_MODEL_ID:
+    description: "Hugging Face repo to fetch on first run"
+    value: Qwen/Qwen3-0.6B
+  MODEL_PATH:
+    description: "This model inside the cache; same path on the host and in the container"
+    value: ${{ artifacts.MODEL_CACHE.path }}/${{ variables.SERVED_MODEL_NAME }}
+
+  # --- Aggregated worker ---------------------------------------------------
+  # TP16 on a 0.6B model exercises the cross-host wiring, not the hardware; the
+  # point of the recipe is that the group spans machines. Swap HF_MODEL_ID and
+  # SERVED_MODEL_NAME for a model that genuinely needs 16 GPUs and nothing else
+  # here changes.
+  NUM_AGG_WORKERS:
+    description: >-
+      Independent aggregated workers. Each one is a whole TP x PP group with its
+      own Ray cluster, and registers itself with etcd so the frontend
+      load-balances across them. The pool just has to hold
+      NUM_AGG_WORKERS x AGG_GPUS_PER_WORKER GPUs: the workers are placed by GPU
+      availability, so they pack onto a host when they fit and span hosts when
+      they do not. Two 8-GPU hosts take one TP16 worker, or four TP4 ones.
+    type: integer
+    value: 1
+  AGG_TP_SIZE:
+    description: "Tensor parallel size; > GPUS_PER_NODE is what makes this multi-node"
+    type: integer
+    value: 16
+  AGG_PP_SIZE:
+    description: "Pipeline parallel size"
+    type: integer
+    value: 1
+  AGG_GPUS_PER_WORKER:
+    description: >-
+      GPUs one worker needs: every TP rank in every PP stage. Derived, and the
+      single definition of the worker's size -- the GPU request, the host count
+      and the Ray readiness gate all read it, so they cannot disagree.
+    type: integer
+    value: ${{ variables.AGG_TP_SIZE * variables.AGG_PP_SIZE }}
+  AGG_BATCH_SIZE:
+    type: integer
+    value: 128
+  AGG_MAX_NUM_TOKENS:
+    type: integer
+    value: 4096
+
+  KV_CACHE_DTYPE:
+    description: "auto matches the checkpoint; Qwen3-0.6B is not an FP8 build"
+    value: auto
+
+  NIXL_SIDE_CHANNEL_PORT:
+    description: >-
+      Base port for vLLM's NIXL side channel. Dynamo's vLLM worker starts the
+      NIXL KV connector even in aggregated mode, and its default port is fixed,
+      so co-located workers must be offset off this base.
+    type: integer
+    value: 5600
+  RAY_PORT:
+    description: "Ray GCS port on the leader; must be free on that host"
+    type: integer
+    value: 6379
+  RAY_READY_TIMEOUT_S:
+    description: "How long a follower waits for the full GPU count to register"
+    type: integer
+    value: 600
+
+  EXTRA_FRONTEND_ARGS:
+    value: ""
+  EXTRA_AGG_ARGS:
+    value: ""
+
+  DATA_IFNAME:
+    description: >-
+      Interface NCCL and Gloo bind to. Leave empty to derive it from the node's
+      own address at runtime, which is what you want when the hosts differ or
+      when rendezvous_address points at a separate fabric.
+    value: ""
+
+  # --- Benchmark -----------------------------------------------------------
+  # Small on purpose: this recipe is here to prove the cross-host TP group forms
+  # and serves, and every decoded token pays a cross-wire all-reduce. Raise these
+  # once the hosts are on a fast fabric.
+  ISL:
+    value: 1024
+  OSL:
+    value: 256
+  MULTI_ROUND:
+    value: 2
+  CONCURRENCY:
+    value: 16
+    domain: [16]
+
+  # --- Images --------------------------------------------------------------
+  DYNAMO_IMAGE:
+    value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+  DOWNLOADER_IMAGE:
+    description: "Fetching weights needs a network and pip, not CUDA -- keep it thin"
+    value: python:3.12-slim
+  AIPERF_IMAGE:
+    value: python:3.12-slim
+
+artifacts:
+  # The model CACHE directory, shared by every model this pool ever downloads.
+  # sflow bind-mounts an `fs://` artifact into every container at the same path
+  # inside and out, so mounting the parent means a second model costs nothing.
+  #
+  #     sflow run -f ... -a MODEL_CACHE=fs:///data/models
+  - name: MODEL_CACHE
+    uri: fs:///opt/sflow/models
+
+backends:
+  - name: docker_cluster
+    type: docker
+    default: true
+    # No backend `image:`: every task below names an operator with its own, and
+    # every host has an ssh address, so nothing would use it.
+    hosts:
+      # `address` is the machine: sflow derives the ssh:// docker endpoint AND
+      # the address peers dial. An ssh alias works too.
+      - name: node-0
+        address: ${{ variables.HOST_0_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+      - name: node-1
+        address: ${{ variables.HOST_1_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: dynamo
+    type: docker_run
+    image: ${{ variables.DYNAMO_IMAGE }}
+    extra_args:
+      # The image ships an entrypoint; sflow launches through bash.
+      - --entrypoint=
+      # Docker builds no cross-host network. Host networking is what lets the
+      # Ray head, etcd, NATS and the frontend be reached from the other machine
+      # at the addresses declared above.
+      - --network=host
+      - --ipc=host
+      # Ray and NCCL both want real shared memory; the 64MB default stalls them.
+      - --shm-size=16g
+
+  - name: downloader
+    type: docker_run
+    # Deliberately NOT the dynamo image. Downloading weights needs a network and
+    # `pip`, not CUDA, so a ~50MB image starts in a second instead of pulling
+    # tens of gigabytes on a host that has not run the workload before.
+    #
+    # It also avoids a trap in the dynamo image: it sets HOME=/home/dynamo, whose
+    # stock ~/.bash_logout ends in `[ -x /usr/bin/clear_console ] && clear_console -q`.
+    # sflow runs scripts through `bash -lc`, a LOGIN shell, which executes that
+    # file on exit; clear_console fails without a TTY, and under `set -e` bash
+    # then exits 1 -- so an `exit 0` would be reported as a task failure. This
+    # image has no ~/.bash_logout.
+    image: ${{ variables.DOWNLOADER_IMAGE }}
+    extra_args:
+      - --network=host
+      # This image already runs as root, which is what writing into the cache
+      # needs: docker auto-creates a missing bind source as root, so a cache
+      # directory left by an earlier run is not writable by anyone else. Only
+      # this task writes; the server below just reads, and downloaded files are
+      # world-readable.
+
+  - name: aiperf
+    type: docker_run
+    image: ${{ variables.AIPERF_IMAGE }}
+    extra_args:
+      - --network=host
+
+workflow:
+  name: dynamo_vllm_agg_tp16_docker
+  variables:
+    HEAD_NODE_IP:
+      value: "${{ backends.docker_cluster.nodes[0].ip_address }}"
+    ETCD_ENDPOINTS:
+      value: "${{ backends.docker_cluster.nodes[0].ip_address }}:2379"
+    NATS_SERVER:
+      value: "nats://${{ backends.docker_cluster.nodes[0].ip_address }}:4222"
+
+  tasks:
+    - name: download_model
+      operator: downloader
+      # A pure NODE claim, the mirror of agg_server's pure GPU claim: this task
+      # wants no GPUs, it wants to exist once per machine. Every host in the
+      # pool, because the workers are placed by GPU availability and may land
+      # anywhere -- the hosts share no filesystem, and every rank loads its own
+      # shard from local disk, so a copy missing on one machine fails the run.
+      resources:
+        nodes:
+          count: ${{ backends.docker_cluster.nodes | length }}
+      script:
+        - set -euo pipefail
+        - echo "node=${SFLOW_TASK_NODE_INDEX}/${SFLOW_TASK_NUM_NODES} host=$(hostname) user=$(id -un 2>/dev/null || id -u)"
+        # Fail here, naming the directory, rather than 40 lines into a
+        # huggingface traceback: this is the usual cause of a failed first run.
+        - >
+          if ! touch "$(dirname "${MODEL_PATH}")/.sflow-write-probe" 2>/dev/null; then
+            echo "ERROR: $(dirname "${MODEL_PATH}") is not writable as $(id -u):$(id -g)." >&2
+            echo "Fix the ownership on this host, or point -a MODEL_CACHE at a writable directory." >&2
+            exit 1
+          fi
+        - rm -f "$(dirname "${MODEL_PATH}")/.sflow-write-probe"
+        # Idempotent: the cache dir is a host path bound into the container, so a
+        # model fetched by an earlier run is still here and is reused.
+        #
+        # `if/else` rather than an early `exit 0`: see the ~/.bash_logout note on
+        # the downloader operator above.
+        #
+        # snapshot_download rather than the CLI: the entry point was renamed
+        # (huggingface-cli -> hf) across versions, the Python API was not.
+        - >
+          if [ -s "${MODEL_PATH}/config.json" ]; then
+            echo "Model already present at ${MODEL_PATH}; skipping download"
+          else
+            echo "Downloading ${HF_MODEL_ID} to ${MODEL_PATH}..."
+            pip install -q "huggingface_hub>=0.34"
+            python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${HF_MODEL_ID}', local_dir='${MODEL_PATH}')"
+            test -s "${MODEL_PATH}/config.json"
+            echo "Model ready at ${MODEL_PATH}"
+          fi
+
+    - name: nats_server
+      operator: dynamo
+      script:
+        - nats-server -js
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+          timeout: 300
+          interval: 2
+
+    - name: etcd_server
+      operator: dynamo
+      script:
+        - >
+          etcd --listen-client-urls "http://0.0.0.0:2379"
+          --advertise-client-urls "http://${HEAD_NODE_IP}:2379"
+          --listen-peer-urls "http://0.0.0.0:2380"
+          --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:2380"
+          --initial-cluster "default=http://${HEAD_NODE_IP}:2380"
+          --data-dir /tmp/etcd
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+          timeout: 300
+          interval: 2
+
+    - name: frontend_server
+      operator: dynamo
+      script:
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
+      probes:
+        readiness:
+          tcp_port:
+            port: 8000
+          timeout: 300
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: agg_server
+      operator: dynamo
+      # A pure GPU claim: say how many GPUs the worker needs -- TP x PP, because
+      # every pipeline stage needs its own full TP group -- and let the planner
+      # decide how many machines that takes. It spans hosts when the count
+      # exceeds one machine (TP16 over 8-GPU hosts becomes 2 containers of 8)
+      # and packs several workers onto one host when it does not (four TP4
+      # workers fit on two 8-GPU hosts, two apiece).
+      #
+      # Deliberately NOT also declaring `nodes:`. Claiming both over-constrains
+      # the placement: a `nodes.count` gives replica i the node slice starting
+      # at i, so four single-node workers would demand four machines and fail on
+      # a two-machine pool that has GPUs to spare.
+      resources:
+        gpus:
+          count: ${{ variables.AGG_GPUS_PER_WORKER }}
+      # Each replica is a separate TP group with its own Ray cluster and its own
+      # set of hosts; they serve together behind the one frontend.
+      replicas:
+        count: ${{ variables.NUM_AGG_WORKERS }}
+        policy: "parallel"
+      script:
+        - set -euo pipefail
+        - set -x
+        # sflow injects these per container, but ONLY for a task that spans
+        # hosts -- they are the docker equivalent of SLURM_NODEID / SLURM_NNODES
+        # / the first node's address, and a single-container task has no peers to
+        # describe. A worker small enough to fit on one machine (TP x PP <=
+        # GPUS_PER_NODE) is exactly that case, so default them rather than die on
+        # `set -u`: it is node 0 of 1, and its own leader.
+        # SFLOW_TASK_ASSIGNED_NODE_IPS is set for any placed task, so MY_IP works
+        # either way.
+        - export SFLOW_TASK_NODE_INDEX="${SFLOW_TASK_NODE_INDEX:-0}"
+        - export SFLOW_TASK_NUM_NODES="${SFLOW_TASK_NUM_NODES:-1}"
+        - export MY_IP=$(echo "${SFLOW_TASK_ASSIGNED_NODE_IPS}" | cut -d',' -f$((SFLOW_TASK_NODE_INDEX + 1)))
+        - export SFLOW_LEADER_ADDRESS="${SFLOW_LEADER_ADDRESS:-${MY_IP}}"
+        - >
+          echo "sflow wiring: node=${SFLOW_TASK_NODE_INDEX}/${SFLOW_TASK_NUM_NODES}
+          leader=${SFLOW_LEADER_ADDRESS} host=$(hostname) cuda=${CUDA_VISIBLE_DEVICES:-unset}"
+        # WITHOUT THIS THE TP GROUP CANNOT FORM. Gloo (torch.distributed's CPU
+        # rendezvous, used before NCCL takes over) falls back to resolving the
+        # container's hostname when GLOO_SOCKET_IFNAME is unset -- and on Debian
+        # and Ubuntu `getent hosts $(hostname)` answers 127.0.1.1. Every rank
+        # then publishes a loopback address, and ranks on the other host get
+        #     connectFullMesh ... remote=[127.0.1.1]:... SO_ERROR: Connection refused
+        # Binding both Gloo and NCCL to the interface that actually holds MY_IP
+        # is the fix, and it also guarantees they use the same link the pool was
+        # declared on rather than picking one at random.
+        #
+        # Derived with python3 because the dynamo image ships no `ip`/iproute2.
+        - |
+          if [ -n "${DATA_IFNAME}" ]; then
+            export NET_IF="${DATA_IFNAME}"
+          else
+            export NET_IF=$(python3 -c '
+          import os, socket, fcntl, struct
+          want = os.environ["MY_IP"]
+          for name in sorted(os.listdir("/sys/class/net")):
+              sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              try:
+                  addr = fcntl.ioctl(sock.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))
+              except OSError:
+                  continue
+              if socket.inet_ntoa(addr[20:24]) == want:
+                  print(name)
+                  break
+          ')
+          fi
+          if [ -z "${NET_IF}" ]; then
+            echo "ERROR: no interface on this host holds ${MY_IP}; set -s DATA_IFNAME=<iface>." >&2
+            exit 1
+          fi
+          echo "Binding NCCL/Gloo to ${NET_IF} (${MY_IP})"
+        - export GLOO_SOCKET_IFNAME="${NET_IF}"
+        - export NCCL_SOCKET_IFNAME="${NET_IF}"
+        # vLLM's own address discovery has the same 127.0.1.1 failure mode.
+        - export VLLM_HOST_IP="${MY_IP}"
+        # So does NIXL's. Dynamo's vLLM worker starts the NIXL KV connector even
+        # in AGGREGATED mode -- nothing here transfers KV between workers, but
+        # the listener is created regardless, and left alone it binds the
+        # hostname-loopback address on a fixed port:
+        #     ZMQError: Address already in use (addr='tcp://127.0.1.1:5600')
+        # Two failures in one line. The address is the same Debian/Ubuntu
+        # `getent hosts $(hostname)` -> 127.0.1.1 trap the NCCL/Gloo note above
+        # describes, and the port is fixed, so of two workers sharing a host one
+        # bound it and the other died. Bind the real interface, and offset the
+        # port per replica so co-located workers cannot collide.
+        - export VLLM_NIXL_SIDE_CHANNEL_HOST="${MY_IP}"
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$(( ${{ variables.NIXL_SIDE_CHANNEL_PORT }} + ${SFLOW_REPLICA_INDEX:-0} ))
+        # The executor must see every GPU the container was given. sflow carves
+        # the device set at the docker level (`--gpus device=...`), so the
+        # container already sees only its own -- but CUDA_VISIBLE_DEVICES is ALSO
+        # set inside, and both Ray and vLLM read it to size the node. Clearing it
+        # hands them the whole carved set rather than re-filtering an
+        # already-filtered one.
+        - unset CUDA_VISIBLE_DEVICES
+        # `|` (literal), not `>` (folded), for every multi-line block below: a
+        # folded scalar joins same-indent lines with a space, which silently
+        # welds `done` onto the next statement.
+        # RAY IS ONLY FOR CROSSING MACHINES. A worker whose TP x PP fits on one
+        # host needs no cluster at all -- vLLM's `mp` backend forks its ranks
+        # locally, starts faster, and has nothing to rendezvous. Standing a Ray
+        # cluster up anyway is not merely wasteful: several single-host workers
+        # share a machine, these containers run with --network=host, and a Ray
+        # head binds a spread of FIXED ports (GCS 6379, dashboard 8265, client
+        # server 10001, and a worker range from 10002). Offsetting them per
+        # replica just walks the second head's ports into the first's worker
+        # range -- which is exactly how this failed:
+        #     ValueError: Ray component worker_ports is trying to use a port
+        #     number 10002 that is used by other components
+        # So: one host, no Ray.
+        - |
+          if [ "${SFLOW_TASK_NUM_NODES}" -gt 1 ]; then
+            export EXEC_BACKEND=ray
+          else
+            export EXEC_BACKEND=mp
+            echo "Single-host worker (${AGG_GPUS_PER_WORKER} GPUs): using vLLM's mp backend, no Ray cluster."
+          fi
+        # One Ray cluster per replica. Only reached when the worker spans hosts,
+        # and a replica that spans hosts occupies whole machines, so no two heads
+        # land together and the default ports are free.
+        - |
+          if [ "${EXEC_BACKEND}" = "ray" ]; then
+            if [ "${SFLOW_TASK_NODE_INDEX}" = "0" ]; then
+              ray start --head --node-ip-address="${MY_IP}" --port=${{ variables.RAY_PORT }}
+            else
+              # The head may still be pulling/starting; Ray's own retry window is
+              # short, so widen it rather than racing the leader.
+              export RAY_worker_register_timeout_seconds=1200
+              ray start --address "${SFLOW_LEADER_ADDRESS}:${{ variables.RAY_PORT }}" --node-ip-address="${MY_IP}"
+            fi
+          fi
+        # Every member blocks here until the whole worker has registered, so the
+        # leader never launches vLLM against a half-formed cluster and fails with
+        # a confusing placement-group error instead of waiting.
+        #
+        # Count AGG_GPUS_PER_WORKER, not AGG_TP_SIZE: the cluster has to hold
+        # every rank of every pipeline stage. They are equal only while
+        # AGG_PP_SIZE is 1, so keying this on TP alone would wait for half a
+        # PP2 cluster and then time out having never been satisfiable.
+        - |
+          if [ "${EXEC_BACKEND}" = "ray" ]; then
+            deadline=$(( $(date +%s) + ${{ variables.RAY_READY_TIMEOUT_S }} ))
+            ready=0
+            while [ "$(date +%s)" -lt "${deadline}" ]; do
+              if ray status 2>/dev/null | grep -q "${AGG_GPUS_PER_WORKER}\.0 GPU"; then
+                ready=1
+                break
+              fi
+              echo "Waiting for ${AGG_GPUS_PER_WORKER} GPUs to register with Ray..."
+              sleep 5
+            done
+            if [ "${ready}" != "1" ]; then
+              echo "ERROR: only these resources registered within ${{ variables.RAY_READY_TIMEOUT_S }}s:" >&2
+              ray status >&2 || true
+              exit 1
+            fi
+            echo "Ray cluster is complete: ${AGG_GPUS_PER_WORKER} GPUs across ${SFLOW_TASK_NUM_NODES} hosts."
+          fi
+        # Node 0 runs vLLM. On a multi-host worker the other members just hold
+        # their GPUs in the Ray cluster -- `sleep infinity` is not idle padding,
+        # the container must outlive the leader's startup, and sflow tears every
+        # member down as soon as the task ends. A single-host worker is node 0 of
+        # 1, so it simply falls through and serves.
+        - |
+          if [ "${SFLOW_TASK_NODE_INDEX}" = "0" ]; then
+            python3 -m dynamo.vllm --model ${{ variables.MODEL_PATH }} \
+              --served-model-name ${{ variables.SERVED_MODEL_NAME }} \
+              --tensor-parallel-size ${AGG_TP_SIZE} \
+              --pipeline-parallel-size ${AGG_PP_SIZE} \
+              --distributed-executor-backend ${EXEC_BACKEND} \
+              --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }} \
+              --no-enable-prefix-caching \
+              --block-size 128 \
+              --max-num-seqs ${AGG_BATCH_SIZE} \
+              --max-num-batched-tokens ${AGG_MAX_NUM_TOKENS} ${EXTRA_AGG_ARGS}
+          else
+            echo "node ${SFLOW_TASK_NODE_INDEX} is a Ray worker; vLLM is launched on the leader."
+            sleep infinity
+          fi
+      depends_on:
+        - frontend_server
+        - download_model
+      probes:
+        # BOTH must trigger -- sflow holds a task RUNNING until every readiness
+        # probe has fired. They answer different questions, and neither alone is
+        # enough:
+        #
+        # * http_post asks "can the frontend serve a request end to end". True as
+        #   soon as the FIRST worker registers, so on its own every replica flips
+        #   ready at once and the benchmark starts against a fleet still loading.
+        # * log_watch asks "is THIS worker serving", from its own log. True per
+        #   replica, but it cannot see whether the frontend has discovered it --
+        #   etcd registration is published, not instant.
+        #
+        # Together: this worker is up AND the frontend is routing. Since
+        # `depends_on` on a replicated task waits for every replica, that gates
+        # the benchmark on all workers being ready, with no warm-up loop needed
+        # in the benchmark itself.
+        readiness:
+          - http_post:
+              url: "http://${{ variables.HEAD_NODE_IP }}:8000/v1/chat/completions"
+              headers:
+                Content-Type: "application/json"
+              body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+            timeout: 1800
+            each_check_timeout: 20
+            interval: 20
+          # Dynamo logs this once per worker, after "init engine (profile, create
+          # kv cache, warmup model) took ...". The alternation tracks the two
+          # spellings dynamo has used; if an upgrade renames it again, the Probe
+          # Traces section of sflow_summary.log shows what the probe last saw.
+          # "this worker has published its generate endpoint", i.e. it can now
+          # take requests. NOT the model-registration line the modular recipes
+          # watch for: a `--is-prefill-worker` registers no servable model, so
+          # that line never appears in a prefill log and the probe would hang
+          # until timeout. This one is logged once by EVERY role -- verified
+          # across 4 prefill and 4 decode workers -- and in a decode worker it
+          # comes AFTER model registration, so it is the stricter of the two.
+          - log_watch:
+              match_pattern: "request plane server endpoint=generate transport"
+              match_count: 1
+            timeout: 1800
+            interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: benchmark
+      operator: aiperf
+      resources:
+        nodes:
+          indices: [0]
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        # On a declared host pool this container runs on node 0, where the
+        # controller's output dir is not mounted: --artifact-dir lands inside
+        # the container and goes with it. The results table aiperf prints is
+        # captured in this task's log, and that is the record of the run.
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ variables.MODEL_PATH }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      # Sample the worker's hardware, not the benchmark client's, over the
+      # benchmark window -- and because the worker spans two hosts, this reports
+      # both of them.
+      monitor:
+        resources:
+          used_by_tasks:
+            - agg_server
+        report:
+          enabled: true
+      depends_on:
+        - agg_server
+        - frontend_server

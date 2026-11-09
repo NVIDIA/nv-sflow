@@ -477,10 +477,13 @@ if [ -n "$RUN_PREFLIGHT" ]; then
             grep -F -- 'Dry-run complete: docker_hello_world' \"$DOCKER_HELLO_DRYRUN_LOG\""
     run_check "dry-run docker_multi_node assigns remote Docker hosts and GPUs" \
         bash -c "sflow run \"$EXAMPLES_DIR/self_contained/docker/multi_node.yaml\" --dry-run --verbose > \"$DOCKER_MULTI_DRYRUN_LOG\" 2>&1 && \
-            grep -F -- \"nodes=['dgx-a', 'dgx-b']\" \"$DOCKER_MULTI_DRYRUN_LOG\" && \
+            grep -F -- \"nodes=['node-0', 'node-1']\" \"$DOCKER_MULTI_DRYRUN_LOG\" && \
             grep -F -- 'operator: docker_run' \"$DOCKER_MULTI_DRYRUN_LOG\" && \
             grep -F -- 'CUDA_VISIBLE_DEVICES: 0' \"$DOCKER_MULTI_DRYRUN_LOG\" && \
-            grep -E -- 'gpus: device=0[^0-9,]' \"$DOCKER_MULTI_DRYRUN_LOG\""
+            grep -E -- 'gpus: device=0[^0-9,]' \"$DOCKER_MULTI_DRYRUN_LOG\" && \
+            grep -F -- 'fan-out: 2 commands' \"$DOCKER_MULTI_DRYRUN_LOG\" && \
+            grep -F -- 'node node-0 (rank 0) -> ssh://' \"$DOCKER_MULTI_DRYRUN_LOG\" && \
+            grep -F -- 'node node-1 (rank 1) -> ssh://' \"$DOCKER_MULTI_DRYRUN_LOG\""
     # The gpu_reservation samples are internal-only: they are excluded from the
     # public sync, and sample_test.sh refuses to package them. Guard rather than
     # assume, so a checkout without them SKIPs here instead of failing four checks
@@ -677,11 +680,12 @@ dynamo_trtllm on k8s|k8s||backends/k8s.yaml workloads/dynamo_common.yaml workloa
 dynamo_trtllm on k8s_mpi|k8s_mpi|-s NUM_NODES=2 -s SERVER_GPUS=16|backends/k8s_mpi.yaml workloads/dynamo_common.yaml workloads/dynamo_trtllm.yaml benchmark.yaml
 dynamo_vllm on k8s|k8s||backends/k8s.yaml workloads/dynamo_common.yaml workloads/dynamo_vllm.yaml benchmark.yaml
 dynamo_vllm on slurm|srun||backends/slurm.yaml workloads/dynamo_common.yaml workloads/dynamo_vllm.yaml benchmark.yaml
+dynamo_trtllm on slurm_mpi|srun||backends/slurm_mpi.yaml workloads/dynamo_common.yaml workloads/dynamo_trtllm.yaml benchmark.yaml
 dynamo_sglang on k8s|k8s||backends/k8s.yaml workloads/dynamo_common.yaml workloads/dynamo_sglang.yaml benchmark.yaml
 dynamo_sglang on slurm|srun||backends/slurm.yaml workloads/dynamo_common.yaml workloads/dynamo_sglang.yaml benchmark.yaml
 trtllm_serve on k8s|k8s||backends/k8s.yaml workloads/trtllm_serve.yaml benchmark.yaml
 trtllm_serve on k8s_mpi|k8s_mpi|-s NUM_NODES=2 -s SERVER_GPUS=16|backends/k8s_mpi.yaml workloads/trtllm_serve.yaml benchmark.yaml
-trtllm_serve on slurm|srun||backends/slurm.yaml workloads/trtllm_serve.yaml benchmark.yaml
+trtllm_serve on slurm_mpi|srun||backends/slurm_mpi.yaml workloads/trtllm_serve.yaml benchmark.yaml
 vllm_serve on k8s|k8s||backends/k8s.yaml workloads/vllm_serve.yaml benchmark.yaml
 vllm_serve on slurm|srun||backends/slurm.yaml workloads/vllm_serve.yaml benchmark.yaml
 sglang_serve on k8s|k8s||backends/k8s.yaml workloads/sglang_serve.yaml benchmark.yaml
@@ -2605,7 +2609,7 @@ PY"
     # auto-detected from the running sflow env (and not an editable install). --
     BATCH_AUTOVERSION_SCRIPT="$BATCH_AUTOVERSION_DIR/auto_version.sh"
     if [ -z "$IS_REAL_SUBMIT" ] && [ -f "$BATCH_AUTOVERSION_SCRIPT" ]; then
-        if grep -Fq '"$VIRTUAL_ENV/bin/uv" pip install '\''sflow @ git+https://github.com/NVIDIA/nv-sflow.git@' "$BATCH_AUTOVERSION_SCRIPT" \
+        if grep -Fq '"$VIRTUAL_ENV/bin/uv" pip install git+https://github.com/NVIDIA/nv-sflow.git@' "$BATCH_AUTOVERSION_SCRIPT" \
             && grep -Fq -- '--prerelease=allow' "$BATCH_AUTOVERSION_SCRIPT" \
             && ! grep -Fq 'pip install -e ".[dev]"' "$BATCH_AUTOVERSION_SCRIPT"; then
             echo "  PASS: batch default install version auto-detected a git ref from the running env"
@@ -3089,6 +3093,13 @@ if [ -n "$SUBMIT" ] && [ -z "$PREFLIGHT_ONLY" ]; then
     if [ -n "$E2E_EXCLUDE_NODES" ]; then
         E2E_BATCH_EXTRA_ARGS+=("-e" "--exclude=$E2E_EXCLUDE_NODES")
     fi
+    # Raw Slurm allocation flags the cluster needs and sflow does not add on its own,
+    # one -e per whitespace-separated flag. GRES partitions (prometheusq: GB300 with
+    # gpu:4 declared) hand a step NO GPU unless the allocation asks, so they need
+    # "--gpus-per-node=4"; gamoraq/ptyche declare no GRES and need nothing.
+    for _flag in ${SLURM_E2E_SALLOC_EXTRA:-}; do
+        E2E_BATCH_EXTRA_ARGS+=("-e" "$_flag")
+    done
     if [ -n "${COLON_SCRIPT_FIXTURE:-}" ] && [ -f "$COLON_SCRIPT_FIXTURE" ]; then
         SFLOW_COLON_SCRIPT_FIXTURE="$COLON_SCRIPT_FIXTURE" \
         SFLOW_COLON_SCRIPT_OUTPUT_DIR="$REPO_DIR/sflow_output/colon_in_task_script" \

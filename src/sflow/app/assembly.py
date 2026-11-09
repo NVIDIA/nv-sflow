@@ -35,7 +35,7 @@ from sflow.app.backend_lifecycle import (
     seed_placeholder_backend_allocations as _seed_placeholder_backend_allocations_impl,
 )
 from sflow.app.resource_planner import plan_resource_placements
-from sflow.app.run_support import backends_execute_offhost
+from sflow.app.run_support import backends_execute_offhost, backends_inject_inline_content
 from sflow.app.task_context import (
     build_task_info,
     build_task_expression_hint,
@@ -835,9 +835,12 @@ def build_task_graph(
             )
         return instances
 
-    def _resolve_int(task_name: str, *, field: str, value: Any) -> int:
+    def _resolve_int(
+        task_name: str, *, field: str, value: Any, rctx: dict | None = None
+    ) -> int:
+        rctx = ctx if rctx is None else rctx
         resolved = (
-            resolver.resolve(value, ctx) if resolver.has_expression(value) else value
+            resolver.resolve(value, rctx) if resolver.has_expression(value) else value
         )
         resolved = _maybe_int(resolved)
         if isinstance(resolved, bool):
@@ -865,24 +868,18 @@ def build_task_graph(
         )
 
     def _http_probe_references_vars(p_conf: Any, var_names: list[str]) -> bool:
-        """Check if an HTTP probe config's URL or body references any of the given variable names.
+        """Check if any field of an HTTP probe config references any of the given variable names.
 
-        Inspects the raw (pre-resolved) strings so per-replica variable references like
+        Inspects the raw (pre-resolved) config — URL, body, and timing fields such as
+        ``timeout`` — so per-replica variable references like
         ``${{ variables.CONCURRENCY }}``, ``${CONCURRENCY}``, or ``${SFLOW_REPLICA_INDEX}``
         are detected.  ``var_names`` should include both user-declared sweep variables and
         reserved replica variables (e.g. ``SFLOW_REPLICA_INDEX``).
         """
-        if not var_names:
+        if not var_names or not _is_http_probe_config(p_conf):
             return False
-        texts: list[str] = []
-        http = getattr(p_conf, "http_get", None) or getattr(p_conf, "http_post", None)
-        if http is None:
-            return False
-        texts.append(str(http.url))
-        body = getattr(http, "body", None)
-        if body is not None:
-            texts.append(str(body))
-        combined = " ".join(texts)
+        # Field names are in the dump too; a sweep var named like one only costs the sharing.
+        combined = str(p_conf.model_dump(exclude_none=True))
         return any(var_name in combined for var_name in var_names)
 
     def _probe_config_list(p_conf: Any) -> list[Any]:
@@ -897,29 +894,42 @@ def build_task_graph(
         p_type: ProbeType,
         default_host: str | None = None,
         default_transport: ProbeTransport | None = None,
+        rctx: dict,
     ):
         """
         Convert a ProbeConfig (from config schema) into a concrete Probe instance.
+
+        ``rctx`` is the replica's resolve context, so sweep variables resolve per replica.
         """
-        delay = int(getattr(p_conf, "delay", 0))
+        delay = _resolve_int(
+            task_name,
+            field=f"probes.{p_type}.delay",
+            value=getattr(p_conf, "delay", 0),
+            rctx=rctx,
+        )
         timeout = _resolve_int(
-            task_name, field=f"probes.{p_type}.timeout", value=p_conf.timeout
+            task_name, field=f"probes.{p_type}.timeout", value=p_conf.timeout, rctx=rctx
         )
         each_check_timeout = _resolve_int(
-            task_name, field=f"probes.{p_type}.each_check_timeout", value=p_conf.each_check_timeout
+            task_name,
+            field=f"probes.{p_type}.each_check_timeout",
+            value=p_conf.each_check_timeout,
+            rctx=rctx,
         )
         interval = _resolve_int(
-            task_name, field=f"probes.{p_type}.interval", value=p_conf.interval
+            task_name, field=f"probes.{p_type}.interval", value=p_conf.interval, rctx=rctx
         )
         success_threshold = _resolve_int(
             task_name,
             field=f"probes.{p_type}.success_threshold",
             value=p_conf.success_threshold,
+            rctx=rctx,
         )
         failure_threshold = _resolve_int(
             task_name,
             field=f"probes.{p_type}.failure_threshold",
             value=p_conf.failure_threshold,
+            rctx=rctx,
         )
 
         if delay < 0:
@@ -954,11 +964,14 @@ def build_task_graph(
         if getattr(p_conf, "tcp_port", None) is not None:
             tcp = p_conf.tcp_port
             port = _resolve_int(
-                task_name, field=f"probes.{p_type}.tcp_port.port", value=tcp.port
+                task_name,
+                field=f"probes.{p_type}.tcp_port.port",
+                value=tcp.port,
+                rctx=rctx,
             )
             host_raw = getattr(tcp, "host", None)
             host = (
-                str(resolver.resolve(host_raw, ctx))
+                str(resolver.resolve(host_raw, rctx))
                 if host_raw is not None and resolver.has_expression(host_raw)
                 else (
                     str(host_raw)
@@ -979,7 +992,7 @@ def build_task_graph(
             http = p_conf.http_get
             url_raw = str(http.url)
             url = (
-                str(resolver.resolve(url_raw, ctx))
+                str(resolver.resolve(url_raw, rctx))
                 if resolver.has_expression(url_raw)
                 else url_raw
             )
@@ -994,13 +1007,13 @@ def build_task_graph(
             http = p_conf.http_post
             url_raw = str(http.url)
             url = (
-                str(resolver.resolve(url_raw, ctx))
+                str(resolver.resolve(url_raw, rctx))
                 if resolver.has_expression(url_raw)
                 else url_raw
             )
             body_raw = getattr(http, "body", None)
             body = (
-                str(resolver.resolve(body_raw, ctx))
+                str(resolver.resolve(body_raw, rctx))
                 if body_raw is not None and resolver.has_expression(body_raw)
                 else body_raw
             )
@@ -1019,6 +1032,7 @@ def build_task_graph(
                     task_name,
                     field=f"probes.{p_type}.log_watch.match_count",
                     value=lw.match_count,
+                    rctx=rctx,
                 )
                 if getattr(lw, "match_count", None) is not None
                 else 1
@@ -1133,12 +1147,40 @@ def build_task_graph(
         replica_policy_by_base=replica_policy_by_base,
     )
 
+    def _replica_ctx(node_name: str) -> dict:
+        """Return ``ctx`` with this replica's sweep values overlaid (``ctx`` if none).
+
+        Built on each call so it sees keys added to ``ctx`` later (e.g. ``task``).
+        """
+        replica_env = replica_envs.get(node_name, {})
+        if not replica_env:
+            return ctx
+        from sflow.core.variable import VariableValue
+
+        replica_ctx = dict(ctx)
+        replica_variables = dict(ctx.get("variables", {}))
+        for k, v in replica_env.items():
+            if k == "SFLOW_REPLICA_INDEX":
+                continue
+            existing = replica_variables.get(k)
+            domain = existing.domain if isinstance(existing, VariableValue) else None
+            wrapped = VariableValue(_maybe_int(v), domain=domain)
+            replica_variables[k] = wrapped
+            replica_ctx[k] = wrapped
+        replica_ctx["variables"] = replica_variables
+        return replica_ctx
+
     # Resolve service ports up front so services_by_node (below) can use them.
     ports_by_node: dict[str, list[TaskPort]] = {}
     for node_name, placement in resource_placements.items():
         resolved_ports: list[TaskPort] = []
         for p in list(getattr(placement.task_config, "ports", None) or []):
-            port_val = _resolve_int(node_name, field="ports.port", value=p.port)
+            port_val = _resolve_int(
+                node_name,
+                field="ports.port",
+                value=p.port,
+                rctx=_replica_ctx(node_name),
+            )
             if not (1 <= port_val <= 65535):
                 raise ValueError(
                     f"Task '{node_name}' ports.port must be in 1..65535, got {port_val}"
@@ -1250,25 +1292,7 @@ def build_task_graph(
         # ${{ variables.CONCURRENCY }} resolves to the replica-specific value.
         # Note: `${{ task.* }}` expressions are resolved in a second pass after
         # all tasks are built (see below).
-        replica_env = replica_envs.get(node_name, {})
-        if replica_env:
-            from sflow.core.variable import VariableValue
-
-            replica_ctx = dict(ctx)
-            replica_variables = dict(ctx.get("variables", {}))
-            for k, v in replica_env.items():
-                if k == "SFLOW_REPLICA_INDEX":
-                    continue
-                existing = replica_variables.get(k)
-                domain = existing.domain if isinstance(existing, VariableValue) else None
-                typed_v = _maybe_int(v)
-                wrapped = VariableValue(typed_v, domain=domain)
-                replica_variables[k] = wrapped
-                replica_ctx[k] = wrapped
-            replica_ctx["variables"] = replica_variables
-            resolve_ctx = replica_ctx
-        else:
-            resolve_ctx = ctx
+        resolve_ctx = _replica_ctx(node_name)
 
         script = [
             str(resolver.resolve(line, resolve_ctx))
@@ -1319,8 +1343,16 @@ def build_task_graph(
                     else:
                         node_ips.append("")  # Fallback if node not found
             task.envs["SFLOW_TASK_ASSIGNED_NODE_NAMES"] = ",".join(node_names)
+            task.envs["SFLOW_TASK_NUM_NODES"] = str(len(node_names))
             if has_runtime_node_addresses:
                 task.envs["SFLOW_TASK_ASSIGNED_NODE_IPS"] = ",".join(node_ips)
+                # Rank 0's address -- the peer a multi-node launcher dials to
+                # rendezvous. Single-node tasks get none: there is no peer, and
+                # the only address on offer would be a loopback that every
+                # container resolves to itself, turning a missing-variable
+                # failure into a hang.
+                if len(node_ips) > 1 and node_ips[0]:
+                    task.envs["SFLOW_LEADER_ADDRESS"] = node_ips[0]
         # Outputs (MVP): store parse patterns to be evaluated from the task log after completion.
         if getattr(t_conf, "outputs", None):
             for o in list(t_conf.outputs or []):
@@ -1464,6 +1496,7 @@ def build_task_graph(
                                 p_type=ProbeType.READINESS,
                                 default_host=default_probe_host,
                                 default_transport=probe_transport,
+                                rctx=resolve_ctx,
                             )
                         )
             failure_probe_configs = _probe_config_list(t_conf.probes.failure)
@@ -1496,6 +1529,7 @@ def build_task_graph(
                                 p_type=ProbeType.FAILURE,
                                 default_host=default_probe_host,
                                 default_transport=probe_transport,
+                                rctx=resolve_ctx,
                             )
                         )
         task.backend_name = backend.name
@@ -1504,15 +1538,22 @@ def build_task_graph(
         # Optional retry policy (REQ-3.6).
         if t_conf.retries:
             retry_count = _resolve_int(
-                node_name, field="retries.count", value=t_conf.retries.count
+                node_name,
+                field="retries.count",
+                value=t_conf.retries.count,
+                rctx=resolve_ctx,
             )
             retry_interval = _resolve_int(
-                node_name, field="retries.interval", value=t_conf.retries.interval
+                node_name,
+                field="retries.interval",
+                value=t_conf.retries.interval,
+                rctx=resolve_ctx,
             )
             retry_backoff = _resolve_int(
                 node_name,
                 field="retries.backoff",
                 value=t_conf.retries.backoff,
+                rctx=resolve_ctx,
             )
             if retry_count < 0:
                 raise ValueError(
@@ -1711,6 +1752,16 @@ async def build_state(
             defer_contexts=frozenset({"artifacts"}),
         )
 
+        if backends_execute_offhost(state) and not backends_inject_inline_content(state):
+            # A Docker host pool bind-mounts the artifact's path on every remote
+            # machine, but inline content is only ever written on this one.
+            inline = [a.name for a in config.artifacts or [] if a.content is not None]
+            if inline:
+                _logger.warning(
+                    f"Inline artifact(s) {', '.join(inline)} are written on this "
+                    "machine only; the Docker hosts will see an empty mount there."
+                )
+
         # Resolve artifacts after allocation so they can reference backend info
         # (e.g. ${{ backends.<name>.nodes[0].ip_address }} when runtime addresses exist).
         # Off-host backends (e.g. Kubernetes) execute remotely, so local fs:// paths
@@ -1721,13 +1772,17 @@ async def build_state(
             workspace_dir=workspace_dir,
             output_dir=output_dir,
             materialize=allocate,
-            remote_filesystem=backends_execute_offhost(state),
-            # Scoped to the fs:// existence check ONLY. It must not ride on
-            # `remote_filesystem`, which additionally means "an off-host backend
-            # injects file:// inline content into the pod" -- on slurm/local there is
-            # no such backend, so an absolute file:// inline artifact would stop being
-            # written on the controller and never be written anywhere.
-            skip_fs_existence_check=skip_artifact_check,
+            # "Someone else delivers file:// inline content", NOT merely "runs
+            # off-host". A Docker host pool is off-host with no way to inject
+            # content, so treating it like Kubernetes here left an absolute
+            # file:// inline artifact written nowhere at all -- and because this
+            # flag is global, it did that to the slurm tasks of a mixed workflow
+            # too.
+            remote_filesystem=backends_inject_inline_content(state),
+            # Scoped to the fs:// existence check ONLY, which is what every
+            # off-host backend needs: a local fs:// path describes the remote
+            # machine, so it must not be hard-validated or created here.
+            skip_fs_existence_check=skip_artifact_check or backends_execute_offhost(state),
         )
 
         # Top-level variables may defer references to backends.* and artifacts.*

@@ -114,8 +114,8 @@ variables:
     description: "AIPerf container image"
     value: python:3.12-slim
   DYNAMO_IMAGE:
-    description: "Dynamo TRTLLM container image"
-    value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+    description: "Dynamo vLLM container image (CUDA 13: 0.8.0's ptxas does not know GB300 sm_103)"
+    value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1-cuda13
 
   # Network device information, change per your cluster or comment out if not needed
   # NCCL_SOCKET_IFNAME:

@@ -1,0 +1,469 @@
+version: "0.1"
+
+# GLM-5.3-Flash (NVFP4) disaggregated prefill/decode on vLLM, on a Docker host pool.
+#
+# Structural twin of sglang_disagg_glm53.yaml: same checkpoint, same hosts, same
+# task DAG (prefill + decode -> router -> benchmark sweep), same monitor, same
+# aiperf invocation. ONLY the image and the three server/router commands differ,
+# so the two recipes measure the same thing on two engines.
+#
+#   sglang                                vLLM
+#   ────────────────────────────────────  ──────────────────────────────────────
+#   --disaggregation-mode prefill/decode  --kv-transfer-config kv_producer/kv_consumer
+#   --disaggregation-transfer-backend     the connector IS the transport (NixlConnector)
+#   --disaggregation-ib-device <list>     NIXL picks its own devices
+#   --disaggregation-bootstrap-port       VLLM_NIXL_SIDE_CHANNEL_PORT (env, not a flag)
+#   sglang_router.launch_router           examples/.../disagg_proxy_demo.py (in the image)
+#   --mem-fraction-static                 --gpu-memory-utilization
+#   --tp                                  --tensor-parallel-size
+#   --max-running-requests                --max-num-seqs
+#
+# HOW THE HANDOFF WORKS: the router sends each request to prefill with
+# max_tokens=1 to populate the KV cache, then replays it against decode, which
+# pulls that KV over NIXL. The router is therefore not a load balancer -- it is
+# what sequences the two halves, exactly like sglang's --pd-disaggregation.
+#
+# Prerequisites:
+#   - ssh from this driver to each `address` already works (sflow pre-flights it)
+#   - NVIDIA Container Toolkit on both hosts
+#   - the checkpoint exists on every host that may run a server, at the same path
+#     (it is the mount source; sflow bind-mounts it same-path-in-same-path-out)
+#   - the image is pulled on those hosts (~21.6GB) -- a cold pull outlasts the
+#     readiness timeout, so pre-pull it or re-enable the load_image task below:
+#         ssh <host> docker pull vllm/vllm-openai:glm53-flash-x86_64-cu130
+#
+# ON PLACEMENT: prefill and decode claim GPUs and nothing else, so the planner
+# decides where they land. On an 8-GPU host both fit on ONE machine (prefill
+# takes devices 0-3, decode 4-7) and the KV hop never leaves the box. To force
+# the cross-machine hop this recipe is named for, pin them:
+#     resources: {gpus: {count: N}, nodes: {indices: [0]}}   # and [1] for decode
+# Either way this recipe follows the placement rather than assuming it: the
+# router reads each server's address from `task.<name>.nodes[0].ip_address`, and
+# the server probes pair http_get with a log_watch on the server's own log.
+# Nothing here hardcodes nodes[1] for decode, which would name a machine that
+# may be running nothing.
+#
+# ON QUOTING: --kv-transfer-config and --model-loader-extra-config both take
+# JSON, and sflow runs task scripts through `bash -lc`. Written bare, bash strips
+# the double quotes and vLLM gets `{kv_connector:NixlConnector}` -- invalid JSON,
+# and the server dies in argument parsing before logging anything useful. Every
+# JSON value below carries single quotes INSIDE it for that reason.
+
+variables:
+  # ── Host pool ──────────────────────────────────────────────────────────────
+  HOST_0_ADDRESS:
+    description: "First pool machine; also runs the router and the benchmark"
+    value: 10.0.0.11
+  HOST_1_ADDRESS:
+    description: "Second pool machine"
+    value: 10.0.0.12
+  SSH_USER:
+    description: "SSH login for both hosts; leave empty to use your own"
+    value: ""
+
+  GPUS_PER_NODE:
+    description: "GPUs per host (used by sflow for GPU placement math)"
+    type: integer
+    value: 8
+
+  CTX_TP_SIZE:
+    description: "Prefill tensor parallel size"
+    type: integer
+    value: 4
+  GEN_TP_SIZE:
+    description: "Decode tensor parallel size"
+    type: integer
+    value: 4
+  DP_SIZE:
+    description: "Data parallel size, per server"
+    type: integer
+    value: 1
+
+  MEM_FRACTION_STATIC:
+    description: "vLLM's --gpu-memory-utilization; named to match the sglang twin"
+    value: "0.90"
+
+  CTX_MAX_RUNNING_REQUESTS:
+    description: "Prefill max concurrent sequences (--max-num-seqs)"
+    type: integer
+    value: 32
+  GEN_MAX_RUNNING_REQUESTS:
+    description: "Decode max concurrent sequences; the ceiling the sweep runs into"
+    type: integer
+    value: 32
+  MAX_PREFILL_TOKENS:
+    description: "Chunked-prefill chunk size (--max-num-batched-tokens)"
+    type: integer
+    value: 8192
+
+  KV_CACHE_DTYPE:
+    description: "fp8 KV cache, matching the NVFP4 checkpoint"
+    value: fp8
+
+  KERNEL_ARGS:
+    description: >
+      Expert-parallel MoE plus the weight filter, from the reference agg command.
+      Unlike the sglang twin there is no DSA backend to choose here: vLLM picks
+      its own attention kernels, so this recipe needs no sm120 workaround block.
+    value: "--enable-expert-parallel --enable-ep-weight-filter"
+
+  VLLM_LOADER_CONFIG:
+    description: "Multithreaded weight loading; JSON, so it must survive bash -lc"
+    value: "--model-loader-extra-config '{\"enable_multithread_load\": true, \"num_threads\": 128}'"
+
+  PREFILL_KV_CONFIG:
+    description: "Prefill produces KV for the decode side to pull over NIXL"
+    value: "--kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\"}'"
+  DECODE_KV_CONFIG:
+    description: "Decode consumes the KV the prefill side produced"
+    value: "--kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\"}'"
+
+  PD_ENV:
+    description: >
+      Env the vLLM GLM-5.3-Flash PD recipe requires on both sides
+      (recipes.vllm.ai/zai-org/GLM-5.3-Flash): DS conv-state and HND KV layouts
+      so NIXL can move the hybrid (mamba + MLA) state, and UCX on every NIC.
+    value: "export VLLM_SSM_CONV_STATE_LAYOUT=DS VLLM_KV_CACHE_LAYOUT=HND UCX_NET_DEVICES=all"
+
+  TRANSFORMERS_PIN:
+    description: "The image ships an older transformers than this checkpoint needs"
+    value: "transformers>=5.16.1"
+
+  ROUTER_SCRIPT:
+    description: "vLLM's own disagg proxy, shipped inside the image"
+    value: /vllm-workspace/examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py
+
+  # ── Benchmark ──────────────────────────────────────────────────────────────
+  ISL:
+    description: "Input sequence length"
+    value: 8192
+  OSL:
+    description: "Output sequence length"
+    value: 1024
+  MULTI_ROUND:
+    description: "Number of benchmark rounds"
+    value: 8
+  CONCURRENCY:
+    description: "Concurrency. Values above GEN_MAX_RUNNING_REQUESTS queue rather than add load"
+    value: 8
+    domain: [8, 16, 32]
+
+  SERVED_MODEL_NAME:
+    description: "Name the API serves under; router and aiperf must use the same string"
+    value: nvidia/GLM-5.3-Flash-NVFP4
+
+  # ── Ports ──────────────────────────────────────────────────────────────────
+  # Containers use --network=host, so these are host ports.
+  PREFILL_PORT:
+    description: "Prefill server port"
+    type: integer
+    value: 8100
+  DECODE_PORT:
+    description: "Decode server port"
+    type: integer
+    value: 8200
+  ROUTER_PORT:
+    description: "Disagg router port; this is what the benchmark talks to"
+    type: integer
+    value: 8000
+  PREFILL_NIXL_PORT:
+    description: "NIXL side channel for the prefill server"
+    type: integer
+    value: 5557
+  DECODE_NIXL_PORT:
+    description: "NIXL side channel for the decode server"
+    type: integer
+    value: 6557
+
+  VLLM_IMAGE:
+    description: >
+      Community vLLM fork with the SM120 NoPE sparse-MLA fix (vllm PR #55277,
+      unmerged). Upstream vllm/vllm-openai:glm53-flash-x86_64-cu130 dies on
+      RTX PRO 6000 with "pe_dim must be 64 for fp8_ds_mla" (vllm#53963);
+      switch back to it on sm100 hosts.
+    value: cstechdev/vllm:glm53-flash-nope-sm120-cu130-20260826-r1
+
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    description: "GLM-5.3-Flash NVFP4 weights, present on every host at this path"
+    uri: fs:///var/data0/sandbox/rogliu/nvidia-GLM-5.3-Flash-NVFP4
+
+backends:
+  - name: docker_cluster
+    type: docker
+    default: true
+    image: ${{ variables.VLLM_IMAGE }}
+    hosts:
+      - name: node-0
+        address: ${{ variables.HOST_0_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+      - name: node-1
+        address: ${{ variables.HOST_1_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+        gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: vllm
+    type: docker_run
+    image: ${{ variables.VLLM_IMAGE }}
+    extra_args:
+      # vllm-openai's entrypoint is `vllm serve`; sflow launches through bash,
+      # so it has to be cleared or the script becomes arguments to it.
+      - --entrypoint=
+      # Docker builds no cross-host network. Host networking is what makes the
+      # server ports and the NIXL side channels reachable from the other machine.
+      - --network=host
+      - --ipc=host
+      - --shm-size=32g
+      # NIXL moves KV over RDMA. Drop these two on a pool without InfiniBand --
+      # a --device that does not exist fails the container at start.
+      - --device=/dev/infiniband
+      - --cap-add=IPC_LOCK
+      # Registering pinned GPU memory for RDMA needs the lock limit lifted; the
+      # default 64KB silently caps what NIXL can register.
+      - --ulimit
+      - memlock=-1:-1
+
+workflow:
+  name: vllm_glm53f_disagg_docker
+
+  variables:
+    # Only the router is pinned, so only its address can be written down here.
+    # The servers claim GPUs and nothing else, so the planner decides where they
+    # land -- their addresses are read back from the placement with
+    # `${{ task.<name>.nodes[0].ip_address }}`, which resolves in SCRIPTS only
+    # and so appears inline in the router command rather than as a variable.
+    # The http_get probes need an address, and probe config cannot use
+    # `task.<name>` (scripts only) -- so this assumes both servers sit on
+    # node-0, which is where GPU-only placement puts them on an 8-GPU host.
+    # If you pin decode to node-1, give it its own probe address.
+    SERVER_PROBE_IP:
+      description: "Host the servers are probed on; see the note above"
+      value: "${{ backends.docker_cluster.nodes[0].ip_address }}"
+    ROUTER_NODE_IP:
+      description: "Router host; pinned to node 0, so this one can be named up front"
+      value: "${{ backends.docker_cluster.nodes[0].ip_address }}"
+
+  tasks:
+    # ── 0. Pull/warm the image on every host ──────────────────────────────────
+    # Disabled to match the sglang twin. Re-enable when a host has not run this
+    # image before: the `docker run` that prints the line is what pulls it, and
+    # a cold ~21.6GB pull otherwise happens inside a server's readiness timeout.
+    # - name: load_image
+    #   operator: vllm
+    #   resources:
+    #     nodes:
+    #       count: 2
+    #   script:
+    #     - echo "Image loaded on $(hostname)"
+    #   probes:
+    #     readiness:
+    #       log_watch:
+    #         match_pattern: "Image loaded"
+    #         match_count: 2
+    #       timeout: 3600
+    #       interval: 2
+
+    # ── 1. Prefill server ─────────────────────────────────────────────────────
+    - name: prefill_server
+      operator: vllm
+      resources:
+        gpus:
+          count: ${{ variables.CTX_TP_SIZE }}
+      script:
+        - set -x
+        - pip install -U "${{ variables.TRANSFORMERS_PIN }}"
+        # The decode side dials this for the KV pull, so it must be the host's
+        # real IP, not a container-local one. A single-node task's assigned list
+        # holds exactly the node it landed on.
+        - export VLLM_NIXL_SIDE_CHANNEL_HOST=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=${{ variables.PREFILL_NIXL_PORT }}
+        - ${{ variables.PD_ENV }}
+        - >
+          vllm serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --host 0.0.0.0
+          --port ${{ variables.PREFILL_PORT }}
+          --enforce-eager
+          --no-disable-hybrid-kv-cache-manager
+          --tensor-parallel-size ${{ variables.CTX_TP_SIZE }}
+          --data-parallel-size ${{ variables.DP_SIZE }}
+          ${{ variables.KERNEL_ARGS }}
+          --reasoning-parser glm45
+          --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }}
+          ${{ variables.VLLM_LOADER_CONFIG }}
+          ${{ variables.PREFILL_KV_CONFIG }}
+          --max-num-batched-tokens ${{ variables.MAX_PREFILL_TOKENS }}
+          --enable-chunked-prefill
+          --max-num-seqs ${{ variables.CTX_MAX_RUNNING_REQUESTS }}
+          --gpu-memory-utilization ${{ variables.MEM_FRACTION_STATIC }}
+      probes:
+        readiness:
+          # BOTH must fire -- sflow holds the task RUNNING until every
+          # readiness probe has. http_get proves the engine answers from
+          # the driver's side; log_watch proves THIS server finished
+          # startup, and is the half that does not care where it landed.
+          - http_get:
+              url: "http://${{ variables.SERVER_PROBE_IP }}:${{ variables.PREFILL_PORT }}/health"
+            timeout: 1800
+            interval: 10
+          # vLLM logs its route table once the engine is up and the API
+          # server is bound; verified present in this image's source.
+          - log_watch:
+              match_pattern: "Available routes are:"
+              match_count: 1
+            timeout: 1800
+            interval: 10
+        failure:
+          # vLLM logs this and leaves the process alive, so without it the run
+          # waits out the full readiness timeout on an already-dead engine.
+          log_watch:
+            match_pattern: "Engine core initialization failed"
+
+    # ── 2. Decode server ──────────────────────────────────────────────────────
+    - name: decode_server
+      operator: vllm
+      resources:
+        gpus:
+          count: ${{ variables.GEN_TP_SIZE }}
+      script:
+        - set -x
+        # - sleep 3600  # TEMP: park decode to isolate prefill bring-up
+        - pip install -U "${{ variables.TRANSFORMERS_PIN }}"
+        - export VLLM_NIXL_SIDE_CHANNEL_HOST=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=${{ variables.DECODE_NIXL_PORT }}
+        - ${{ variables.PD_ENV }}
+        - >
+          vllm serve ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --host 0.0.0.0
+          --port ${{ variables.DECODE_PORT }}
+          --no-disable-hybrid-kv-cache-manager
+          --tensor-parallel-size ${{ variables.GEN_TP_SIZE }}
+          --data-parallel-size ${{ variables.DP_SIZE }}
+          ${{ variables.KERNEL_ARGS }}
+          --reasoning-parser glm45
+          --kv-cache-dtype ${{ variables.KV_CACHE_DTYPE }}
+          ${{ variables.VLLM_LOADER_CONFIG }}
+          ${{ variables.DECODE_KV_CONFIG }}
+          --max-num-seqs ${{ variables.GEN_MAX_RUNNING_REQUESTS }}
+          --gpu-memory-utilization ${{ variables.MEM_FRACTION_STATIC }}
+      probes:
+        readiness:
+          # BOTH must fire -- sflow holds the task RUNNING until every
+          # readiness probe has. http_get proves the engine answers from
+          # the driver's side; log_watch proves THIS server finished
+          # startup, and is the half that does not care where it landed.
+          - http_get:
+              url: "http://${{ variables.SERVER_PROBE_IP }}:${{ variables.DECODE_PORT }}/health"
+            timeout: 1800
+            interval: 10
+          # vLLM logs its route table once the engine is up and the API
+          # server is bound; verified present in this image's source.
+          - log_watch:
+              match_pattern: "Available routes are:"
+              match_count: 1
+            timeout: 1800
+            interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Engine core initialization failed"
+
+    # ── 3. Disagg router (node 0, CPU only) ───────────────────────────────────
+    # vLLM's own XpYd proxy, shipped in the image -- the counterpart of sglang's
+    # `sglang_router.launch_router --pd-disaggregation`.
+    - name: router
+      operator: vllm
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - set -x
+        - >
+          python3 ${{ variables.ROUTER_SCRIPT }}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --prefill ${{ task.prefill_server.nodes[0].ip_address }}:${{ variables.PREFILL_PORT }}
+          --decode ${{ task.decode_server.nodes[0].ip_address }}:${{ variables.DECODE_PORT }}
+          --port ${{ variables.ROUTER_PORT }}
+      probes:
+        readiness:
+          # The proxy serves ONLY POST /v1/completions and
+          # /v1/chat/completions -- there is no GET route, so a GET would
+          # 405. Posting one token is also the stronger check: it proves the
+          # whole chain (router -> prefill -> KV over NIXL -> decode) works,
+          # not merely that a socket is open.
+          - http_post:
+              url: "http://${{ variables.ROUTER_NODE_IP }}:${{ variables.ROUTER_PORT }}/v1/chat/completions"
+              headers:
+                Content-Type: "application/json"
+              body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+            timeout: 600
+            each_check_timeout: 30
+            interval: 20
+          # The proxy logs `Instance: <host:port> could be added.` per backend
+          # it verifies, so two matches means it reached prefill AND decode.
+          - log_watch:
+              match_pattern: "could be added"
+              match_count: 2
+            timeout: 600
+            interval: 5
+      depends_on:
+        - prefill_server
+        - decode_server
+
+    # ── 4. aiperf load generation (node 0, CPU only) ──────────────────────────
+    # Points at the ROUTER: hitting prefill directly would measure a truncated
+    # one-token reply, and hitting decode directly would skip the KV handoff.
+    - name: benchmark
+      operator: vllm
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - set -x
+        - pip install --quiet aiperf==0.3.0
+        - export COLUMNS=200
+        - >
+          aiperf profile
+          --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.ROUTER_NODE_IP }}:${{ variables.ROUTER_PORT }}
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature:0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT_USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        # aiperf exits 0 even when every request failed, so a green task proves
+        # nothing on its own -- open the CSV before believing a number.
+        - echo "Benchmarking finished"
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
+      replicas:
+        variables:
+          - CONCURRENCY
+        policy: sequential
+      depends_on:
+        - router

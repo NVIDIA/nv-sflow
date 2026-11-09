@@ -5,6 +5,10 @@ sidebar_position: 7
 
 `resources` lets you constrain where a task runs (which nodes) and how many GPUs it should get.
 
+:::note
+YAML snippets on this page are fragments: add `workflow.name` (and any `variables:` they reference) before running them.
+:::
+
 ## GPUs: `CUDA_VISIBLE_DEVICES` slicing (local / Slurm / Docker)
 
 On the **local**, **slurm**, and **docker** backends sflow slices GPU indices per task and

@@ -27,7 +27,7 @@ sflow sample self_contained/local/dag --output my_workflow.yaml
 Two families ship with sflow:
 
 - **`self_contained/<backend>/<name>`** — one file, ready to run. Grouped below by backend.
-- **`modular/inference_x_v2`** — a composable recipe set (framework fragments + benchmarks + a CSV sweep). See [Modular inference recipe](#modular-inference-recipe-inference_x_v2).
+- **`modular/<set>`** — folders of composable fragments (`sflow compose` / `sflow batch --bulk-input`). See [Modular Samples](#modular-samples-folder-based).
 
 | Backend | `sflow sample <path>` | What it shows |
 |---------|-----------------------|---------------|
@@ -39,9 +39,14 @@ Two families ship with sflow:
 | local | `self_contained/local/storage_upload_all` | `upload_all:` — zip the whole run and upload |
 | local | `self_contained/local/monitor` | `monitor:` hardware telemetry (GPU/CPU/mem/net) |
 | docker | `self_contained/docker/hello_world` | Single container task via `docker_run` |
-| docker | `self_contained/docker/multi_node` | Multi-host Docker (`docker_host`/`context`) |
-| docker | `self_contained/docker/sglang_qwen3` | SGLang Qwen3 server + client in containers |
+| docker | `self_contained/docker/multi_node` | Two-host torchrun rendezvous smoke test: one container + one torchrun process per Docker host, proving node-index / leader-address wiring |
+| docker | `self_contained/docker/sglang_qwen3` | SGLang Qwen3-0.6B server + stdlib client + AIPerf, all in local containers |
 | docker | `self_contained/docker/gpu_monitor` | GPU monitor with a log-marker report `window:` — runs a stock CUDA `nbody` container as a deliberate idle/burst/idle square wave, so the lifecycle report and the windowed report visibly differ |
+| docker | `self_contained/docker/sglang_glm52` | GLM-5.2 (NVFP4) on SGLang, one remote Docker host: a TP8 server plus the InferenceX AgentX benchmark as a reference run invoked it |
+| docker | `self_contained/docker/sglang_disagg_glm53` | GLM-5.3-Flash disaggregated prefill/decode on a Docker host pool — pure SGLang (no Dynamo, no NATS/etcd), SGLang's built-in `disagg_router`, prefill and decode on different machines |
+| docker | `self_contained/docker/vllm_disagg_glm53` | GLM-5.3-Flash (NVFP4) disaggregated prefill/decode on vLLM — structural twin of `sglang_disagg_glm53` (same hosts, DAG, monitor, aiperf; only image and server commands differ) |
+| docker | `self_contained/docker/dynamo_vllm_agg` | One aggregated vLLM worker at TP16 spanning two Docker hosts (a single process group across machines) |
+| docker | `self_contained/docker/dynamo_vllm_disagg` | Cross-node prefill/decode disaggregation on a Docker host pool — prefill on one machine, decode on another, so the KV transfer over NIXL is a real network hop |
 | slurm | `self_contained/slurm/sglang_server_client` | Server + client on Slurm with readiness probes |
 | slurm | `self_contained/slurm/aiperf_template` | AIPerf benchmark template |
 | slurm | `self_contained/slurm/auto_replica` | Replica fan-out sized from a variable sweep |
@@ -52,10 +57,32 @@ Two families ship with sflow:
 | slurm | `self_contained/slurm/multi_backend` | One workflow spanning multiple backends |
 | slurm | `self_contained/slurm/trtllm_serve_disagg` | TRT-LLM disaggregated serving |
 | slurm | `self_contained/slurm/infmax_v1_ds_r1` | InfMax DeepSeek-R1 benchmark |
-| slurm | `self_contained/slurm/dynamo_{sglang,vllm,trtllm}_agg` | Dynamo aggregated inference (3 frameworks) |
-| slurm | `self_contained/slurm/dynamo_{sglang,vllm,trtllm}_disagg` | Dynamo prefill/decode disaggregated (3 frameworks) |
+| slurm | `self_contained/slurm/dynamo_sglang_agg` | Dynamo + SGLang aggregated serving |
+| slurm | `self_contained/slurm/dynamo_vllm_agg` | Dynamo + vLLM aggregated serving |
+| slurm | `self_contained/slurm/dynamo_trtllm_agg` | Dynamo + TensorRT-LLM aggregated serving |
+| slurm | `self_contained/slurm/dynamo_sglang_disagg` | Dynamo + SGLang prefill/decode disaggregated |
+| slurm | `self_contained/slurm/dynamo_vllm_disagg` | Dynamo + vLLM prefill/decode disaggregated |
+| slurm | `self_contained/slurm/dynamo_trtllm_disagg` | Dynamo + TensorRT-LLM prefill/decode disaggregated |
 | kubernetes | `self_contained/kubernetes/hello_world` | Single pod via the `k8s` operator |
-| kubernetes | `self_contained/kubernetes/dynamo_trtllm_disagg` | Multi-node MPI (`k8s_mpi`), RDMA, node reservation |
+| kubernetes | `self_contained/kubernetes/multinode` | Multi-node distributed training: one pod per reserved node (leader = index 0) via device-plugin GPU scheduling |
+| kubernetes | `self_contained/kubernetes/dynamo_sglang_agg` | Kubernetes port of the Slurm `dynamo_sglang_agg`: a single aggregated SGLang worker serves prefill and decode |
+| kubernetes | `self_contained/kubernetes/dynamo_sglang_disagg` | Kubernetes port of the Slurm `dynamo_sglang_disagg`: prefill/decode workers, KV cache transferred over NIXL by default |
+| kubernetes | `self_contained/kubernetes/dynamo_sglang_disagg_dsr1` | Same recipe with the KV transfer defaulting to mooncake over NVLink/MNNVL (NVL72 racks) |
+| kubernetes | `self_contained/kubernetes/dynamo_trtllm_agg` | Aggregated TRT-LLM + Dynamo; the worker runs on `k8s_mpi` so one recipe covers single-node and cross-node aggregation as one MPI world |
+| kubernetes | `self_contained/kubernetes/dynamo_trtllm_disagg` | Kubernetes port of the Slurm `dynamo_trtllm_disagg`: prefill/decode servers on `k8s_mpi`, device-plugin GPUs, node reservation |
+| kubernetes | `self_contained/kubernetes/dynamo_vllm_agg` | Aggregated companion of `dynamo_vllm_disagg`: one TP16 worker spanning 2 nodes as a Ray cluster |
+| kubernetes | `self_contained/kubernetes/dynamo_vllm_disagg` | Kubernetes port of the Slurm `dynamo_vllm_disagg`; model and JIT cache are `fs://` artifacts on PVCs, overridable at runtime |
+| kubernetes | `self_contained/kubernetes/trtllm_serve_agg` | Aggregated bare `trtllm-serve` (no NATS/etcd/frontend) on `k8s_mpi` |
+| kubernetes | `self_contained/kubernetes/trtllm_serve_disagg` | Disaggregated bare `trtllm-serve`: separate prefill and decode servers plus a `trtllm-serve disaggregated` router, no Dynamo infra |
+| kubernetes | `self_contained/kubernetes/qwen3_8b/dgx_dynamo_trtllm_agg` | Qwen3-8B FP8, Dynamo + TRT-LLM aggregated on a DGX-style 8-GPU node (TP=8 fits one node; no IMEX) |
+| kubernetes | `self_contained/kubernetes/qwen3_8b/dgx_dynamo_trtllm_disagg` | Qwen3-8B FP8, Dynamo + TRT-LLM disaggregated on DGX nodes (one 8-GPU node per worker; KV over UCX/InfiniBand) |
+| kubernetes | `self_contained/kubernetes/qwen3_8b/dgx_trtllm_serve` | Qwen3-8B FP8, bare `trtllm-serve` on a DGX-style 8-GPU node |
+| kubernetes | `self_contained/kubernetes/qwen3_8b/gb_dynamo_trtllm_agg` | Qwen3-8B FP8, Dynamo + TRT-LLM aggregated on a GB NVL72 rack (TP=8 spans two 4-GPU nodes over MNNVL via an IMEX `compute_domain`) |
+| kubernetes | `self_contained/kubernetes/qwen3_8b/gb_dynamo_trtllm_disagg` | Qwen3-8B FP8, Dynamo + TRT-LLM disaggregated on a GB NVL72 rack (each worker spans two 4-GPU nodes; KV over MNNVL) |
+| kubernetes | `self_contained/kubernetes/qwen3_8b/gb_trtllm_serve` | Qwen3-8B FP8, bare `trtllm-serve` on a GB NVL72 rack (TP=8 across two 4-GPU nodes via IMEX) |
+| modular | `modular/backend_agnostic` | Workload × backend composition: the same workload YAML runs on Slurm, Kubernetes, Kubernetes MPI or Docker via scattered merge + `required_by` |
+| modular | `modular/inference_x_v2` | Framework fragments + benchmarks + a CSV sweep (see [Modular inference recipe](#modular-inference-recipe-inference_x_v2)) |
+| modular | `modular/utils` | `set_up_dynamo.yaml` — idempotent Dynamo bootstrap fragment (`ai-dynamo` libs, `nats-server`, `etcd`) that folds itself into any Dynamo workflow via `required_by` |
 
 Run `sflow sample --list` for the live list (it annotates each sample with node/GPU needs).
 
@@ -169,6 +196,20 @@ and workflow-level `results.json` index.
 ```yaml
 version: "0.1"
 
+# This example demonstrates the consolidated `result` task entry.
+#
+# It covers two common ways to produce small structured task results:
+#   1. Parse metrics from the task log with regex patterns.
+#   2. Write JSON directly to $SFLOW_TASK_RESULT_FILE and let sflow normalize it.
+#
+# Run it locally:
+#   sflow run examples/self_contained/local/result_parsing.yaml
+#
+# Key output files:
+#   <run_dir>/benchmark_log/result.json
+#   <run_dir>/benchmark_file/result.json
+#   <run_dir>/results.json
+
 backends:
   - name: local
     type: local
@@ -177,21 +218,30 @@ backends:
 
 workflow:
   name: local_result_parsing
+
   tasks:
     - name: benchmark_log
       script:
+        # Block scalar keeps `: ` in echoed benchmark lines from being parsed
+        # as YAML mapping syntax.
         - |
+          echo "warming up"
           echo "TTFT: 40.0 ms"
           echo "TTFT: 42.5 ms"
           echo "tok/s: 123.0"
           echo "p99 latency: 88 ms"
       result:
-        ttft: 'TTFT:\s*([0-9.]+)\s*ms'      # last match wins -> 42.5
+        # Simple regex map: each regex is matched against the merged task log.
+        # The first capture group becomes the result value; the default
+        # aggregate is `last`, so ttft resolves to 42.5.
+        ttft: 'TTFT:\s*([0-9.]+)\s*ms'
         tps: 'tok/s:\s*([0-9.]+)'
         latency_p99: 'p99 latency:\s*([0-9.]+)\s*ms'
 
     - name: benchmark_file
       script:
+        # Tasks that already produce structured output can write a plain JSON
+        # object directly to $SFLOW_TASK_RESULT_FILE.
         - |
           echo '{"throughput": 999.5, "errors": 0}' > "$SFLOW_TASK_RESULT_FILE"
       result:
@@ -200,8 +250,31 @@ workflow:
     - name: verify
       depends_on: [benchmark_log, benchmark_file]
       script:
-        - test -f "$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_log/result.json"
-        - test -f "$SFLOW_WORKFLOW_RESULT_FILE"
+        - |
+          set -euo pipefail
+
+          log_result="$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_log/result.json"
+          file_result="$SFLOW_WORKFLOW_OUTPUT_DIR/benchmark_file/result.json"
+          index="$SFLOW_WORKFLOW_RESULT_FILE"
+
+          test -f "$log_result"
+          test -f "$file_result"
+          test -f "$index"
+
+          grep -q '"schema_version": "sflow.result.v1"' "$log_result"
+          grep -q '"ttft": 42.5' "$log_result"
+          grep -q '"tps": 123.0' "$log_result"
+          grep -q '"latency_p99": 88' "$log_result"
+
+          grep -q '"schema_version": "sflow.result.v1"' "$file_result"
+          grep -q '"throughput": 999.5' "$file_result"
+          grep -q '"errors": 0' "$file_result"
+
+          grep -q '"schema_version": "sflow.results.v1"' "$index"
+          grep -q '"benchmark_log"' "$index"
+          grep -q '"benchmark_file"' "$index"
+
+          printf 'RESULT_PARSING_SAMPLE_PASS\n' > "$SFLOW_TASK_OUTPUT_DIR/verify.txt"
 ```
 
 **Run it:**
@@ -236,7 +309,7 @@ sflow sample self_contained/local/storage_upload_all
 sflow run -f storage_upload_all.yaml
 ```
 
-> S3 uploads need the S3 extra: `pip install 'sflow[s3]'` (credentials come from the boto3 default chain).
+> S3 uploads need the S3 extra: `pip install 'nv-sflow[s3]'` (credentials come from the boto3 default chain).
 
 ---
 
@@ -249,7 +322,7 @@ sflow sample self_contained/local/monitor
 sflow run -f monitor.yaml
 ```
 
-> PNG charts need the monitor extra: `pip install 'sflow[monitor]'`.
+> PNG charts need the monitor extra: `pip install 'nv-sflow[monitor]'`.
 
 ---
 
@@ -326,18 +399,25 @@ Deploys an SGLang inference server with AIPerf benchmarking on Slurm.
 - Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - AIPerf benchmarking client
 - Readiness probes for service orchestration
+- Model path as an `fs://` artifact (`LOCAL_MODEL_PATH`), overridden with `-a` at run time
+
+Full file (`sflow sample self_contained/slurm/sglang_server_client`):
 
 ```yaml
 version: "0.1"
 
 variables:
-  # Slurm Configuration
+  # Variables has 2 ways of access, and can be overridden by --set flag in sflow batch / sflow run command
+  # 1. In YAML expressions: `${{ variables.NAME }}`, sflow will automatically resolve the expression and inject the value before the workflow is executed, it works across any fields in the yaml file, such as backends, operators, workflow, tasks, scripts, etc.
+  # 2. In task scripts (as env var): `${NAME}`, the variable can also be accessed as an environment variable in the task script
+  
+  # Slurm Configuration - These will be skipped if you use 'sflow batch -f sflow.yaml --submit' to launch the workflow and overwrite the variables in cli args
   SLURM_ACCOUNT:
     description: "SLURM account"
-    value: your_account
+    value: your_slurm_account
   SLURM_PARTITION:
     description: "SLURM partition"
-    value: your_partition
+    value: your_slurm_partition
   SLURM_TIMELIMIT:
     description: "SLURM time limit"
     value: 60
@@ -355,9 +435,6 @@ variables:
   SERVED_MODEL_NAME:
     description: "Served model name"
     value: Qwen3-0-6B-FP8
-  LOCAL_MODEL_PATH:
-    description: "Local model path"
-    value: /tmp/models/Qwen3-0.6B-FP8
   
   # SGLang Server Configuration
   NUM_SERVERS:
@@ -382,7 +459,7 @@ variables:
     value: 8
   CONCURRENCY:
     description: "Concurrency"
-    value: 32
+    value: 16
   
   # Container Images
   SGLANG_IMAGE:
@@ -391,6 +468,12 @@ variables:
   AIPERF_IMAGE:
     description: "AIPerf container image"
     value: python:3.12-slim
+
+# If you want to use a local model path, you can define a fs:// type artifact and reference it in the task scripts as `${{ artifacts.NAME.path }}`
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    description: "Qwen3-0.6B-FP8 model path"
+    uri: fs:///path/to/your/model 
 
 backends:
   - name: slurm_cluster
@@ -401,13 +484,17 @@ backends:
     partition: ${{ variables.SLURM_PARTITION }}
     account: ${{ variables.SLURM_ACCOUNT }}
     gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # In some cluster like Corewaeve / OCI, you may need to add --gpus-per-node=N directive to the sbatch / salloc command
+    # For GB200 / GB300 clusters, you may need to add --segment=N directive to make sure allocated nodes are in same network domain
+    # extra_args:
+    #   - "--gpus-per-node=${{ variables.GPUS_PER_NODE }}"
+    #   - "--segment=${{ variables.SLURM_NODES }}"
 
 operators:
   - name: sglang_runtime
     type: srun
     container_name: sglang_runtime
     container_writable: true
-    container_mount_home: false
     ntasks_per_node: 1
     mpi: pmix
     extra_args:
@@ -431,6 +518,7 @@ workflow:
     - name: load_image
       operator: 
         name: sglang_runtime
+        ntasks: ${{ variables.SLURM_NODES }}
         ntasks_per_node: 1
       script:
         - echo "Image Loaded"
@@ -438,26 +526,11 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Image Loaded"
+            match_pattern: "Image Loaded"
+            match_count: ${{ variables.SLURM_NODES }}
           timeout: 1200
           interval: 2
-
-    - name: install_aiperf
-      operator: 
-        name: aiperf
-        ntasks_per_node: 1
-      script:
-        - pip install aiperf==0.3.0
-        - hf download ${{ variables.HF_MODEL_NAME }} --local-dir ${{ variables.LOCAL_MODEL_PATH }}
-        - echo "AIPerf installed"
-        - sleep 3600
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "AIPerf installed"
-          timeout: 1200
-          interval: 2
-
+    
     - name: sglang_server
       operator: sglang_runtime
       replicas:
@@ -475,8 +548,6 @@ workflow:
           python -m sglang_router.launch_server --model ${{ variables.HF_MODEL_NAME }} 
           --host 0.0.0.0
           --port 8000
-          --fp8-gemm-backend flashinfer_trtllm
-          --moe-runner-backend flashinfer_trtllm
           --served-model-name ${{ variables.SERVED_MODEL_NAME }}
           --tensor-parallel-size ${{ variables.TP_SIZE }}
           --trust-remote-code
@@ -484,7 +555,7 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Workflow completed"
+            match_pattern: "Workflow completed"
       depends_on:
         - load_image
 
@@ -493,11 +564,13 @@ workflow:
         name: aiperf
         ntasks: 1
       script:
+        - pip install aiperf==0.3.0
         - set -x
+        - export COLUMNS=200
         - >
           aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
           --model ${{ variables.SERVED_MODEL_NAME }}
-          --tokenizer ${{ variables.LOCAL_MODEL_PATH }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
           --endpoint-type chat
           --endpoint /v1/chat/completions
           --streaming
@@ -509,19 +582,25 @@ workflow:
           --extra-inputs "max_tokens:${{ variables.OSL }}"
           --extra-inputs "min_tokens:${{ variables.OSL }}"
           --extra-inputs "ignore_eos:true"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
           --concurrency ${CONCURRENCY}
           --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
           --warmup-request-count ${CONCURRENCY}
           --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
           --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
           --ui simple
         - echo "Benchmarking finished"
       resources:
         nodes:
           indices: [0]
-      # Sample the SERVER's resources from this benchmark task (used_by_tasks),
-      # not the benchmark client's own node, so the report captures the server's
-      # GPU/CPU usage over the benchmark window.
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # server's resources (used_by_tasks), not the benchmark client's own node
+      # -- so the report captures the server's GPU/CPU usage over the benchmark
+      # window.
       monitor:
         resources:
           used_by_tasks:
@@ -530,7 +609,6 @@ workflow:
           enabled: true
       depends_on:
         - sglang_server
-        - install_aiperf
 ```
 
 **Run it:**
@@ -540,13 +618,14 @@ sflow sample self_contained/slurm/sglang_server_client
 
 # Validate configuration
 sflow run -f sglang_server_client.yaml \
-  --set SLURM_ACCOUNT=your_account \
-  --set SLURM_PARTITION=your_partition \
+  --set SLURM_ACCOUNT=ACCOUNT \
+  --set SLURM_PARTITION=PARTITION \
   --dry-run
 
 # Submit to Slurm
 sflow batch -f sglang_server_client.yaml \
-  -A your_account -p your_partition -N 1 -G 4 \
+  -a LOCAL_MODEL_PATH=fs:///path/to/model \
+  -A ACCOUNT -p PARTITION -N 1 -G 4 \
   --sbatch-path sglang_job.sh --submit
 ```
 
@@ -559,206 +638,165 @@ Deploys a disaggregated inference setup with separate prefill and decode servers
 **Features:**
 - Disaggregated prefill/decode architecture
 - NATS and etcd for service discovery
-- Configurable tensor parallelism
+- Configurable tensor parallelism (`*_GPUS_PER_WORKER` computed from TP × DP × PP sizes the srun `ntasks`/GPU count)
 - Sequential benchmark sweeps with variable domains
-- Retry policies for server reliability
+- HTTP readiness probes against the frontend, log-watch failure probes
 - File-type artifacts for dynamic configuration
 
+Excerpt — the `decode_server` task mirrors `prefill_server`; see `sflow sample self_contained/slurm/dynamo_trtllm_disagg` for the full file:
+
 ```yaml
-version: "0.1"
-
-variables:
-  # Slurm Configuration
-  SLURM_ACCOUNT:
-    description: "SLURM account"
-    value: your_account
-  SLURM_PARTITION:
-    description: "SLURM partition"
-    value: your_partition
-  SLURM_TIMELIMIT:
-    description: "SLURM time limit"
-    value: 120
-  GPUS_PER_NODE:
-    description: "GPUs per node"
-    value: 4
-  SLURM_NODES:
-    description: "Number of nodes"
-    value: 1
-
-  # Model Configuration
-  SERVED_MODEL_NAME:
-    description: "Served model name"
-    value: Qwen3-0-6B-FP8
-  MODEL_NAME:
-    description: "Model path"
-    value: Qwen/Qwen3-0.6B-FP8
-  LOCAL_MODEL_PATH:
-    description: "Local model path"
-    value: /tmp/models/Qwen3-0.6B-FP8
-
-  # Prefill Server Configuration
-  NUM_CTX_SERVERS:
-    description: "Number of context/prefill servers"
-    value: 1
-  CTX_TP_SIZE:
-    description: "Context tensor parallel size"
-    value: 2
-
-  # Decode Server Configuration
-  NUM_GEN_SERVERS:
-    description: "Number of generation/decode servers"
-    value: 1
-  GEN_TP_SIZE:
-    description: "Generation tensor parallel size"
-    value: 2
-
-  # Benchmark Configuration with Domain Sweep
   CONCURRENCY:
     description: "Concurrency"
-    value: 64
-    domain: [64, 128]  # Will create sequential benchmark runs
+    value: 50
+    domain: [50, 100]
   
   # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
   DYNAMO_IMAGE:
     description: "Dynamo TRTLLM container image"
-    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.8.0
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0
+
+# ... (12 lines omitted)
 
 artifacts:
-  # File-type artifacts are generated by sflow with dynamic content
-  - name: PREFILL_CONFIG
-    uri: file://prefill_config.yaml
-    content: |
-      max_batch_size: 128
-      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
-      # ... additional configuration
+  # file type artifacts will be generated by sflow with the content defined in this yaml file, accessible as `${{ artifacts.NAME.path }}` in task scripts
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
 
-  - name: DECODE_CONFIG
-    uri: file://decode_config.yaml
-    content: |
-      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
-      # ... additional configuration
-
-backends:
-  - name: slurm_cluster
-    type: slurm
-    default: true
-    time: ${{ variables.SLURM_TIMELIMIT }}
-    nodes: ${{ variables.SLURM_NODES }}
-    partition: ${{ variables.SLURM_PARTITION }}
-    account: ${{ variables.SLURM_ACCOUNT }}
-    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+# ... (59 lines omitted)
 
 operators:
-  - name: dynamo_trtllm
+  - name: dynamo
     type: srun
-    container_name: dynamo_trtllm
+    container_image: ${{ variables.DYNAMO_IMAGE }}
     container_writable: true
-    container_mount_home: false
     mpi: pmix
-    extra_args:
-      - --container-image=${{ variables.DYNAMO_IMAGE }}
+  - name: aiperf
+    type: srun
+    container_image: ${{ variables.AIPERF_IMAGE }}
+    container_writable: true
+    mpi: pmix
 
-workflow:
-  name: dynamo
-  timeout: 115m
-  variables:
-    HEAD_NODE_IP:
-      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
-    ETCD_ENDPOINTS:
-      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
-    NATS_SERVER:
-      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
-
-  tasks:
-    - name: nats_server
-      operator: dynamo_trtllm
-      script:
-        - nats-server -js
-      probes:
-        readiness:
-          tcp_port:
-            port: 4222
-          timeout: 60
-
-    - name: etcd_server
-      operator: dynamo_trtllm
-      script:
-        - etcd --listen-client-urls "http://0.0.0.0:2379" ...
-      probes:
-        readiness:
-          tcp_port:
-            port: 2379
-          timeout: 60
+# ... (72 lines omitted)
 
     - name: frontend_server
-      operator: dynamo_trtllm
+      operator: dynamo
       script:
-        - python3 -m dynamo.frontend --http-port 8000
+        - python3 -m dynamo.frontend --http-port 8000 ${{ variables.EXTRA_FRONTEND_ARGS }}
+      resources:
+        nodes:
+          indices: [0]
       probes:
         readiness:
           tcp_port:
             port: 8000
-            timeout: 120
+          timeout: 300
+          interval: 5
       depends_on:
         - nats_server
         - etcd_server
 
     - name: prefill_server
       operator:
-        name: dynamo_trtllm
-        ntasks: ${{ variables.CTX_TP_SIZE }}
+        name: dynamo
+        ntasks: ${{ variables.CTX_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.CTX_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
       replicas:
         count: ${{ variables.NUM_CTX_SERVERS }}
-        policy: parallel
+        policy: "parallel"
       script:
-        - trtllm-llmapi-launch python3 -m dynamo.trtllm --disaggregation-mode prefill ...
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode prefill
+          --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
       resources:
         gpus:
-          count: ${{ variables.CTX_TP_SIZE }}
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
+      depends_on:
+        - frontend_server
       probes:
         readiness:
-          log_watch:
-            regex_pattern: "Setting PyTorch memory fraction"
-          timeout: 600
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          interval: 20
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-      retries:
-        count: 3
-        interval: 30
-        backoff: 2
-      depends_on:
-        - frontend_server
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
-    - name: decode_server
-      operator:
-        name: dynamo_trtllm
-        ntasks: ${{ variables.GEN_TP_SIZE }}
-      replicas:
-        count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: parallel
-      script:
-        - trtllm-llmapi-launch python3 -m dynamo.trtllm --disaggregation-mode decode ...
-      resources:
-        gpus:
-          count: ${{ variables.GEN_TP_SIZE }}
-      retries:
-        count: 3
-        interval: 30
-        backoff: 2
-      depends_on:
-        - frontend_server
+# ... (44 lines omitted)
 
     - name: benchmark
       operator:
         name: aiperf
         ntasks: 1
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
       replicas:
         variables:
-          - CONCURRENCY  # Sweeps over domain [64, 128]
+          - CONCURRENCY
         policy: sequential
-      script:
-        - aiperf profile --concurrency ${CONCURRENCY} ...
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # prefill/decode SERVERS' resources (used_by_tasks), not the benchmark
+      # client's own node -- so the report captures the servers' GPU/CPU usage
+      # over the benchmark window.
+      monitor:
+        resources:
+          used_by_tasks:
+            - prefill_server
+            - decode_server
+        report:
+          enabled: true
       depends_on:
         - prefill_server
         - decode_server
@@ -772,13 +810,14 @@ sflow sample self_contained/slurm/dynamo_trtllm_disagg
 
 # Validate configuration
 sflow run -f dynamo_trtllm_disagg.yaml \
-  --set SLURM_ACCOUNT=your_account \
-  --set SLURM_PARTITION=your_partition \
+  --set SLURM_ACCOUNT=ACCOUNT \
+  --set SLURM_PARTITION=PARTITION \
   --dry-run
 
 # Submit to Slurm
 sflow batch -f dynamo_trtllm_disagg.yaml \
-  -A your_account -p your_partition -N 1 -G 4 \
+  -a LOCAL_MODEL_PATH=fs:///path/to/model \
+  -A ACCOUNT -p PARTITION -N 1 -G 4 \
   --sbatch-path dynamo_job.sh --submit
 ```
 
@@ -790,123 +829,66 @@ Deploys a disaggregated inference setup with separate prefill and decode servers
 
 **Features:**
 - Disaggregated prefill/decode architecture with `trtllm-serve`
-- Dynamic configuration using file-type artifacts with backend node IP resolution
+- Dynamic configuration using file-type artifacts: the router config resolves the backend node IP, and each worker appends its own `host:port` to a placeholder URL list
 - Configurable tensor parallelism for prefill and decode servers
 - Hardware monitoring driven from the benchmark task (declarative `monitor` with `used_by_tasks`)
 - Sequential benchmark sweeps with variable domains
 - Failure probes for error detection
 
+Excerpt — the `decode_server` task mirrors `prefill_server`; see `sflow sample self_contained/slurm/trtllm_serve_disagg` for the full file:
+
 ```yaml
-version: "0.1"
-
-variables:
-  # Slurm Configuration
-  SLURM_ACCOUNT:
-    description: "SLURM account"
-    value: your_account
-  SLURM_PARTITION:
-    description: "SLURM partition"
-    value: your_partition
-  SLURM_TIMELIMIT:
-    description: "SLURM time limit"
-    value: 120
-  GPUS_PER_NODE:
-    description: "GPUs per node"
-    value: 4
-  SLURM_NODES:
-    description: "Number of nodes"
-    value: 1
-
-  # Model Configuration
-  SERVED_MODEL_NAME:
-    description: "Served model name"
-    value: Qwen3-0-6B-FP8
-  MODEL_NAME:
-    description: "Model path"
-    value: Qwen/Qwen3-0.6B-FP8
-  LOCAL_MODEL_PATH:
-    description: "Local model path"
-    value: /tmp/models/Qwen3-0.6B-FP8
-
-  # Prefill Server Configuration
-  NUM_CTX_SERVERS:
-    description: "Number of context/prefill servers"
-    value: 1
-  CTX_TP_SIZE:
-    description: "Context tensor parallel size"
-    value: 2
-
-  # Decode Server Configuration
-  NUM_GEN_SERVERS:
-    description: "Number of generation/decode servers"
-    value: 1
-  GEN_TP_SIZE:
-    description: "Generation tensor parallel size"
-    value: 2
-
-  # Benchmark Configuration with Domain Sweep
   CONCURRENCY:
     description: "Concurrency"
-    value: 128
-    domain: [128, 256]  # Will create sequential benchmark runs
-
+    value: 20
+    domain: [20,40]
+  
   # Container Images
-  TRTLLM_IMAGE:
-    description: "TRT-LLM container image"
-    value: nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6.post2
   AIPERF_IMAGE:
     description: "AIPerf container image"
     value: python:3.12-slim
+  TRTLLM_IMAGE:
+    description: "Dynamo TRTLLM container image"
+    # value: nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc1 # 19 GB
+    value: nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6.post2 # 15 GB
+
+# ... (12 lines omitted)
 
 artifacts:
-  # File-type artifacts with dynamic backend node IP resolution
+  # file type artifacts will be generated by sflow with the content defined in this yaml file, accessible as `${{ artifacts.NAME.path }}` in task scripts
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///path/to/your/model
+  - name: PREFILL_URLS
+    # Place holder file for prefill URLs, wil be injected later by each worker
+    uri: file://prefill_urls.yaml
+    content: |
+      
+      context_servers:
+        num_instances: ${{ variables.NUM_CTX_SERVERS }}
+        urls:
+  - name: DECODE_URLS
+    # Place holder file for decode URLs, wil be injected later by each worker
+    uri: file://decode_urls.yaml
+    content: |
+      
+      generation_servers:
+        num_instances: ${{ variables.NUM_GEN_SERVERS }}
+        urls:
   - name: SERVER_CONFIG
     uri: file://server_config.yaml
     content: |
       hostname: ${{ backends.slurm_cluster.nodes[0].ip_address }}
       port: 8000
       backend: pytorch
-      context_servers:
-        num_instances: ${{ variables.NUM_CTX_SERVERS }}
-        urls:
-          - ${{ backends.slurm_cluster.nodes[0].ip_address }}:8536
-      generation_servers:
-        num_instances: ${{ variables.NUM_GEN_SERVERS }}
-        urls:
-          - ${{ backends.slurm_cluster.nodes[0].ip_address }}:8336
 
-  - name: PREFILL_CONFIG
-    uri: file://prefill_config.yaml
-    content: |
-      max_batch_size: 128
-      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
-      # ... additional configuration
-
-  - name: DECODE_CONFIG
-    uri: file://decode_config.yaml
-    content: |
-      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
-      # ... additional configuration
-
-backends:
-  - name: slurm_cluster
-    type: slurm
-    default: true
-    time: ${{ variables.SLURM_TIMELIMIT }}
-    nodes: ${{ variables.SLURM_NODES }}
-    partition: ${{ variables.SLURM_PARTITION }}
-    account: ${{ variables.SLURM_ACCOUNT }}
-    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+# ... (63 lines omitted)
 
 operators:
   - name: trtllm_container
     type: srun
-    container_name: trtllm_container
+    container_image: ${{ variables.TRTLLM_IMAGE }}
     container_writable: true
-    container_mount_home: false
     mpi: pmix
-    extra_args:
-      - --container-image=${{ variables.TRTLLM_IMAGE }}
   - name: aiperf
     type: srun
     container_name: aiperf
@@ -915,32 +897,16 @@ operators:
     extra_args:
       - --container-image=${{ variables.AIPERF_IMAGE }}
 
-workflow:
-  name: trtllm_server_disagg
-  timeout: 115m
-  variables:
-    HEAD_NODE_IP:
-      description: "Head node IP (resolved after allocation)"
-      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
-
-  tasks:
-    - name: load_image
-      operator:
-        name: trtllm_container
-        ntasks_per_node: 1
-      script:
-        - hf download ${{ variables.MODEL_NAME }} --local-dir ${{ variables.LOCAL_MODEL_PATH }}
-        - echo "Image Loaded"
-        - sleep 3600
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "Image Loaded"
-          timeout: 1200
+# ... (29 lines omitted)
 
     - name: frontend_server
       operator: trtllm_container
       script:
+        - set -x
+        - export TRTLLM_SERVER_DISABLE_GC=1
+        - export TRTLLM_WORKER_DISABLE_GC=1
+        - cat ${{ artifacts.PREFILL_URLS.path }} >> ${{ artifacts.SERVER_CONFIG.path }}
+        - cat ${{ artifacts.DECODE_URLS.path }} >> ${{ artifacts.SERVER_CONFIG.path }}
         - cat ${{ artifacts.SERVER_CONFIG.path }}
         - trtllm-serve disaggregated -c ${{ artifacts.SERVER_CONFIG.path }} -t 7200 -r 7200
       resources:
@@ -949,8 +915,9 @@ workflow:
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Application startup complete"
-          timeout: 120
+            match_pattern: "Application startup complete"
+          timeout: 300
+          interval: 2
       depends_on:
         - prefill_server
         - decode_server
@@ -958,74 +925,101 @@ workflow:
     - name: prefill_server
       operator:
         name: trtllm_container
-        ntasks: ${{ variables.CTX_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.CTX_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
+        ntasks: ${{ variables.CTX_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.CTX_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
       replicas:
         count: ${{ variables.NUM_CTX_SERVERS }}
-        policy: parallel
+        policy: "parallel"
       script:
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        # GPU placement probe. sflow plans a per-task slice and re-applies it
+        # inside the step; this prints what the container ACTUALLY has next to
+        # what was planned, which is the only way to tell the two failure modes
+        # apart: if the planned ordinals are absent from `nvidia-smi -L`, the
+        # slice never reached the container (carved and renumbered by the
+        # runtime); if they are present, placement worked and the launcher chose
+        # the wrong device. Cheap, and it makes every future triage one grep.
+        - echo "SFLOW_GPU_PROBE task=${SLURM_JOB_NAME:-?} procid=${SLURM_PROCID:-?} localid=${SLURM_LOCALID:-?} planned_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+        - nvidia-smi -L 2>&1 | sed "s/^/SFLOW_GPU_PROBE visible: /" || true
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_SERVER_DISABLE_GC=1
+        - export TRTLLM_WORKER_DISABLE_GC=1
+        - export NCCL_GRAPH_MIXING_SUPPORT=0
+        - export TRTLLM_ENABLE_PDL=1
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
         - cat ${{ artifacts.PREFILL_CONFIG.path }}
+        - export FIRST_CUDA_DEVICE=$(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)
+        - export CTX_PORT=$((${{ variables.CTX_START_PORT }} + ${FIRST_CUDA_DEVICE}))
+        - export FIRST_NODE_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - if [ "${SLURM_PROCID:-0}" = "0" ]; then echo -e "\n    - ${FIRST_NODE_IP}:${CTX_PORT}" >> ${{ artifacts.PREFILL_URLS.path }}; fi
         - >
-          trtllm-llmapi-launch trtllm-serve ${LOCAL_MODEL_PATH}
-          --host ${HEAD_NODE_IP}
-          --port $((8536 + ${SFLOW_REPLICA_INDEX}))
-          --extra_llm_api_options ${{ artifacts.PREFILL_CONFIG.path }}
+          trtllm-llmapi-launch trtllm-serve ${{ artifacts.LOCAL_MODEL_PATH.path }} 
+          --host ${FIRST_NODE_IP} 
+          --port ${CTX_PORT} 
+          --extra_llm_api_options ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
       resources:
         gpus:
-          count: ${{ variables.CTX_TP_SIZE }}
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
+      depends_on:
+        - load_image
       probes:
         readiness:
           log_watch:
-            regex_pattern: "Application startup complete"
-          timeout: 600
+            match_pattern: "Application startup complete"
+          timeout: 1200
+          interval: 20
         failure:
           log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-      depends_on:
-        - load_image
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
-    - name: decode_server
-      operator:
-        name: trtllm_container
-        ntasks: ${{ variables.GEN_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.GEN_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
-      replicas:
-        count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: parallel
-      script:
-        - cat ${{ artifacts.DECODE_CONFIG.path }}
-        - >
-          trtllm-llmapi-launch trtllm-serve ${LOCAL_MODEL_PATH}
-          --host ${HEAD_NODE_IP}
-          --port $((8336 + ${SFLOW_REPLICA_INDEX}))
-          --extra_llm_api_options ${{ artifacts.DECODE_CONFIG.path }}
-      resources:
-        gpus:
-          count: ${{ variables.GEN_TP_SIZE }}
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "Application startup complete"
-          timeout: 600
-        failure:
-          log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-      depends_on:
-        - load_image
+# ... (56 lines omitted)
 
     - name: benchmark
       operator:
         name: aiperf
         ntasks: 1
+      script:
+        - pip install aiperf==0.3.0
+        - set -x
+        - export COLUMNS=200
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
       replicas:
         variables:
-          - CONCURRENCY  # Sweeps over domain [128, 256]
+          - CONCURRENCY
         policy: sequential
-      script:
-        - aiperf profile --concurrency ${CONCURRENCY} --url http://${HEAD_NODE_IP}:8000 ...
-      # Sample the prefill/decode SERVERS' resources from this benchmark task
-      # (used_by_tasks), not the benchmark client's own node, so the report
-      # captures the servers' GPU/CPU usage over the benchmark window.
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # prefill/decode SERVERS' resources (used_by_tasks), not the benchmark
+      # client's own node -- so the report captures the servers' GPU/CPU usage
+      # over the benchmark window.
       monitor:
         resources:
           used_by_tasks:
@@ -1046,13 +1040,14 @@ sflow sample self_contained/slurm/trtllm_serve_disagg
 
 # Validate configuration
 sflow run -f trtllm_serve_disagg.yaml \
-  --set SLURM_ACCOUNT=your_account \
-  --set SLURM_PARTITION=your_partition \
+  --set SLURM_ACCOUNT=ACCOUNT \
+  --set SLURM_PARTITION=PARTITION \
   --dry-run
 
 # Submit to Slurm
 sflow batch -f trtllm_serve_disagg.yaml \
-  -A your_account -p your_partition -N 1 -G 4 \
+  -a LOCAL_MODEL_PATH=fs:///path/to/model \
+  -A ACCOUNT -p PARTITION -N 1 -G 4 \
   --sbatch-path trtllm_disagg_job.sh --submit
 ```
 
@@ -1072,22 +1067,12 @@ A production-ready multi-node disaggregated inference setup optimized for large 
 - File-type artifacts for dynamic server configuration
 - Failure probes for error detection
 
-```yaml
-version: "0.1"
+Excerpt — same task DAG as the Dynamo TRT-LLM sample above (`load_image`, `nats_server`, `etcd_server`, `frontend_server`, `prefill_server`, `decode_server`, `benchmark`); see `sflow sample self_contained/slurm/infmax_v1_ds_r1` for the full file:
 
-variables:
-  # Slurm Configuration
-  SLURM_ACCOUNT:
-    description: "SLURM account"
-    value: your_account
-  SLURM_PARTITION:
-    description: "SLURM partition"
-    value: your_partition
-  SLURM_TIMELIMIT:
-    description: "SLURM time limit"
-    value: 120
+```yaml
   GPUS_PER_NODE:
     description: "GPUs per node"
+    type: integer
     value: 4
   SLURM_NODES:
     description: "Number of nodes"
@@ -1098,204 +1083,141 @@ variables:
     description: "Served model name"
     value: DS-R1
 
-  # Prefill Server Configuration
-  NUM_CTX_SERVERS:
-    description: "Number of context/prefill servers"
-    value: 1
-  CTX_TP_SIZE:
-    description: "Context tensor parallel size"
-    value: 4
-  CTX_BATCH_SIZE:
-    description: "Context batch size"
-    value: 1
-  CTX_MAX_NUM_TOKENS:
-    description: "Context max number of tokens"
-    value: 8448
+# ... (102 lines omitted)
 
-  # Decode Server Configuration
-  NUM_GEN_SERVERS:
-    description: "Number of generation/decode servers"
-    value: 1
-  GEN_TP_SIZE:
-    description: "Generation tensor parallel size"
-    value: 8
-  GEN_BATCH_SIZE:
-    description: "Generation batch size"
-    value: 128
-
-  # Benchmark Configuration with Domain Sweep
   CONCURRENCY:
     description: "Concurrency"
     value: 64
-    domain: [32, 64]  # Will create sequential benchmark runs
-
+    domain: [32, 64]
+  
   # Container Images
+  AIPERF_IMAGE:
+    description: "AIPerf container image"
+    value: python:3.12-slim
   DYNAMO_IMAGE:
     description: "Dynamo TRTLLM container image"
-    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.8.0
+    value: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0
+
+# ... (1 lines omitted)
 
 artifacts:
+  # file type artifacts will be generated by sflow with the content defined in this yaml file, accessible as `${{ artifacts.NAME.path }}` in task scripts
   - name: LOCAL_MODEL_PATH
     uri: fs:///path/to/your/model
-  - name: PREFILL_CONFIG
-    uri: file://prefill_config.yaml
-    content: |
-      max_batch_size: ${{ variables.CTX_BATCH_SIZE }}
-      tensor_parallel_size: ${{ variables.CTX_TP_SIZE }}
-      moe_expert_parallel_size: ${{ variables.CTX_TP_SIZE }}
-      # ... additional configuration
-  - name: DECODE_CONFIG
-    uri: file://decode_config.yaml
-    content: |
-      tensor_parallel_size: ${{ variables.GEN_TP_SIZE }}
-      max_batch_size: ${{ variables.GEN_BATCH_SIZE }}
-      # ... additional configuration
 
-backends:
-  - name: slurm_cluster
-    type: slurm
-    default: true
-    time: ${{ variables.SLURM_TIMELIMIT }}
-    nodes: ${{ variables.SLURM_NODES }}
-    partition: ${{ variables.SLURM_PARTITION }}
-    account: ${{ variables.SLURM_ACCOUNT }}
-    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+# ... (60 lines omitted)
 
 operators:
-  - name: dynamo_trtllm
+  - name: dynamo
     type: srun
     container_image: ${{ variables.DYNAMO_IMAGE }}
     container_writable: true
-    container_mount_home: false
     mpi: pmix
+    # extra_args:
+    #   - --container-image=${{ variables.DYNAMO_IMAGE }}
+    #   - --container-writable
+  - name: aiperf
+    type: srun
+    container_name: aiperf
+    container_writable: true
+    mpi: pmix
+    extra_args:
+      - --container-image=${{ variables.AIPERF_IMAGE }}
 
-workflow:
-  name: infmax
-  timeout: 115m
-  variables:
-    HEAD_NODE_IP:
-      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
-    ETCD_ENDPOINTS:
-      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
-    NATS_SERVER:
-      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
-
-  tasks:
-    - name: load_image
-      operator:
-        name: dynamo_trtllm
-        ntasks: ${{ variables.SLURM_NODES }}
-        ntasks_per_node: 1
-      script:
-        - echo "Image Loaded"
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "Image Loaded"
-          timeout: 1200
-
-    - name: nats_server
-      operator: dynamo_trtllm
-      script:
-        - nats-server -js
-      resources:
-        nodes:
-          indices: [0]
-      probes:
-        readiness:
-          tcp_port:
-            port: 4222
-      depends_on:
-        - load_image
-
-    - name: etcd_server
-      operator: dynamo_trtllm
-      script:
-        - etcd --listen-client-urls "http://0.0.0.0:2379" ...
-      resources:
-        nodes:
-          indices: [0]
-      probes:
-        readiness:
-          tcp_port:
-            port: 2379
-      depends_on:
-        - load_image
-
-    - name: frontend_server
-      operator: dynamo_trtllm
-      script:
-        - python3 -m dynamo.frontend --http-port 8000
-      resources:
-        nodes:
-          indices: [0]
-      probes:
-        readiness:
-          tcp_port:
-            port: 8000
-      depends_on:
-        - nats_server
-        - etcd_server
+# ... (88 lines omitted)
 
     - name: prefill_server
       operator:
-        name: dynamo_trtllm
-        ntasks: ${{ variables.CTX_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.CTX_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
+        name: dynamo
+        ntasks: ${{ variables.CTX_GPUS_PER_WORKER }}
+        ntasks_per_node: ${{ [ variables.CTX_GPUS_PER_WORKER, variables.GPUS_PER_NODE ] | min }}
       replicas:
         count: ${{ variables.NUM_CTX_SERVERS }}
-        policy: parallel
+        policy: "parallel"
       script:
-        - trtllm-llmapi-launch python3 -m dynamo.trtllm --disaggregation-mode prefill ...
+        - set -x
+        - echo ${CUDA_VISIBLE_DEVICES}
+        - export TLLM_LOG_LEVEL=INFO
+        - export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
+        - export TRTLLM_MOE_USE_LOW_PRECISION_COMBINE=1
+        - env | grep TLLM
+        - env | grep UCX
+        - unset UCX_TLS
+        - >
+          trtllm-llmapi-launch python3 -m dynamo.trtllm
+          --model-path ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --disaggregation-mode prefill
+          --extra-engine-args ${{ artifacts.PREFILL_CONFIG.path }} ${EXTRA_PREFILL_ARGS}
       resources:
         gpus:
-          count: ${{ variables.CTX_TP_SIZE }}
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "Setting PyTorch memory fraction"
-        failure:
-          log_watch:
-            regex_pattern: "Traceback (most recent call last)"
+          count: ${{ variables.CTX_GPUS_PER_WORKER }}
       depends_on:
         - frontend_server
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1200
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
 
-    - name: decode_server
-      operator:
-        name: dynamo_trtllm
-        ntasks: ${{ variables.GEN_TP_SIZE }}
-        ntasks_per_node: ${{ [ variables.GEN_TP_SIZE, variables.GPUS_PER_NODE ] | min }}
-      replicas:
-        count: ${{ variables.NUM_GEN_SERVERS }}
-        policy: parallel
-      script:
-        - trtllm-llmapi-launch python3 -m dynamo.trtllm --disaggregation-mode decode ...
-      resources:
-        gpus:
-          count: ${{ variables.GEN_TP_SIZE }}
-      probes:
-        readiness:
-          log_watch:
-            regex_pattern: "Setting PyTorch memory fraction"
-        failure:
-          log_watch:
-            regex_pattern: "Traceback (most recent call last)"
-      depends_on:
-        - frontend_server
+# ... (44 lines omitted)
 
     - name: benchmark
       operator:
         name: aiperf
         ntasks: 1
+      script:
+        - set -x
+        - export COLUMNS=200
+        - pip install aiperf==0.3.0
+        - ls ${{ artifacts.LOCAL_MODEL_PATH.path }}
+        - >
+          aiperf profile --artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${CONCURRENCY}
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.LOCAL_MODEL_PATH.path }}
+          --endpoint-type chat
+          --endpoint /v1/chat/completions
+          --streaming
+          --url http://${{ variables.HEAD_NODE_IP }}:8000
+          --synthetic-input-tokens-mean ${{ variables.ISL }}
+          --synthetic-input-tokens-stddev 0
+          --output-tokens-mean ${{ variables.OSL }}
+          --output-tokens-stddev 0
+          --extra-inputs "max_tokens:${{ variables.OSL }}"
+          --extra-inputs "min_tokens:${{ variables.OSL }}"
+          --extra-inputs "ignore_eos:true"
+          --extra-inputs "repetition_penalty:1.0"
+          --extra-inputs "temperature: 0.0"
+          --concurrency ${CONCURRENCY}
+          --request-count $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --warmup-request-count ${CONCURRENCY}
+          --num-dataset-entries $((${{ variables.MULTI_ROUND }}*${CONCURRENCY}))
+          --random-seed 100
+          -H 'Authorization: Bearer NOT USED'
+          -H 'Accept: text/event-stream'
+          --record-processors 8
+          --ui simple
+        - echo "Benchmarking finished"
+      resources:
+        nodes:
+          indices: [0]
       replicas:
         variables:
-          - CONCURRENCY  # Sweeps over domain [32, 64]
+          - CONCURRENCY
         policy: sequential
-      script:
-        - aiperf profile --concurrency ${CONCURRENCY} ...
-      # Sample the prefill/decode SERVERS' resources from this benchmark task
-      # (used_by_tasks), not the benchmark client's own node, so the report
-      # captures the servers' GPU/CPU usage over the benchmark window.
+      # Trigger a hardware monitor from this benchmark task but sample the
+      # prefill/decode SERVERS' resources (used_by_tasks), not the benchmark
+      # client's own node -- so the report captures the servers' GPU/CPU usage
+      # over the benchmark window.
       monitor:
         resources:
           used_by_tasks:
@@ -1316,13 +1238,14 @@ sflow sample self_contained/slurm/infmax_v1_ds_r1
 
 # Validate configuration
 sflow run -f infmax_v1_ds_r1.yaml \
-  --set SLURM_ACCOUNT=your_account \
-  --set SLURM_PARTITION=your_partition \
+  --set SLURM_ACCOUNT=ACCOUNT \
+  --set SLURM_PARTITION=PARTITION \
   --dry-run
 
 # Submit to Slurm (multi-node)
 sflow batch -f infmax_v1_ds_r1.yaml \
-  -A your_account -p your_partition -N 3 -G 4 \
+  -a LOCAL_MODEL_PATH=fs:///path/to/model \
+  -A ACCOUNT -p PARTITION -N 3 -G 4 \
   --sbatch-path infmax_job.sh --submit
 ```
 
@@ -1347,7 +1270,7 @@ Additional single-file Slurm workflows (copy with `sflow sample self_contained/s
 ```bash
 sflow sample self_contained/slurm/dynamo_sglang_agg
 sflow run -f dynamo_sglang_agg.yaml \
-  --set SLURM_ACCOUNT=your_account --set SLURM_PARTITION=your_partition --dry-run
+  --set SLURM_ACCOUNT=ACCOUNT --set SLURM_PARTITION=PARTITION --dry-run
 ```
 
 ---
@@ -1376,31 +1299,6 @@ sflow run -f dynamo_trtllm_disagg.yaml \
   -a LOCAL_MODEL_PATH=fs:///mnt/model-cache/your-model \
   --kube-namespace my-namespace --kube-node-selector tenant=my-pool
 ```
-
----
-
-## Key Concepts Demonstrated
-
-| Sample | Concepts |
-|--------|----------|
-| `self_contained/local/hello_world` | Variables, basic task execution |
-| `self_contained/local/dag` | Task dependencies, parallel execution, built-in env vars |
-| `self_contained/local/variable_domain` | Variable `domain` sweeps (one run per value) |
-| `self_contained/local/result_parsing` | Regex/JSON result parsing into `result.json` / `results.json` |
-| `self_contained/local/storage_upload` | Per-task `uploads:` to a storage target (e.g. S3) |
-| `self_contained/local/storage_upload_all` | `upload_all` to ship every task's outputs |
-| `self_contained/local/monitor` | Workflow-level hardware monitor and charts |
-| `self_contained/docker/hello_world` | Local Docker backend, `docker_run` operator |
-| `self_contained/docker/multi_node` | Multi-host Docker pool, one container per host |
-| `self_contained/docker/sglang_qwen3` | Local Docker backend, containerized LLM serving (SGLang + Qwen3-0.6B), readiness/failure probes, file:// client script |
-| `self_contained/slurm/sglang_server_client` | Slurm backend, operators, probes, replicas, GPU resources |
-| `self_contained/slurm/dynamo_trtllm_disagg` | Service discovery (NATS/etcd), retry policies, multi-process tasks |
-| `self_contained/slurm/trtllm_serve_disagg` | Artifacts with backend IP resolution, failure probes, variable sweeps |
-| `self_contained/slurm/infmax_v1_ds_r1` | Multi-node deployment, MoE optimization, GPU monitoring, file artifacts |
-| `self_contained/slurm/auto_replica` | Auto replica detection, task context, node/GPU assignment |
-| `self_contained/slurm/aiperf_template` | AIPerf benchmarking template, simple single-task workflow |
-| `self_contained/kubernetes/hello_world` | Kubernetes backend, `k8s` operator, pod scheduling |
-| `self_contained/kubernetes/dynamo_trtllm_disagg` | Disaggregated inference on Kubernetes GPU pods |
 
 ---
 
@@ -1516,6 +1414,6 @@ variables:
 
 1. **Always validate first**: Use `--dry-run` before actual execution
 2. **Override variables**: Use `--set KEY=VALUE` to customize configurations
-3. **Override model path**: Use `--artifact LOCAL_MODEL_PATH=fs:///path/to/model` to point to your actual model
+3. **Override model path**: the serving samples declare `LOCAL_MODEL_PATH` as an `fs://` artifact (default `fs:///path/to/your/model`) and reference it as `${{ artifacts.LOCAL_MODEL_PATH.path }}`; point it at your checkpoint with `--artifact LOCAL_MODEL_PATH=fs:///path/to/model` (`-a` for short)
 4. **Use `--resolve`**: Add `--resolve` to `sflow compose` or `sflow batch --bulk-input` to inline all variables into literal values for a fully-baked config
 5. **Check sample source**: Samples are located in `src/sflow/samples/` in the sflow package

@@ -43,7 +43,7 @@ class _FileArtifactResolver:
                 why = (
                     "off-host backend"
                     if remote_filesystem
-                    else "--skip-artifact-check"
+                    else "off-host backend or --skip-artifact-check"
                 )
                 _logger.info(
                     f"Artifact '{name}' fs:// path '{path}' is treated as a remote "

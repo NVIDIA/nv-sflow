@@ -34,6 +34,12 @@ variables:
   SERVER_SHM_SIZE:
     description: "Shared memory for the server container (inference runtimes need well above Docker's 64m default)"
     value: 16g
+  MPI_LAUNCH:
+    description: >-
+      Launcher prefix for the TRT-LLM workloads, which run as ONE MPI world of SERVER_GPUS
+      ranks. Here mpirun starts the ranks itself inside the server container. Fragments whose
+      operator already launches one task per rank (slurm_mpi) set this to "".
+    value: mpirun -np ${{ variables.SERVER_GPUS }} --allow-run-as-root
 
 backends:
   - name: cluster
@@ -73,3 +79,20 @@ operators:
     image: ${{ variables.CLIENT_IMAGE }}
     extra_args:
       - --network=host
+
+artifacts:
+  # The model weights, declared HERE rather than in the workloads: getting the
+  # weights in front of the server is a backend concern (how a path becomes
+  # visible inside a container), while a workload only needs to name it. Every
+  # workload references it as `${{ artifacts.LOCAL_MODEL_PATH.path }}`.
+  #
+  # NOTE: unlike srun and k8s, `docker_run` does NOT mount artifacts. On this
+  # backend the declaration only supplies the PATH the workloads resolve; what
+  # actually makes that path exist inside the container is the MODEL_HOST_PATH
+  # bind mount above (same path in and out). Keep the two consistent: point
+  # LOCAL_MODEL_PATH at a directory under MODEL_HOST_PATH.
+  #
+  # Point it at a real checkout per run:
+  #   -a LOCAL_MODEL_PATH=fs:///abs/path/to/model
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///models/Qwen3-0.6B

@@ -52,7 +52,7 @@ monitor:
     used_by_tasks: [taskA, ...]  # follow these tasks' nodes+GPUs (takes precedence)
   scopes:                        # omit -> ALL built-ins; listing turns on only those (+custom)
     cpu:    { enabled, interval }
-    gpu:    { enabled, interval, fields: [index, ...] }
+    gpu:    { enabled, interval, fields: "index,utilization.gpu,memory.used" }  # comma-separated string, must start with index
     memory: { enabled, interval }
     disk:   { enabled, interval }
     network:{ enabled, interval }
@@ -96,7 +96,15 @@ anything beyond the defaults (custom scopes, `used_by_tasks`, GPU subsets, etc.)
   container-introduced noise.
 - **Passive.** Monitors overlap the workload and never reserve nodes or GPUs. On
   Slurm this overlap is the `srun --overlap` mechanism; local and docker backends
-  launch their own bare-host collector alongside the workload.
+  launch their own bare-host collector alongside the workload. A docker backend
+  with a declared `hosts:` pool runs the collector **on each host**, over the
+  same ssh connection the backend already uses — those machines are not the
+  driver, so a collector on the driver would report the driver's hardware under
+  their names. The collector's source rides in on stdin and its samples ride back
+  on stdout, so no host needs to share a filesystem with the driver. A host with
+  no ssh endpoint (`context:`, or a `tcp://` `docker_host:`) names a daemon, not
+  a machine sflow can log into, so there the collector runs as a container on
+  that daemon instead.
 - **Singleton per node.** At most one collector runs per physical node. When the
   workflow monitor and one or more task monitors (or overlapping `used_by_tasks`)
   cover the same node, they share a single collector that captures the **union**
@@ -129,7 +137,7 @@ only the listed ones (plus `custom`) are active.
 | Scope | Notes |
 |-------|-------|
 | `cpu` | utilization %, load averages (`/proc/stat`, `getloadavg`) |
-| `gpu` | `nvidia-smi` (util, mem, power, temp, clocks). `fields:` overrides the `--query-gpu` list (must start with `index`). Degrades to an `ERROR` row when `nvidia-smi` is absent. |
+| `gpu` | `nvidia-smi` (util, mem, power, temp, clocks). `fields:` overrides the `--query-gpu` list as one comma-separated string, e.g. `fields: "index,utilization.gpu,memory.used"` (must start with `index`). Degrades to an `ERROR` row when `nvidia-smi` is absent. |
 | `memory` | total / available / used / swap (`/proc/meminfo`) |
 | `disk` | `/` usage (`statvfs`) |
 | `network` | cumulative rx/tx **bytes**, plus per-second rates for both bytes and packets (`/proc/net/dev`). Packets are reported only as rates, not cumulative counts. |
@@ -279,18 +287,35 @@ the box. The SVG is a multi-panel line timeline that opens in any browser and
 scales without quality loss.
 
 `png` is also supported but is the only format that needs a third-party library
-(`matplotlib`, the optional `sflow[monitor]` extra, which is large). Request it
+(`matplotlib`, the optional `nv-sflow[monitor]` extra, which is large). Request it
 with `format: [csv, svg, png]`; if matplotlib is not installed, PNG is skipped
 with a one-line hint while CSV and SVG are still written. Install it with
-`pip install sflow[monitor]` (or `uv pip install sflow[monitor]`).
+`pip install nv-sflow[monitor]` (or `uv pip install nv-sflow[monitor]`).
 
 ## Notes & limitations (this release)
 
 - **Backend support.** `monitor:` is supported on the **local**, **slurm**, and
-  **docker** backends. **Kubernetes** backends do **not** support host monitoring
-  yet (there is no DCGM/DaemonSet collector), so `monitor:` blocks are **skipped**
-  on k8s targets rather than sampling the sflow driver host and reporting
-  misleading metrics.
+  **docker** backends, including multi-host docker `hosts:` pools. **Kubernetes**
+  backends do **not** support host monitoring yet (there is no DCGM/DaemonSet
+  collector), so `monitor:` blocks are **skipped** on k8s targets rather than
+  sampling the sflow driver host and reporting misleading metrics.
+- **Docker pool hosts need `python3`** (standard library only) and, for the
+  `gpu` scope, `nvidia-smi`. The collector runs bare on the host over ssh; the
+  workload image is irrelevant — nothing is pulled to sample, and an image whose
+  entrypoint is not a shell (e.g. `vllm/vllm-openai`) does not break monitoring.
+  The script is fed in on stdin, so nothing is copied to the host and nothing is
+  left behind. If the host has no `python3` the collector exits and says so — the
+  run still succeeds, with no samples for that node. A collector that dies on its
+  own is reported as a warning rather than silently producing an empty report.
+- **Hosts with no ssh endpoint still use a container.** On a `context:` or
+  `tcp://` `docker_host:` host the collector runs as a container from the
+  backend's `image:` (which then needs `python3`). Its `gpu` scope follows
+  `gpus_per_node`: the container is only given GPUs when the pool declares them
+  (per host, or on the backend), because requesting them on a host with no NVIDIA
+  runtime fails the whole container and costs the cpu/memory/disk/network scopes
+  too — so a pool that declares no GPUs collects the other four. `nvidia-smi`
+  does **not** need to be in the image — the container toolkit injects it — but
+  the host does need that toolkit.
 - `monitor` fields are concrete (intervals, resource counts/indices): `${{ }}`
   expressions are not resolved for monitors, so use literal values.
 - `scopes.custom.script` lines run as literal shell commands; runtime env vars

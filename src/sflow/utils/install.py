@@ -16,14 +16,18 @@ imported across CLI modules).
 
 Two mutually exclusive install routes are supported:
 
-* **git** -- a branch/tag, or a ``repo-url@ref``, installed as ``sflow @ git+...``.
-* **PyPI index** -- a PEP 440 version/specifier installed as ``sflow==...`` from
-  ``--sflow-index-url``.
+* **git** -- a branch/tag, or a ``repo-url@ref``, installed as a bare ``git+...`` URL
+  (no distribution name, so refs from before the ``nv-sflow`` rename still install).
+* **PyPI index** -- a PEP 440 version/specifier installed as ``nv-sflow==...``: from
+  ``--sflow-index-url`` in ``sflow batch``, and from PyPI (plus that index, if given)
+  in ``sflow upgrade``.
 """
 
 from __future__ import annotations
 
 from urllib.parse import urlparse
+
+from sflow.utils.distribution import DIST_NAME
 
 # Public OSS repository. The default source for both the batch job bootstrap and
 # `sflow upgrade`.
@@ -59,19 +63,19 @@ def sflow_git_spec(repo: str | None, branch: str | None) -> str:
 
 
 def sflow_pypi_requirement(sflow_version: str | None) -> str:
-    """Build the ``sflow`` requirement for a PyPI-index install (PyPI route).
+    """Build the ``nv-sflow`` requirement for a PyPI-index install (PyPI route).
 
     ``sflow_version`` is a PEP 440 version/specifier already validated by
     :func:`sflow_version_error`: a bare version is pinned (``0.2.1`` ->
-    ``sflow==0.2.1``), an operator-led spec is kept (``>=0.2,<0.3`` ->
-    ``sflow>=0.2,<0.3``), and an empty value installs the latest (``sflow``).
+    ``nv-sflow==0.2.1``), an operator-led spec is kept (``>=0.2,<0.3`` ->
+    ``nv-sflow>=0.2,<0.3``), and an empty value installs the latest (``nv-sflow``).
     """
     spec = (sflow_version or "").strip()
     if not spec:
-        return "sflow"
+        return DIST_NAME
     if spec[0] in "=<>!~":
-        return f"sflow{spec}"
-    return f"sflow=={spec}"
+        return f"{DIST_NAME}{spec}"
+    return f"{DIST_NAME}=={spec}"
 
 
 def sflow_index_url_error(
@@ -106,11 +110,11 @@ def sflow_version_error(
 ) -> str | None:
     """Sanity-check a version value for the active install route.
 
-    * **git** (``registry=False``, i.e. no ``--sflow-index-url``): a git
-      branch/tag or a ``repo-url@ref``, installed as ``sflow @ git+...``.
-    * **PyPI index** (``registry=True``, ``--sflow-index-url`` set): a PEP 440
-      version (``0.2.1``) or specifier (``>=0.2,<0.3``), installed as
-      ``sflow==...`` from that index.
+    * **git** (``registry=False``: ``sflow batch`` without ``--sflow-index-url``):
+      a git branch/tag or a ``repo-url@ref``, installed as a bare ``git+...`` URL.
+    * **PyPI index** (``registry=True``: ``sflow batch`` with ``--sflow-index-url``,
+      and ``sflow upgrade`` always): a PEP 440 version (``0.2.1``) or specifier
+      (``>=0.2,<0.3``), installed as ``nv-sflow==...``.
 
     Returns an error message, or ``None`` when the value is acceptable. An empty
     value is always accepted -- each route has a sensible default (git falls back
@@ -138,8 +142,8 @@ def sflow_version_error(
     # whitespace is unconditional; the PEP 440 parse needs ``packaging`` and is
     # skipped (best-effort) when it is unavailable.
     pypi_message = (
-        f"{option} '{sflow_version}' is not a valid PyPI version specifier "
-        "(required with --sflow-index-url). Use a plain version like '0.2.1' or a "
+        f"{option} '{sflow_version}' is not a valid PyPI version specifier. "
+        "Use a plain version like '0.2.1' or a "
         "specifier like '>=0.2,<0.3'; package names, URLs and '@' direct references "
         "are not allowed."
     )

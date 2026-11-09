@@ -35,7 +35,7 @@ or
 
 **Cause:** The YAML file exists but contains no content.
 
-**Fix:** Add valid sflow YAML content to the file. At minimum: `version: "0.1"`.
+**Fix:** Add valid sflow YAML content to the file. At minimum: a `workflow:` section with a `name` and `tasks`.
 
 ---
 
@@ -74,7 +74,7 @@ Fix: check line 5 for indentation or syntax issues.
 
 **Fix:** Read the Pydantic error detail carefully. Common issues:
 - Extra/unknown fields in a section
-- `version` not set to `"0.1"`
+- `version` declared with a value other than `"0.1"` (omitting it is fine)
 - `gpus_per_node` not a positive integer
 - `replicas.policy` not `"parallel"` or `"sequential"`
 - `script` is empty or not a list
@@ -92,7 +92,7 @@ Fix: check line 5 for indentation or syntax issues.
   Error: <jinja2_error>
 ```
 
-**Cause:** A `${{ }}` expression has invalid Jinja2 syntax.
+**Cause:** A ``${{ }}`` expression has invalid Jinja2 syntax.
 
 **Fix:** Check the expression for:
 - Unmatched brackets or parentheses
@@ -155,9 +155,9 @@ Source: line N in file.yaml
 **Cause:** Jinja2 cannot parse the expression.
 
 **Fix:** Common syntax issues:
-- `${{ a + }}` -- incomplete expression
-- `${{ variables.X | nonexistent_filter }}` -- unknown filter
-- `${{ if x }}` -- Jinja2 uses `x if condition else y`, not `if condition`
+- ``${{ a + }}`` -- incomplete expression
+- ``${{ variables.X | nonexistent_filter }}`` -- unknown filter
+- ``${{ if x }}`` -- Jinja2 uses `x if condition else y`, not `if condition`
 
 ---
 
@@ -272,7 +272,7 @@ ArtifactConfig: content is only valid with file:// URIs
 
 **Cause:** Two files being merged have different `version` values.
 
-**Fix:** All files must use `version: "0.1"`.
+**Fix:** Make every file that declares `version` use `"0.1"`, or drop the field (it is optional and defaults to `"0.1"`).
 
 ---
 
@@ -300,9 +300,9 @@ last-file-wins with an override warning.
 ✗ Configuration error: Merged configuration from [<files>] is incomplete: <detail>
 ```
 
-**Cause:** After merging all files, required sections (version, workflow, tasks) are still missing.
+**Cause:** After merging all files, required sections (`workflow`, its `name`, `tasks`) are still missing.
 
-**Fix:** Ensure the combined set of files provides all required sections. At minimum, one file must have `version` and `workflow.tasks`.
+**Fix:** Ensure the combined set of files provides all required sections. At minimum, one file must have `workflow.name` and one must have `workflow.tasks`. `version` is optional.
 
 ---
 
@@ -353,6 +353,60 @@ sbatch failed: <stderr>
 - Invalid `--partition` or `--account`
 - `--gpus-per-node` exceeds available GPUs
 - Invalid `extra_args`
+
+---
+
+### 5.4 GRES partition: the allocation has no GPUs
+
+**Pattern (task log):**
+```
+nvidia-smi: No devices were found
+RuntimeError: No CUDA GPUs are available
+```
+while the placement record `<task>/sflow_gpus.log` shows `visible_gpu_count=0` with
+`nvidia_visible_devices_inherited=all`.
+
+**Cause:** The partition declares `gpu:N` GRES and the allocation asked Slurm for none.
+sflow's backend `gpus_per_node` is **planning-only** — it never adds `--gpus-per-node` to
+`salloc`. On a non-GRES partition every step sees all of the node's GPUs anyway, which is why
+the same recipe works there and not here.
+
+**Fix:** Request the GPUs from Slurm: `--extra-salloc-args '--gpus-per-node=N'`, or
+`extra_args: ["--gpus-per-node=N"]` on the backend.
+
+---
+
+### 5.5 Allocation revoked / nodes not ready (node boot failure)
+
+**Pattern:**
+```
+salloc: error: Nodes <nodelist> are still not ready
+salloc: error: Something is wrong with the boot of the nodes.
+salloc: error: Job allocation <N> has been revoked.
+```
+
+**Cause:** The allocation was granted, then lost to a node prolog/boot failure; Slurm drains
+the node (`sinfo -R` shows `Prolog error`). Not a recipe problem.
+
+**Fix:** Re-run. If the same node keeps failing, route around it with
+`--exclude-nodes <node>` until it is repaired.
+
+---
+
+### 5.6 Allocation expired while a partner backend was still queued
+
+**Pattern:**
+```
+srun: error: Unable to confirm allocation for job <N>: Invalid job id specified
+srun: error: Unable to confirm allocation for job <N>: Expired or invalid job <N>
+```
+
+**Cause:** In a two-backend recipe (e.g. `self_contained/slurm/multi_backend`) each backend
+is its own `salloc`. One allocation's `time:` ran out while the other was still queued, so
+when the tasks finally launched the first job no longer existed.
+
+**Fix:** Raise `time:` on both backends (it must cover the partner's queue wait), run when the
+partner partition is quieter, or put both on one backend.
 
 ---
 
@@ -415,6 +469,48 @@ nvidia-container-cli: initialization error: ...
 - Ensure enroot/Pyxis is properly configured on the cluster
 - Try pulling the image manually: `enroot import docker://<image>`
 
+**Variant — cold enroot cache race (first container start on a node):**
+```
+enroot-mount: failed to mount: /dev/nvidia-caps-imex-channels at <rootfs>/dev/nvidia-caps-imex-channels: No such file or directory
+slurmstepd: error: pyxis: couldn't start container
+```
+or `mv: not replacing '<enroot cache path>'`. Several steps importing/unpacking the same
+image into the node-local enroot cache at once; a plain retry succeeds. Pre-import the image
+once per node before the run — `srun -N<n> --ntasks-per-node=1 --container-image=<img> true`
+— or give the task `retries:`.
+
+---
+
+### 6.3b Image toolchain predates the GPU
+
+**Pattern (task log):**
+```
+ptxas fatal   : Value 'sm_103a' is not defined for option 'gpu-name'
+```
+or `no kernel image is available for execution on the device`.
+
+**Cause:** The container's CUDA/Triton is older than the GPU architecture (GB300 is
+`sm_103a` and needs a CUDA 13 toolchain). `vllm-runtime:0.8.0` cannot target it;
+`vllm-runtime:1.2.1-cuda13` can.
+
+**Fix:** Use a newer image — `--set DYNAMO_IMAGE=<newer tag>` on the shipped samples.
+
+---
+
+### 6.3c aiperf measured nothing (exit 0)
+
+**Pattern (task log):**
+```
+Processed 0 valid requests and <N> errors
+```
+
+**Cause:** Every request failed, but aiperf still exits 0, so the task is `COMPLETED` and
+the CSV/JSON it wrote is empty. sflow has no result gate for this.
+
+**Fix:** Read the error breakdown in the same log — HTTP 404 means the wrong `--endpoint` /
+served model name, connection refused means the frontend died or the URL is wrong — then the
+frontend/server task log. Always open the CSV before trusting a green benchmark.
+
 ---
 
 ### 6.4 Port Already in Use
@@ -429,7 +525,7 @@ OSError: [Errno 98] Address already in use
 **Fix:**
 - Kill stale processes from a previous run
 - Use a different port
-- For replicated tasks, ensure port calculation includes replica offset (e.g., `$((8082 + ${FIRST_CUDA_DEVICE}))`)
+- For replicated tasks, ensure port calculation includes replica offset (e.g., ``$((8082 + ${FIRST_CUDA_DEVICE}))``)
 
 ---
 
@@ -633,12 +729,13 @@ secrets; get pods/logs; DRA `resourceclaimtemplates`; `computedomains` when crea
 `nodes`, `deviceclasses`) and a forbidden `auth can-i` only warn.
 
 **Fix:**
-- Wrong cluster/context/namespace: pass `--kubeconfig`, `--kube-context`, `--kube-namespace`.
+- Wrong cluster/context/namespace: pass `--kube-context` / `--kube-namespace` (or the config-file
+  override in `sflow run --help`).
 - Missing permission: grant the RBAC, or use a namespace where you have it.
 - To bypass the check: `SFLOW_SKIP_K8S_PREFLIGHT=1`.
 
 **Note on `Forbidden`:** a 403 means the API *was* reached and the credentials *did*
-authenticate — it is an authorization gap, never a connectivity or kubeconfig problem. sflow
+authenticate — it is an authorization gap, never a connectivity or cluster-config problem. sflow
 no longer fails on 403s for permissions it does not use, so
 `namespaces "<ns>" is forbidden: User "system:serviceaccount:..." cannot get resource
 "namespaces"` — the normal result for a namespaced `Role` on a shared cluster — is only a debug
@@ -700,16 +797,73 @@ every `kubectl` call and emits a warning (or kubectl rejects it).
 **Fix:** Use `--extra-kubectl-args` for kubectl-only flags (or `--extra-args`, which is generic
 across Slurm/docker/kubectl). Don't pass Slurm-isms (e.g. `--gpus-per-node`) as kubectl flags.
 
+### 10.6 Readiness timeout after an OOM right after another run's pods were deleted
+
+**Pattern:** `Task '<task>' readiness probe timed out: ...` in `sflow.log`, and shortly
+before it in the task log a TRT-LLM `OOM during general warmup` or
+`ncclMemAlloc ... unhandled cuda error`, on a node where another recipe's pods were deleted
+moments earlier.
+
+**Cause:** GPU memory from the previous pods had not been released yet when the new server
+started warming up. Not a recipe problem; the same recipe passes on a cold node.
+
+**Fix:** Wait a minute or two (or check `nvidia-smi` on the node) before relaunching on the
+same node, or pin to a different node with `--include-nodes`.
+
 ---
 
 ## 11. Docker Backend Errors
 
-### 11.1 docker run failed / daemon unreachable
+### 11.0 Plan-time rejections (before anything launches)
 
-**Cause:** The Docker daemon isn't running/reachable, or `docker run` rejected the args.
+| Message | Fix |
+|---------|-----|
+| `Docker backend '<b>' asks for <N> nodes but declares no 'hosts:'. Multi-node docker runs one container per machine, so list the machines under 'hosts:' -- or set 'nodes: 1' to run several containers on this one.` | Several machines → declare them under `hosts:`; one machine → `nodes: 1` |
+| `Docker backend '<b>' declares <H> host(s) but asks for nodes: <N>. 'hosts:' is the node list, so the run would use <H> and ignore the rest. Drop 'nodes:', or declare a host per node.` | Remove `nodes:` or make it equal the pool size |
+| `docker host '<h>' needs an 'address' (the machine), or a 'docker_host'/'context' endpoint override` | Add `address: <ip/hostname/ssh alias>` |
+| `docker host '<h>' has address '<v>': drop the scheme; 'address' is a host, not a URL` / `put the login in 'user' instead` / `an address cannot contain whitespace` | `address` is a bare host; put `ssh://` in `docker_host` and the login in `user` |
+| `docker host '<h>' sets both 'docker_host' and 'context'; they are alternative endpoint overrides, so set at most one` | Keep one |
+| `docker host '<h>' sets 'user' without 'address'. 'user' decorates the endpoint derived from 'address'; with an explicit 'docker_host' put the user in the URL instead` | `docker_host: ssh://user@host`, or switch to `address` + `user` |
+| `Docker backend '<b>': multi-node task cannot resolve a rendezvous address for host(s) <names>. Give each host an 'address' (or 'rendezvous_address'); peers need it to find the leader.` | A `context:`-only host has no machine address; give it `address` or `rendezvous_address` |
+| `Task '<t>' declares no 'operator:' and Docker backend '<b>' has no 'image:' to run it with -- set one of them.` | Name a `docker_run` operator on the task, or set the backend `image` |
+| `Docker backend '<b>': host '<h>' has no ssh endpoint, so its monitor collector runs as a container and needs the backend's 'image:' -- set it, or give the host an 'address'.` | `monitor:` on a `context:`/`tcp://` host runs in a container from the backend `image` |
+| `Docker backend '<b>': include/exclude node filters removed all hosts from the pool` | Fix `--include-nodes` / `--exclude-nodes` (they match `hosts[].name`) |
+| *warning* `docker host '<h>': 'ip_address' is deprecated, use 'rendezvous_address' (or just 'address' when the machine is reachable at one address)` | Rename it, or drop it when `address` is what peers dial. An `address` and `ip_address` that disagree are honoured as a control/data split |
 
-**Fix:** Verify `docker info` works on the host; check the backend `image`, `mounts`,
-`extra_args`. For remote hosts, verify the `docker_host` (`ssh://...`) or `context`.
+### 11.1 Pre-flight failed / daemon unreachable
+
+**Pattern:** a declared `hosts:` pool is probed before launch (in parallel, 20 s bound per
+probe) and every problem is reported together:
+```
+Pre-flight validation failed for Docker backend '<b>':
+  - host '<h>' (ssh://user@10.0.0.11) unreachable: <last line of ssh/docker stderr>
+  - host '<h>' (ssh://dgx-b): no response within 20s
+  - host '<h>': mount source(s) not found on that machine: /mnt/models, /data
+```
+or, with no docker CLI on the driver at all,
+`Pre-flight validation failed for Docker backend '<b>'. Missing required command: docker.`
+The narrated INFO lines (`Pre-flight: validating N declared Docker host(s) ...`,
+`Pre-flight host '<h>': daemon OK (server 27.x)`, `... mount sources OK`) tell you how far
+it got; the warning `Pre-flight host '<h>': artifact path(s) not present yet: ... Docker will
+create them empty` is informational (a task is expected to populate them).
+
+**Cause / fix per line:**
+- `unreachable: <reason>` — the reason is ssh's or docker's last stderr line. Probes run with
+  `BatchMode=yes` and no terminal, so `Host key verification failed` = unknown host key (ssh
+  once by hand), `Permission denied` = key/agent/passphrase not usable non-interactively, a
+  `docker:` error = daemon down or user not in the `docker` group on that machine. Verify
+  `ssh <address> docker version` works from the driver without a prompt.
+- `no response within 20s` — network/DNS/ProxyJump; check `~/.ssh/config` for that alias.
+- `mount source(s) not found on that machine` — a declared `mounts:` source (backend, host
+  or operator) or a local `fs://` artifact path does not exist **on that host**. Docker would
+  create it empty and the workload would report missing data, so sflow stops here. Create it,
+  fix the path, or give that host its own `mounts:`.
+- Path checks need a shell, so a `context:` host is skipped; `docker_host`/`context`
+  overrides are probed as written.
+- `SFLOW_SKIP_DOCKER_PREFLIGHT=1` bypasses the host-touching checks (not the `docker` CLI check).
+
+A plain `Cannot connect to the Docker daemon` on a run without `hosts:` means the local
+daemon: `docker info` on the driver.
 
 ### 11.2 NVIDIA container toolkit missing (GPU tasks)
 
@@ -720,11 +874,31 @@ the host GPU count. sflow narrows `docker run --gpus device=...` to the planned 
 
 ### 11.3 Remote host path not found
 
-**Cause:** For remote daemons (`docker_host`/`context`) sflow does not auto-mount local
-workspace/output paths (they may not exist on the remote host).
+**Cause:** On a declared `hosts:` entry sflow does not auto-mount the controller's
+workspace/output paths (they may not exist on that machine). Local `fs://`/`file://`
+artifacts *are* bind-mounted at their own path, but pre-flight fails the run when that
+path is missing on a host — docker would otherwise create it as an empty directory.
 
 **Fix:** Provide explicit backend/host/operator `mounts` pointing at a shared filesystem
-available at the same path on every Docker host.
+available at the same path on every Docker host, or per-host `mounts` for the one that
+differs; make artifact paths exist on each host.
+
+### 11.4 Leftover containers / `docker ps` shows `sflow-…` after a run
+
+Containers are named `sflow-<machine>p<pid>-<task>-<node>` (`<machine>` is a short hash of
+the driver's machine identity) and are removed on completion, failure, signal and Ctrl-C.
+After a driver crash the **next** run reclaims its own orphans on every host it targets,
+never a colleague's live ones.
+
+- Containers named `sflow-p<pid>-…` or `sflow-<task>-<node>` were left by a **pre-v0.3.2**
+  sflow; the sweep's filter does not match them — clean them up once by hand.
+- A driver running **inside a container** (CI) gets a fresh machine identity per run and
+  cannot recognise its previous orphans: set `SFLOW_DRIVER_ID` to a stable value.
+- A container kept with `docker_run.rm: false` is stopped, not removed, at teardown and is
+  reaped as an orphan by the next `sflow run` on that host — `docker logs` / `inspect` it first.
+- A multi-node member that exited non-zero fails the whole task with its exit code and the
+  peers are stopped at once; look for the rank label in the merged task log to find which
+  member died.
 
 ---
 
@@ -734,11 +908,11 @@ available at the same path on every Docker host.
 
 **Pattern:**
 ```
-S3 storage requires boto3. Install with: pip install 'sflow[s3]'
+S3 storage requires boto3. Install with: pip install 'nv-sflow[s3]'
 ```
 or (dry-run) `storage target '<name>' (s3) requires boto3, which is not installed`.
 
-**Fix:** `pip install 'sflow[s3]'`.
+**Fix:** `pip install 'nv-sflow[s3]'`.
 
 ### 12.2 No AWS Credentials
 
@@ -748,9 +922,9 @@ storage target '<name>' (s3): no AWS credentials detected ...
 ```
 
 **Cause:** No `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or `AWS_PROFILE` env and no
-`~/.aws/credentials`. (An attached IAM role can't be detected offline.)
+AWS shared credentials file. (An attached IAM role can't be detected offline.)
 
-**Fix:** Provide credentials via the boto3 chain (env vars, `~/.aws/credentials`, or an
+**Fix:** Provide credentials via the boto3 chain (env vars, the AWS shared credentials file, or an
 instance/pod IAM role). **Never put secrets in YAML.**
 
 ### 12.3 Unknown Storage Target
@@ -816,3 +990,74 @@ workflow.monitor.resources.used_by_tasks refers to unknown task '<ref>'
 
 **Fix:** Use an `interval` >= 100 (ms); enable at least one scope when `scopes:` is present;
 ensure `used_by_tasks` names existing tasks.
+
+---
+
+## 14. Install / Upgrade Errors
+
+The distribution is **`nv-sflow`** on PyPI from v0.3.2 (GitHub builds and v0.3.1 and
+earlier are named `sflow`; the import name and CLI are unchanged). `sflow upgrade` installs
+the latest PyPI release by default; `--sflow-version` is a PEP 440 version/specifier only;
+`--branch` / `--repo` install a git ref.
+
+### 14.1 `--sflow-version` given a git ref
+
+**Pattern:**
+```
+Error: --sflow-version 'develop' is not a valid PyPI version specifier. Use a plain version like '0.2.1' or a specifier like '>=0.2,<0.3'; package names, URLs and '@' direct references are not allowed. For a git branch or tag use --branch/--repo.
+```
+
+**Fix:** `sflow upgrade --sflow-version <ref>` → `sflow upgrade --branch <ref>`;
+`--sflow-version <repo>@<ref>` → `--repo <repo> --branch <ref>`. (`sflow batch
+--sflow-version` is unchanged and still takes a git ref unless `--sflow-index-url` is set.)
+
+### 14.2 Two sources at once
+
+**Pattern:** `--repo/--branch install a git ref and cannot be combined with --sflow-version, --sflow-index-url; a PyPI version or index does not apply to a git checkout.` or
+`--sflow-source-path is mutually exclusive with ...`.
+
+**Fix:** Pick one route: PyPI (`--sflow-version` / `--sflow-index-url`), git
+(`--repo` / `--branch`), or a local checkout (`--sflow-source-path`).
+
+### 14.3 Refusing to replace a development install
+
+**Pattern:** `Error: sflow is currently a 'editable' (development) install (<path>). Upgrading would replace it with a released build and your local changes would no longer be used. Re-run with --force if that is what you want, or reinstall from your checkout with 'pip install -e .'.`
+
+**Fix:** That is the guard working. `--force` to replace the checkout with a release;
+otherwise `git pull` in the checkout instead.
+
+### 14.4 No installer
+
+**Pattern:** `Error: neither 'uv' nor 'pip' is available in this environment, so sflow cannot install anything. Install uv (https://docs.astral.sh/uv/) or add pip with '<python> -m ensurepip --upgrade', then retry.`
+
+**Fix:** As the message says — uv-created venvs routinely ship without pip.
+
+### 14.5 Installer failed / old release not on a private index
+
+**Pattern:** `Error: install failed with exit code <N>.` after the installer's own output,
+e.g. `No solution found ... nv-sflow==0.3.1` / `No matching distribution found for nv-sflow==0.3.1`.
+
+**Cause:** Wheels up to and including v0.3.1 were published under the old name `sflow`, so
+`--sflow-index-url <url> --sflow-version 0.3.1` looks for `nv-sflow==0.3.1` and finds nothing.
+
+**Fix:** Install old releases from their git tag: `sflow upgrade --branch v0.3.1`, or
+`sflow batch --sflow-version v0.3.1` (no index URL). Otherwise read the installer output above
+the error line (network, index auth via `~/.netrc`, Python floor 3.10).
+
+### 14.6 `sflow` broken after `pip uninstall sflow` / wrong package installed
+
+**Cause:** `sflow` and `nv-sflow` own the same files, so `pip uninstall sflow` after an
+upgrade deletes the working install. `pip install sflow` installs an **unrelated** project
+from pypi.org.
+
+**Fix:** `pip install --force-reinstall nv-sflow`. Upgrading from v0.3.1 or earlier: `pip
+install nv-sflow`, or `sflow upgrade` **twice** (the old command lands on the GitHub build,
+which then moves you to PyPI); the stale `sflow` record is tidied on the next `sflow` run
+(`SFLOW_NO_AUTO_MIGRATE=1` disables that).
+
+### 14.7 Credentials in the index URL
+
+**Pattern:** `--sflow-index-url must not contain embedded credentials; use ~/.netrc or a credential helper instead.` (also rejects query strings / fragments).
+
+**Fix:** Put credentials in `~/.netrc` or a credential helper; the URL is embedded verbatim
+in generated scripts and logs.

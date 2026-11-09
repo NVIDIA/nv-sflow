@@ -1,0 +1,249 @@
+# GLM-5.2 (NVFP4) on SGLang, one remote Docker host: one TP8 server plus
+# the InferenceX AgentX benchmark exactly as a reference run invoked it
+# (replayed Claude Code agent sessions, 24 concurrent session trees, 60 min).
+#
+# Same server -> client shape as sglang_qwen3.yaml; the server flags are the
+# reference GLM-5.2 command verbatim (EAGLE speculative decode + hierarchical
+# KV cache in host memory), split into variables only where you would tune them.
+#
+# Prerequisites:
+#   - ssh from this driver to HOST_ADDRESS works; Docker + NVIDIA Container
+#     Toolkit and 8 free GPUs on that host
+#   - the checkpoint at MODEL_PATH on that host (bind-mounted same-path into both containers;
+#     point it elsewhere with `-a MODEL_PATH=fs:///path/to/GLM-5.2-NVFP4`)
+#   - TP_SIZE x HICACHE_SIZE x ~1.23 GB of available HOST memory (~1575GB at
+#     the defaults): --hicache-size is per TP rank, plus a DSA-indexer host
+#     cache ~23% on top, all pinned at startup
+#   - the image pulled on that host beforehand; a cold pull eats into the readiness timeout
+#   - HuggingFace reachable from that host: the benchmark downloads the trace
+#     corpus (~1.8GB) on first run, cached in CACHE_DIR afterwards
+#
+# Run it:
+#   sflow run -f examples/self_contained/docker/sglang_glm52.yaml
+#   sflow run -f examples/self_contained/docker/sglang_glm52.yaml --dry-run
+#
+# aiperf exits 0 even when every request failed -- open the results under
+# aiperf_agentx_concurrency_*/ (and check submission_valid) before believing a number.
+version: "0.1"
+
+variables:
+  HOST_ADDRESS:
+    description: "Docker host that runs both tasks (ssh-reachable from the driver)"
+    value: 10.114.98.206
+  SSH_USER:
+    description: "SSH login on that host; leave empty to use your own"
+    value: rogliu
+
+  SERVED_MODEL_NAME:
+    description: "Name the server advertises; aiperf must request the same string"
+    value: nvidia/GLM-5.2-NVFP4
+
+  # Server
+  PORT:
+    description: "SGLang server port (host networking, so also the host port)"
+    type: integer
+    value: 8888
+  TP_SIZE:
+    description: "Tensor parallel size; the server reserves this many GPUs"
+    type: integer
+    value: 8
+  GPUS_PER_NODE:
+    description: "GPUs on this machine -- the planning ceiling, not a reservation"
+    type: integer
+    value: 8
+  MAX_RUNNING_REQUESTS:
+    description: "Server-side concurrency cap; also bounds --cuda-graph-max-bs"
+    type: integer
+    value: 48
+  MEM_FRACTION_STATIC:
+    description: "Fraction of GPU memory for weights + KV pool"
+    value: "0.85"
+  HICACHE_SIZE:
+    description: >
+      Hierarchical-cache host memory in GB, PER TP RANK. Each rank also pins a
+      DSA-indexer host cache ~23% of this (45.83GB at 200), and sglang gives
+      each rank a budget of (MemAvailable - 10GiB) / TP_SIZE measured at
+      startup. At 200 a rank needs 245.8GB against ~261GB idle on the 2TB B300
+      host -- a 6% margin that one run lost ("Not enough host memory for DSA
+      indexer": 38.7GB left of 45.8GB). 160 needs ~197GB per rank.
+    type: integer
+    value: 160
+
+  # Benchmark: the InferenceX AgentX command recovered from a reference run's
+  # benchmark.log ("CLI Command:" line) -- replays real Claude Code sessions
+  # (SemiAnalysis Weka traces, subagents included) with recorded think time.
+  AIPERF_REF:
+    description: >
+      aiperf build. The reference used SemiAnalysis's agentx-harness fork, which
+      installs AS `aiperf` and is pinned by commit -- it adds
+      --warmup-requests-per-lane (not in PyPI aiperf up to 0.13.0.dev20260922)
+      and accepts --trace-idle-gap-cap-seconds under the scenario. This is the
+      commit TensorRT-LLM's agentx_client.py pins; it accepts the reference
+      command verbatim. A tarball, so the image needs no git.
+    value: https://github.com/SemiAnalysisAI/agentx-harness/archive/754356e9a39acc6cc6afb242d123bb57c3fb6f75.tar.gz
+  AGENTX_DATASET:
+    description: >
+      Weka trace corpus (393 traces with subagents, peak context 996579 --
+      under GLM-5.2's 1048576 window, so the reference replays all of them
+      with no --max-context-length). Downloaded from HuggingFace on first run,
+      cached under CACHE_DIR/huggingface.
+    value: semianalysis_cc_traces_weka_062126
+  CONCURRENCY:
+    description: >
+      Live agent session TREES (a root session plus its subagents), not
+      requests -- in-flight requests exceed this during subagent fan-out, which
+      is why the server gets 2x the running slots.
+    type: integer
+    value: 24
+  BENCHMARK_DURATION:
+    description: "Profiling seconds after warmup; warmup itself may add up to --warmup-grace-period (1800s)"
+    type: integer
+    value: 3600
+
+  CACHE_DIR:
+    description: >
+      Dir on the docker host mounted over the container's /root/.cache, so the
+      FlashInfer JIT builds and sglang's autotune results
+      (/root/.cache/sglang/flashinfer/autotune/<ver>/<sm>/...) survive the --rm
+      container and later runs skip the rebuild. Entries are keyed by version and
+      arch, so one dir can serve several images. Docker creates it if missing.
+    value: /var/data0/sandbox/rogliu/flashinfer-cache
+
+  SGLANG_IMAGE:
+    description: "SGLang image new enough for GLM-5.2 and these flags; pin a tag for reproducible runs"
+    value: lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729
+
+artifacts:
+  # Bind-mounted into the server AND the benchmark container at the same path:
+  # the server loads weights from it, aiperf loads the tokenizer from it.
+  - name: MODEL_PATH
+    description: "GLM-5.2 NVFP4 checkpoint, a path on the docker host"
+    uri: fs:///var/data0/Games/Huggingface_Models_nvidia_GLM_5_2_NVFP4_1
+
+backends:
+  - name: docker_host
+    type: docker
+    default: true
+    image: ${{ variables.SGLANG_IMAGE }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # One remote machine: sflow drives its daemon over ssh (docker --host
+    # ssh://...), so the checkpoint path above is a path on THAT host.
+    hosts:
+      - name: node-0
+        address: ${{ variables.HOST_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+
+operators:
+  - name: sglang
+    type: docker_run
+    image: ${{ variables.SGLANG_IMAGE }}
+    # No `gpus:` -- resources.gpus.count pins the container to exactly the
+    # reserved devices.
+    extra_args:
+      # The image ships an application entrypoint; sflow launches through bash.
+      - --entrypoint=
+      - --network=host   # aiperf reaches the server at localhost:PORT
+      - --ipc=host
+      - --shm-size=32g
+    # Persist JIT/autotune caches across runs (see CACHE_DIR). Not an artifact:
+    # artifacts mount same-path, and this must land on /root/.cache. `mounts:`
+    # rather than a raw `-v` in extra_args, so sflow dedupes it against the
+    # artifact auto-mounts and lists it in --dry-run.
+    mounts:
+      - ${{ variables.CACHE_DIR }}:/root/.cache
+
+workflow:
+  name: sglang_glm52_docker
+  tasks:
+    - name: sglang_server
+      operator: sglang
+      resources:
+        gpus:
+          count: ${{ variables.TP_SIZE }}
+      ports:
+        - port: ${{ variables.PORT }}
+      script:
+        - set -x
+        - >
+          python3 -m sglang.launch_server
+          --model-path ${{ artifacts.MODEL_PATH.path }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --host 0.0.0.0
+          --port ${{ variables.PORT }}
+          --trust-remote-code
+          --tp ${{ variables.TP_SIZE }}
+          --ep-size 1
+          --kv-cache-dtype fp8_e4m3
+          --bf16-gemm-backend cutedsl
+          --max-prefill-tokens 8192
+          --quantization modelopt_fp4
+          --tool-call-parser glm47
+          --reasoning-parser glm45
+          --chunked-prefill-size 8192
+          --mem-fraction-static ${{ variables.MEM_FRACTION_STATIC }}
+          --max-running-requests ${{ variables.CONCURRENCY * 2 }}
+          --speculative-algorithm EAGLE
+          --speculative-num-steps 3
+          --speculative-eagle-topk 1
+          --speculative-num-draft-tokens 4
+          --cuda-graph-max-bs ${{ variables.CONCURRENCY * 2 }}
+          --enable-hierarchical-cache
+          --hicache-size ${{ variables.HICACHE_SIZE }}
+          --hicache-write-policy write_back
+          --hicache-io-backend direct
+          --hicache-mem-layout page_first_direct
+          --watchdog-timeout 1800
+          --enable-metrics
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "The server is fired up and ready to roll"
+          # TP8 NVFP4 load (~4min) + EAGLE cuda graphs + pinning the host cache.
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+
+    - name: benchmark
+      operator: sglang   # reuses the image: its transformers can load the GLM tokenizer
+      depends_on:
+        - sglang_server
+      script:
+        - set -x
+        - pip install --quiet "aiperf @ ${{ variables.AIPERF_REF }}"
+        - export COLUMNS=200
+        # The reference command verbatim, except what must follow this recipe:
+        # --url/--server-metrics point at this server, --tokenizer is the local
+        # checkpoint (same tokenizer as HF 'nvidia/GLM-5.2-NVFP4', no download),
+        # and the artifact dir is under the run's output dir. The scenario
+        # itself adds ignore_eos, cache-bust first_turn_prefix and a 10s system
+        # idle cap -- the reference log shows those same four lines.
+        - >
+          aiperf profile
+          --scenario inferencex-agentx-mvp
+          --url http://localhost:${{ variables.PORT }}
+          --endpoint /v1/chat/completions
+          --endpoint-type chat
+          --streaming
+          --model ${{ variables.SERVED_MODEL_NAME }}
+          --tokenizer ${{ artifacts.MODEL_PATH.path }}
+          --tokenizer-trust-remote-code
+          --concurrency ${CONCURRENCY}
+          --benchmark-duration ${{ variables.BENCHMARK_DURATION }}
+          --stats-interval 30
+          --random-seed 42
+          --failed-request-threshold 0.1
+          --trajectory-start-min-ratio 0.25
+          --trajectory-start-max-ratio 0.75
+          --warmup-requests-per-lane 10
+          --trace-idle-gap-cap-seconds 300
+          --warmup-grace-period 1800
+          --use-server-token-count
+          --no-gpu-telemetry
+          --num-dataset-entries 393
+          --slice-duration 1.0
+          --output-artifact-dir ${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_agentx_concurrency_${CONCURRENCY}
+          --public-dataset ${{ variables.AGENTX_DATASET }}
+          --server-metrics http://localhost:${{ variables.PORT }}/metrics
+        - echo "Benchmarking finished"

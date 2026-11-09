@@ -3817,7 +3817,7 @@ def test_resolve_effective_sflow_version_uses_requested_revision():
         ),
     )
 
-    with patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist):
+    with patch("sflow.cli.batch.installed_distribution", return_value=dist):
         assert batch_mod._resolve_effective_sflow_version(None) == "feature/infmax_v3"
 
 
@@ -3834,17 +3834,42 @@ def test_resolve_effective_sflow_version_uses_editable_repo_branch(tmp_path):
     )
 
     with (
-        patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist),
+        patch("sflow.cli.batch.installed_distribution", return_value=dist),
         patch("sflow.cli.batch._git_current_ref", return_value="feature/infmax_v3"),
     ):
         assert batch_mod._resolve_effective_sflow_version(None) == "feature/infmax_v3"
 
 
 def test_resolve_effective_sflow_version_falls_back_to_installed_package_version():
+    # A PyPI/index install records only its version; release tags are v-prefixed,
+    # so the bare version is mapped to the tag (v0.3.2 breaking change 4).
     dist = _FakeSflowDistribution(version="0.2.0", direct_url_text=None)
 
-    with patch("sflow.cli.batch.importlib_metadata.distribution", return_value=dist):
-        assert batch_mod._resolve_effective_sflow_version(None) == "0.2.0"
+    with patch("sflow.cli.batch.installed_distribution", return_value=dist):
+        assert batch_mod._resolve_effective_sflow_version(None) == "v0.2.0"
+
+
+@pytest.mark.parametrize("version", ["0.4.0rc1", "0.3.2.dev5+develop.abc1234"])
+def test_resolve_effective_sflow_version_keeps_versions_without_a_github_tag(version):
+    dist = _FakeSflowDistribution(version=version, direct_url_text=None)
+
+    with patch("sflow.cli.batch.installed_distribution", return_value=dist):
+        assert batch_mod._resolve_effective_sflow_version(None) == version
+
+
+def test_resolve_effective_sflow_version_never_rewrites_a_recorded_git_ref():
+    # A numeric branch or an unprefixed tag recorded by a git install is a real
+    # ref; only the version fallback is mapped, never direct_url.json.
+    dist = _FakeSflowDistribution(
+        version="0.3.2",
+        direct_url_text=(
+            '{"url":"https://github.com/NVIDIA/nv-sflow.git",'
+            '"vcs_info":{"vcs":"git","requested_revision":"0.3.2","commit_id":"abc123"}}'
+        ),
+    )
+
+    with patch("sflow.cli.batch.installed_distribution", return_value=dist):
+        assert batch_mod._resolve_effective_sflow_version(None) == "0.3.2"
 
 
 def test_batch_defaults_sflow_version_from_execution_env(
@@ -3880,12 +3905,86 @@ def test_batch_defaults_sflow_version_from_execution_env(
     # --prerelease=allow ...
     expected_install = (
         '"$VIRTUAL_ENV/bin/uv" pip install '
-        "'sflow @ git+https://github.com/NVIDIA/nv-sflow.git@feature/infmax_v3' "
+        "git+https://github.com/NVIDIA/nv-sflow.git@feature/infmax_v3 "
         "--prerelease=allow"
     )
     assert expected_install in script_content
     # ... and the editable (--sflow-source-path) install path must NOT be taken.
     assert 'pip install -e ".[dev]"' not in script_content
+
+
+@pytest.mark.parametrize(
+    "detected, ref",
+    [
+        ("0.3.1", "v0.3.1"),
+        # Pre-release tags are never synced to GitHub; keep the old pass-through.
+        ("0.4.0rc1", "0.4.0rc1"),
+        # No tag exists for a .devN build; it keeps the old pass-through.
+        ("0.3.2.dev5+develop.abc1234", "0.3.2.dev5+develop.abc1234"),
+    ],
+)
+def test_batch_maps_a_detected_release_version_to_its_tag(
+    mock_sflow_app, temp_workflow_file, tmp_path, detected, ref
+):
+    # A PyPI/index install has no direct_url.json, so only the version is known;
+    # release tags are v-prefixed, so a bare version is not a usable git ref.
+    sbatch_path = tmp_path / "test.sh"
+    with patch(
+        "sflow.cli.batch.installed_distribution",
+        return_value=_FakeSflowDistribution(version=detected, direct_url_text=None),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "batch",
+                "--file",
+                str(temp_workflow_file),
+                "--partition",
+                "batch",
+                "--account",
+                "testaccount",
+                "--nodes",
+                "1",
+                "--sbatch-path",
+                str(sbatch_path),
+            ],
+        )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert (
+        '"$VIRTUAL_ENV/bin/uv" pip install '
+        f"git+https://github.com/NVIDIA/nv-sflow.git@{ref} --prerelease=allow"
+        in sbatch_path.read_text()
+    )
+
+
+def test_batch_keeps_an_explicit_bare_version_as_given(
+    mock_sflow_app, temp_workflow_file, tmp_path
+):
+    # Only the auto-detected version is rewritten; an explicit --sflow-version
+    # is a git ref the user chose and is used verbatim.
+    sbatch_path = tmp_path / "test.sh"
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            "--file",
+            str(temp_workflow_file),
+            "--partition",
+            "batch",
+            "--account",
+            "testaccount",
+            "--nodes",
+            "1",
+            "--sflow-version",
+            "0.3.1",
+            "--sbatch-path",
+            str(sbatch_path),
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert "nv-sflow.git@0.3.1 --prerelease=allow" in sbatch_path.read_text()
 
 
 def test_batch_sflow_version_accepts_repo_url_with_ref(
@@ -3915,7 +4014,8 @@ def test_batch_sflow_version_accepts_repo_url_with_ref(
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     script_content = sbatch_path.read_text()
     assert (
-        "sflow @ git+https://git.example.com/example/sflow.git@develop"
+        '"$VIRTUAL_ENV/bin/uv" pip install '
+        "git+https://git.example.com/example/sflow.git@develop --prerelease=allow"
         in script_content
     )
     assert (
@@ -3931,13 +4031,13 @@ def test_batch_sflow_version_accepts_repo_url_with_ref(
 
 def test_sflow_pypi_requirement_builds_specs():
     """_sflow_pypi_requirement turns a validated version/specifier into a requirement."""
-    assert batch_mod._sflow_pypi_requirement(None) == "sflow"
-    assert batch_mod._sflow_pypi_requirement("") == "sflow"
-    assert batch_mod._sflow_pypi_requirement("   ") == "sflow"
-    assert batch_mod._sflow_pypi_requirement("0.2.1") == "sflow==0.2.1"
-    assert batch_mod._sflow_pypi_requirement("==0.2.1") == "sflow==0.2.1"
-    assert batch_mod._sflow_pypi_requirement(">=0.2,<0.3") == "sflow>=0.2,<0.3"
-    assert batch_mod._sflow_pypi_requirement("~=0.2.0") == "sflow~=0.2.0"
+    assert batch_mod._sflow_pypi_requirement(None) == "nv-sflow"
+    assert batch_mod._sflow_pypi_requirement("") == "nv-sflow"
+    assert batch_mod._sflow_pypi_requirement("   ") == "nv-sflow"
+    assert batch_mod._sflow_pypi_requirement("0.2.1") == "nv-sflow==0.2.1"
+    assert batch_mod._sflow_pypi_requirement("==0.2.1") == "nv-sflow==0.2.1"
+    assert batch_mod._sflow_pypi_requirement(">=0.2,<0.3") == "nv-sflow>=0.2,<0.3"
+    assert batch_mod._sflow_pypi_requirement("~=0.2.0") == "nv-sflow~=0.2.0"
 
 
 def test_batch_sflow_index_url_installs_pinned_version_from_registry(
@@ -3971,12 +4071,12 @@ def test_batch_sflow_index_url_installs_pinned_version_from_registry(
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     script_content = sbatch_path.read_text()
     assert (
-        '"$VIRTUAL_ENV/bin/uv" pip install sflow==0.2.1 '
+        '"$VIRTUAL_ENV/bin/uv" pip install nv-sflow==0.2.1 '
         f"--extra-index-url {index_url} --prerelease=allow" in script_content
     )
     assert (
         "set +x\n"
-        '"$VIRTUAL_ENV/bin/uv" pip install sflow==0.2.1 '
+        '"$VIRTUAL_ENV/bin/uv" pip install nv-sflow==0.2.1 '
         f"--extra-index-url {index_url} --prerelease=allow\n"
         "set -x"
         in script_content
@@ -4015,7 +4115,7 @@ def test_batch_sflow_index_url_without_version_installs_latest(
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     script_content = sbatch_path.read_text()
     assert (
-        f'"$VIRTUAL_ENV/bin/uv" pip install sflow --extra-index-url {index_url} '
+        f'"$VIRTUAL_ENV/bin/uv" pip install nv-sflow --extra-index-url {index_url} '
         "--prerelease=allow" in script_content
     )
     assert "git+" not in script_content
@@ -4051,7 +4151,7 @@ def test_batch_sflow_index_url_passes_through_version_spec(
 
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     script_content = sbatch_path.read_text()
-    assert "'sflow>=0.2,<0.3'" in script_content
+    assert "'nv-sflow>=0.2,<0.3'" in script_content
     assert f"--extra-index-url {index_url}" in script_content
 
 
@@ -4252,7 +4352,7 @@ def test_batch_sflow_index_url_threads_into_bulk_submit(mock_sflow_app, tmp_path
     assert scripts, "expected at least one generated script"
     content = scripts[0].read_text()
     assert (
-        f"pip install sflow==0.2.1 --extra-index-url {index_url} --prerelease=allow"
+        f"pip install nv-sflow==0.2.1 --extra-index-url {index_url} --prerelease=allow"
         in content
     )
     assert "git+" not in content
@@ -5586,3 +5686,23 @@ def test_bulk_submit_nodes_mismatch_warns(mock_sflow_app, tmp_path):
     assert result.exit_code == 0, result.output
     assert "--nodes=4 does not match" in result.output
     assert "wf.yaml says 6" in result.output
+
+
+def test_submitted_job_ids_are_recorded_for_remote_cancellation(
+    tmp_path, monkeypatch
+) -> None:
+    # SSH delegation points this env var at a session file so an interrupted
+    # remote run can scancel exactly the jobs it submitted.
+    jobs = tmp_path / "submitted-jobs"
+    monkeypatch.setenv(batch_mod.SUBMITTED_JOBS_FILE_ENV, str(jobs))
+
+    batch_mod._record_submitted_job("Submitted batch job 4242")
+    batch_mod._record_submitted_job("Submitted batch job 4243")
+    batch_mod._record_submitted_job("sbatch said nothing useful")
+
+    assert jobs.read_text().split() == ["4242", "4243"]
+
+
+def test_submitted_job_recording_is_off_without_the_env_channel(tmp_path) -> None:
+    # A plain local batch run must not write bookkeeping files anywhere.
+    batch_mod._record_submitted_job("Submitted batch job 1")

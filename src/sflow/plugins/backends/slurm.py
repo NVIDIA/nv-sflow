@@ -182,7 +182,7 @@ class SlurmBackend(Backend):
             )
         return filtered
 
-    def preflight_validate(self) -> None:
+    def preflight_validate(self, *, artifacts: Sequence[Any] = ()) -> None:
         required = ["salloc", "srun", "scontrol", "scancel"]
         missing = [c for c in required if shutil.which(c) is None]
         if missing:

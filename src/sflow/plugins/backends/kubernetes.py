@@ -613,6 +613,9 @@ class KubernetesBackendConfig(BackendConfig):
     def planning_node_count(self) -> Resolvable[int] | None:
         return self.nodes
 
+    def executes_offhost(self) -> bool:
+        return True
+
 
 @register_backend("kubernetes", KubernetesBackendConfig)
 class KubernetesBackend(Backend):
@@ -655,6 +658,8 @@ class KubernetesBackend(Backend):
             # DCGM/DaemonSet collector); the monitor planner skips it rather than
             # sampling the sflow driver host and reporting misleading metrics.
             supports_host_monitoring=False,
+            # file:// inline content rides into the pod as a ConfigMap.
+            injects_inline_artifact_content=True,
         )
         # Populated in allocate(): maps a real k8s node name -> the placeholder
         # pod holding it (used for the create-before-destroy GPU handoff).
@@ -2001,7 +2006,7 @@ class KubernetesBackend(Backend):
             perms.append(("get", "deviceclasses.resource.k8s.io", False))
         return perms
 
-    def preflight_validate(self) -> None:
+    def preflight_validate(self, *, artifacts: Sequence[Any] = ()) -> None:
         if shutil.which("kubectl") is None:
             raise ValueError(
                 f"Pre-flight validation failed for Kubernetes backend '{self.name}'. "

@@ -624,20 +624,27 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 .doc-btn svg{flex-shrink:0}
 .gh-corner{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(.6rem,2vw,1.2rem);z-index:400;padding:.3em .5em;border:1px solid rgba(255,255,255,.2);border-radius:50%;color:rgba(255,255,255,.6);text-decoration:none;background:rgba(6,10,16,.92);transition:all .3s;display:flex;align-items:center;justify-content:center}
 .gh-corner:hover{border-color:#fff;color:#fff;background:rgba(255,255,255,.15);box-shadow:0 0 12px rgba(255,255,255,.15)}
+.why-corner{background:var(--cy)!important;color:#060a10!important;font-weight:700!important;border-color:var(--cy)!important}
 .corner-links{position:fixed;top:clamp(.6rem,2vh,1.2rem);left:clamp(3.2rem,6vw,4.5rem);z-index:400;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
-.doc-corner,.map-corner{padding:.35em .9em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s;box-shadow:0 0 8px rgba(0,212,255,.15)}
+.why-corner,.doc-corner,.map-corner,.recipes-corner{padding:.35em .9em;border:1px solid var(--cy);border-radius:999px;color:var(--cy);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s;box-shadow:0 0 8px rgba(0,212,255,.15)}
 .map-corner{border-color:var(--gr);color:var(--gr);background:rgba(6,10,16,.92);box-shadow:0 0 8px rgba(118,255,2,.15)}
+.recipes-corner{border-color:#ff9f1c;color:#ff9f1c;background:rgba(6,10,16,.92);box-shadow:0 0 8px rgba(255,159,28,.15)}
 /* Persistent nav, so it should recede. Neutral hairline instead of a lit brand
    border keeps these legible over busy slides without reading as two more chips
    competing with the slide's own content; the colour returns on hover. */
-.doc-corner,.map-corner{border-color:rgba(255,255,255,.14);box-shadow:none}
+.why-corner,.doc-corner,.map-corner,.recipes-corner{border-color:rgba(255,255,255,.14);box-shadow:none}
 .doc-corner:hover{background:var(--cy);color:#060a10;box-shadow:0 0 20px rgba(0,212,255,.35)}
 .map-corner:hover{background:var(--gr);color:#060a10;box-shadow:0 0 20px rgba(118,255,2,.3)}
-/* Language switch. Deliberately not brand-coloured: the two chips beside it are
+.recipes-corner:hover{background:#ff9f1c;color:#060a10;box-shadow:0 0 20px rgba(255,159,28,.35)}
+/* Language switch. Deliberately not brand-coloured: the three chips beside it are
    destinations, this one only relabels the page you are already on. */
 .lang-corner{display:inline-flex;align-items:center;gap:.4em;padding:.35em .9em;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:var(--dim);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s}
 .lang-corner:hover{border-color:rgba(255,255,255,.5);color:#fff;background:rgba(255,255,255,.15)}
 .lang-corner svg{flex-shrink:0}
+/* Back to the homepage (the feature video at the site root). Neutral like the language
+   switch: it returns you, it is not a destination chip. */
+.home-corner{display:inline-flex;align-items:center;gap:.4em;padding:.35em .9em;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:var(--dim);text-decoration:none;font-size:var(--s);font-family:var(--font-display);font-weight:600;background:rgba(6,10,16,.92);transition:all .3s}
+.home-corner:hover{border-color:rgba(255,255,255,.5);color:#fff;background:rgba(255,255,255,.15)}
 .mb{margin-bottom:var(--gap)}.ms{margin-bottom:calc(var(--gap)*.4)}
 @media(max-height:700px){:root{--pad:clamp(.6rem,2.5vw,1.5rem);--gap:clamp(.3rem,1vw,.7rem);--t:clamp(1.5rem,4.5vw,2.8rem);--h:clamp(1.3rem,3.2vw,2.1rem)}}
 @media(max-height:600px){:root{--pad:clamp(.5rem,2vw,1.2rem);--gap:clamp(.25rem,.8vw,.55rem);--t:clamp(1.25rem,4vw,2.2rem);--h:clamp(1.05rem,2.8vw,1.65rem);--b:clamp(.72rem,1.3vw,.95rem)}}
@@ -655,8 +662,11 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
 </a>
 <div class="corner-links">
+<a href="./" class="home-corner" target="_top" onclick="event.stopPropagation()" title="Back to the homepage">&larr; Home</a>
+<a href="why-sflow" class="why-corner" target="_top" onclick="event.stopPropagation()">Why sflow &rarr;</a>
 <a href="docs/user/intro" class="doc-corner" target="_top" onclick="event.stopPropagation()">Docs &rarr;</a>
 <a href="feature-map" class="map-corner" target="_top" onclick="event.stopPropagation()">Feature Map &rarr;</a>
+<a href="vllm-recipes" class="recipes-corner" target="_top" onclick="event.stopPropagation()">vLLM Recipes &rarr;</a>
 <!-- No target: the deck is also iframed as the site homepage, and swapping in place
      keeps the reader where they are instead of punting them to a bare file URL. -->
 <a href="sflow_intro_zh.html" class="lang-corner" id="langToggle" hreflang="zh-Hans" lang="zh-Hans" title="切换到中文" onclick="event.stopPropagation()">
@@ -685,6 +695,7 @@ code{color:var(--cy);font-family:'Consolas',monospace;font-size:.95em}
 <div class="hero-cta r au d3">
 <a href="docs/user/intro" class="doc-btn primary" target="_top" onclick="event.stopPropagation()">View Documentation &rarr;</a>
 <a href="feature-map" class="doc-btn ghost" target="_top" onclick="event.stopPropagation()">Feature Map &rarr;</a>
+<a href="vllm-recipes" class="doc-btn ghost" target="_top" onclick="event.stopPropagation()">vLLM Recipes &rarr;</a>
 <a href="https://github.com/NVIDIA/nv-sflow" class="doc-btn ghost gh-btn" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;margin-right:.4em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
 </div>
 </div></div>
@@ -1334,7 +1345,7 @@ networking config match Dynamo disagg routing.</div>
 <div class="try-layout">
   <div class="term install-panel r al d2"><span class="section"># install from the repository</span>
 <span class="command">$ uv venv --python python3 &amp;&amp; source .venv/bin/activate</span>
-<span class="command">$ uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"</span>
+<span class="command">$ uv pip install nv-sflow</span>
 
 <span class="section"># verify and try a local workflow</span>
 <span class="command">$ sflow --version</span>

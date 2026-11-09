@@ -1,0 +1,141 @@
+/* Scoped under .vr-page so nothing here leaks into the rest of the docs
+   site. Colors/spacing reference the site's own Infima custom properties
+   (--ifm-*) instead of copied hex, so this page tracks the real docs theme
+   (including light/dark toggle) instead of a hand-maintained snapshot of it. */
+.vr-page {
+  --vr-panel: var(--ifm-background-surface-color);
+  --vr-panel-2: var(--ifm-color-emphasis-200);
+  --vr-border: var(--ifm-color-emphasis-300);
+  --vr-text: var(--ifm-font-color-base);
+  --vr-muted: var(--ifm-color-content-secondary);
+  --vr-accent: var(--ifm-color-primary);
+  --vr-ok: var(--ifm-color-success);
+  --vr-ok-bg: var(--ifm-color-success-contrast-background);
+  --vr-ok-fg: var(--ifm-color-success-contrast-foreground);
+  --vr-warn: var(--ifm-color-warning);
+  --vr-warn-bg: var(--ifm-color-warning-contrast-background);
+  --vr-warn-fg: var(--ifm-color-warning-contrast-foreground);
+  --vr-radius: var(--ifm-global-radius);
+  --vr-radius-lg: calc(var(--ifm-global-radius) * 2);
+  color: var(--vr-text);
+}
+.vr-page * { box-sizing: border-box; }
+.vr-page code, .vr-page pre { font-family: var(--ifm-font-family-monospace); }
+
+.vr-layout { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - var(--ifm-navbar-height, 3.75rem)); }
+
+.vr-sidebar {
+  /* No panel fill - the real docs sidebar has none either, just the
+     hairline border, so it reads as part of the page rather than a
+     distinct chrome element. */
+  border-right: 1px solid var(--vr-border);
+  padding: 1rem; overflow-y: auto;
+  max-height: calc(100vh - var(--ifm-navbar-height, 3.75rem));
+  position: sticky; top: var(--ifm-navbar-height, 3.75rem);
+}
+.vr-sidebar input {
+  width: 100%; padding: .5rem .6rem; border-radius: var(--vr-radius); border: 1px solid var(--vr-border);
+  background: var(--ifm-background-color); color: var(--vr-text); font-size: .9rem;
+}
+.vr-hits { color: var(--vr-muted); font-size: .75rem; margin: .5rem 0; }
+
+/* The model tree is built from the site's own real Docusaurus sidebar
+   markup and class names (li.menu__list-item > details > summary.menu__list
+   -item-collapsible > a.menu__link[--sublist][--active], nested ul.menu__list)
+   - see builder.js's renderOptions(). Those classes are plain global Infima
+   classes (not CSS-module-scoped), so nearly everything below is inherited
+   for free from the site's own stylesheet; this block only patches the two
+   things a <details>-based collapse needs that Docusaurus's own JS-driven
+   collapse doesn't: hiding the native <details> marker, and rotating the
+   sublist caret off `[open]` instead of `aria-expanded`. */
+.vr-sidebar details { border: none; margin: 0; }
+.vr-sidebar summary {
+  list-style: none; cursor: pointer;
+  /* <summary>'s UA default is shrink-to-fit, unlike the <div> Docusaurus
+     itself wraps its category link in - the .menu__list-item-collapsible
+     class already sets display:flex (real Infima rule), but without an
+     explicit full width the flex row itself shrink-wraps, so the child
+     menu__link has nothing to flex:1 *into* and its sublist caret
+     (margin-left:auto) sits right next to the text instead of the row's
+     far edge like the real sidebar. */
+  width: 100%;
+}
+.vr-sidebar summary::-webkit-details-marker,
+.vr-sidebar summary::marker { display: none; content: ""; }
+.vr-sidebar .vr-org-label { flex: 1; }
+.vr-sidebar .menu__link--sublist-caret::after { transition: transform .2s; transform: rotate(90deg); }
+.vr-sidebar details[open] > summary .menu__link--sublist-caret::after { transform: rotate(180deg); }
+
+.vr-content { padding: 1.5rem 2rem 3rem; max-width: 900px; margin: 0 auto; }
+/* --ifm-h1-font-size (2rem), not the larger size Docusaurus's markdown
+   content wrapper applies to doc-page h1s (48px) - this page isn't
+   markdown content, so it should match the site's generic heading scale,
+   not the long-form-article one. */
+.vr-content .model-header h1 { font-size: var(--ifm-h1-font-size); font-weight: var(--ifm-heading-font-weight); margin: 0 0 .3rem; }
+.vr-content .model-header .default-model { color: var(--vr-muted); font-size: .85rem; margin: 0 0 1rem; }
+
+.vr-content .pills-label { display: block; font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; color: var(--vr-muted); margin-bottom: .3rem; }
+.vr-content #variantRow.empty, .vr-content #strategyRow.empty { display: none; }
+.vr-content .pills { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1rem; }
+.vr-content .pill {
+  border: 1px solid var(--vr-border); background: var(--vr-panel-2); color: var(--vr-text);
+  padding: .35rem .8rem; border-radius: 999px; font-size: .8rem; cursor: pointer;
+}
+.vr-content .pill:hover { border-color: var(--vr-accent); }
+.vr-content .pill.selected { background: var(--vr-accent); border-color: var(--vr-accent); color: #fff; }
+/* Offered by the recipe set but unrunnable on this hardware - struck through
+   rather than hidden, so it is clear the combination exists and why it is out. */
+.vr-content .pill.disabled {
+  text-decoration: line-through; color: var(--vr-muted); opacity: .6; cursor: not-allowed;
+}
+.vr-content .pill.disabled:hover { border-color: var(--vr-border); }
+
+.vr-content .note { color: var(--vr-muted); font-size: .85rem; }
+#details { margin-bottom: 1.3rem; }
+
+.vr-content section.card {
+  background: var(--vr-panel); border: 1px solid var(--vr-border); border-radius: var(--vr-radius-lg);
+  padding: 1rem 1.2rem; margin-bottom: 1.2rem;
+}
+.vr-content section.card h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--vr-muted); margin: 0 0 .8rem; }
+
+.vr-content .opt-row { display: flex; gap: 1rem; margin-bottom: .8rem; }
+.vr-content .opt-row:last-child { margin-bottom: 0; }
+.vr-content .opt-row > div { flex: 1; }
+.vr-page label.opt { display: flex; align-items: center; gap: .5rem; font-size: .85rem; margin-bottom: .35rem; cursor: pointer; }
+.vr-content input[type="text"], .vr-content input:not([type]), .vr-content select {
+  width: 100%; padding: .45rem .6rem; border-radius: var(--vr-radius); border: 1px solid var(--vr-border);
+  background: var(--ifm-background-color); color: var(--vr-text); font-size: .85rem; font-family: inherit;
+}
+.vr-page input[type="checkbox"] { width: auto; accent-color: var(--vr-accent); }
+.vr-content select { cursor: pointer; }
+
+#todo { border: 1px solid var(--vr-warn); border-radius: var(--vr-radius-lg); background: var(--vr-warn-bg); padding: .8rem 1.1rem; margin-bottom: 1.2rem; }
+#todo h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--vr-warn-fg); margin: 0 0 .4rem; }
+#todo ul { margin: 0; padding-left: 1.1rem; font-size: .82rem; color: var(--vr-warn-fg); }
+#todo.empty { display: none; }
+.vr-page mark.ph { background: var(--vr-warn); color: var(--vr-warn-fg); padding: 0 3px; border-radius: 3px; }
+
+.vr-content .code-block { border: 1px solid var(--vr-border); border-radius: var(--vr-radius-lg); overflow: hidden; margin-bottom: 1.2rem; }
+.vr-content .code-head {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .4rem;
+  background: var(--vr-panel-2); padding: .5rem .9rem; font-size: .78rem; color: var(--vr-muted);
+}
+.vr-content .code-head > span:last-child { display: flex; flex-wrap: wrap; gap: .4rem; }
+.vr-content .code-head button {
+  background: var(--vr-accent); border: 1px solid var(--vr-accent); color: #fff;
+  padding: .25rem .7rem; border-radius: var(--vr-radius); font-size: .75rem; cursor: pointer;
+}
+.vr-content .code-head button:hover { opacity: .85; }
+/* --ifm-pre-background, not --ifm-code-background - this site decouples the
+   two (dark mode: near-black pre vs. green-tinted inline code, see
+   src/css/custom.css), and a <pre> block is a pre, not inline code. Using
+   the wrong var matched in light mode (Infima defaults pre-bg = code-bg)
+   but went green in dark mode instead of matching real doc code blocks. */
+.vr-content pre { margin: 0; padding: 1rem; background: var(--ifm-pre-background); color: var(--vr-text); overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: .8rem; }
+#yaml, #machineYaml { max-height: 420px; overflow-y: auto; }
+
+@media (max-width: 768px) {
+  .vr-layout { grid-template-columns: 1fr; }
+  .vr-sidebar { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--vr-border); }
+}

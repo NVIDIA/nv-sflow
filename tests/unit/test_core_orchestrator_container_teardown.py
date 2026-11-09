@@ -707,3 +707,42 @@ def test_an_operator_with_the_older_release_signature_still_works(monkeypatch):
 
     assert rc == 0
     assert released == ["legacy"], "the ordinary release must still reach the operator"
+
+
+def test_a_slow_reap_does_not_block_the_event_loop(monkeypatch):
+    """The container reap must be offloaded, like the release beside it.
+
+    A reap is `docker rm -f` per container; against a REMOTE daemon that is an
+    ssh round trip, seconds rather than milliseconds. Run inline it froze the
+    loop for ~10s per task -- measured at 49s to tear down five server tasks
+    across two hosts -- stalling every other task's probes and log pumps.
+
+    Only the OWN-container reap is slowed here. The pre-launch orphan sweep is
+    already offloaded, so slowing that one too would let the ticker run during
+    it and hide an inline teardown.
+    """
+    def fake_run(cmd, **kwargs):
+        if "own-server" in list(cmd):
+            time.sleep(0.3)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(orch_mod.subprocess, "run", fake_run)
+
+    task = Task(name="server", operator=_ContainerOperator(), logger=logging.getLogger("t"))
+    orch = _orchestrator(_NoopLauncher())
+
+    ticks = 0
+
+    async def _ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    async def _run():
+        spinner = asyncio.create_task(_ticker())
+        await orch._launch_task_with_timeout(task)
+        spinner.cancel()
+
+    asyncio.run(_run())
+    assert ticks > 5, f"event loop was blocked during the container reap (ticks={ticks})"

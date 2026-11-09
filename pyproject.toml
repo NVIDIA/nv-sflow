@@ -131,10 +131,17 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = [
-    "--cov=src",
-    "--cov-report=term-missing",
-    "--cov-report=xml",
+markers = [
+    "e2e: needs real external infrastructure (a Docker daemon, GPUs). Deselected by default; run with `pytest -m e2e`.",
 ]
+# Real-infrastructure tests are opt-in. They live under tests/e2e_tests/, which is
+# inside testpaths, so a bare `pytest` would otherwise pull images and launch
+# containers on any developer box that happens to have Docker running -- slow, and
+# it touches state the developer did not agree to hand over. CI selects them
+# explicitly (`pytest tests/e2e_tests/... -m e2e`).
+# Parallelism (`pytest -n auto`) is OPT-IN, never the default: `auto` counts the
+# HOST's CPUs, not a container's quota, and the suite is subprocess-bound, so in
+# CI it starved the wall-clock tests for no speedup. See CONTRIBUTING.md.
+addopts = ["-m", "not e2e"]
 
 

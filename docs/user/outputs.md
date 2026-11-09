@@ -31,18 +31,25 @@ log off the driver's event loop and treats the on-disk file as ground truth:
 flowchart TD
   A["kubectl apply"] --> B["wait Running"] --> C["kubectl logs -f"] --> L["&lt;task&gt;.log<br/>ground truth — driver never in the byte path"]
   L -.->|decoupled bounded tailer| CON["console / TUI<br/>best-effort, may be cut early"]
-  L --> T{"pod terminal<br/>OR DAG terminal?"}
-  T -->|interrupt the live -f stream| ONE["one-shot kubectl logs, no -f<br/>reads the node's own file"]
-  ONE --> RB["rebuild &lt;task&gt;.log<br/>then atomic rename"]
-  RB --> PR["probes + result/output parsing<br/>run on the complete log"]
+  L --> T{"pod terminal?"}
+  T -->|yes| D["drain the -f stream<br/>it delivers its tail and exits"]
+  D --> S["sanitize in place<br/>collapse CR redraws, strip ANSI"]
+  S --> PR["probes + result/output parsing"]
 ```
 
-- **The console/TUI stream may be cut early; the on-disk `<task>.log` is always made complete
-  before anything parses it.** After pod status is final, sflow re-fetches each pod's whole
-  container log (one-shot, not `-f`, so it isn't behind), rebuilds `<task>.log` (grouped per
-  pod for multi-pod tasks), and atomically renames it into place — no duplication.
-- **Exceptions** (the live-streamed content is kept as-is): a pod *cancelled* because the
-  workflow ended, or one deleted out from under the driver so it can no longer be re-fetched.
+- **`<task>.log` IS the log — there is no post-run rebuild.** It is exactly what
+  `kubectl logs -f` delivered. When a pod goes terminal its follow is **drained** so it
+  delivers its tail and exits on its own; a pod still RUNNING at teardown has its follow
+  cut instead, since it would otherwise never end.
+- **This replaced an earlier re-fetch (removed in v0.3.1).** sflow used to pull each pod's
+  whole container log with a one-shot `kubectl logs` and overwrite the streamed file with
+  it. Because the kubelet **rotates** container logs, that re-fetch returned only the last
+  rotation window — a one-hour server was persisted as its final ~11 seconds.
+- After the follow ends, the persisted file is **sanitized in place**: `\r` redraws are
+  collapsed to their last frame and ANSI escapes are stripped, so a TTY task's progress
+  bars don't pollute it. The live stream itself is untouched.
+- The console/TUI copy is a decoupled, bounded tailer and may be cut early or drop lines
+  under load; the on-disk file always keeps them.
 - Long-lived services that reach `READY` are stopped (pods deleted) as soon as the workflow
   finishes, rather than lingering.
 

@@ -109,6 +109,13 @@ _EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 _GPU_EXAMPLES = _EXAMPLES / "gpu_reservation"
 _HOG_SAMPLE = _GPU_EXAMPLES / "hog.yaml"
 _SCHEDULING_SAMPLE = _GPU_EXAMPLES / "scheduling_smoke.yaml"
+# examples/gpu_reservation/ is internal-only: the OSS sync does not publish it, but
+# this file IS published. Without the guard the public repo launches a missing
+# YAML and then waits out every reservation poll (5 min per test) for nothing.
+_needs_gpu_samples = pytest.mark.skipif(
+    not _GPU_EXAMPLES.is_dir(),
+    reason="examples/gpu_reservation/ is internal-only (not shipped to the OSS repo)",
+)
 
 # `e2e` makes these opt-in: they are inside `testpaths`, so without it a bare
 # `pytest` on any machine with a Docker daemon would pull images and launch real
@@ -169,7 +176,11 @@ def _force_remove(prefix: str) -> None:
 
 
 def _run_sflow(
-    cfg: Path, tmp_path: Path, env: dict[str, str] | None = None
+    cfg: Path,
+    tmp_path: Path,
+    env: dict[str, str] | None = None,
+    extra_args: list[str] | None = None,
+    timeout: int = _RUN_TIMEOUT,
 ) -> subprocess.CompletedProcess:
     out_dir = tmp_path / "out"
     return subprocess.run(
@@ -184,10 +195,11 @@ def _run_sflow(
             str(tmp_path),
             "--output-dir",
             str(out_dir),
+            *(extra_args or []),
         ],
         capture_output=True,
         text=True,
-        timeout=_RUN_TIMEOUT,
+        timeout=timeout,
         env={**os.environ, **(env or {})},
     )
 
@@ -247,9 +259,15 @@ def test_docker_e2e_single_node_runs_and_reaps_container(tmp_path: Path):
     assert leaked == [], f"leaked containers: {leaked}"
 
 
-def test_docker_e2e_local_multi_node_runs_both_and_reaps_all(tmp_path: Path):
-    """Two synthetic localhost nodes must each launch a real container and all of
-    them must be reaped (exercises the local multi-node bash wrapper for real)."""
+def test_docker_e2e_local_replicas_run_both_and_reap_all(tmp_path: Path):
+    """Several real containers on ONE daemon must all launch and all be reaped.
+
+    This used to ask for `nodes: 2` with no `hosts:`, which invented a second
+    node out of this machine. That form is now refused: multi-node docker means
+    several machines. Replicas are how you ask for several containers on one, so
+    that is what this exercises -- the coverage that mattered (real containers,
+    every one reaped) is unchanged.
+    """
     sentinel = "SFLOW_E2E_MULTI_OK"
     prefix = "e2emulti"
     cfg = tmp_path / "multi.yaml"
@@ -262,16 +280,16 @@ def test_docker_e2e_local_multi_node_runs_both_and_reaps_all(tmp_path: Path):
                 type: docker
                 default: true
                 image: {E2E_IMAGE}
-                nodes: 2
+                nodes: 1
             workflow:
               name: e2e_docker_multi
               tasks:
                 - name: e2emulti
-                  resources:
-                    nodes:
-                      count: 2
+                  replicas:
+                    count: 2
+                    policy: "parallel"
                   script:
-                    - echo "{sentinel} on ${{SFLOW_TASK_ASSIGNED_NODE_NAMES:-?}}"
+                    - echo "{sentinel} replica ${{SFLOW_REPLICA_INDEX:-?}}"
             """
         ).strip()
     )
@@ -284,8 +302,306 @@ def test_docker_e2e_local_multi_node_runs_both_and_reaps_all(tmp_path: Path):
         _force_remove(prefix)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert sentinel in _output_haystack(result, tmp_path)
+    haystack = _output_haystack(result, tmp_path)
+    assert sentinel in haystack
+    # Both replicas really ran, not one container twice.
+    for index in (0, 1):
+        assert f"{sentinel} replica {index}" in haystack, haystack[-2000:]
     assert leaked == [], f"leaked containers: {leaked}"
+
+
+def test_docker_e2e_multi_node_without_hosts_is_refused(tmp_path: Path):
+    """The removed fiction, pinned so it cannot creep back.
+
+    `nodes: 2` with no pool used to advertise this machine's GPU count once per
+    fake node, so the planner handed the same devices out twice. It must fail at
+    config time -- before any container starts.
+    """
+    cfg = tmp_path / "bad.yaml"
+    cfg.write_text(
+        textwrap.dedent(
+            f"""
+            version: "0.1"
+            backends:
+              - name: docker
+                type: docker
+                default: true
+                image: {E2E_IMAGE}
+                nodes: 2
+            workflow:
+              name: e2e_docker_bad
+              tasks:
+                - name: nope
+                  script:
+                    - echo hi
+            """
+        ).strip()
+    )
+
+    result = _run_sflow(cfg, tmp_path)
+
+    assert result.returncode != 0
+    assert "declares no 'hosts:'" in (result.stdout + result.stderr)
+
+
+# Two ssh-reachable Docker hosts for the real multi-node case, comma-separated:
+#   SFLOW_E2E_DOCKER_HOSTS=host-a.example.com,host-b.example.com
+# Unset by default: no test should ssh into machines it was not pointed at. The
+# login, key and host-key policy are ssh's business (~/.ssh/config), exactly as
+# they are for a user -- `docker -H ssh://` spawns plain `ssh` and cannot be
+# handed -i/-o, so there is no way to inject them from here anyway.
+_MULTI_HOSTS = [
+    h.strip()
+    for h in os.environ.get("SFLOW_E2E_DOCKER_HOSTS", "").split(",")
+    if h.strip()
+]
+_MULTI_SSH_USER = os.environ.get("SFLOW_E2E_DOCKER_SSH_USER", "")
+_MULTI_GPUS_PER_NODE = os.environ.get("SFLOW_E2E_DOCKER_GPUS_PER_NODE", "1")
+_MULTI_TORCH_IMAGE = os.environ.get("SFLOW_E2E_DOCKER_TORCH_IMAGE", "")
+_MULTI_NODE_SAMPLE = _EXAMPLES / "self_contained" / "docker" / "multi_node.yaml"
+
+
+def _ssh_target(host: str) -> str:
+    return f"{_MULTI_SSH_USER}@{host}" if _MULTI_SSH_USER else host
+
+
+def _remote_docker(host: str) -> list[str]:
+    return ["docker", "--host", f"ssh://{_ssh_target(host)}"]
+
+
+def _remote_container_names(host: str, needle: str) -> list[str]:
+    result = subprocess.run(
+        [*_remote_docker(host), "ps", "-a", "--filter", f"name={needle}", "--format", "{{.Names}}"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return [n for n in result.stdout.split() if n]
+
+
+def _remote_force_remove(host: str, needle: str) -> None:
+    for name in _remote_container_names(host, needle):
+        subprocess.run(
+            [*_remote_docker(host), "rm", "-f", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+
+
+@pytest.mark.skipif(
+    len(_MULTI_HOSTS) != 2,
+    reason="set SFLOW_E2E_DOCKER_HOSTS=host0,host1 (two ssh-reachable Docker hosts, a GPU each)",
+)
+def test_docker_e2e_multi_node_torchrun_rendezvous_across_two_hosts(tmp_path: Path):
+    """The shipped two-host sample, against two real machines.
+
+    This is the only place the `hosts:` pool meets real daemons: the unit suite
+    is daemon-free and every other case here runs on the local daemon. torchrun
+    blocks until BOTH nodes join, so two ranks printing is the load-bearing
+    assertion -- the derived `ssh://` endpoints, the leader address handed to
+    rank 1 and the per-rank env all had to be right for it to get that far.
+    """
+    needle = "distributed_job"  # the task name sits mid-container-name
+    overrides = [
+        "-s", f"HOST_0_ADDRESS={_MULTI_HOSTS[0]}",
+        "-s", f"HOST_1_ADDRESS={_MULTI_HOSTS[1]}",
+        "-s", f"SSH_USER={_MULTI_SSH_USER}",
+        "-s", f"GPUS_PER_NODE={_MULTI_GPUS_PER_NODE}",
+        # Not the sample's fixed 29500: a concurrent pipeline on the same pair
+        # would otherwise collide on the rendezvous port.
+        "-s", f"MASTER_PORT={29500 + os.getpid() % 1000}",
+    ]
+    if _MULTI_TORCH_IMAGE:
+        overrides += ["-s", f"PYTORCH_IMAGE={_MULTI_TORCH_IMAGE}"]
+
+    for host in _MULTI_HOSTS:
+        _remote_force_remove(host, needle)
+    try:
+        result = _run_sflow(_MULTI_NODE_SAMPLE, tmp_path, extra_args=overrides)
+    finally:
+        leaked = {h: _remote_container_names(h, needle) for h in _MULTI_HOSTS}
+        for host in _MULTI_HOSTS:
+            _remote_force_remove(host, needle)
+
+    haystack = _output_haystack(result, tmp_path)
+    assert result.returncode == 0, haystack[-4000:]
+    assert "sflow wiring: node=0/2" in haystack, haystack[-4000:]
+    assert "sflow wiring: node=1/2" in haystack, haystack[-4000:]
+    assert "torchrun rank=0/2" in haystack, haystack[-4000:]
+    assert "torchrun rank=1/2" in haystack, haystack[-4000:]
+    # Each rank ran `nvidia-smi -L` on its own box: two DIFFERENT physical GPUs,
+    # which is what one-container-per-host means (the allocation-truth argument
+    # in the dev-note, observed).
+    uuids = set(re.findall(r"\(UUID: (GPU-[0-9a-f-]+)\)", haystack))
+    assert len(uuids) == 2, f"expected two distinct GPU UUIDs, saw {sorted(uuids)}"
+    # And each member's `docker run` was sent to ITS host's daemon (docker_cmds.log).
+    for host in _MULTI_HOSTS:
+        assert f"--host ssh://{_ssh_target(host)}" in haystack, f"no docker run sent to {host}"
+    # Teardown reaches every daemon the task targeted, not just the local one.
+    assert not any(leaked.values()), f"leaked containers: {leaked}"
+
+
+# The dynamo serving samples on the same pair. Both stand up NATS/etcd/frontend
+# on node 0, serve Qwen3-0.6B through dynamo+vLLM, then run aiperf against the
+# frontend; the model is fetched into /opt/sflow/models on first run and cached
+# on the hosts after that. Measured on a two-host A100 pair: disagg ~5 min end to end.
+# A 1 GbE link between the hosts makes them slow, not broken -- the budget is
+# generous on purpose, the pass criteria are about correctness, not speed.
+_DYNAMO_RUN_TIMEOUT = 1800
+_DYNAMO_SAMPLES = _EXAMPLES / "self_contained" / "docker"
+# aiperf exits 0 even when every request failed, so the run's exit code and the
+# sflow summary alone cannot vouch for the benchmark. This line is its own
+# verdict; the test insists on "0 errors" with at least one valid request.
+_AIPERF_VERDICT_RE = re.compile(r"Processed (\d+) valid requests and (\d+) errors")
+
+
+def _aiperf_metric(haystack: str, label: str) -> float:
+    """The avg column of one row of aiperf's results table, e.g.
+    ``│ Request Throughput (requests/sec) │ 0.87 │ N/A ...``."""
+    m = re.search(re.escape(label) + r"\s*│\s*([\d,.]+)", haystack)
+    assert m, f"aiperf table has no row {label!r}\n{haystack[-6000:]}"
+    return float(m.group(1).replace(",", ""))
+
+
+# Perf gates per sample: (aiperf row, ">=" floor or "<=" ceiling, bound, measured).
+# Floors sit at ~75 % and ceilings at ~1.4-1.5x of what the reference A100 pair
+# measured on 2026-10-28 -- Qwen3-0.6B, ISL 1024 / OSL 256, concurrency 16,
+# 1 GbE between the hosts. CI always runs on that pair, so the numbers are
+# reproducible (two disagg runs agreed within 2 %); the band is wide enough for
+# lab-network jitter and tight enough that a transport which quietly degraded
+# (KV over the wrong link, a TP group that formed but barely serves) fails.
+# Re-measure and update the fourth column if the hosts or the sample change.
+_PERF_GATES: dict[str, tuple[tuple[str, str, float, float], ...]] = {
+    # Prefill node 0 -> decode node 1: TTFT is the 112 MiB/request KV hop over
+    # 1 GbE; ITL is one A100 decoding a 0.6B model. Measured twice: 0.87/0.86
+    # req/s, 221/220 tok/s, TTFT 14.1/14.5 s, ITL 3.7/3.9 ms.
+    "dynamo_vllm_disagg.yaml": (
+        ("Request Throughput (requests/sec)", ">=", 0.65, 0.86),
+        ("Output Token Throughput (tokens/sec)", ">=", 165, 220.6),
+        ("Time to First Token (ms)", "<=", 20_000, 14_469),
+        ("Inter Token Latency (ms)", "<=", 6, 3.9),
+    ),
+    # One TP16 worker across both hosts: every decode step's all-reduce crosses
+    # 1 GbE, hence the ~135 ms ITL. One measurement so far, so a little more
+    # headroom than disagg until a second run confirms the spread.
+    "dynamo_vllm_agg.yaml": (
+        ("Request Throughput (requests/sec)", ">=", 0.27, 0.36),
+        ("Output Token Throughput (tokens/sec)", ">=", 70, 91.2),
+        ("Time to First Token (ms)", "<=", 15_000, 10_473),
+        ("Inter Token Latency (ms)", "<=", 200, 134.8),
+    ),
+}
+
+
+def _assert_perf_gates(sample: str, haystack: str) -> None:
+    """Every gate for ``sample`` holds; each measured value is printed with its gate
+    so the job log carries the numbers on every run, not only when one trips."""
+    failures = []
+    for label, op, bound, measured in _PERF_GATES[sample]:
+        value = _aiperf_metric(haystack, label)
+        ok = value >= bound if op == ">=" else value <= bound
+        print(f"[perf] {sample} {label}: {value:g}  gate {op} {bound:g}  "
+              f"(measured {measured:g})  {'ok' if ok else 'FAIL'}")
+        if not ok:
+            failures.append(f"{label} = {value:g}, gate {op} {bound:g}")
+    assert not failures, "perf gates failed:\n  " + "\n  ".join(failures)
+
+
+def _assert_monitor_covered_both_hosts(tmp_path: Path, haystack: str) -> None:
+    """The samples enable `monitor:` over the benchmark window; on a host pool the
+    collector runs on each machine and the driver reassembles the per-node raw
+    files. Both nodes must have GPU samples (not one host's, not the driver's)
+    and the per-task report must have been post-processed."""
+    runs = list((tmp_path / "out").glob("*/sflow_monitor"))
+    assert runs, f"no sflow_monitor dir under {tmp_path / 'out'}\n{haystack[-3000:]}"
+    raw = runs[0] / "raw"
+    for node in ("node-0", "node-1"):
+        samples = list(raw.glob(f"gpu_monitor_node_*_{node}.log"))
+        assert samples, f"no GPU samples for {node}: {sorted(p.name for p in raw.glob('*'))}"
+        lines = sum(1 for _ in samples[0].open(errors="replace"))
+        assert lines >= 10, f"{samples[0].name}: only {lines} GPU samples"
+    assert list(runs[0].glob("lifecycle/*__monitored_by__benchmark/summary.csv")), (
+        f"monitor report not post-processed: {sorted(str(p) for p in runs[0].rglob('*'))[:20]}"
+    )
+
+
+def _run_dynamo_sample(
+    sample: str, tmp_path: Path, worker_needles: tuple[str, ...]
+) -> tuple[subprocess.CompletedProcess, str]:
+    overrides = [
+        "-s", f"HOST_0_ADDRESS={_MULTI_HOSTS[0]}",
+        "-s", f"HOST_1_ADDRESS={_MULTI_HOSTS[1]}",
+        "-s", f"SSH_USER={_MULTI_SSH_USER}",
+        "-s", f"GPUS_PER_NODE={_MULTI_GPUS_PER_NODE}",
+    ]
+    for host in _MULTI_HOSTS:
+        for needle in worker_needles:
+            _remote_force_remove(host, needle)
+    try:
+        result = _run_sflow(
+            _DYNAMO_SAMPLES / sample, tmp_path, extra_args=overrides, timeout=_DYNAMO_RUN_TIMEOUT
+        )
+    finally:
+        leaked = {
+            f"{h}:{n}": _remote_container_names(h, n)
+            for h in _MULTI_HOSTS
+            for n in worker_needles
+        }
+        for host in _MULTI_HOSTS:
+            for needle in worker_needles:
+                _remote_force_remove(host, needle)
+
+    haystack = _output_haystack(result, tmp_path)
+    tail = haystack[-6000:]
+    assert result.returncode == 0, tail
+    assert "Status   : COMPLETED" in haystack, tail
+    assert "FAILED/CANCELLED Tasks : none" in haystack, tail
+    verdict = _AIPERF_VERDICT_RE.search(haystack)
+    assert verdict, f"no aiperf verdict line in the run output\n{tail}"
+    valid, errors = int(verdict.group(1)), int(verdict.group(2))
+    assert valid > 0 and errors == 0, f"aiperf: {valid} valid, {errors} errors\n{tail}"
+    assert not any(leaked.values()), f"leaked containers: {leaked}"
+    _assert_monitor_covered_both_hosts(tmp_path, haystack)
+    _assert_perf_gates(sample, haystack)
+    return result, haystack
+
+
+@pytest.mark.skipif(
+    len(_MULTI_HOSTS) != 2,
+    reason="set SFLOW_E2E_DOCKER_HOSTS=host0,host1 (two ssh-reachable Docker hosts, a GPU each)",
+)
+def test_docker_e2e_dynamo_disagg_prefill_and_decode_on_different_hosts(tmp_path: Path):
+    """Prefill on node 0, decode on node 1, KV handed off across the wire.
+
+    The sample pins the two roles to different machines; without the pin the
+    planner packed both onto node 0 and a "cross-node" disagg run never left the
+    box. The per-host container names below are what prove the placement.
+    """
+    _, haystack = _run_dynamo_sample(
+        "dynamo_vllm_disagg.yaml", tmp_path, ("prefill_server", "decode_server")
+    )
+    node0, node1 = _MULTI_HOSTS
+    assert f"--host ssh://{_ssh_target(node0)}" in haystack and "prefill_server_0-node-0" in haystack
+    assert f"--host ssh://{_ssh_target(node1)}" in haystack and "decode_server_0-node-1" in haystack
+
+
+@pytest.mark.skipif(
+    len(_MULTI_HOSTS) != 2,
+    reason="set SFLOW_E2E_DOCKER_HOSTS=host0,host1 (two ssh-reachable Docker hosts, 8 GPUs each)",
+)
+def test_docker_e2e_dynamo_agg_tp16_worker_spans_both_hosts(tmp_path: Path):
+    """ONE vLLM worker at TP16 across two 8-GPU hosts, via a Ray cluster.
+
+    The other multi-node shape: not two workers talking, but one worker larger
+    than a machine. The sample's own gate line is the proof that all 16 GPUs
+    registered with Ray from both hosts before vLLM launched on the leader.
+    """
+    _, haystack = _run_dynamo_sample("dynamo_vllm_agg.yaml", tmp_path, ("agg_server",))
+    assert "Ray cluster is complete: 16 GPUs across 2 hosts" in haystack, haystack[-6000:]
+    assert "agg_server_0-node-0" in haystack and "agg_server_0-node-1" in haystack
+    for host in _MULTI_HOSTS:
+        assert f"--host ssh://{_ssh_target(host)}" in haystack, f"no member sent to {host}"
 
 
 @pytest.mark.skipif(
@@ -418,7 +734,18 @@ def test_docker_e2e_monitor_log_window_clips_the_gpu_report(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def _await_reservations(tmp_path: Path, count: int, *, timeout: float = 300.0) -> None:
+def _fail_if_exited(procs: tuple[subprocess.Popen, ...]) -> None:
+    """A run that already exited will never write (or drop) the record being awaited:
+    fail now with its output instead of polling out the whole timeout."""
+    for proc in procs:
+        if proc.poll() is not None:
+            out = proc.stdout.read() if proc.stdout else ""
+            pytest.fail(f"`sflow run` exited (rc={proc.returncode}) while awaited:\n{out}")
+
+
+def _await_reservations(
+    tmp_path: Path, count: int, *procs: subprocess.Popen, timeout: float = 300.0
+) -> None:
     """Block until ``count`` reservation records exist in the shared registry.
 
     The sessions' ordering has to be CAUSAL, not timed: sleeping a fixed few
@@ -433,12 +760,17 @@ def _await_reservations(tmp_path: Path, count: int, *, timeout: float = 300.0) -
     while time.time() < deadline:
         if len(list(registry.glob("*.json"))) >= count:
             return
+        _fail_if_exited(procs)
         time.sleep(0.1)
     pytest.fail(f"expected {count} GPU reservation(s) in {registry}, timed out")
 
 
 def _await_record(
-    registry: Path, pattern: str, *, present: bool, timeout: float = 300.0
+    registry: Path,
+    pattern: str,
+    *procs: subprocess.Popen,
+    present: bool,
+    timeout: float = 300.0,
 ) -> None:
     """Block until a record matching ``pattern`` exists (or is gone).
 
@@ -450,6 +782,7 @@ def _await_record(
     while time.time() < deadline:
         if bool(list(registry.glob(pattern))) is present:
             return
+        _fail_if_exited(procs)
         time.sleep(0.1)
     pytest.fail(f"{pattern} in {registry}: waited for present={present}, timed out")
 
@@ -525,6 +858,7 @@ def _devices_reserved(output: str) -> set[int]:
 @pytest.mark.skipif(
     _GPU_COUNT < 2, reason="needs >= 2 GPUs to prove two sessions land on different ones"
 )
+@_needs_gpu_samples
 def test_concurrent_runs_of_the_sample_get_disjoint_gpus(tmp_path: Path):
     """Two `sflow run` processes on one box must not land on the same GPU.
 
@@ -535,9 +869,9 @@ def test_concurrent_runs_of_the_sample_get_disjoint_gpus(tmp_path: Path):
     _force_remove("hog")
     try:
         first = _start_sflow(_HOG_SAMPLE, tmp_path / "a", sets=common, env=env)
-        _await_reservations(tmp_path, 1)  # first has its GPU before the second asks
+        _await_reservations(tmp_path, 1, first)  # first has its GPU before the second asks
         second = _start_sflow(_HOG_SAMPLE, tmp_path / "b", sets=common, env=env)
-        _await_reservations(tmp_path, 2)  # both hold at once -> the overlap we assert on
+        _await_reservations(tmp_path, 2, first, second)  # both hold at once -> the overlap we assert on
         out_a, _ = first.communicate(timeout=_RUN_TIMEOUT)
         out_b, _ = second.communicate(timeout=_RUN_TIMEOUT)
     finally:
@@ -560,6 +894,7 @@ def test_concurrent_runs_of_the_sample_get_disjoint_gpus(tmp_path: Path):
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_second_run_fails_fast_while_the_first_holds_every_gpu(tmp_path: Path):
     """Default is fail-fast: an oversubscribed box refuses rather than sharing.
 
@@ -576,7 +911,7 @@ def test_a_second_run_fails_fast_while_the_first_holds_every_gpu(tmp_path: Path)
                   "CLAIM": _GPU_COUNT, "HOLD": 25},
             env=env,
         )
-        _await_reservations(tmp_path, 1)  # holder now owns every GPU
+        _await_reservations(tmp_path, 1, holder)  # holder now owns every GPU
         contender = _start_sflow(
             _HOG_SAMPLE,
             tmp_path / "contender",
@@ -596,6 +931,7 @@ def test_a_second_run_fails_fast_while_the_first_holds_every_gpu(tmp_path: Path)
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_second_run_waits_for_gpus_then_succeeds(tmp_path: Path):
     """`--wait-for-gpus` turns the refusal above into a queue-and-proceed.
 
@@ -612,7 +948,7 @@ def test_a_second_run_waits_for_gpus_then_succeeds(tmp_path: Path):
                   "CLAIM": _GPU_COUNT, "HOLD": 12},
             env=env,
         )
-        _await_reservations(tmp_path, 1)  # holder owns the board; the waiter must queue
+        _await_reservations(tmp_path, 1, holder)  # holder owns the board; the waiter must queue
         waiter = _start_sflow(
             _HOG_SAMPLE,
             tmp_path / "waiter",
@@ -666,7 +1002,9 @@ def _run_dir_text(out_dir: Path) -> str:
     return "\n".join(parts)
 
 
-def _await_reusable_record(tmp_path: Path, *, timeout: float = 300.0) -> set:
+def _await_reusable_record(
+    tmp_path: Path, *procs: subprocess.Popen, timeout: float = 300.0
+) -> set:
     """Block until some run has handed GPUs back at READY; return those UUIDs.
 
     This is the causal signal the timing-sensitive tests need. Sleeping instead
@@ -685,6 +1023,7 @@ def _await_reusable_record(tmp_path: Path, *, timeout: float = 300.0) -> set:
                 continue
             if record.get("state") in ("lent", "handover"):
                 return set(record.get("gpu_uuids") or [])
+        _fail_if_exited(procs)
         time.sleep(0.1)
     pytest.fail(f"no reusable GPU reservation appeared in {registry}")
 
@@ -818,6 +1157,7 @@ def _assert_pipeline_shape(text: str, label: str, *, board: int | None = None) -
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_one_run_pins_one_gpu_and_reshapes_the_rest_as_it_goes(tmp_path: Path):
     """The whole sample in one go, on a board with no slack anywhere.
 
@@ -875,6 +1215,7 @@ def test_one_run_pins_one_gpu_and_reshapes_the_rest_as_it_goes(tmp_path: Path):
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_a_gpu_freed_mid_run_is_taken_by_a_concurrent_run(tmp_path: Path):
     """A run that frees a GPU WITHOUT finishing hands it to a competing run.
 
@@ -899,7 +1240,7 @@ def test_a_gpu_freed_mid_run_is_taken_by_a_concurrent_run(tmp_path: Path):
             sets=_pipeline_sets(label="A", hold_a=120, hold_b=2, tail_hold=90),
             env=env,
         )
-        _await_reusable_record(tmp_path)
+        _await_reusable_record(tmp_path, holder)
         contender = _start_sflow(
             _HOG_SAMPLE, tmp_path / "contender",
             sets={"IMAGE": E2E_GPU_IMAGE, "GPUS_PER_NODE": _GPU_COUNT,
@@ -940,6 +1281,7 @@ def test_a_gpu_freed_mid_run_is_taken_by_a_concurrent_run(tmp_path: Path):
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_another_run_cannot_take_gpus_handed_back_for_in_run_reuse(tmp_path: Path):
     """The `task_ready` hand-back is scoped to the run that made it.
 
@@ -958,7 +1300,7 @@ def test_another_run_cannot_take_gpus_handed_back_for_in_run_reuse(tmp_path: Pat
             sets=_pipeline_sets(label="A", hold_a=90, hold_b=90, tail_hold=30),
             env=env,
         )
-        handed_back = _await_reusable_record(tmp_path)
+        handed_back = _await_reusable_record(tmp_path, holder)
         outsider = _start_sflow(
             _HOG_SAMPLE, tmp_path / "outsider",
             sets={"IMAGE": E2E_GPU_IMAGE, "GPUS_PER_NODE": _GPU_COUNT,
@@ -987,6 +1329,7 @@ def test_another_run_cannot_take_gpus_handed_back_for_in_run_reuse(tmp_path: Pat
     _GPU_COUNT < _PIPELINE_BOARD,
     reason=f"the pipeline sample needs a {_PIPELINE_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_competing_runs_with_dynamic_release_never_share_a_gpu(tmp_path: Path):
     """The full contention scenario, checked as an invariant rather than a schedule.
 
@@ -1121,6 +1464,7 @@ _RACE_CONTENDER_STAGGER_S = 1.0
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_completing_task_does_not_lose_its_successors_gpu_to_waiting_runs(
     tmp_path: Path,
 ):
@@ -1146,7 +1490,7 @@ def test_a_completing_task_does_not_lose_its_successors_gpu_to_waiting_runs(
     try:
         holder = _start_sflow(cfg, out_dir, sets={}, env=env)
         # The workflow owns the board before any contender is allowed to ask.
-        _await_reservations(tmp_path, 1)
+        _await_reservations(tmp_path, 1, holder)
         for i in range(_RACE_CONTENDERS):
             contenders.append(
                 _start_sflow(
@@ -1184,6 +1528,7 @@ def test_a_completing_task_does_not_lose_its_successors_gpu_to_waiting_runs(
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_waiting_run_only_gets_the_gpu_after_the_workflow_is_done_with_it(
     tmp_path: Path,
 ):
@@ -1202,7 +1547,7 @@ def test_a_waiting_run_only_gets_the_gpu_after_the_workflow_is_done_with_it(
         _force_remove(name)
     try:
         holder = _start_sflow(cfg, out_dir, sets={}, env=env)
-        _await_reservations(tmp_path, 1)
+        _await_reservations(tmp_path, 1, holder)
         contender = _start_sflow(
             _HOG_SAMPLE, tmp_path / "contender",
             sets={"IMAGE": E2E_GPU_IMAGE, "GPUS_PER_NODE": _GPU_COUNT,
@@ -1307,6 +1652,7 @@ _LIVE_REUSE_TASKS = ("liveserver", "reuser", "reusetail")
 
 
 @pytest.mark.skipif(_GPU_COUNT < 1, reason="needs a GPU and the NVIDIA Container Toolkit")
+@_needs_gpu_samples
 def test_a_live_servers_gpu_is_not_published_when_its_reuser_finishes(tmp_path: Path):
     """The device stays this run's until the SERVER exits, not until the reuser does.
 
@@ -1334,8 +1680,8 @@ def test_a_live_servers_gpu_is_not_published_when_its_reuser_finishes(tmp_path: 
         # it the device is held by a claim of its own and the test would prove
         # nothing; killing the container to get there would just fail the run.
         registry = tmp_path / "registry"
-        _await_record(registry, "*-reuser.json", present=True)
-        _await_record(registry, "*-reuser.json", present=False)
+        _await_record(registry, "*-reuser.json", holder, present=True)
+        _await_record(registry, "*-reuser.json", holder, present=False)
 
         contender = _start_sflow(
             _HOG_SAMPLE, tmp_path / "contender",
@@ -1386,6 +1732,7 @@ _SCHEDULING_BOARD = _SCHEDULING_GPUS["tp8"]
     _GPU_COUNT < _SCHEDULING_BOARD,
     reason=f"the scheduling smoke needs a {_SCHEDULING_BOARD}-GPU board",
 )
+@_needs_gpu_samples
 def test_the_scheduler_never_double_books_a_gpu_across_four_waves(tmp_path: Path):
     """Eleven tasks drain and refill a full board; no two may share a device.
 
