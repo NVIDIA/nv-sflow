@@ -29,10 +29,10 @@ version: "0.1"
 variables:
   HOST_ADDRESS:
     description: "Docker host that runs both tasks (ssh-reachable from the driver)"
-    value: 10.114.98.206
+    value: 10.0.0.11
   SSH_USER:
     description: "SSH login on that host; leave empty to use your own"
-    value: rogliu
+    value: ""
 
   SERVED_MODEL_NAME:
     description: "Name the server advertises; aiperf must request the same string"
@@ -107,7 +107,7 @@ variables:
       (/root/.cache/sglang/flashinfer/autotune/<ver>/<sm>/...) survive the --rm
       container and later runs skip the rebuild. Entries are keyed by version and
       arch, so one dir can serve several images. Docker creates it if missing.
-    value: /var/data0/sandbox/rogliu/flashinfer-cache
+    value: /var/tmp/sflow-sglang-cache
 
   SGLANG_IMAGE:
     description: "SGLang image new enough for GLM-5.2 and these flags; pin a tag for reproducible runs"
@@ -118,7 +118,7 @@ artifacts:
   # the server loads weights from it, aiperf loads the tokenizer from it.
   - name: MODEL_PATH
     description: "GLM-5.2 NVFP4 checkpoint, a path on the docker host"
-    uri: fs:///var/data0/Games/Huggingface_Models_nvidia_GLM_5_2_NVFP4_1
+    uri: fs:///path/to/GLM-5.2-NVFP4
 
 backends:
   - name: docker_host
