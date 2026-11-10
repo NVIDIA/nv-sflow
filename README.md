@@ -1,25 +1,44 @@
 # sflow
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/nv-sflow.svg)](https://pypi.org/project/nv-sflow/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml/badge.svg)](https://github.com/NVIDIA/nv-sflow/actions/workflows/ci.yml)
 
 ## Install
 
+**Using an AI coding agent?** Paste this into Claude Code, Codex, Cursor or any other
+coding agent. It installs sflow, checks that it runs, and installs the sflow skills for
+that agent:
+
+```text
+Set up sflow for me by following
+https://raw.githubusercontent.com/NVIDIA/nv-sflow/main/docs-site/agents-src/setup.md
+step by step, then tell me what you installed and where.
+```
+
+**By hand:** sflow is on PyPI as [`nv-sflow`](https://pypi.org/project/nv-sflow/); the command is `sflow`.
+
 ```bash
-uv venv --python python3 && source .venv/bin/activate
-uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
+uv tool install nv-sflow      # sflow on PATH everywhere; or `uv pip install nv-sflow` inside a venv
 sflow --version
 ```
 
-Already on **sflow v0.3.0+**? Upgrade in place -- no incantation to remember:
+Already installed? Upgrade in place -- no incantation to remember:
 
 ```bash
-sflow upgrade                 # latest main; --branch <ref> / --dry-run also supported
+sflow upgrade                 # latest PyPI release; --branch <ref> for a git branch, --dry-run to preview
 ```
 
+Coming from **v0.3.1 or earlier**? The distribution is now `nv-sflow` on PyPI. Either
+`pip install nv-sflow`, or run `sflow upgrade` twice (the first lands on the current
+GitHub build, the second moves it to PyPI). The next `sflow` command tidies up the old
+`sflow` install record by itself. Never `pip install sflow` -- that name on pypi.org is an
+unrelated project -- and don't `pip uninstall sflow`.
+
 No `uv`? `pip install uv` (or `curl -LsSf https://astral.sh/uv/install.sh | sh`).
-Optional extras: `sflow[s3]` (S3 uploads), `sflow[monitor]` (PNG hardware charts).
+Optional extras: `nv-sflow[s3]` (S3 uploads), `nv-sflow[monitor]` (PNG hardware charts).
+Contributing? Skip to [Development Setup](#development-setup) for the editable install.
 
 **Quickstart:** https://nvidia.github.io/nv-sflow/docs/user/quickstart
 
@@ -33,7 +52,9 @@ A **declarative workflow descriptor for massive GPU clusters** that separates _w
 
 All four backends ship today: `local`, `docker`, `slurm`, and `kubernetes`.
 
-![sflow TUI](docs-site/static/img/sflow_tui.gif)
+[![sflow v0.3.2 in action](docs/assets/sflow_v0.3.2.gif)](docs/assets/sflow_v0.3.2.mp4)
+
+_Click for the full-quality video._
 
 ## Key Features
 
@@ -90,8 +111,8 @@ sflow run -f backends/docker.yaml -f workloads/sglang_serve.yaml -f benchmark.ya
 | `sflow compose` | Merge multiple YAMLs | `--resolve` `--missable-tasks` `-o` |
 | `sflow visualize` | Render DAG graph | `--format png/svg/mermaid` |
 | `sflow sample` | List / copy examples | `--list` `-o` |
-| `sflow skill` | Export AI agent skills | `--list` `-o` |
-| `sflow upgrade` | Reinstall sflow in place (alias: `sflow update`) | `--branch` `--dry-run` `--force` |
+| `sflow skill` | Install AI agent skills (Claude Code, Cursor, Codex) | `--target claude\|cursor\|codex\|all` `--global` `--list` |
+| `sflow upgrade` | Upgrade to the latest PyPI release in place (alias: `sflow update`) | `--sflow-version` `--branch` `--dry-run` `--force` |
 
 ## Documentation
 
@@ -145,10 +166,10 @@ sflow run \
   --missable-tasks agg_server --tui
 ```
 
-Export AI agent skills for your IDE:
+Install the AI agent skills into your coding agent:
 
 ```bash
-sflow skill -o .cursor/skills/
+sflow skill --target claude      # or cursor, codex, all; --global for the user-level dir
 ```
 
 ## Development Setup
