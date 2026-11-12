@@ -659,7 +659,7 @@ def test_fetch_from_a_missing_remote_session_fails_loudly(tmp_path: Path) -> Non
     )
 
     assert result.returncode == 1, result.stderr
-    assert "failed to fetch remote output" in result.stderr
+    assert "failed to fetch remote output" in result.stderr.lower()
     assert not (tmp_path / "recovered").exists()
 
 

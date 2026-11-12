@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,8 @@ _RICH_LOG_COLUMNS_WIDTH = 48
 _DEFAULT_CONSOLE_WIDTH = 120
 _RUNTIME_INFO_LABEL_WIDTH = 7
 _BRANCH_BUILD_PREFIXES = ("feature.", "feat.", "bugfix.", "hotfix.")
+SSH_RUNTIME_ENV = "SFLOW_SSH_RUNTIME"
+SSH_SOURCE_ENV = "SFLOW_SSH_SOURCE"
 
 
 def _resolve_bin_path() -> str:
@@ -190,11 +193,20 @@ def _git_info_for_repo(repo: Path | None) -> str:
 def format_runtime_info() -> str:
     package_path = Path(sflow.__file__).resolve().parent
     install_mode, install_repo = _install_info()
+    ssh_runtime = os.environ.get(SSH_RUNTIME_ENV)
+    if ssh_runtime:
+        # pip's direct_url.json belongs to the session that built the cache,
+        # while PYTHONPATH selects the current session's uploaded package.
+        install_mode, install_repo = "ssh-runtime", ssh_runtime
     imported_source_repo = _repo_from_imported_source(package_path)
     if install_mode == "installed" and install_repo is None and imported_source_repo:
         install_mode = "editable"
         install_repo = str(imported_source_repo)
-    repo_path = _repo_for_git_info(install_mode, install_repo, package_path)
+    repo_path = (
+        None
+        if ssh_runtime
+        else _repo_for_git_info(install_mode, install_repo, package_path)
+    )
     git_info = _git_info_for_repo(repo_path)
 
     fields = [
@@ -203,10 +215,15 @@ def format_runtime_info() -> str:
         ("python", str(Path(sys.executable).resolve())),
         ("package", str(package_path)),
         ("install", install_mode),
-        ("source", _source_label(install_mode, install_repo, __version__)),
+        (
+            "source",
+            os.environ.get(SSH_SOURCE_ENV, "mirrors local install")
+            if ssh_runtime
+            else _source_label(install_mode, install_repo, __version__),
+        ),
     ]
     if install_repo and not _is_remote_url(install_repo):
-        fields.append(("repo", install_repo))
+        fields.append(("runtime" if ssh_runtime else "repo", install_repo))
     if git_info:
         fields.append(("git", git_info))
 

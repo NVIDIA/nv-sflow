@@ -33,6 +33,16 @@ sflow compose base.yaml tasks.yaml -o composed.yaml --ssh 'user@login'
 
 The remote host needs Python 3.10 or newer, but does not need sflow or rsync. sflow uploads its current source (including local edits), caches a dependency venv remotely, and uploads only explicit YAML/CSV inputs plus relative `file://` or `fs://` artifacts contained by the workspace. Relative artifacts that escape `--workspace-dir` are rejected; absolute artifact paths keep their remote meaning. Undeclared files referenced only inside shell commands are not discovered automatically. Uploaded directories skip `.git`, `.venv`, `.sflow`, `sflow_output`, and `__pycache__`.
 
+The remote executable banner reports `install : ssh-runtime`, the local install
+it mirrors (for example, `source : mirrors local PyPI 0.3.2`), and a `runtime`
+field naming the cached dependency venv. It does not report that venv's original
+build-session directory as a repository. The `package` field still identifies
+the current session's staged source, even when multiple runs reuse one venv.
+
+For `run` and `batch`, `--skip-artifact-check` also skips the SSH pre-check of
+absolute artifact paths on the remote host. The flag is forwarded to the remote
+command. To check a different path instead, use `--artifact NAME=URI`.
+
 Common SSH options:
 
 - `--ssh '<host> [ssh options]'`: connection and ordinary OpenSSH flags
@@ -46,6 +56,15 @@ Every SSH execution owns one local folder, `<output-dir>/ssh-<UTC timestamp>-<id
 sflow never deletes the remote run directory it creates under `--ssh-remote-root/runs/<session>/` (only the cached runtime venv is cleaned up on rebuild). Every `--ssh` execution leaves its full work/output tree on the remote host regardless of `--ssh-fetch`; clean up old sessions yourself if remote disk space matters.
 
 Progress is reported in four stages on stderr — connect, stage inputs, prepare the remote runtime, run — each followed by the remote facts it established (remote session/work/output dirs, where each input was staged, the receipt path, and the translated remote command). The first run on a host also reports whether the runtime is being built with `uv` or `pip`.
+
+SSH progress uses the same timestamp, severity, and message columns as the
+workflow logs. Warnings and errors have their own severity instead of appearing
+as unformatted text. `--log-level WARNING` hides routine SSH progress, including
+cached-runtime messages and log-tail headers. Remote log snapshots remain
+visible at every local progress level, and recovery commands print without
+wrapping so they can be copied directly. Diagnostics stay on stderr so `sflow compose --ssh`
+can still write clean YAML to stdout. Output from OpenSSH, package installers,
+and the remote workflow itself is preserved.
 
 Reconnect to that receipt after a network interruption or detached batch submission:
 

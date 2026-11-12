@@ -151,6 +151,17 @@ class DeferredTaskLogHandler(logging.Handler):
             super().close()
 
 
+def create_console_handler(*, stderr: bool = False) -> RichHandler:
+    """Use the same Rich layout and non-TTY width on either output stream."""
+    stream = sys.stderr if stderr else sys.stdout
+    console = Console(
+        stderr=stderr,
+        width=None if stream.isatty() else _DEFAULT_NON_TTY_WIDTH,
+        force_terminal=None if stream.isatty() else False,
+    )
+    return RichHandler(console=console, rich_tracebacks=True)
+
+
 def configure_logging(
     level: str = "INFO", log_file: Optional[str] = None, *, console: bool = True
 ):
@@ -170,12 +181,7 @@ def configure_logging(
 
     # Console handler (Rich)
     if console:
-        # Use a wider default width when output is not a TTY (e.g. piped to file).
-        if sys.stdout.isatty():
-            rich_console = Console()
-        else:
-            rich_console = Console(width=_DEFAULT_NON_TTY_WIDTH, force_terminal=False)
-        console_handler = RichHandler(console=rich_console, rich_tracebacks=True)
+        console_handler = create_console_handler()
         console_handler.setLevel(numeric_level)
         handlers.append(console_handler)
 
@@ -225,11 +231,7 @@ def enable_console_logging(level: Optional[str] = None) -> None:
         if level
         else (logger.level or logging.INFO)
     )
-    if sys.stdout.isatty():
-        rich_console = Console()
-    else:
-        rich_console = Console(width=_DEFAULT_NON_TTY_WIDTH, force_terminal=False)
-    console_handler = RichHandler(console=rich_console, rich_tracebacks=True)
+    console_handler = create_console_handler()
     console_handler.setLevel(numeric_level if isinstance(numeric_level, int) else logging.INFO)
     logger.addHandler(console_handler)
 
