@@ -110,7 +110,7 @@ Same requirement: the artifact must already be defined in `artifacts`, otherwise
 
 ## backends
 
-sflow ships four backend types — `local`, `slurm`, `docker`, and `kubernetes`. Every
+sflow ships five backend types: `local`, `slurm`, `docker`, `kubernetes`, and `osmo`. Every
 backend shares a few common fields, including `gpus_per_node` (GPU capacity per node for
 planning/packing) and the node filters `include_nodes` / `exclude_nodes` (also settable
 via the `--include-nodes` / `--exclude-nodes` CLI flags). This page is a summary; see
@@ -174,7 +174,7 @@ selection and credentials are `sflow run` CLI flags, not YAML. See
 
 ## operators
 
-An operator defines how a task is launched. sflow ships seven operator types:
+An operator defines how a task is launched. sflow ships eight operator types:
 
 - `bash`: run locally via bash
 - `srun`: run via Slurm `srun` (supports common Pyxis `--container-*` flags)
@@ -183,10 +183,11 @@ An operator defines how a task is launched. sflow ships seven operator types:
 - `ssh`: run on a remote host over SSH
 - `k8s`: run as a Kubernetes pod (the workload `image` lives on this operator)
 - `k8s_mpi`: run any MPI (`mpirun`) job on Kubernetes — single- or multi-node (write `mpirun` explicitly)
+- `osmo`: run as a one-task OSMO workflow on the `osmo` backend (the workload `image` lives on this operator)
 
 If a task does not set `operator:`, the backend picks a default: local → `bash`,
 slurm → `srun`, docker → `docker_run`, kubernetes → none (you must declare a `k8s`
-operator). Note the Docker naming: the *backend* is `type: docker`, but its launch
+operator), osmo → none (you must declare an `osmo` operator). Note the Docker naming: the *backend* is `type: docker`, but its launch
 *operator* is `type: docker_run`. See
 [Operators](./operators.md) for per-type fields and examples.
 
@@ -343,7 +344,7 @@ Beyond `depends_on`, `resources`, `replicas`, and `probes`, a task supports:
 - `operator` / `backend`: name (or inline override object) of the operator or backend for this task.
 - `ports`: service ports the task exposes (each with `port` and an optional `name`).
 - `timeout`: **accepted but not enforced.** Both the per-task and the workflow `timeout` are parsed and merged, but nothing reads them — a task that sets one runs unbounded, and `sflow run` logs a warning naming every task that does. Bound the run with the backend's own limit instead (Slurm `--time`, a Kubernetes `activeDeadlineSeconds`). Kept so existing recipes keep loading.
-- `fail_fast`: bool, **default depends on the backend** — `true` on Kubernetes (a failed command in a pod should fail the task), `false` on Slurm/local/docker (shell default: only the last command's exit code counts). Leave unset to take the backend default, or set explicitly (`true`/`false`) to override per task. When effective-true, sflow prepends `set -e` to shell-operator scripts so any failed command fails the task. Applies to shell operators only (never `python`, whose script is Python source).
+- `fail_fast`: bool, **default depends on the backend** — `true` on Kubernetes and OSMO (a failed command in a pod or OSMO task should fail the task), `false` on Slurm/local/docker (shell default: only the last command's exit code counts). Leave unset to take the backend default, or set explicitly (`true`/`false`) to override per task. When effective-true, sflow prepends `set -e` to shell-operator scripts so any failed command fails the task. Applies to shell operators only (never `python`, whose script is Python source).
 - `variables`: task-scoped variables (same format as top-level `variables`).
 - `retries`: retry policy (`count`, `interval`, `backoff`) for a failed task.
 - `result`: consolidated result parsing that writes `result.json` — see [Results](./results.md).

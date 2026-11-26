@@ -39,6 +39,15 @@ def is_valid_container_image(image: str) -> bool:
     return bool(_REGISTRY_IMAGE_RE.match(image))
 
 
+def is_local_container_image(image: str) -> bool:
+    """Return True if *image* is a file on disk (a ``.sqsh`` or a path), not a registry ref.
+
+    The runtime opens such an image in place, so there is nothing to pull.
+    """
+    image = image.strip()
+    return image.endswith(".sqsh") or image.startswith(("/", "./", "../", "~"))
+
+
 def validate_container_image_reference(
     image: str | None,
     *,

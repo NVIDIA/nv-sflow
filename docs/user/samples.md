@@ -80,6 +80,7 @@ Two families ship with sflow:
 | kubernetes | `self_contained/kubernetes/qwen3_8b/gb_dynamo_trtllm_agg` | Qwen3-8B FP8, Dynamo + TRT-LLM aggregated on a GB NVL72 rack (TP=8 spans two 4-GPU nodes over MNNVL via an IMEX `compute_domain`) |
 | kubernetes | `self_contained/kubernetes/qwen3_8b/gb_dynamo_trtllm_disagg` | Qwen3-8B FP8, Dynamo + TRT-LLM disaggregated on a GB NVL72 rack (each worker spans two 4-GPU nodes; KV over MNNVL) |
 | kubernetes | `self_contained/kubernetes/qwen3_8b/gb_trtllm_serve` | Qwen3-8B FP8, bare `trtllm-serve` on a GB NVL72 rack (TP=8 across two 4-GPU nodes via IMEX) |
+| osmo | `self_contained/osmo/hello_world` | Two CPU tasks in order, each run as its own OSMO workflow via the `osmo` operator |
 | modular | `modular/backend_agnostic` | Workload × backend composition: the same workload YAML runs on Slurm, Kubernetes, Kubernetes MPI or Docker via scattered merge + `required_by` |
 | modular | `modular/inference_x_v2` | Framework fragments + benchmarks + a CSV sweep (see [Modular inference recipe](#modular-inference-recipe-inference_x_v2)) |
 | modular | `modular/utils` | `set_up_dynamo.yaml` — idempotent Dynamo bootstrap fragment (`ai-dynamo` libs, `nats-server`, `etcd`) that folds itself into any Dynamo workflow via `required_by` |

@@ -1,0 +1,47 @@
+# Two Kubernetes nodes, two GPUs per node, plain TCP networking.
+# Access/selection stays on the CLI: --kubeconfig and --kube-node-selector.
+version: "0.1"
+variables:
+  K8S_NAMESPACE:
+    value: default
+  MODEL_PVC_CLAIM:
+    description: "Existing ReadOnlyMany or ReadWriteMany model PVC in K8S_NAMESPACE"
+    value: your-model-pvc
+  GPUS_PER_NODE:
+    type: integer
+    value: 2
+  GEN_TP_SIZE:
+    type: integer
+    value: 2
+backends:
+  - name: cluster
+    type: kubernetes
+    default: true
+    nodes: 2
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    namespace: ${{ variables.K8S_NAMESPACE }}
+    scheduling: device_plugin
+    host_network: true
+    host_ipc: true
+    rdma: disable
+    volumes:
+      - name: model-store
+        claim: ${{ variables.MODEL_PVC_CLAIM }}
+        mount_path: /models
+        read_only: true
+    reservation:
+      timeout: 1200
+operators:
+  - name: server
+    type: k8s
+    image: ${{ variables.SERVER_IMAGE }}
+    run_as_root: true
+  - name: helper
+    type: k8s
+    image: ${{ variables.SERVER_IMAGE }}
+  - name: client
+    type: k8s
+    image: ${{ variables.CLIENT_IMAGE }}
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///models/Qwen3-0.6B

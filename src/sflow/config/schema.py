@@ -155,6 +155,11 @@ class BackendConfig(BaseModel):
     # or whitespace-joined (backends normalize after resolution).
     include_nodes: Optional[List[Resolvable[str]]] = None
     exclude_nodes: Optional[List[Resolvable[str]]] = None
+    # Opt-in: after allocation and before any task starts, pull each task's
+    # container image once onto every node that will run it, retrying failed
+    # nodes, so a bad pull stops the run up front instead of failing a task
+    # mid-run. Backends without a prefetch primitive ignore it.
+    prefetch_images: bool = False
 
     def container_images(self) -> list[str]:
         """Return backend-owned default operator image references, if any."""

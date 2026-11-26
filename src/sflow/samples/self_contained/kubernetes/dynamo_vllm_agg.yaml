@@ -221,6 +221,9 @@ backends:
     namespace: ${{ variables.K8S_NAMESPACE }}
     nodes: ${{ variables.NUM_NODES }}
     gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # Pull the dynamo and aiperf images onto each reserved node before any task
+    # starts, so a pull failure stops the run up front instead of mid-run.
+    prefetch_images: true
     # pod IP == node IP, so peers can be addressed by the node InternalIPs that
     # reservation returns (etcd/NATS registration mirrors the Slurm path). It also
     # lets the multi-node Ray cluster address its head by a reachable node IP.

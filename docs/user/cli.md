@@ -33,6 +33,16 @@ sflow compose base.yaml tasks.yaml -o composed.yaml --ssh 'user@login'
 
 The remote host needs Python 3.10 or newer, but does not need sflow or rsync. sflow uploads its current source (including local edits), caches a dependency venv remotely, and uploads only explicit YAML/CSV inputs plus relative `file://` or `fs://` artifacts contained by the workspace. Relative artifacts that escape `--workspace-dir` are rejected; absolute artifact paths keep their remote meaning. Undeclared files referenced only inside shell commands are not discovered automatically. Uploaded directories skip `.git`, `.venv`, `.sflow`, `sflow_output`, and `__pycache__`.
 
+The remote executable banner reports `install : ssh-runtime`, the local install
+it mirrors (for example, `source : mirrors local PyPI 0.3.2`), and a `runtime`
+field naming the cached dependency venv. It does not report that venv's original
+build-session directory as a repository. The `package` field still identifies
+the current session's staged source, even when multiple runs reuse one venv.
+
+For `run` and `batch`, `--skip-artifact-check` also skips the SSH pre-check of
+absolute artifact paths on the remote host. The flag is forwarded to the remote
+command. To check a different path instead, use `--artifact NAME=URI`.
+
 Common SSH options:
 
 - `--ssh '<host> [ssh options]'`: connection and ordinary OpenSSH flags
@@ -46,6 +56,15 @@ Every SSH execution owns one local folder, `<output-dir>/ssh-<UTC timestamp>-<id
 sflow never deletes the remote run directory it creates under `--ssh-remote-root/runs/<session>/` (only the cached runtime venv is cleaned up on rebuild). Every `--ssh` execution leaves its full work/output tree on the remote host regardless of `--ssh-fetch`; clean up old sessions yourself if remote disk space matters.
 
 Progress is reported in four stages on stderr — connect, stage inputs, prepare the remote runtime, run — each followed by the remote facts it established (remote session/work/output dirs, where each input was staged, the receipt path, and the translated remote command). The first run on a host also reports whether the runtime is being built with `uv` or `pip`.
+
+SSH progress uses the same timestamp, severity, and message columns as the
+workflow logs. Warnings and errors have their own severity instead of appearing
+as unformatted text. `--log-level WARNING` hides routine SSH progress, including
+cached-runtime messages and log-tail headers. Remote log snapshots remain
+visible at every local progress level, and recovery commands print without
+wrapping so they can be copied directly. Diagnostics stay on stderr so `sflow compose --ssh`
+can still write clean YAML to stdout. Output from OpenSSH, package installers,
+and the remote workflow itself is preserved.
 
 Reconnect to that receipt after a network interruption or detached batch submission:
 
@@ -113,7 +132,8 @@ Common options:
 - `--extra-kubectl-apply-args <flag>`: extra flag for the `kubectl apply` **subcommand** (e.g. `--extra-kubectl-apply-args=--validate=false`, `=--server-side`, `=--force-conflicts`); repeatable. kubectl takes global flags *before* the verb and subcommand flags *after* it, so an apply-only flag cannot go through `--extra-kubectl-args` (`kubectl --validate=false apply` is an unknown flag, and it would break every other kubectl call too). Applies to every apply sflow issues, including the allocate-time reservation objects
 - `--enable-workflow-monitor`: enable a default workflow-level hardware monitor (all scopes, whole pool, for the full run) without editing the recipe; no-op if the recipe already declares `workflow.monitor`
 - `--enable-task-monitor <names>`: enable a default hardware monitor bound to the named task(s); accepts a comma- or space-separated list and is repeatable (e.g. `--enable-task-monitor prefill_server,decode_server`)
-- `--offload-task-logs` / `--no-offload-task-logs`: force per-task log offload on or off, overriding each backend's `offload_task_logs`. On by default for local/docker/slurm when non-interactive (auto-falls back to streaming on a TTY/`--tui`); no effect on `k8s` (always offloads its pod log to file) or `ssh`/`python` (always stream through the driver). Use `--no-offload-task-logs` to force live streaming through the driver
+- `--stream-task-logs`: stream task stdout/stderr to stdout even when piped or redirected, using the same task prefixes and progress handling as a TTY. Disables per-task log offload, including an explicit `--offload-task-logs`; per-task log files are still written. Default non-TTY runs keep task output in those files. For example: `sflow run -f examples/self_contained/local/stream_task_logs.yaml --stream-task-logs > run.log`. With `--tui`, output goes to the TUI log pane
+- `--offload-task-logs` / `--no-offload-task-logs`: force per-task log offload on or off, overriding each backend's `offload_task_logs`. On by default for local/docker/slurm when non-interactive (auto-falls back to streaming on a TTY); no effect on `k8s` (always offloads its pod log to file) or `ssh`/`python` (always stream through the driver). `--no-offload-task-logs` streams through the driver but does not echo task output to non-TTY stdout; use `--stream-task-logs` for that
 - `--wait-for-gpus <seconds>` (**docker backend only**): when the local docker backend can't reserve enough free GPUs, wait for them to free up instead of failing fast. The flag always takes a value: a positive number bounds the wait (e.g. `--wait-for-gpus 600`), while `0` or an empty value waits indefinitely (`--wait-for-gpus ""`) — the same meaning `0` has in the backend's `wait_for_gpus` field, which this flag overrides. Omit the flag entirely to fail fast. A non-numeric or negative value is rejected at parse time. The flag works by setting `SFLOW_WAIT_FOR_GPUS`, which you can also export directly — but note that *any* accepted value there (empty included) turns waiting on, so `unset` it to get fail-fast back, and a malformed exported value is only caught at the first GPU task rather than at parse time. No effect on other backends. See [Docker GPU reservation](backends.md#gpu-reservation-local-concurrent-runs)
 - `--tui-refresh <fps>`: TUI refresh rate in frames per second (default: `2`, minimum: `1`)
 - `--log-level <level>`: `debug|info|warning|error|critical` (default: `info`)

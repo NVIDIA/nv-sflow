@@ -10,6 +10,7 @@ its dependencies installed. It must therefore import nothing from sflow and
 nothing outside the standard library.
 """
 
+import logging
 import os
 import shutil
 import signal
@@ -109,14 +110,29 @@ def _snapshot_text(root: Path) -> str:
     return "\n".join(output) or "(waiting for sflow logs)"
 
 
-def _follow(root: Path) -> None:
+def _progress_logger(log_level: str) -> logging.Logger:
+    """Match sflow's log columns without requiring its remote dependencies."""
+    progress = logging.getLogger("sflow.ssh.remote")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="[%x %X]")
+    )
+    progress.handlers = [handler]
+    progress.setLevel(log_level.upper())
+    progress.propagate = False
+    return progress
+
+
+def _follow(root: Path, log_level: str = "INFO") -> None:
+    progress = _progress_logger(log_level)
     previous = None
     unchanged = 0
     while True:
         current = _snapshot_text(root)
         unchanged = unchanged + 5 if current == previous else 0
         suffix = f", unchanged for {unchanged}s" if unchanged else ""
-        print(f"\n[ssh {time.strftime('%H:%M:%S')}{suffix}]\n{current}", flush=True)
+        progress.info("[ssh] remote log snapshot%s", suffix)
+        print(current, flush=True)
         previous = current
         time.sleep(5)
 
@@ -240,10 +256,14 @@ def _cancel(session: Path) -> None:
     raise SystemExit(1)
 
 
-def _bootstrap(runtime: Path, source_project: Path, version: str) -> None:
+def _bootstrap(
+    runtime: Path, source_project: Path, version: str, log_level: str = "INFO"
+) -> None:
     """Build one cached runtime under an automatically released file lock."""
     import fcntl
 
+    # No Rich or sflow imports: this runs before the remote venv exists.
+    progress = _progress_logger(log_level)
     runtime.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(f"{runtime}.lock")
     with lock_path.open("a+") as lock:
@@ -258,14 +278,12 @@ def _bootstrap(runtime: Path, source_project: Path, version: str) -> None:
                     raise SystemExit("Timed out waiting for sflow runtime bootstrap")
                 if not waited:
                     waited = True
-                    print(
-                        "    another sflow run is building this runtime; waiting",
-                        file=sys.stderr,
-                        flush=True,
+                    progress.info(
+                        "    another sflow run is building this runtime; waiting"
                     )
                 time.sleep(1)
         if (runtime / ".ready").is_file():
-            print(f"    cached runtime: {runtime}", file=sys.stderr, flush=True)
+            progress.info("    cached runtime: %s", runtime)
             return
         temporary = Path(
             tempfile.mkdtemp(prefix=f"{runtime.name}.tmp-", dir=runtime.parent)
@@ -274,11 +292,9 @@ def _bootstrap(runtime: Path, source_project: Path, version: str) -> None:
             environment = os.environ.copy()
             environment["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SFLOW"] = version
             uv = shutil.which("uv")
-            print(
+            progress.info(
                 f"    building runtime with {'uv' if uv else 'pip'} "
                 "(first run for this dependency set)",
-                file=sys.stderr,
-                flush=True,
             )
             if uv:
                 create = [uv, "venv", "--python", sys.executable, str(temporary)]
@@ -314,13 +330,13 @@ def _helper_main() -> None:
     if action == "snapshot":
         print(_snapshot_text(root))
     elif action == "follow":
-        _follow(root)
+        _follow(root, sys.argv[3] if len(sys.argv) > 3 else "INFO")
     elif action == "pack":
         _pack(root, sys.argv[3])
     elif action == "cancel":
         _cancel(root)
     elif action == "bootstrap":
-        _bootstrap(root, Path(sys.argv[3]), sys.argv[4])
+        _bootstrap(root, Path(sys.argv[3]), sys.argv[4], sys.argv[5])
     else:
         raise SystemExit("unknown action")
 

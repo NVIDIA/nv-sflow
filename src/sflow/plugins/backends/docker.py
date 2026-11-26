@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import shutil
@@ -23,6 +24,8 @@ from sflow.core.backend import (
 )
 from sflow.core.backend_registry import register_backend
 from sflow.core.compute_node import ComputeNode
+from sflow.core.image_prefetch import PrefetchResult
+from sflow.core.launcher import SubprocessLauncher
 from sflow.core.monitor import MonitorDelivery
 from sflow.core.operator import Operator
 from sflow.logging import get_logger
@@ -37,6 +40,7 @@ from sflow.utils.container import local_artifact_mounts
 from sflow.utils.extra_args import normalize_extra_args
 from sflow.utils.gpu import count_visible_devices
 from sflow.utils.gpu_reservation import validate_config_wait_for_gpus
+from sflow.utils.logging import run_capturing
 from sflow.utils.node_filters import (
     filter_by_node_names,
     normalize_node_list,
@@ -289,6 +293,7 @@ class DockerBackend(Backend):
     def __init__(self, config: DockerBackendConfig):
         super().__init__(name=config.name)
         self.config = config
+        self._subprocess_launcher = SubprocessLauncher()
         self._include_nodes = normalize_node_list(config.include_nodes)
         self._exclude_nodes = normalize_node_list(config.exclude_nodes)
         self._hosts = self._filter_hosts(list(config.hosts or []))
@@ -665,6 +670,38 @@ class DockerBackend(Backend):
 
     def host_for_node(self, node_name: str) -> DockerHostConfig | None:
         return self._host_by_name.get(node_name)
+
+    async def prefetch_image(
+        self, image: str, nodes: Sequence[str], tasks: Sequence[Any]
+    ) -> PrefetchResult:
+        """Pull *image* on each node's daemon unless it is already there.
+
+        ``image inspect`` first, so an image already on the host is used as is,
+        the way ``docker run``'s default ``--pull=missing`` would. Hosts run in
+        parallel.
+        """
+
+        async def _pull_on_host(node: str) -> str | None:
+            host = self.host_for_node(node)
+            control = list(host.control_args()) if host is not None else []
+            rc, _ = await run_capturing(
+                self._subprocess_launcher,
+                ["docker", *control, "image", "inspect", image],
+                name="docker.image_inspect",
+            )
+            if rc == 0:
+                return None
+            rc, lines = await run_capturing(
+                self._subprocess_launcher,
+                ["docker", *control, "pull", image],
+                name="docker.image_pull",
+            )
+            if rc == 0:
+                return None
+            return f"docker pull exit code {rc}\n" + "\n".join(lines)
+
+        errors = await asyncio.gather(*[_pull_on_host(node) for node in nodes])
+        return PrefetchResult.from_node_errors(list(zip(nodes, errors)))
 
     def _gpus_on(self, host: DockerHostConfig) -> int | None:
         """This host's GPU count: its own if declared, else the backend's.

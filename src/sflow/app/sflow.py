@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sflow.app.assembly import build_state, release_backends
+from sflow.app.backend_lifecycle import plan_backend_image_prefetch
 from sflow.app.monitor_cli import apply_monitor_cli_overrides
 from sflow.app.monitor_planner import run_monitor_postprocess
 from sflow.app.run_support import (
@@ -35,6 +36,7 @@ from sflow.core.command_log import (
 )
 from sflow.core.command_trace import get_command_trace
 from sflow.core.execution_summary import SflowSummaryWriter
+from sflow.core.image_prefetch import supports_image_prefetch
 from sflow.core.uploads import UploadResult
 from sflow.logging import (
     CoalescingFileHandler,
@@ -650,6 +652,22 @@ class SflowApp:
                         log_dry_run_section("Allocation map")
                         for line in allocation_map_lines:
                             _logger.info(line)
+
+                    prefetch_plans = plan_backend_image_prefetch(state)
+                    if prefetch_plans:
+                        log_dry_run_section("Image prefetch")
+                        for b_name, plan in prefetch_plans.items():
+                            if not supports_image_prefetch(state.backends[b_name]):
+                                _logger.info(
+                                    f"  [{b_name}] not supported by this backend "
+                                    "type; skipped"
+                                )
+                                continue
+                            for entry in plan:
+                                _logger.info(
+                                    f"  [{b_name}] {entry.image} -> "
+                                    f"{','.join(entry.nodes)}"
+                                )
 
                     resource_rehearsal_lines = build_resource_rehearsal_lines(
                         [tg.get_task(name) for name in order]

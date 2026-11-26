@@ -1,0 +1,42 @@
+# Server startup and client progress, including stderr, with no infrastructure.
+# sflow run -f examples/self_contained/local/stream_task_logs.yaml --stream-task-logs | tee run.log
+version: "0.1"
+artifacts:
+  - name: EMITTER
+    uri: file://emitter.py
+    content: |
+      import sys
+      import time
+      role = sys.argv[1]
+      if role == "server":
+          for step in range(3):
+              print(f"NTTY_SERVER_STARTUP_{step}", flush=True)
+              time.sleep(1)
+          print("NTTY_SERVER_READY", flush=True)
+          for _ in range(20):
+              print("NTTY_SERVER_HEARTBEAT", flush=True)
+              time.sleep(1)
+      else:
+          for step in range(4):
+              print(f"NTTY_CLIENT_PROGRESS_{step}", flush=True)
+              print(f"NTTY_CLIENT_STDERR_{step}", file=sys.stderr, flush=True)
+              time.sleep(1)
+          print("NTTY_CLIENT_" + "DONE", flush=True)
+workflow:
+  name: stream_task_logs
+  tasks:
+    - name: server
+      script:
+        - python3 -u ${{ artifacts.EMITTER.path }} server
+      probes:
+        readiness:
+          interval: 1
+          log_watch:
+            regex_pattern: NTTY_SERVER_READY
+        failure:
+          log_watch:
+            regex_pattern: "Traceback (most recent call last)"
+    - name: client
+      depends_on: [server]
+      script:
+        - python3 -u ${{ artifacts.EMITTER.path }} client

@@ -139,6 +139,9 @@ backends:
     partition: ${{ variables.SLURM_PARTITION }}
     account: ${{ variables.SLURM_ACCOUNT }}
     gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # Pull the dynamo and aiperf images once per node before any task starts,
+    # retrying failed nodes, instead of each srun importing its own.
+    prefetch_images: true
 
 operators:
   - name: dynamo

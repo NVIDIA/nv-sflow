@@ -26,7 +26,7 @@ Not sure where to start? Open the [Feature Map](/feature-map) to choose a goal, 
 
 **Cluster-level orchestration at scale.** Topology-aware node and GPU placement, multi-node replicas and sweeps, readiness/failure probes, and batch submission — so one descriptor drives hundreds of GPUs instead of a pile of hand-written bash.
 
-All four backends ship today: `local`, `docker`, `slurm`, and `kubernetes` (`k8s` / `k8s_mpi`). It is light enough to write and debug a recipe on your laptop and submit that same file to the cluster.
+Five backends ship today: `local`, `docker`, `slurm`, `kubernetes` (`k8s` / `k8s_mpi`), and `osmo` (single-node tasks as OSMO workflows). It is light enough to write and debug a recipe on your laptop and submit that same file to the cluster.
 
 ![sflow TUI](/img/sflow_tui.gif)
 
@@ -117,8 +117,8 @@ Use the `local` backend with the `bash` operator to validate your DAG and script
 |---------|-------------|
 | **Workflow** | A set of tasks wired into a DAG via `depends_on`. |
 | **Task** | An executable unit. The key field is `script` — a list of lines joined into a bash script. |
-| **Backend** | Where compute comes from. Built-ins: `local` (simulates nodes on the local machine), `slurm` (allocates via `salloc`), `docker` (launches tasks via `docker run`), and `kubernetes` (schedules tasks as pods). |
-| **Operator** | How a task is launched. Built-ins: `bash`, `srun`, `docker_run`, `k8s`, `k8s_mpi`, `ssh`, `python`. Named operators let you preset flags and reuse them across tasks. |
+| **Backend** | Where compute comes from. Built-ins: `local` (simulates nodes on the local machine), `slurm` (allocates via `salloc`), `docker` (launches tasks via `docker run`), `kubernetes` (schedules tasks as pods), and `osmo` (submits each task as an OSMO workflow). |
+| **Operator** | How a task is launched. Built-ins: `bash`, `srun`, `docker_run`, `k8s`, `k8s_mpi`, `osmo`, `ssh`, `python`. Named operators let you preset flags and reuse them across tasks. |
 | **Variable** | A named value referenced as `${{ variables.NAME }}` in YAML or `${NAME}` in scripts. Override from the CLI with `--set`. |
 | **Expression** | Jinja2-based `${{ ... }}` syntax inside YAML to reference variables, backend info, task metadata, and more (e.g. `${{ backends.slurm.nodes[0].ip_address }}`). Supports filters (`${{ [a, b] \| min }}`), conditionals, and list indexing. |
 | **Artifact** | A named external resource (model, config, dataset) referenced by URI and resolved to a local path at runtime. |
@@ -226,7 +226,7 @@ This user guide reflects actual code behavior. Not all planned features may be a
 | Run a minimal example | [Quickstart](./quickstart.md) |
 | Variables, expressions, env injection | [Variables](./variables.md) |
 | Named inputs (paths, images, etc.) | [Artifacts](./artifacts.md) |
-| Compute backends (local, Slurm, Docker, Kubernetes) | [Backends](./backends.md) |
+| Compute backends (local, Slurm, Docker, Kubernetes, OSMO) | [Backends](./backends.md) |
 | Task launch methods (bash, srun, containers) | [Operators](./operators.md) |
 | Node/GPU placement, CUDA_VISIBLE_DEVICES | [Resources](./resources.md) |
 | Parallel/sequential replicas, sweeps | [Replicas](./replicas.md) |

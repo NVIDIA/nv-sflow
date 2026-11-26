@@ -14,6 +14,7 @@ import csv
 import glob
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -36,6 +37,7 @@ from sflow.core.artifact_registry import resolve_file_like_uri_to_path
 from sflow.ssh.invocation import Invocation, argv_to_invocation
 from sflow.ssh.receipt import initial_receipt, write_receipt
 from sflow.ssh.transport import DEFAULT_TRANSPORT, Transport
+from sflow.ssh.progress import configure_logging as configure_ssh_logging, log
 
 _SSH_OPTIONS_WITH_VALUE = {
     "-B",
@@ -202,11 +204,11 @@ _STAGED_FACTS = 5
 
 def _stage(number: int, description: str) -> None:
     """Announce one delegation stage; stdout stays reserved for the command."""
-    typer.echo(f"[ssh {number}/{_STAGES}] {description}...", err=True)
+    log(logging.INFO, "[ssh %s/%s] %s...", number, _STAGES, description)
 
 
 def _fact(label: str, value: str) -> None:
-    typer.echo(f"    {label}: {value}", err=True)
+    log(logging.INFO, "    %s: %s", label, value)
 
 
 def _staged_report(
@@ -234,9 +236,9 @@ def _staged_report(
 def _tty_mode(mode: str, raw_args: list[str]) -> str:
     """Let ``--tui`` win over an explicit ``never``; it cannot render on a pipe."""
     if "--tui" in raw_args and mode == "never":
-        typer.echo(
-            "Warning: --tui needs a remote PTY to render; ignoring --ssh-tty never.",
-            err=True,
+        log(
+            logging.WARNING,
+            "--tui needs a remote PTY to render; ignoring --ssh-tty never.",
         )
         return "always"
     return mode
@@ -254,7 +256,7 @@ def _cancel_remote(
     Killing the local SSH client only closes the channel: without this the
     remote controller (and anything it allocated) keeps running.
     """
-    typer.echo("\nCancelling the remote run...", err=True)
+    log(logging.INFO, "Cancelling the remote run...")
     try:
         result = transport.run_to_stderr(
             ssh,
@@ -263,10 +265,10 @@ def _cancel_remote(
     except KeyboardInterrupt:
         # A second Ctrl-C means the user is done waiting; the remote state is
         # then genuinely unknown.
-        typer.echo("Stopped waiting for the remote cancel to confirm.", err=True)
+        log(logging.WARNING, "Stopped waiting for the remote cancel to confirm.")
         return False
     except OSError as exc:
-        typer.echo(f"Could not reach the host to cancel: {exc}", err=True)
+        log(logging.ERROR, "Could not reach the host to cancel: %s", exc)
         return False
     if result.returncode == 255:
         ssh_failure_hint(ssh)
@@ -291,10 +293,10 @@ def _resolve_follow(follow: str, *, live_stream: bool) -> str:
     if follow == "auto":
         return "none" if live_stream else "logs"
     if live_stream and follow in {"logs", "status"}:
-        typer.echo(
-            f"Warning: a PTY is already streaming the run live; ignoring "
+        log(
+            logging.WARNING,
+            f"A PTY is already streaming the run live; ignoring "
             f"--ssh-follow {follow} to avoid two writers on the terminal.",
-            err=True,
         )
         return "none"
     return follow
@@ -370,16 +372,23 @@ def ssh_failure_hint(ssh: list[str]) -> None:
             destination,
         ]
     )
-    typer.echo(
+    log(
+        logging.ERROR,
         "SSH could not establish a connection (exit 255). If this host requires "
-        "MFA, run this command and complete MFA:\n"
+        "MFA, run this command and complete MFA:",
+    )
+    # Shell commands must survive copy/paste even on a narrow terminal.
+    typer.echo(
         f"  {master}\n"
         "Then rerun sflow using:\n"
-        f"  --ssh {shlex.quote(reuse)}\n"
+        f"  --ssh {shlex.quote(reuse)}",
+        err=True,
+    )
+    log(
+        logging.ERROR,
         "Exit 255 can also mean a network, DNS, host-key, or SSH configuration "
         "failure. Documentation: "
         "https://nvidia.github.io/nv-sflow/docs/user/cli#run-through-ssh",
-        err=True,
     )
 
 
@@ -640,16 +649,18 @@ def _check_remote_artifacts(
     except (json.JSONDecodeError, TypeError):
         missing = None
     if result.returncode != 0 or not isinstance(missing, list):
-        typer.echo(
+        log(
+            logging.ERROR,
             f"✗ Could not verify remote artifact paths: "
             f"{result.stderr.strip() or 'unknown error'}",
-            err=True,
         )
         raise typer.Exit(code=1)
     if missing:
-        typer.echo(
-            "✗ Artifact path(s) not found on remote host: " + ", ".join(missing),
-            err=True,
+        log(
+            logging.ERROR,
+            "✗ Artifact path(s) not found on remote host: " + ", ".join(missing)
+            + ". Use --artifact NAME=URI to override the path, or "
+            "--skip-artifact-check to skip this pre-check.",
         )
         raise typer.Exit(code=1)
 
@@ -855,7 +866,9 @@ def snapshot(
     )
     unchanged = unchanged + 5 if snapshot == previous else 0
     suffix = f", unchanged for {unchanged}s" if unchanged else ""
-    typer.echo(f"\n[ssh {time.strftime('%H:%M:%S')}{suffix}]\n{snapshot}", err=True)
+    log(logging.INFO, "[ssh] remote log snapshot%s", suffix)
+    # Remote output has its own severity/layout; never filter or rewrap it.
+    typer.echo(snapshot, err=True)
     if connection_hint and result.returncode != 0:
         raise typer.Exit(code=result.returncode)
     return snapshot, unchanged
@@ -878,12 +891,12 @@ def fetch(
         try:
             result = transport.run_to_file(ssh, command, archive_file)
         except OSError as exc:
-            typer.echo(f"Warning: failed to fetch remote output: {exc}", err=True)
+            log(logging.WARNING, "Failed to fetch remote output: %s", exc)
             return False
         if result.returncode != 0:
             if result.returncode == 255:
                 ssh_failure_hint(ssh)
-            typer.echo("Warning: failed to fetch remote output.", err=True)
+            log(logging.WARNING, "Failed to fetch remote output.")
             return False
         archive_file.flush()
         try:
@@ -892,7 +905,7 @@ def fetch(
                 _safe_extract(Path(archive_file.name), staged)
                 _merge_tree(staged, destination)
         except (OSError, RuntimeError, tarfile.TarError) as exc:
-            typer.echo(f"Warning: unsafe or incomplete remote output: {exc}", err=True)
+            log(logging.WARNING, "Unsafe or incomplete remote output: %s", exc)
             return False
     return True
 
@@ -937,7 +950,7 @@ def _validate_recipe_locally(
             config_files, variable_overrides, artifact_overrides, missable_tasks
         )
     except (ValueError, FileNotFoundError) as exc:
-        typer.echo(f"✗ Configuration error: {exc}", err=True)
+        log(logging.ERROR, "✗ Configuration error: %s", exc)
         raise typer.Exit(code=1) from None
 
 
@@ -945,7 +958,9 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
     """Delegate one parsed CLI invocation, then exit with the remote status."""
     # Imported here, not at module scope: sflow.cli imports this module back.
     from sflow.cli.batch import SUBMITTED_JOBS_FILE_ENV
+    from sflow.runtime_info import SSH_RUNTIME_ENV, SSH_SOURCE_ENV, install_info
 
+    configure_ssh_logging(invocation.log_level)
     transport = transport or DEFAULT_TRANSPORT
     command = invocation.command
     connection = invocation.connection
@@ -1035,7 +1050,8 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
             for config in configs
             for path in _remote_artifact_paths(config, artifact_overrides)
         ]
-        _check_remote_artifacts(ssh, remote_artifact_paths, transport=transport)
+        if not invocation.skip_artifact_check:
+            _check_remote_artifacts(ssh, remote_artifact_paths, transport=transport)
         for override in artifact_overrides or []:
             if "=" in override:
                 artifact_path = _relative_uri_path(override.split("=", 1)[1], workspace)
@@ -1131,7 +1147,7 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
             f"exec python3 {shlex.quote(remote_helper)} bootstrap "
             f"{shlex.quote(remote_runtime)} "
             f"{shlex.quote(remote_session + '/source-project')} "
-            f"{shlex.quote(_version())}"
+            f"{shlex.quote(_version())} {shlex.quote(invocation.log_level)}"
         )
         receipt = initial_receipt(
             command=command,
@@ -1181,6 +1197,14 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
         write_receipt(receipt_path, receipt)
 
     quoted_args = " ".join(shlex.quote(arg) for arg in [command, *raw_args])
+    local_install_mode, _ = install_info()
+    local_install_label = {
+        "installed": "PyPI",
+        "editable": "editable checkout",
+        "source-tree": "source tree",
+        "direct-url": "direct-url install",
+    }.get(local_install_mode, local_install_mode)
+    mirrored_source = f"mirrors local {local_install_label} {_version()}"
     remote_command = (
         f"umask 077; cd {shlex.quote(remote_work)}; "
         # exec keeps this PID, so the pid file addresses the controller itself
@@ -1189,6 +1213,8 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
         f"echo $$ > {shlex.quote(remote_session + '/controller.pid')}; "
         f"export PYTHONPATH={shlex.quote(remote_session + '/source-project/src')}; "
         f"export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SFLOW={shlex.quote(_version())}; "
+        f"export {SSH_RUNTIME_ENV}={shlex.quote(remote_runtime)}; "
+        f"export {SSH_SOURCE_ENV}={shlex.quote(mirrored_source)}; "
         f"export {SUBMITTED_JOBS_FILE_ENV}="
         f"{shlex.quote(remote_session + '/' + SUBMITTED_JOBS_FILE)}; "
         f"exec {shlex.quote(remote_runtime + '/bin/python')} -m sflow {quoted_args}"
@@ -1227,7 +1253,8 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
         try:
             follower = transport.start_to_stderr(
                 ssh,
-                f"exec python3 {shlex.quote(remote_helper)} follow {shlex.quote(remote_output)}",
+                f"exec python3 {shlex.quote(remote_helper)} follow {shlex.quote(remote_output)} "
+                f"{shlex.quote(invocation.log_level)}",
             )
         except OSError as exc:
             process.terminate()
@@ -1243,7 +1270,7 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
                 phase="launch",
             )
             write_receipt(receipt_path, receipt)
-            typer.echo(f"Could not start SSH log follower: {exc}", err=True)
+            log(logging.ERROR, "Could not start SSH log follower: %s", exc)
             raise typer.Exit(code=1) from exc
 
     previous: str | None = None
@@ -1270,10 +1297,7 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
                             transport=transport,
                         )
                     elif follow == "status":
-                        typer.echo(
-                            f"[ssh {time.strftime('%H:%M:%S')}] remote process is still running",
-                            err=True,
-                        )
+                        log(logging.INFO, "[ssh] remote process is still running")
         except KeyboardInterrupt:
             cancelled = _cancel_remote(
                 ssh, remote_helper, remote_session, transport=transport
@@ -1287,12 +1311,12 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
                 process.wait()
             return_code = 130
             if cancelled:
-                typer.echo("Remote run cancelled.", err=True)
+                log(logging.INFO, "Remote run cancelled.")
             else:
-                typer.echo(
+                log(
+                    logging.WARNING,
                     "Remote SSH session interrupted; remote state is unknown and "
                     "the receipt keeps its location.",
-                    err=True,
                 )
     finally:
         if follower is not None and follower.poll() is None:
@@ -1319,9 +1343,9 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
         )
     if return_code == 255:
         ssh_failure_hint(ssh)
-        typer.echo(
+        log(
+            logging.ERROR,
             f"SSH transport failed; remote state is unknown. Inspect or reconnect with {receipt_path}.",
-            err=True,
         )
     should_fetch = (
         fetch_mode != "none"
@@ -1365,13 +1389,13 @@ def delegate(invocation: Invocation, transport: Transport | None = None) -> None
                         try:
                             _copy_file_atomic(fetched_file, local_path)
                         except (OSError, RuntimeError) as exc:
-                            typer.echo(
-                                f"Warning: failed to restore {local_path}: {exc}",
-                                err=True,
+                            log(
+                                logging.WARNING,
+                                "Failed to restore %s: %s", local_path, exc,
                             )
                             fetched = False
             if fetched:
-                typer.echo(f"Fetched remote output to {fetch_destination}", err=True)
+                log(logging.INFO, "Fetched remote output to %s", fetch_destination)
         except KeyboardInterrupt:
             receipt.update(fetch_status="interrupted", phase="finished")
             write_receipt(receipt_path, receipt)

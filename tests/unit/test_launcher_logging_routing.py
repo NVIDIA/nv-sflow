@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import pytest
 
 import sflow.core.launcher as launcher_mod
+import sflow.core.log_offload as log_offload
 from sflow.core.launcher import (
     SubprocessLauncher,
     _console_streams_task_output,
@@ -138,10 +139,10 @@ def test_console_streams_task_output_follows_tty(monkeypatch):
         def isatty(self) -> bool:
             return self._tty
 
-    monkeypatch.setattr(launcher_mod.sys, "stdout", _FakeStdout(True))
+    monkeypatch.setattr(log_offload.sys, "stdout", _FakeStdout(True))
     assert _console_streams_task_output() is True
 
-    monkeypatch.setattr(launcher_mod.sys, "stdout", _FakeStdout(False))
+    monkeypatch.setattr(log_offload.sys, "stdout", _FakeStdout(False))
     assert _console_streams_task_output() is False
 
 

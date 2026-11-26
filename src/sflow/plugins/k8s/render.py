@@ -41,6 +41,9 @@ RESERVATION_ROLE = "reservation"
 # network probes (TCP/HTTP) on the sflow driver's behalf, so the checks reach the
 # workload's node/pod IPs from inside the cluster network.
 PROBE_ROLE = "probe"
+# Role for the short-lived pods that pull a task image onto a reserved node before
+# any task starts (backend ``prefetch_images``).
+IMAGE_PREFETCH_ROLE = "image-prefetch"
 
 # Standard node label carrying the node's hostname; the placement primitive for
 # pinning pods onto reserved nodes (nodeSelector / nodeAffinity / anti-affinity).
@@ -600,6 +603,55 @@ def render_probe_pod_manifest(
         pod_name,
         namespace,
         labels={SFLOW_ALLOC_LABEL: allocation_id, SFLOW_ROLE_LABEL: PROBE_ROLE},
+    )
+    return {"apiVersion": "v1", "kind": "Pod", "metadata": metadata, "spec": pod_spec}
+
+
+def render_image_prefetch_pod_manifest(
+    *,
+    pod_name: str,
+    allocation_id: str,
+    image: str,
+    node: str,
+    namespace: str | None = None,
+    image_pull_policy: str | None = None,
+    image_pull_secrets: Sequence[str] = (),
+    node_selector: Mapping[str, str] | None = None,
+    tolerations: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Render a run-once Pod that makes the kubelet on *node* pull *image*.
+
+    Pinned by hostname, it holds no GPU and only a token of CPU/memory, so it
+    schedules beside the placeholder that reserves the node. It runs ``true`` and
+    exits; the caller judges the pull from the container status, so an image
+    without a ``true`` binary still counts as pulled. It carries the allocation
+    label so ``release()`` sweeps any pod the caller could not delete.
+    """
+    container: dict[str, Any] = {
+        "name": "pull",
+        "image": image,
+        "command": ["true"],
+        "resources": {
+            "requests": {"cpu": "10m", "memory": "16Mi"},
+            "limits": {"cpu": "100m", "memory": "64Mi"},
+        },
+    }
+    if image_pull_policy:
+        container["imagePullPolicy"] = image_pull_policy
+    pod_spec: dict[str, Any] = {
+        "restartPolicy": "Never",
+        "terminationGracePeriodSeconds": 0,
+        "containers": [container],
+        "nodeSelector": _merged_node_selector(node_selector, node),
+    }
+    if tolerations:
+        pod_spec["tolerations"] = [dict(t) for t in tolerations]
+    if image_pull_secrets:
+        pod_spec["imagePullSecrets"] = [{"name": str(s)} for s in image_pull_secrets]
+    metadata = _manifest_metadata(
+        pod_name,
+        namespace,
+        labels={SFLOW_ALLOC_LABEL: allocation_id, SFLOW_ROLE_LABEL: IMAGE_PREFETCH_ROLE},
     )
     return {"apiVersion": "v1", "kind": "Pod", "metadata": metadata, "spec": pod_spec}
 

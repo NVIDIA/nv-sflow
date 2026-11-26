@@ -247,6 +247,7 @@ entirely, a default `local` backend is created.
 | `gpus_per_node` | int/expr  | No       |         | GPUs/node for sflow planning & GPU index assignment. `0` = CPU-only. **Does not** add a Slurm `--gpus-per-node` flag |
 | `include_nodes` | list      | No       | []      | Restrict the node pool to these hostnames (also `--include-nodes`) |
 | `exclude_nodes` | list      | No       | []      | Remove these hostnames from the node pool (also `--exclude-nodes`) |
+| `prefetch_images` | bool  | No       | false   | Pull each task image once per node before any task starts (retries failed nodes; final failure stops the run). Slurm/Docker/Kubernetes; ignored on local |
 
 Node include/exclude is backend-agnostic: also settable via `--include-nodes` /
 `--exclude-nodes` on `sflow run` / `sflow batch` (CLI values union over the recipe). A host
@@ -740,7 +741,7 @@ workflow:
 | `probes`     | dict        | No       | Readiness and failure probes               |
 | `retries`    | dict        | No       | Retry policy                               |
 | `timeout`    | int/str     | No       | Per-task timeout (e.g. `1800`, `"30m"`)    |
-| `fail_fast`  | bool        | No       | **Default depends on the backend** — `true` on Kubernetes, `false` on Slurm/local/docker (shell default: only the LAST command's exit code counts). Leave unset for the backend default, or set explicitly (`true`/`false`) to override per task. When effective-true, runs the task's shell script with `set -e` so a failed command fails the task instead of a later successful command (e.g. a trailing `echo`) masking it. Ignored by the `python` operator (its script is Python source). |
+| `fail_fast`  | bool        | No       | **Default depends on the backend** — `true` on Kubernetes and OSMO, `false` on Slurm/local/docker (shell default: only the LAST command's exit code counts). Leave unset for the backend default, or set explicitly (`true`/`false`) to override per task. When effective-true, runs the task's shell script with `set -e` so a failed command fails the task instead of a later successful command (e.g. a trailing `echo`) masking it. Ignored by the `python` operator (its script is Python source). |
 | `ports`      | list        | No       | Named service ports (`{ port, name }`) the task exposes |
 | `variables`  | dict/list   | No       | Task-scoped variables (same format as global) |
 | `outputs`    | list        | No       | Output parsing patterns (legacy MVP)       |

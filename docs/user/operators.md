@@ -29,6 +29,7 @@ backend configs still use `type: docker`.
 | `docker_run` | `docker` | bash shell inside the container | offload to `<task>.log` (default) or stream |
 | `k8s` | — (declare explicitly) | bash shell inside the pod | streamed from the pod via `kubectl` |
 | `k8s_mpi` | — (declare explicitly) | `mpirun` launcher inside the pod | streamed from the pod via `kubectl` |
+| `osmo` | - (declare explicitly) | bash shell inside the OSMO task container | streamed from OSMO via `osmo workflow logs` |
 | `ssh` | — | bash shell on the remote host | streamed through the driver |
 | `python` | — | Python **source** via `python -c` (not a shell) | streamed through the driver |
 
@@ -205,6 +206,40 @@ workflow:
     - name: train
       operator: server_op
       resources: {gpus: {count: 2}}
+      script:
+        - nvidia-smi -L
+```
+
+### osmo
+
+Runs the task as a one-task OSMO workflow on the `osmo` backend. Like `k8s`, the workload
+**`image` lives on the operator**. Fields: `image` (required), `cpu`, `memory`, `storage`,
+`platform` (overrides the backend's), and `poll_interval` (seconds between status
+queries, default `10`). See [Backends](./backends.md#osmo-backend).
+
+```yaml
+version: "0.1"
+
+backends:
+  - name: osmo
+    type: osmo
+    default: true
+    pool: my-pool
+
+operators:
+  - name: osmo_gpu
+    type: osmo
+    image: nvcr.io/my-org/trainer:1.0
+    cpu: 8
+    memory: 40Gi
+    storage: 20Gi
+
+workflow:
+  name: osmo_demo
+  tasks:
+    - name: train
+      operator: osmo_gpu
+      resources: {gpus: {count: 1}}
       script:
         - nvidia-smi -L
 ```

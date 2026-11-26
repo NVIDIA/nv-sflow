@@ -311,13 +311,14 @@ VALID_OPERATOR_TYPES = {
     "ssh",
     "k8s",
     "k8s_mpi",
+    "osmo",
 }
 # Common invalid operator-type mistakes -> the type to use instead. `docker` is the
 # Docker *backend* type, but the Docker launch *operator* is `docker_run`.
 INVALID_OPERATOR_TYPE_HINTS = {
     "docker": "docker_run",
 }
-VALID_BACKEND_TYPES = {"local", "slurm", "docker", "kubernetes"}
+VALID_BACKEND_TYPES = {"local", "slurm", "docker", "kubernetes", "osmo"}
 
 
 def check_operator_types(config: dict, result: ValidationResult) -> None:

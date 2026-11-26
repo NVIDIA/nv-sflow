@@ -108,8 +108,8 @@ flowchart TD
 
   subgraph Phase2["2. Assembly Pipeline"]
     resolve_vars["Resolve global variables\n${{ variables.* }}"]
-    resolve_be["Resolve & instantiate backends\n(local / slurm / docker / kubernetes)"]
-    allocate["Allocate backend resources\n(salloc for slurm, synthetic nodes\nfor local/docker, cluster alloc for k8s)"]
+    resolve_be["Resolve & instantiate backends\n(local / slurm / docker / kubernetes / osmo)"]
+    allocate["Allocate backend resources\n(salloc for slurm, synthetic nodes\nfor local/docker, cluster alloc for k8s,\nnone for osmo)"]
     resolve_art["Resolve artifacts\n(download http(s), locate paths)"]
     resolve_wf_vars["Resolve workflow variables\n(can reference backends/artifacts)"]
     build_tg["Build task graph\n(replicas, GPU packing,\noperator assignment, probes, monitors)"]
@@ -120,7 +120,7 @@ flowchart TD
   subgraph Phase3["3. Orchestration"]
     poll["Poll loop\n(async, configurable interval)"]
     submit["Submit ready tasks\n(all deps COMPLETED/READY)"]
-    launch["Launch via operator\n(bash/srun/docker_run/k8s/k8s_mpi/ssh/python)"]
+    launch["Launch via operator\n(bash/srun/docker_run/k8s/k8s_mpi/osmo/ssh/python)"]
     probes["Run probes on\nRUNNING/READY tasks"]
     check_exit["Check subprocess exits\n(exit code, retries)"]
     failfast["Fail-fast check\n(cancel all on failure)"]
@@ -151,7 +151,7 @@ The assembly pipeline (`build_state()`) transforms raw config into a ready-to-ex
 |------|----------|-------------|
 | 1 | `resolve_global_variables()` | Evaluates `${{ }}` in top-level variables (topological order for inter-variable deps) |
 | 2 | `resolve_backends()` | Instantiates `Backend` objects from config, resolving backend-level expressions |
-| 3 | `allocate_backends()` | Calls `backend.allocate()` — runs `salloc` for Slurm, synthetic nodes for local/docker, reserves cluster nodes for Kubernetes |
+| 3 | `allocate_backends()` | Calls `backend.allocate()` — runs `salloc` for Slurm, synthetic nodes for local/docker, reserves cluster nodes for Kubernetes, nothing for OSMO (each task is scheduled on submit) |
 | 4 | `resolve_artifacts()` | Materializes artifacts: downloads & caches `http(s)://`, locates `fs://` / `file://` paths (a missing `fs://` path warns rather than failing) |
 | 5 | `resolve_workflow_variables()` | Resolves workflow-scoped variables (can reference `backends.*`, `artifacts.*`) |
 | 6 | `build_task_graph()` | Expands replicas, assigns GPUs/nodes, builds operators, creates probes, plans monitors, resolves `${{ task.* }}` expressions |

@@ -30,7 +30,7 @@ from sflow.cli._args import (
     split_list_arg,
 )
 from sflow.core.kubectl_config import KubectlConfig
-from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV
+from sflow.core.log_offload import OFFLOAD_TASK_LOGS_ENV, STREAM_TASK_LOGS
 from sflow.logging import configure_logging, get_logger
 from sflow.resolution import enrich_error_with_location
 from sflow.runtime_info import log_runtime_info
@@ -432,6 +432,14 @@ def run(
             min=1,
         ),
     ] = 2,
+    stream_task_logs: Annotated[
+        bool,
+        typer.Option(
+            "--stream-task-logs",
+            help="Stream task stdout/stderr to stdout even without a TTY. "
+            "Disables task log offload; per-task log files are still written.",
+        ),
+    ] = False,
     offload_task_logs: Annotated[
         Optional[bool],
         typer.Option(
@@ -440,7 +448,8 @@ def run(
             "or a host-side shell redirect for local/docker) through a compute-side "
             "prefixer, instead of streaming it through the sflow driver. ON by default "
             "for local/docker/slurm in non-interactive runs (auto-streams on a "
-            "TTY/--tui); pass --no-offload-task-logs to force streaming. Overrides the "
+            "TTY); --no-offload-task-logs streams through the driver. Use "
+            "--stream-task-logs to also echo to stdout without a TTY. Overrides the "
             "backend's offload_task_logs; no-op for k8s/ssh.",
         ),
     ] = None,
@@ -507,6 +516,7 @@ def run(
             typer.echo(f"Error: --wait-for-gpus: {e}", err=True)
             raise typer.Exit(code=2) from None
 
+    stream_token = STREAM_TASK_LOGS.set(stream_task_logs)
     try:
         if row and bulk_input is None:
             typer.echo("Error: --row requires --bulk-input.", err=True)
@@ -699,3 +709,5 @@ def run(
         if _sflow_app.last_workflow_output_dir:
             _print_run_artifacts(_sflow_app.last_workflow_output_dir, err=True)
         raise typer.Exit(code=1)
+    finally:
+        STREAM_TASK_LOGS.reset(stream_token)

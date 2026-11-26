@@ -40,6 +40,7 @@ from collections.abc import Awaitable, Iterator, Mapping, Sequence
 
 from sflow.core.command import Command
 from sflow.core.command_trace import get_command_trace
+from sflow.core.log_offload import console_streams_task_output
 from sflow.utils.console_text import (
     CONSOLE_LINE_CHAR_CAP,
     clamp_for_console,
@@ -1100,10 +1101,7 @@ def _sanitize_file_inplace(path: str) -> None:
 
 
 def _console_active() -> bool:
-    try:
-        return bool(sys.stdout.isatty())
-    except Exception:
-        return False
+    return console_streams_task_output()
 
 
 def _console_line(raw: bytes, *, task_name: str) -> str:
@@ -1127,7 +1125,7 @@ def _console_line(raw: bytes, *, task_name: str) -> str:
 async def tail_file_to_console(
     path: str, *, task_name: str, line_prefix: str = ""
 ) -> None:
-    """Echo new lines of ``path`` to the console (TTY only), decoupled from the writer.
+    """Echo new lines to the console on a TTY or with --stream-task-logs.
 
     Reads only content appended after it starts (so it doesn't re-print the apply
     diagnostics already shown live), emits at most ``_TAIL_MAX_LINES_PER_TICK`` per

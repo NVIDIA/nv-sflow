@@ -23,6 +23,7 @@ import os
 import shlex
 import sys
 from collections.abc import Mapping
+from contextvars import ContextVar
 from pathlib import Path
 
 # The compiled regex is the single definition; only its pattern text travels
@@ -36,6 +37,9 @@ from sflow.utils.console_text import _ANSI_ESCAPE_RE
 # recognized for backwards compatibility.
 OFFLOAD_TASK_LOGS_ENV = "SFLOW_OFFLOAD_TASK_LOGS"
 LEGACY_OFFLOAD_TASK_LOGS_ENV = "SFLOW_SLURM_OFFLOAD_TASK_LOGS"
+
+# Scoped to one CLI invocation; asyncio tasks inherit the streaming decision.
+STREAM_TASK_LOGS: ContextVar[bool] = ContextVar("stream_task_logs", default=False)
 
 
 def offload_env_override() -> bool | None:
@@ -55,17 +59,22 @@ def stdout_is_tty() -> bool:
         return False
 
 
+def console_streams_task_output() -> bool:
+    """Echo task output on a TTY or when explicitly requested by the CLI."""
+    return STREAM_TASK_LOGS.get() or stdout_is_tty()
+
+
 def offload_enabled(log_to_file: bool) -> bool:
     """Resolve whether a task offloads its log.
 
     Precedence: env channel (CLI flag) > operator config > off. In an interactive
-    TTY/--tui session we keep streaming task output to the console (offload is
+    TTY session or with --stream-task-logs we keep streaming to the console (offload is
     file-only), so offload auto-falls back to stream mode; a file-tailer could
     lift this in the future.
     """
     override = offload_env_override()
     enabled = override if override is not None else bool(log_to_file)
-    if enabled and stdout_is_tty():
+    if enabled and console_streams_task_output():
         return False
     return enabled
 

@@ -1120,6 +1120,16 @@ EOF
     run_check "run per-task log offload x TUI matrix (4 combos: file + console) (live)" \
         bash "$OFFLOAD_TUI_CHECK" "$OFFLOAD_TUI_FIXTURE" "$OFFLOAD_TUI_DIR"
 
+    # Force TTY-style task output with --stream-task-logs on a real non-TTY pipe.
+    # Reuse the live server/client checks: startup/progress arrive before completion,
+    # explicit offload cannot silence them, and the default remains file-only.
+    run_check "run forced task log streaming without a TTY (live)" \
+        env SFLOW_E2E_STREAM_BACKEND=local \
+            SFLOW_E2E_ARTIFACT_DIR="$PREFLIGHT_DIR/task_log_streaming" \
+            "${SFLOW_TEST_PYTHON:-python}" -m pytest \
+            "$REPO_DIR/tests/integration/test_cli_stream_task_logs.py" \
+            -k test_non_tty_task_logs -v -s -o addopts=""
+
     # -- sflow run/batch: plain script commands containing ':' must stay strings --
     run_check "run colon in task script (dry-run)" \
         bash -c "sflow run \"$COLON_SCRIPT_FIXTURE\" --dry-run > \"$COLON_SCRIPT_DRYRUN_LOG\" 2>&1"

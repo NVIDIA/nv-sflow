@@ -50,7 +50,7 @@ pip install 'nv-sflow[monitor]'   # PNG charts for the hardware monitor
 
 | Concept | What it does | Example |
 |---------|-------------|---------|
-| **Backend** | Declares *where* tasks run. Swap one line to move between `local`, `slurm`, `docker`, and `kubernetes`. | `type: slurm`, `partition: gpu` |
+| **Backend** | Declares *where* tasks run. Swap one line to move between `local`, `slurm`, `docker`, `kubernetes`, and `osmo`. | `type: slurm`, `partition: gpu` |
 | **Operator** | Declares *how* a task's script is launched. Each backend has a default (local → `bash`, Slurm → `srun`). Define named operators to preset flags and reuse them across tasks. | `type: srun`, `ntasks: 4` |
 | **Variable** | A named value reusable everywhere — scripts, resource counts, backend config. Override from the CLI with `--set`. | `NUM_GPUS: 8` |
 | **Task & DAG** | Each task is a unit of work with a script. `depends_on` wires them into a directed graph so sflow runs them in the right order. | `depends_on: [train]` |

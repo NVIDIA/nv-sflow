@@ -208,6 +208,9 @@ def resolve_backends(
             )
         else:
             resolved_conf = b_conf_obj
+        # Each resolve_config rebuilds its config field by field; carry the
+        # backend-agnostic switch over here once rather than in every backend.
+        resolved_conf.prefetch_images = b_conf_obj.prefetch_images
 
         backend = backend_cls(resolved_conf)  # type: ignore[call-arg]
         if kubectl_config is not None and hasattr(backend, "apply_kubectl_config"):
@@ -264,6 +267,57 @@ async def allocate_backends(state: SflowState) -> SflowState:
         )
         raise exc
 
+    return state
+
+
+def plan_backend_image_prefetch(state: SflowState) -> dict[str, list[Any]]:
+    """Per backend with ``prefetch_images`` on: each task image and its nodes.
+
+    One plan for the real run and the dry-run, so the two cannot disagree.
+    """
+    from sflow.core.image_prefetch import plan_image_prefetch
+
+    enabled = {
+        name: b
+        for name, b in (state.backends or {}).items()
+        if b.allocation is not None
+        and getattr(getattr(b, "config", None), "prefetch_images", False)
+    }
+    tasks_by_backend: dict[str, list[Any]] = {name: [] for name in enabled}
+    workflow = getattr(state, "workflow", None)
+    if workflow is not None:
+        for task in workflow.task_graph.get_tasks():
+            if task.backend_name in tasks_by_backend:
+                tasks_by_backend[task.backend_name].append(task)
+    plans = {
+        name: plan_image_prefetch(
+            tasks_by_backend[name], [node.name for node in b.allocation.nodes]
+        )
+        for name, b in enabled.items()
+    }
+    return {name: plan for name, plan in plans.items() if plan}
+
+
+async def prefetch_images(state: SflowState) -> SflowState:
+    """Pull each task image once per node, on every backend with ``prefetch_images``.
+
+    Runs after allocation and planning, before any task starts. Backends run
+    concurrently; a failure on any of them is raised once all have finished, so
+    the caller releases every allocation with no pull still in flight.
+    """
+    from sflow.core.image_prefetch import prefetch_backend_images
+
+    plans = plan_backend_image_prefetch(state)
+    results = await asyncio.gather(
+        *[
+            prefetch_backend_images(state.backends[name], plan)
+            for name, plan in plans.items()
+        ],
+        return_exceptions=True,
+    )
+    exc = next((r for r in results if isinstance(r, BaseException)), None)
+    if exc is not None:
+        raise exc
     return state
 
 

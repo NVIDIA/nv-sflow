@@ -30,6 +30,7 @@ from sflow.app.backend_lifecycle import (
     allocate_backends as _allocate_backends_impl,
     preflight_validate_backends as _preflight_validate_backends_impl,
     preflight_validate_container_images as _preflight_validate_container_images_impl,
+    prefetch_images as _prefetch_images_impl,
     release_backends as _release_backends_impl,
     resolve_backends as _resolve_backends_impl,
     seed_placeholder_backend_allocations as _seed_placeholder_backend_allocations_impl,
@@ -245,6 +246,10 @@ def resolve_backends(
 
 async def allocate_backends(state: SflowState) -> SflowState:
     return await _allocate_backends_impl(state)
+
+
+async def prefetch_images(state: SflowState) -> SflowState:
+    return await _prefetch_images_impl(state)
 
 
 async def release_backends(state: SflowState) -> SflowState:
@@ -1821,6 +1826,12 @@ async def build_state(
         state.monitor_registry = build_monitor_registry(
             config, state, output_dir=output_dir, materialize=allocate
         )
+
+        # Last step before the orchestrator launches anything: pull each task
+        # image once per node (backends with `prefetch_images`). A failure here
+        # releases the allocation like any other planning failure.
+        if allocate:
+            state = await prefetch_images(state)
         return state
     except BaseException:
         # If we allocated real resources, make sure we release them even if planning fails

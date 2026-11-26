@@ -12,6 +12,7 @@ from .monitor import MonitorDelivery
 from .operator import Operator
 
 if TYPE_CHECKING:
+    from .image_prefetch import PrefetchResult
     from .probe_transport import ProbeTransport
 
 _logger = get_logger(__name__)
@@ -190,6 +191,21 @@ class Backend(ABC):
     def emergency_release(self, allocation: Allocation) -> None:
         """Best-effort synchronous cleanup for atexit fallback paths."""
         return None
+
+    async def prefetch_image(
+        self, image: str, nodes: Sequence[str], tasks: Sequence[Any]
+    ) -> "PrefetchResult":
+        """Pull *image* onto each of *nodes* of the allocation, once, and report.
+
+        Called after allocation and planning, before any task starts, when the
+        backend sets ``prefetch_images``. *tasks* are the tasks that run *image*
+        (for per-task pull credentials or policy). Return the nodes the pull
+        failed on, with the runtime's output; never wait forever on a state that
+        is recognisably stuck. Retries and the final error belong to the caller
+        (:mod:`sflow.core.image_prefetch`). Backends that do not override this
+        are skipped.
+        """
+        raise NotImplementedError
 
     async def allocate_resources(self) -> None:
         """

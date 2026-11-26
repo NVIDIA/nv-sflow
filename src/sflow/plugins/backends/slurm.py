@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import logging
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Sequence
@@ -14,12 +14,18 @@ from sflow.core.backend_registry import register_backend
 from sflow.core.command import Command
 from sflow.core.command_log import register_command_family
 from sflow.core.compute_node import ComputeNode
+from sflow.core.image_prefetch import PrefetchResult
 from sflow.core.launcher import SubprocessLauncher
 from sflow.core.operator import Operator
 from sflow.logging import get_logger
 from sflow.plugins.operators.srun import SrunOperator, SrunOperatorConfig
 from sflow.utils.extra_args import normalize_extra_args
-from sflow.utils.logging import isolated_logger, temporary_handler
+from sflow.utils.logging import (
+    LineCaptureHandler,
+    isolated_logger,
+    run_capturing,
+    temporary_handler,
+)
 from sflow.utils.node_filters import (
     filter_by_node_names,
     normalize_node_list,
@@ -114,15 +120,39 @@ def _planned_gpu_uuids(
     return ";".join(entries)
 
 
-class _OutputCapture(logging.Handler):
-    """Collect a subprocess's log lines into *sink*, for the srun/salloc probes."""
+# srun's per-node failure line, e.g. "srun: error: node002: task 1: Exited with exit code 1".
+_SRUN_NODE_ERROR_RE = re.compile(r"srun: error: (?P<node>[^\s:]+): tasks? [\d,\-]+: ")
 
-    def __init__(self, sink: list[str]) -> None:
-        super().__init__()
-        self._sink = sink
 
-    def emit(self, record: logging.LogRecord) -> None:
-        self._sink.append(record.getMessage())
+def image_prefetch_command(
+    *, job_id: str | None, image: str, nodes: Sequence[str]
+) -> list[str]:
+    """One srun step that imports *image* on each of *nodes* (pyxis/enroot) and exits."""
+    cmd: list[str] = ["srun"]
+    if job_id:
+        cmd.extend(["--jobid", str(job_id)])
+    cmd.extend(
+        [
+            "--nodelist",
+            ",".join(nodes),
+            "--ntasks-per-node=1",
+            "--overlap",
+            "--job-name=sflow_image_prefetch",
+            f"--container-image={image}",
+            "true",
+        ]
+    )
+    return cmd
+
+
+def _failed_srun_nodes(output_lines: Sequence[str], nodes: Sequence[str]) -> list[str]:
+    """Nodes srun reported a failed task on; all of *nodes* when it named none."""
+    reported = {
+        match.group("node")
+        for line in output_lines
+        if (match := _SRUN_NODE_ERROR_RE.search(line))
+    }
+    return [node for node in nodes if node in reported] or list(nodes)
 
 
 @register_backend("slurm", SlurmBackendConfig)
@@ -194,6 +224,22 @@ class SlurmBackend(Backend):
 
     def planning_capacity(self) -> tuple[int, int | None]:
         return (self._nodes, self._gpu_per_node)
+
+    async def prefetch_image(
+        self, image: str, nodes: Sequence[str], tasks: Sequence[Any]
+    ) -> PrefetchResult:
+        """Import *image* on *nodes* with one ``srun --container-image=<image> true`` step."""
+        allocation_id = self.allocation.allocation_id if self.allocation else None
+        cmd = image_prefetch_command(job_id=allocation_id, image=image, nodes=nodes)
+        exit_code, output_lines = await run_capturing(
+            self._subprocess_launcher, cmd, name="slurm.image_prefetch"
+        )
+        if exit_code == 0:
+            return PrefetchResult()
+        return PrefetchResult(
+            failed_nodes=_failed_srun_nodes(output_lines, nodes),
+            output=f"srun exit code {exit_code}\n" + "\n".join(output_lines),
+        )
 
     def dry_run_details(self) -> list[tuple[str, str]]:
         details: list[tuple[str, str]] = [
@@ -387,7 +433,7 @@ class SlurmBackend(Backend):
 
         capture_logger = isolated_logger("slurm.gpu_discovery")
         try:
-            with temporary_handler(capture_logger, _OutputCapture(output_lines)):
+            with temporary_handler(capture_logger, LineCaptureHandler(output_lines)):
                 exit_code = await self._subprocess_launcher.run_async(
                     cmd, output_logger=capture_logger
                 )
@@ -455,7 +501,7 @@ class SlurmBackend(Backend):
         # Capture output
         output_lines: list[str] = []
 
-        capture_handler = _OutputCapture(output_lines)
+        capture_handler = LineCaptureHandler(output_lines)
         # Use a per-call isolated logger so concurrent backend allocations don't
         # capture each other's output (see isolated_logger docstring).
         capture_logger = isolated_logger("slurm.srun_resolve")
@@ -620,7 +666,7 @@ class SlurmBackend(Backend):
         # Capture all output lines for error reporting
         output_lines: list[str] = []
 
-        capture_handler = _OutputCapture(output_lines)
+        capture_handler = LineCaptureHandler(output_lines)
         # Use a per-call isolated logger so concurrent backend allocations don't
         # capture each other's salloc output. Routing through the shared module
         # logger caused parsers from sibling allocations to see each other's

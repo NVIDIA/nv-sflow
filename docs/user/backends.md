@@ -3,7 +3,7 @@ title: Backends
 sidebar_position: 5
 ---
 
-A `backend` provides compute resources for task execution. **v0.1 ships with** `local`, `slurm`, `docker`, and `kubernetes` backends.
+A `backend` provides compute resources for task execution. **v0.1 ships with** `local`, `slurm`, `docker`, `kubernetes`, and `osmo` backends.
 
 :::note
 YAML snippets on this page are fragments: add `workflow.name` (and any `variables:` they reference) before running them.
@@ -268,6 +268,42 @@ Complex Slurm hostlist expressions (e.g. `node[01-05]`) should be passed through
 Slurm's own flags via `extra_args` / `-e`; `--include-nodes` / `--exclude-nodes`
 take plain hostnames.
 :::
+
+## Image prefetch (all backends)
+
+Without prefetch, each task pulls its own container image when it starts. Tasks that
+share an image may pull it several times, and a failed pull (a registry 401, a
+timeout) fails that task mid-run, often after the expensive tasks are already up.
+Set `prefetch_images: true` on a backend (default `false`) to move every pull to the
+front of the run:
+
+```yaml
+backends:
+  - name: gpu_cluster
+    type: slurm          # or docker / kubernetes
+    # ...
+    prefetch_images: true
+```
+
+Once the allocation is up and the tasks are placed, sflow collects each distinct
+image of the backend's tasks and the nodes that will run it, and pulls it **once per
+node**. It handles one image at a time, each on all of its nodes in parallel; separate
+backends prefetch concurrently. A failed pull is retried twice, 10 s apart, on the
+failed nodes only. If the last attempt fails, sflow logs the image, the node(s) and
+the runtime's output, releases the allocation, and exits without starting any task.
+
+| Backend | How one image is pulled onto its nodes |
+|---------|----------------------------------------|
+| Slurm | one `srun --overlap --ntasks-per-node=1 --container-image=<image> true` step over the nodes (pyxis/enroot); failed nodes are read from srun's `srun: error: <node>: task N` lines |
+| Docker | on each host's daemon: `docker image inspect <image>`, then `docker pull <image>` only if it is missing (what `docker run` does by default) |
+| Kubernetes | one short pod per node, pinned by hostname, holding no GPU, running `true`; it uses the tasks' `image_pull_secrets` and `image_pull_policy` (else the backend's). `ErrImagePull`, `ImagePullBackOff`, `InvalidImageName`, `ErrImageNeverPull` or an unschedulable pod counts as a failed attempt. The pod is deleted afterwards. |
+| Local | not supported; the setting is ignored |
+
+Local images (`.sqsh` files, paths) and tasks that run no container are skipped.
+Prefetch also runs in a reused allocation (`SLURM_JOB_ID`, e.g. under `sflow batch`).
+`--dry-run` pulls nothing; it lists the planned `image -> nodes` per backend under
+**Image prefetch**. There is no prefetch timeout: a pull that hangs without failing
+is bounded the same way as one inside a task (Slurm walltime, Ctrl-C).
 
 ## Docker backend
 
@@ -1502,3 +1538,92 @@ backends:
     dra:
       # nvlink_domain_label_key: nvidia.com/gpu.clique  # multi-domain clusters only
 ```
+
+## OSMO backend
+
+The `osmo` backend runs each task as its own [OSMO](https://github.com/NVIDIA/OSMO)
+workflow through the `osmo` CLI. OSMO schedules every task on submit, so the backend holds
+no allocation. It carries the pool and the default platform.
+
+```yaml
+backends:
+  - name: osmo
+    type: osmo
+    default: true
+    pool: my-pool        # optional; default: the pool in your OSMO profile
+    platform: ovx-l40    # optional; default: the pool's default platform
+
+operators:
+  - name: osmo_cpu
+    type: osmo
+    image: ubuntu:24.04  # required; the backend has no image
+    cpu: 1
+    memory: 1Gi
+    storage: 1Gi
+```
+
+Full example: `examples/self_contained/osmo/hello_world.yaml`.
+
+### What the backend does (task → OSMO workflow)
+
+For each task, sflow:
+
+1. Writes a one-task OSMO spec. The task's `script:` and env ship as one base64 file, so
+   `{{ }}`, `{% %}` and `{# #}` in scripts reach the container unchanged (OSMO
+   Jinja-renders any spec that contains them).
+2. Runs `osmo workflow submit --pool <pool>`, plus `--label sflow-task=<task>` when the
+   installed CLI supports it (OSMO 6.4+; 6.3 has no `--label`).
+3. Streams `osmo workflow logs <id> --task main` into `<task>.log`. sflow drops OSMO's
+   header line and the timestamp prefix on workload lines, so `result:` and `log_watch`
+   patterns see the same text as on other backends. OSMO's own `[main][osmo]` lines keep
+   their prefix.
+   While the workflow waits in the OSMO queue (`PENDING`, or `WAITING` to be rescheduled
+   after e.g. a preemption), sflow polls `osmo workflow query` instead and logs the queue
+   state (e.g. `queued in <pool>: SCHEDULING`) when it changes and once a minute; it
+   attaches the stream once the workflow leaves the queue.
+   The stream can still be cut when the task prints nothing for about a minute, or fail
+   on a network error; sflow re-attaches until the workflow ends and skips lines it
+   already wrote. The CLI's "New client available" banner is kept out of `<task>.log`.
+4. Reads the task's exit code from `osmo workflow query <id>`. OSMO failures with no
+   process exit code (image pull, cancel, eviction, timeouts) map to exit code 1.
+
+If sflow stops a task before its workflow ends (Ctrl-C, the run stopping early, or an
+error while waiting), it runs `osmo workflow cancel <id>`, so nothing keeps running on
+the pool. sflow does not enforce task `timeout` on any backend, so use OSMO's own
+workflow timeouts to bound a job.
+
+### Authentication
+
+sflow reuses the `osmo` CLI session and stores no credentials. Pre-flight fails with a
+login hint when `osmo` is missing or cannot list workflows.
+
+- Interactive: `osmo login <url>`.
+- CI or other non-interactive runs: `osmo login <url> --method token --token-file <file>`,
+  with an OSMO access token (for example a service account's). No browser or MFA step is
+  needed.
+
+### Resources
+
+| Field | Where | Default | Maps to |
+|-------|-------|---------|---------|
+| `pool` | backend | OSMO profile pool | `osmo workflow submit --pool` |
+| `platform` | backend or operator | pool default | OSMO resource `platform` |
+| `cpu`, `memory`, `storage` | operator | `1`, `4Gi`, `10Gi` | OSMO resource fields |
+| `resources.gpus.count` | task | none | OSMO resource `gpu` |
+
+### Current limits
+
+- One node per task. A task with `resources.nodes.count` above 1 is rejected.
+- Task outputs stay in OSMO. sflow creates the `SFLOW_*_OUTPUT_DIR` paths inside the
+  container so scripts can write there, but the files are not collected back to the
+  driver yet.
+- Env names that are not shell names (for example `my-var`) are not passed to the task.
+- An `osmo` operator runs only on an `osmo` backend; sflow rejects other combinations.
+- TCP/HTTP readiness probes run from the sflow driver, which usually cannot reach OSMO
+  tasks. Use `log_watch` probes.
+- Hardware monitoring is not available.
+- Env values are written into the OSMO spec, which the OSMO service stores. Use OSMO
+  credentials, not task `env:`, for secrets.
+- Each task spends about 20-30 s in OSMO itself (queue, input download, finalize), so the
+  backend suits batch jobs of minutes or longer.
+

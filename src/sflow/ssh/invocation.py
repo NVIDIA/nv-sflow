@@ -62,11 +62,13 @@ class Invocation:
     variable_overrides: list[str] = field(default_factory=list)
     artifact_overrides: list[str] = field(default_factory=list)
     missable_tasks: list[str] = field(default_factory=list)
+    skip_artifact_check: bool = False
     bulk_input: Path | None = None
     compose_output: Path | None = None
     compose_bulk: bool = False
     batch_sbatch_path: Path | None = None
     batch_runtime_explicit: bool = False
+    log_level: str = "INFO"
 
 
 def parse_command_options(command: str, args: list[str]) -> dict[str, object] | None:
@@ -193,6 +195,8 @@ def argv_to_invocation(argv: list[str]) -> Invocation | None:
         variable_overrides=_strings(options.get("set_var")),
         artifact_overrides=_strings(options.get("artifact")),
         missable_tasks=_strings(options.get("missable_tasks")),
+        skip_artifact_check=bool(options.get("skip_artifact_check", False)),
+        log_level=str(options.get("log_level", "INFO")),
         bulk_input=bulk_input,
         compose_output=compose_output,
         compose_bulk=command == "compose" and bulk_input is not None,

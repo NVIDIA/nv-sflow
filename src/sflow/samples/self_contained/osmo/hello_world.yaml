@@ -1,0 +1,36 @@
+version: "0.1"
+
+variables:
+  OSMO_POOL:
+    description: OSMO pool to submit to
+    value: dht-l40-05
+
+backends:
+  - name: osmo
+    type: osmo
+    default: true
+    pool: ${{ variables.OSMO_POOL }}
+    platform: ovx-l40
+
+operators:
+  - name: osmo_cpu
+    type: osmo
+    # The osmo backend has no image; the workload image lives on the operator.
+    image: ubuntu:24.04
+    cpu: 1
+    memory: 1Gi
+    storage: 1Gi
+
+workflow:
+  name: osmo_hello_world
+  tasks:
+    - name: hello
+      operator: osmo_cpu
+      script:
+        - echo "Hello from OSMO"
+        - 'echo "literal braces survive: {{ not_jinja }}"'
+    - name: goodbye
+      operator: osmo_cpu
+      depends_on: [hello]
+      script:
+        - echo "Goodbye from OSMO"

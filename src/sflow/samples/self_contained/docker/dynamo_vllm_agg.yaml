@@ -173,6 +173,9 @@ backends:
   - name: docker_cluster
     type: docker
     default: true
+    # Pull the dynamo and aiperf images on each host before any task starts,
+    # so a registry failure stops the run up front instead of mid-run.
+    prefetch_images: true
     # No backend `image:`: every task below names an operator with its own, and
     # every host has an ssh address, so nothing would use it.
     hosts:

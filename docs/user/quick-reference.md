@@ -14,8 +14,8 @@ For detailed explanations and examples, see [Configuration](./configuration.md).
 | `version` | No | string | `"0.1"` | Schema version. If declared, must be `"0.1"`. |
 | `variables` | | dict / list | — | Global variables available to expressions and task env. |
 | `artifacts` | | dict / list | — | Named resources referenced by URI. |
-| `backends` | | dict / list | — | Compute backends (`local`, `slurm`, `docker`, `kubernetes`). |
-| `operators` | | dict / list | — | Task execution operators (`bash`, `srun`, `docker_run`, `ssh`, `python`, `k8s`, `k8s_mpi`). |
+| `backends` | | dict / list | — | Compute backends (`local`, `slurm`, `docker`, `kubernetes`, `osmo`). |
+| `operators` | | dict / list | — | Task execution operators (`bash`, `srun`, `docker_run`, `ssh`, `python`, `k8s`, `k8s_mpi`, `osmo`). |
 | `storage` | | dict / list | — | Post-execution upload targets (S3, …) referenced by task `uploads` / `upload_all` (see [Storage](#storage)). |
 | `workflow` | Yes | object | — | Workflow definition containing name and tasks. |
 
@@ -61,11 +61,12 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 
 | Field | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
-| `type` | Yes | string | — | `local`, `slurm`, `docker`, or `kubernetes`. |
+| `type` | Yes | string | — | `local`, `slurm`, `docker`, `kubernetes`, or `osmo`. |
 | `default` | | bool | `false` | Mark as the default backend (only one allowed). |
 | `gpus_per_node` | | int / expr | `null` | GPUs per node for sflow planning / packing. Does not add Slurm GPU allocation flags. |
 | `include_nodes` | | list[string] | `null` | Restrict allocation to these node hostnames (unioned with `--include-nodes`). Translated per backend: Slurm `--nodelist`, k8s `nodeAffinity` In, Docker host filter. |
 | `exclude_nodes` | | list[string] | `null` | Exclude these node hostnames (unioned with `--exclude-nodes`). |
+| `prefetch_images` | | bool | `false` | Pull each task image once per node before any task starts, retrying failed nodes; a final failure stops the run. Slurm, Docker, Kubernetes. See [Image prefetch](backends.md#image-prefetch-all-backends). |
 
 ## Backends — Local
 
@@ -371,7 +372,7 @@ and `addressing_style` (`auto` / `virtual` / `path`).
 | `probes` | | object | `null` | Readiness and failure probes. |
 | `outputs` | | list | `null` | Output parsing configuration (legacy MVP). |
 | `result` | | map / object | `null` | Consolidated result parsing (regex map, `patterns`, or `file`). Writes `result.json` + workflow `results.json`. |
-| `fail_fast` | | bool | backend | Prepend `set -e` to the script (shell operators) so the task fails on the first failing command. Unset takes the backend default: `true` on Kubernetes, `false` on Slurm/local/docker. Set explicitly to override. |
+| `fail_fast` | | bool | backend | Prepend `set -e` to the script (shell operators) so the task fails on the first failing command. Unset takes the backend default: `true` on Kubernetes and OSMO, `false` on Slurm/local/docker. Set explicitly to override. |
 | `uploads` | | list | `null` | Per-task file uploads to a `storage` target, fired on `COMPLETED` (see [Task Uploads](#task-uploads)). |
 | `ports` | | list | `null` | Service ports the task exposes, feeding `${{ task.<name>.service }}` expressions (see [Task Ports](#task-ports)). |
 | `monitor` | | object | `null` | Per-task hardware monitor (see [Monitor](#monitor)). |

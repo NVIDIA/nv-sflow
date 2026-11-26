@@ -1,0 +1,42 @@
+# Two SSH-accessible Docker hosts; replace the documentation addresses on the CLI.
+version: "0.1"
+variables:
+  HOST_0_ADDRESS:
+    value: 192.0.2.10
+  HOST_1_ADDRESS:
+    value: 192.0.2.11
+  SSH_USER:
+    value: ""
+  GPUS_PER_NODE:
+    type: integer
+    value: 8
+  SERVED_MODEL_NAME:
+    value: Qwen3-0.6B
+backends:
+  - name: cluster
+    type: docker
+    default: true
+    hosts:
+      - name: node-0
+        address: ${{ variables.HOST_0_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+      - name: node-1
+        address: ${{ variables.HOST_1_ADDRESS }}
+        user: ${{ variables.SSH_USER }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+operators:
+  - name: server
+    type: docker_run
+    image: ${{ variables.SERVER_IMAGE }}
+    extra_args: ["--entrypoint=", "--network=host", "--ipc=host", "--shm-size=16g"]
+  - name: helper
+    type: docker_run
+    image: ${{ variables.SERVER_IMAGE }}
+    extra_args: ["--entrypoint=", "--network=host"]
+  - name: client
+    type: docker_run
+    image: ${{ variables.CLIENT_IMAGE }}
+    extra_args: ["--entrypoint=", "--network=host"]
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///models/Qwen3-0.6B

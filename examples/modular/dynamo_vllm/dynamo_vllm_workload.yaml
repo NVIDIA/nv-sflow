@@ -1,0 +1,275 @@
+# Shared Dynamo vLLM P/D workload: node 0 has two TP1 prefill workers;
+# node 1 has one decode worker. Compose with exactly one infrastructure file.
+version: '0.1'
+variables:
+  SERVED_MODEL_NAME:
+    description: Served model name (advertised by the frontend / OpenAI API)
+    value: Qwen3-0.6B
+  SERVER_IMAGE:
+    description: Dynamo vLLM runtime image
+    value: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1-cuda13
+  FRONTEND_PORT:
+    description: Frontend / OpenAI HTTP port
+    type: integer
+    value: 8000
+  ETCD_PORT:
+    description: etcd client port
+    type: integer
+    value: 2379
+  ETCD_PEER_PORT:
+    description: etcd peer port (single-member cluster, but etcd still needs it)
+    type: integer
+    value: 2380
+  NATS_PORT:
+    description: NATS client port
+    type: integer
+    value: 4222
+  NUM_PREFILL_WORKERS:
+    type: integer
+    value: 2
+  NUM_DECODE_WORKERS:
+    type: integer
+    value: 1
+  CTX_TP_SIZE:
+    type: integer
+    value: 1
+  GEN_TP_SIZE:
+    type: integer
+    value: 4
+  EXTRA_PREFILL_ARGS:
+    value: --max-model-len 4096 --max-num-seqs 4 --gpu-memory-utilization 0.8
+  EXTRA_DECODE_ARGS:
+    value: --max-model-len 4096 --max-num-seqs 4 --gpu-memory-utilization 0.8
+  CLIENT_IMAGE:
+    description: Benchmark client image (AIPerf runs here)
+    value: python:3.12-slim
+  ISL:
+    description: Input sequence length
+    type: integer
+    value: 1024
+  OSL:
+    description: Output sequence length
+    type: integer
+    value: 256
+  CONCURRENCY:
+    description: Concurrent request count
+    type: integer
+    value: 4
+  MULTI_ROUND:
+    description: Number of benchmark rounds; request count is MULTI_ROUND * CONCURRENCY
+    type: integer
+    value: 4
+  TOKENIZER:
+    description: 'Tokenizer for aiperf: a local model dir OR a HuggingFace name. Defaults to the mounted weights,
+      which is what works on an offline cluster; set it to a HuggingFace id only if the benchmark client can
+      actually reach huggingface.co.'
+    value: ${{ artifacts.LOCAL_MODEL_PATH.path }}
+workflow:
+  name: dynamo_vllm_disagg
+  variables:
+    HEAD_NODE_IP:
+      description: Head node IP (resolved after allocation)
+      value: ${{ backends.cluster.nodes[0].ip_address }}
+    ETCD_ENDPOINTS:
+      description: etcd client endpoint the frontend and workers register with
+      value: ${{ backends.cluster.nodes[0].ip_address }}:${{ variables.ETCD_PORT }}
+    NATS_SERVER:
+      description: NATS URL the frontend and workers connect to
+      value: nats://${{ backends.cluster.nodes[0].ip_address }}:${{ variables.NATS_PORT }}
+  tasks:
+  - name: nats_server
+    operator: helper
+    script:
+    - nats-server -js --port ${{ variables.NATS_PORT }}
+    resources:
+      nodes:
+        indices:
+        - 0
+    probes:
+      readiness:
+        tcp_port:
+          port: ${{ variables.NATS_PORT }}
+        timeout: 600
+        interval: 2
+  - name: etcd_server
+    operator: helper
+    script:
+    - >
+      etcd
+      --listen-client-urls "http://0.0.0.0:${{ variables.ETCD_PORT }}"
+      --advertise-client-urls "http://0.0.0.0:${{ variables.ETCD_PORT }}"
+      --listen-peer-urls "http://0.0.0.0:${{ variables.ETCD_PEER_PORT }}"
+      --initial-advertise-peer-urls "http://${HEAD_NODE_IP}:${{ variables.ETCD_PEER_PORT }}"
+      --initial-cluster "default=http://${HEAD_NODE_IP}:${{ variables.ETCD_PEER_PORT }}"
+      --data-dir /tmp/etcd
+    resources:
+      nodes:
+        indices:
+        - 0
+    probes:
+      readiness:
+        tcp_port:
+          port: ${{ variables.ETCD_PORT }}
+        timeout: 600
+        interval: 2
+  - name: frontend_server
+    operator: helper
+    script:
+    - python3 -m dynamo.frontend --http-port ${{ variables.FRONTEND_PORT }}
+    resources:
+      nodes:
+        indices:
+        - 0
+    depends_on:
+    - nats_server
+    - etcd_server
+    probes:
+      readiness:
+        tcp_port:
+          port: ${{ variables.FRONTEND_PORT }}
+        timeout: 300
+        interval: 5
+  - name: prefill_server
+    operator: server
+    replicas:
+      count: ${{ variables.NUM_PREFILL_WORKERS }}
+      policy: parallel
+    script:
+    - set -x
+    - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + ${SFLOW_REPLICA_INDEX:-0}))
+    - export VLLM_NIXL_SIDE_CHANNEL_HOST=$(echo "$SFLOW_TASK_ASSIGNED_NODE_IPS" | cut -d',' -f1)
+    - >
+      python3 -m dynamo.vllm
+      --model ${{ artifacts.LOCAL_MODEL_PATH.path }}
+      --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+      --tensor-parallel-size ${{ variables.CTX_TP_SIZE }} --disaggregation-mode prefill
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+      --no-enable-prefix-caching ${{ variables.EXTRA_PREFILL_ARGS }}
+    resources:
+      nodes:
+        indices:
+        - 0
+      gpus:
+        count: ${{ variables.CTX_TP_SIZE }}
+    depends_on:
+    - frontend_server
+    required_by:
+    - benchmark
+    probes:
+      readiness:
+      - http_post:
+          url: http://${{ backends.cluster.nodes[0].ip_address }}:8000/v1/chat/completions
+          headers:
+            Content-Type: application/json
+          body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1}'
+        timeout: 1200
+        each_check_timeout: 20
+        interval: 20
+      - log_watch:
+          match_pattern: Registered endpoint 'dynamo.prefill.generate'
+          match_count: 1
+        timeout: 1200
+        interval: 10
+      failure:
+        log_watch:
+          match_pattern: Traceback (most recent call last)
+          match_count: 5
+        interval: 30
+  - name: decode_server
+    operator: server
+    replicas:
+      count: ${{ variables.NUM_DECODE_WORKERS }}
+      policy: parallel
+    script:
+    - set -x
+    - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((6557 + ${SFLOW_REPLICA_INDEX:-0}))
+    - export VLLM_NIXL_SIDE_CHANNEL_HOST=$(echo "$SFLOW_TASK_ASSIGNED_NODE_IPS" | cut -d',' -f1)
+    - >
+      python3 -m dynamo.vllm
+      --model ${{ artifacts.LOCAL_MODEL_PATH.path }}
+      --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+      --tensor-parallel-size ${{ variables.GEN_TP_SIZE }} --disaggregation-mode decode
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+      --no-enable-prefix-caching ${{ variables.EXTRA_DECODE_ARGS }}
+    resources:
+      nodes:
+        indices:
+        - 1
+      gpus:
+        count: ${{ variables.GEN_TP_SIZE }}
+    depends_on:
+    - frontend_server
+    required_by:
+    - benchmark
+    probes:
+      readiness:
+      - http_post:
+          url: http://${{ backends.cluster.nodes[0].ip_address }}:8000/v1/chat/completions
+          headers:
+            Content-Type: application/json
+          body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1}'
+        timeout: 1200
+        each_check_timeout: 20
+        interval: 20
+      - log_watch:
+          match_pattern: Registered endpoint 'dynamo.backend.generate'
+          match_count: 1
+        timeout: 1200
+        interval: 10
+      failure:
+        log_watch:
+          match_pattern: Traceback (most recent call last)
+          match_count: 5
+        interval: 30
+  - name: benchmark
+    operator: client
+    script:
+    - pip install aiperf==0.3.0
+    - set -x
+    - export COLUMNS=200
+    - export AIPERF_DIR="${SFLOW_WORKFLOW_OUTPUT_DIR}/aiperf_concurrency_${{ variables.CONCURRENCY }}"
+    - >
+      aiperf profile
+      --artifact-dir "${AIPERF_DIR}"
+      --model ${{ variables.SERVED_MODEL_NAME }}
+      --tokenizer ${{ variables.TOKENIZER }}
+      --endpoint-type chat
+      --endpoint /v1/chat/completions
+      --streaming
+      --url http://${{ backends.cluster.nodes[0].ip_address }}:8000
+      --synthetic-input-tokens-mean ${{ variables.ISL }}
+      --synthetic-input-tokens-stddev 0
+      --output-tokens-mean ${{ variables.OSL }}
+      --output-tokens-stddev 0
+      --extra-inputs "min_tokens:${{ variables.OSL }}"
+      --extra-inputs "ignore_eos:true"
+      --extra-inputs "repetition_penalty:1.0"
+      --extra-inputs "temperature: 0.0"
+      --concurrency ${{ variables.CONCURRENCY }}
+      --request-count ${{ variables.MULTI_ROUND * variables.CONCURRENCY }}
+      --warmup-request-count ${{ variables.CONCURRENCY }}
+      --num-dataset-entries ${{ variables.MULTI_ROUND * variables.CONCURRENCY }}
+      --random-seed 100 -H 'Authorization: Bearer NOT USED' -H 'Accept: text/event-stream' -H 'Connection: close'
+      --record-processors 8
+      --ui simple
+    - |
+      csv="${AIPERF_DIR}/profile_export_aiperf.csv"
+      if [ ! -s "$csv" ]; then
+        echo "aiperf produced no results: $csv is missing or empty." >&2
+        echo "Read the AIPerf errors above -- aiperf exits 0 even when it measures nothing." >&2
+        exit 1
+      fi
+      if ! grep -q "Time to First Token" "$csv"; then
+        echo "aiperf measured no generation: $csv has no per-request latency" >&2
+        echo "metrics, so the server accepted the requests but returned no tokens." >&2
+        echo "Check the server logs for KV-transfer / handshake errors." >&2
+        exit 1
+      fi
+      echo "aiperf wrote $(($(wc -l < "$csv") - 1)) metric rows to $csv"
+    - echo "Benchmarking finished"
+    resources:
+      nodes:
+        indices:
+        - 0

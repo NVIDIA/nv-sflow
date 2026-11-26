@@ -26,6 +26,7 @@ from sflow.core.backend import (
 )
 from sflow.core.backend_registry import register_backend
 from sflow.core.compute_node import ComputeNode
+from sflow.core.image_prefetch import PrefetchResult, operator_config
 from sflow.core.kubectl_config import kubectl_global_args
 from sflow.core.operator import Operator
 from sflow.logging import get_logger
@@ -35,6 +36,7 @@ from sflow.plugins.k8s.render import (
     RESOURCE_API_VERSION,
     SFLOW_ALLOC_LABEL,
     render_compute_domain_manifest,
+    render_image_prefetch_pod_manifest,
     render_probe_pod_manifest,
     render_reservation_pod_manifest,
     render_resource_claim_template,
@@ -615,6 +617,46 @@ class KubernetesBackendConfig(BackendConfig):
 
     def executes_offhost(self) -> bool:
         return True
+
+
+# Seconds between status reads of an image-prefetch pod, and how many reads in a
+# row may fail (kubectl/API errors) before the attempt counts as failed.
+_IMAGE_PREFETCH_POLL_S = 2.0
+_IMAGE_PREFETCH_READ_ERRORS = 5
+
+# Waiting reasons that mean the kubelet will not get the image without help.
+# ErrImagePull is the first failure before back-off; the caller retries with a
+# fresh pod, so there is no point waiting through the kubelet's own back-off.
+_IMAGE_PULL_FAILURE_REASONS = frozenset(
+    {"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull"}
+)
+# Waiting reasons the kubelet reaches only after the image is on the node.
+_IMAGE_PULLED_WAITING_REASONS = frozenset({"CreateContainerError", "RunContainerError"})
+
+
+def _image_pull_verdict(pod: dict[str, Any]) -> str | None:
+    """Judge an image-prefetch pod: "" pulled, a reason string failed, None not yet."""
+    status = pod.get("status") or {}
+    for cs in status.get("containerStatuses") or []:
+        state = cs.get("state") or {}
+        waiting = state.get("waiting") or {}
+        reason = waiting.get("reason") or ""
+        if reason in _IMAGE_PULL_FAILURE_REASONS:
+            return f"{reason}: {waiting.get('message') or ''}".strip()
+        if cs.get("imageID") or "terminated" in state or "running" in state:
+            return ""
+        if reason in _IMAGE_PULLED_WAITING_REASONS:
+            return ""
+    for cond in status.get("conditions") or []:
+        if (
+            cond.get("type") == "PodScheduled"
+            and cond.get("status") == "False"
+            and cond.get("reason") == "Unschedulable"
+        ):
+            return f"Unschedulable: {cond.get('message') or ''}".strip()
+    if status.get("phase") == "Failed":
+        return f"pod failed: {status.get('reason') or status.get('message') or ''}"
+    return None
 
 
 @register_backend("kubernetes", KubernetesBackendConfig)
@@ -1430,6 +1472,88 @@ class KubernetesBackend(Backend):
             kind = manifest.get("kind", "object")
             raise RuntimeError(
                 f"Failed to create reservation {kind} '{name}': {err}"
+            )
+
+    # ------------------------------------------------------------------
+    # Image prefetch (backend ``prefetch_images``; see core.image_prefetch)
+    # ------------------------------------------------------------------
+
+    async def prefetch_image(
+        self, image: str, nodes: Sequence[str], tasks: Sequence[Any]
+    ) -> PrefetchResult:
+        """Make the kubelet on each of *nodes* pull *image*, one short pod per node.
+
+        Pull credentials are the union of the tasks' ``image_pull_secrets``; the
+        policy is the first task's ``image_pull_policy``, else the backend's.
+        """
+        policy = next(
+            (
+                str(p)
+                for t in tasks
+                if (p := getattr(operator_config(t), "image_pull_policy", None))
+            ),
+            self._image_pull_policy,
+        )
+        secrets: list[str] = []
+        for t in tasks:
+            for secret in getattr(operator_config(t), "image_pull_secrets", None) or []:
+                if str(secret) not in secrets:
+                    secrets.append(str(secret))
+
+        outcomes = await asyncio.gather(
+            *[self._prefetch_on_node(image, node, policy, secrets) for node in nodes]
+        )
+        return PrefetchResult.from_node_errors(list(zip(nodes, outcomes)))
+
+    async def _prefetch_on_node(
+        self, image: str, node: str, policy: str | None, secrets: Sequence[str]
+    ) -> str | None:
+        """Pull *image* on *node*; None on success, else why it failed."""
+        alloc_id = str(self.allocation.allocation_id) if self.allocation else "none"
+        pod_name = (
+            f"sflow-pull-{sanitize_name(self.name)[:12]}-{uuid.uuid4().hex[:10]}"
+        )
+        manifest = render_image_prefetch_pod_manifest(
+            pod_name=pod_name,
+            allocation_id=alloc_id,
+            image=image,
+            node=node,
+            namespace=self._namespace,
+            image_pull_policy=policy,
+            image_pull_secrets=secrets,
+            node_selector=self._node_selector,
+            tolerations=self._effective_tolerations(),
+        )
+        try:
+            await self._apply_manifest(manifest)
+        except (RuntimeError, OSError) as exc:
+            return f"could not create pull pod '{pod_name}': {exc}"
+        try:
+            read_errors = 0
+            while True:
+                rc, out, err = await self._kubectl(
+                    ["get", "pod", pod_name, "-o", "json"]
+                )
+                if rc != 0:
+                    # A pod that is gone (evicted, deleted) will never report a
+                    # pull; an API that keeps failing is no better. Either is
+                    # a failed attempt, not a reason to poll forever.
+                    read_errors += 1
+                    if "NotFound" in err or read_errors >= _IMAGE_PREFETCH_READ_ERRORS:
+                        return f"could not read pull pod '{pod_name}': {err.strip()}"
+                else:
+                    read_errors = 0
+                    try:
+                        pod = json.loads(out or "{}")
+                    except json.JSONDecodeError:
+                        pod = {}
+                    verdict = _image_pull_verdict(pod)
+                    if verdict is not None:
+                        return verdict or None
+                await asyncio.sleep(_IMAGE_PREFETCH_POLL_S)
+        finally:
+            await self._kubectl(
+                ["delete", "pod", pod_name, "--wait=false", "--ignore-not-found"]
             )
 
     # ------------------------------------------------------------------

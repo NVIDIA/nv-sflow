@@ -9,6 +9,7 @@ from .bash import BashOperator, BashOperatorConfig
 from .docker_run import DockerRunOperator, DockerRunOperatorConfig
 from .k8s import K8sOperator, K8sOperatorConfig
 from .k8s_mpi import K8sMpiOperator, K8sMpiOperatorConfig
+from .osmo import OsmoOperator, OsmoOperatorConfig
 from .python import PythonOperator, PythonOperatorConfig
 from .srun import SrunOperator, SrunOperatorConfig
 from .ssh import SshOperator, SshOperatorConfig
@@ -22,6 +23,8 @@ __all__ = [
     "K8sOperatorConfig",
     "K8sMpiOperator",
     "K8sMpiOperatorConfig",
+    "OsmoOperator",
+    "OsmoOperatorConfig",
     "PythonOperator",
     "PythonOperatorConfig",
     "SshOperator",

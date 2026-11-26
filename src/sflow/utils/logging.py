@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -66,6 +66,31 @@ def temporary_handler(
         logger.propagate = old_propagate
         if not already_attached:
             logger.removeHandler(handler)
+
+
+class LineCaptureHandler(logging.Handler):
+    """Collect each record's message into *sink*, for capturing subprocess output."""
+
+    def __init__(self, sink: list[str]) -> None:
+        super().__init__()
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._sink.append(record.getMessage())
+
+
+async def run_capturing(
+    launcher: Any, cmd: Sequence[str], *, name: str
+) -> tuple[int, list[str]]:
+    """Run *cmd* via a ``SubprocessLauncher``; return its exit code and output lines.
+
+    The output goes to an isolated logger, so it stays out of the main log.
+    """
+    lines: list[str] = []
+    capture_logger = isolated_logger(name)
+    with temporary_handler(capture_logger, LineCaptureHandler(lines)):
+        exit_code = await launcher.run_async(list(cmd), output_logger=capture_logger)
+    return exit_code, lines
 
 
 # --- Dry-run output formatting -------------------------------------------------

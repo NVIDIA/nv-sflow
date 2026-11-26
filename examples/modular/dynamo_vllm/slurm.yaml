@@ -1,0 +1,41 @@
+# Two Slurm nodes, four GPUs per node. Set your partition/account on the CLI.
+version: "0.1"
+variables:
+  SLURM_PARTITION:
+    value: your_partition
+  SLURM_ACCOUNT:
+    value: your_account
+  SLURM_TIME:
+    type: integer
+    value: 30
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+backends:
+  - name: cluster
+    type: slurm
+    default: true
+    nodes: 2
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    time: ${{ variables.SLURM_TIME }}
+    extra_args: ["--gpus-per-node=${{ variables.GPUS_PER_NODE }}"]
+operators:
+  - name: server
+    type: srun
+    container_image: ${{ variables.SERVER_IMAGE }}
+    container_writable: true
+    mpi: pmix
+    ntasks_per_node: 1
+  - name: helper
+    type: srun
+    container_image: ${{ variables.SERVER_IMAGE }}
+    container_writable: true
+  - name: client
+    type: srun
+    container_image: ${{ variables.CLIENT_IMAGE }}
+    container_writable: true
+artifacts:
+  - name: LOCAL_MODEL_PATH
+    uri: fs:///models/Qwen3-0.6B

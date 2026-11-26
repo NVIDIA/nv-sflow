@@ -7,7 +7,6 @@ import logging
 import os
 import shlex
 import subprocess
-import sys
 from typing import Callable, Mapping, Optional
 
 try:
@@ -26,6 +25,7 @@ from sflow.utils.console_text import (
 
 from .command import Command, format_command
 from .command_log import record_active_command
+from .log_offload import console_streams_task_output
 
 _logger = get_logger(__name__)
 
@@ -33,15 +33,11 @@ _logger = get_logger(__name__)
 def _console_streams_task_output() -> bool:
     """Whether per-task subprocess output should be echoed to the root logger.
 
-    True only for interactive TTY sessions. In batch mode (Slurm redirects
-    stdout/stderr to files) or when output is piped to a file, this returns
-    False so task content never floods sflow.log or the Slurm stdout/err files.
-    Per-task content is always written to the per-task log regardless.
+    True for interactive TTY sessions or an explicit --stream-task-logs. Otherwise,
+    task output stays in per-task logs when piped or redirected (including Slurm
+    batch stdout/stderr). Per-task content is always written to the per-task log.
     """
-    try:
-        return bool(sys.stdout.isatty())
-    except Exception:
-        return False
+    return console_streams_task_output()
 
 
 def _emit_task_output_line(
